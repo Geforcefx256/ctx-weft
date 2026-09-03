@@ -69,10 +69,15 @@ def launch_recognize_intent(state: LoopState, ctx: LoopContext) -> asyncio.Task:
             await RecognizeIntentStep().execute(snapshot, ctx)
         except asyncio.CancelledError:
             # F2：CancelledError 不是 Exception 子类，下面的 except Exception 接不住——
-            # 接不住则 run_error 仍是 None，RunFinished 会谎报 completed。同一口径抄
-            # runtime.py::_run_loop 的 except asyncio.CancelledError（R1 定下）：记下来、
-            # 不重新抛出——本就是 fire-and-forget，没有调用方等它的异常。
+            # 接不住则 run_error 仍是 None，RunFinished 会谎报 completed。记下来，供
+            # finally 里的 RunFinished.outcome 用（在异常继续传播之前发出，见下）。
+            #
+            # 这里**要重新抛出**——与 runtime.py::_run_loop 的 except asyncio.CancelledError
+            # 刻意不同，不是疏漏：_run_loop 吞是因为它把取消结果转成了 RunOutcome{kind=
+            # CANCELED} 这个**返回值契约**塞回调用方；这里没有这种契约，虽是
+            # fire-and-forget、没人 await 结果，但没理由让协作取消在这里被悄悄吸收掉。
             was_cancelled = True
+            raise
         except Exception as exc:
             run_error = exc
             logger.exception("recognize_intent concurrent run failed (ignored)")

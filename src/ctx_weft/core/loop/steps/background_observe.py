@@ -389,10 +389,17 @@ async def _run_background_observe(state: "LoopState", ctx: "LoopContext", bounda
     except asyncio.CancelledError:
         # F2：CancelledError 不是 Exception 子类（3.8+ 起继承 BaseException），上面
         # `except Exception` 接不住它——不接住就意味着 run_error 仍是 None，下面
-        # RunFinished 会把一次真取消谎报成 completed。同一口径抄 runtime.py::_run_loop
-        # 的 `except asyncio.CancelledError`（R1 定下）：记下来、不重新抛出——这段 run
-        # 本就是 fire-and-forget，没有调用方在等它的异常，吞掉与 _run_loop 一致。
+        # RunFinished 会把一次真取消谎报成 completed。记下来，供 finally 里的
+        # RunFinished.outcome 用（在异常继续传播之前发出，见下）。
+        #
+        # 这里**要重新抛出**——与 runtime.py::_run_loop 的 `except asyncio.CancelledError`
+        # 刻意不同，不是疏漏：_run_loop 吞是因为它把取消结果转成了 `RunOutcome{kind=
+        # CANCELED}` 这个**返回值契约**塞回给调用方（run 层报结局靠返回值），取消信息
+        # 没丢，只是换了个载体。这里没有这种契约——虽是 fire-and-forget、没人 await
+        # 结果，但吞掉真正的 CancelledError 没有任何好处，也没理由让协作取消在这里
+        # 被悄悄吸收掉。
         was_cancelled = True
+        raise
     except Exception as exc:
         # 上面那个 except 只吞真正跑出 fold/observe 的失败（业务已降级 = 段保
         # raw，run 仍算跑完）；这里接的是护栏段（幂等检查 / is_short_segment）本身

@@ -2754,10 +2754,18 @@ class CtxWeftRuntime:
                     await self._event_bus.emit(ev)
             except asyncio.CancelledError:
                 # F2：CancelledError 不是 Exception 子类，下面的 except Exception 接不住
-                # ——接不住则 run_error 仍是 None，RunFinished 会谎报 completed。同一口径
-                # 抄 `_run_loop` 的 except asyncio.CancelledError（R1 定下）：记下来、不重新
-                # 抛出。
+                # ——接不住则 run_error 仍是 None，RunFinished 会谎报 completed。记下来，
+                # 供 finally 里的 RunFinished.outcome 用（在异常继续传播之前发出，见下）。
+                #
+                # 这里**要重新抛出**——与本文件下方 `_run_loop` 的 except asyncio.CancelledError
+                # 刻意不同，不是疏漏：`_run_loop` 吞是因为它把取消结果转成了 RunOutcome{kind=
+                # CANCELED} 这个**返回值契约**塞回调用方（run 层报结局靠返回值）。
+                # `compact_session` 没有这种契约——它返回的是 `{"session_id", "agent_id",
+                # "task_id"}` 一个 id 字典，吞掉 CancelledError 会让调用方
+                # （`task.cancel()` / `asyncio.wait_for(...)`）拿到一个看似正常的返回值、
+                # 取消信息凭空消失——比事件层面的谎报更糟的语义谎报，必须重新抛出。
                 was_cancelled = True
+                raise
             except Exception as exc:
                 run_error = exc
                 raise
