@@ -259,6 +259,7 @@ async def _run_background_observe(state: "LoopState", ctx: "LoopContext", bounda
         payload={"task_id": state.task.id, "boundary": boundary, "agent_id": state.agent.id},
     ))
     run_error: Exception | None = None
+    was_cancelled = False
     try:
         async with _lock_for(state.task.id):
             # 重跑幂等护栏（恢复重跑时才生效）：非 close 边界若该段已无 active raw，说明上次
@@ -385,6 +386,13 @@ async def _run_background_observe(state: "LoopState", ctx: "LoopContext", bounda
                 if boundary in _CLOSE_BOUNDARIES:
                     pop_close_synth(state.task.id)
                 logger.exception("background observe failed (ignored); segment kept raw")
+    except asyncio.CancelledError:
+        # F2：CancelledError 不是 Exception 子类（3.8+ 起继承 BaseException），上面
+        # `except Exception` 接不住它——不接住就意味着 run_error 仍是 None，下面
+        # RunFinished 会把一次真取消谎报成 completed。同一口径抄 runtime.py::_run_loop
+        # 的 `except asyncio.CancelledError`（R1 定下）：记下来、不重新抛出——这段 run
+        # 本就是 fire-and-forget，没有调用方在等它的异常，吞掉与 _run_loop 一致。
+        was_cancelled = True
     except Exception as exc:
         # 上面那个 except 只吞真正跑出 fold/observe 的失败（业务已降级 = 段保
         # raw，run 仍算跑完）；这里接的是护栏段（幂等检查 / is_short_segment）本身
@@ -398,7 +406,8 @@ async def _run_background_observe(state: "LoopState", ctx: "LoopContext", bounda
         ))
         await ctx.event_bus.emit(make_event(state, EventType.RUN_FINISHED, payload={
             "outcome": (
-                RunOutcomeKind.COMPLETED.value if run_error is None
+                RunOutcomeKind.CANCELED.value if was_cancelled
+                else RunOutcomeKind.COMPLETED.value if run_error is None
                 else RunOutcomeKind.INTERRUPTED.value
             ),
             "final_status": state.task.status,
