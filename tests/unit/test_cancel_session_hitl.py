@@ -37,6 +37,7 @@ def _runtime():
 
 async def _wire_pending_session(
     rt, session_id: str, task_id: str, *, agent_id: str = "ag1",
+    tenant_id: str = "default",
 ) -> None:
     """手搭一个「有 task 正等 ask_user」的会话：不真跑 TaskManager.drain，只登记
     runtime 侧的两处状态（`_task_managers` 映射 + SessionRegistry 的会话状态），
@@ -47,17 +48,21 @@ async def _wire_pending_session(
     `cancel_session` 现在要把这个 session 下每个 agent 显式转 `terminated`，
     没有 agent 记录就没有可观测的 `AgentTerminated`）。`_plant` 是纯 dict 注入，
     不发事件，不影响其余只盯 `HitlResolved` 的既有测试。
+
+    `tenant_id` 可覆盖（F7）：默认场景全程 "default" 掩盖了「非 default 租户是否
+    也被正确透传」这条——机制上 `HitlService._emit` 的 `tenant_id=req.tenant_id`
+    已经是对的，只是此前没有测试固定过非 default 的取值。
     """
     session = Session(
         id=session_id, user_prompt="hi", status="RUNNING",
-        tenant_id="default", created_at=now_utc(),
+        tenant_id=tenant_id, created_at=now_utc(),
     )
     tm = TaskManager(session_id=session_id, event_bus=rt._event_bus, max_concurrent=0)
     tm.set_session(session)
-    task = Task(id=task_id, session_id=session_id, status="SUSPENDED", tenant_id="default")
+    task = Task(id=task_id, session_id=session_id, status="SUSPENDED", tenant_id=tenant_id)
     tm.register_task(task)
     rt._task_managers[session_id] = tm
-    rt._session_registry.register_session(session_id, tenant_id="default")
+    rt._session_registry.register_session(session_id, tenant_id=tenant_id)
     _plant(rt, agent_id, None, session_id=session_id, status="waiting_human")
 
 
@@ -75,6 +80,23 @@ async def runtime_with_pending_hitl():
         session_id=session_id, task_id=task_id, stage="tool", unattended=False,
     )
     return rt, bus, session_id, req.id
+
+
+@pytest.fixture
+async def runtime_with_pending_hitl_non_default_tenant():
+    """同 `runtime_with_pending_hitl`，但 tenant 不是 "default"（F7）。"""
+    rt = _runtime()
+    bus = _RecordingBus()
+    rt._event_bus.subscribe(None, bus._record)  # type: ignore[attr-defined]
+
+    session_id, task_id, tenant_id = "s1", "t1", "acme-corp"
+    await _wire_pending_session(rt, session_id, task_id, tenant_id=tenant_id)
+
+    req = await rt.hitl.open(
+        HitlAsk(form="wait", delivery=UserTurnDelivery(task_id=task_id)),
+        session_id=session_id, task_id=task_id, stage="tool", tenant_id=tenant_id,
+    )
+    return rt, bus, session_id, req.id, tenant_id
 
 
 @pytest.fixture
@@ -98,6 +120,22 @@ async def test_cancel_session_resolves_pending_hitl(runtime_with_pending_hitl):
     assert resolved[0].payload["hitl_id"] == hitl_id
     assert resolved[0].payload["outcome"] == HITL_OUTCOME_CANCELLED
     assert rt.hitl_registry.list_pending(session_id=session_id) == []
+
+
+async def test_cancel_session_resolves_pending_hitl_with_non_default_tenant(
+        runtime_with_pending_hitl_non_default_tenant):
+    """F7：取消路径把 `PendingHitl.tenant_id` 正确透传到 `HitlResolved`——全程非
+    default tenant，钉住 `service.py:200` `tenant_id=req.tenant_id` 这条透传。"""
+    rt, bus, session_id, hitl_id, tenant_id = runtime_with_pending_hitl_non_default_tenant
+
+    await rt.cancel_session(session_id)
+
+    resolved = [e for e in bus.events if e.type == EventType.HITL_RESOLVED]
+    assert len(resolved) == 1, "未决的 ask_user 没有被终局"
+    assert resolved[0].payload["hitl_id"] == hitl_id
+    assert resolved[0].payload["outcome"] == HITL_OUTCOME_CANCELLED
+    assert resolved[0].tenant_id == tenant_id, "取消发出的 HitlResolved 没带对 tenant"
+    assert resolved[0].tenant_id != "default"
 
 
 async def test_hitl_cancelled_before_session_terminal(runtime_with_pending_hitl):
