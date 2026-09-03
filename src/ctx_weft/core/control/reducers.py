@@ -468,9 +468,12 @@ def _apply(view: RunStateView, ev: Event) -> None:
     elif t == EventType.STEP_COMPLETED:
         view.current_step = p.get("next_step")
     elif t == EventType.RUN_STARTED:
-        view.task_status = "ACTIVE"
-        # 会话状态不在此写：run 是任务级的，会话状态归 SessionRegistry
-        # （docs/events-v2.md §2.1.1）。
+        # run 起止不写 task 状态：ACTIVE 的正主是 TASK_STARTED（TASK_STATUS_BY_EVENT，
+        # TM 派发时发）。recap / recognize_intent 等观测型 run 也会发 RunStarted，
+        # 若这里再写 ACTIVE，纯文本冷 park 场景下会把已经 AWAITING_HUMAN 的 task 错误
+        # 拉回 ACTIVE——标量与逐 task 视图自相矛盾。会话状态同样不在此写：run 是任务
+        # 级的，会话状态归 SessionRegistry（docs/events-v2.md §2.1.1）。
+        pass
     elif t == EventType.RUN_FINISHED:
         pass   # run 的记账，不承载状态——它在 §3.2 已是 O 档
 

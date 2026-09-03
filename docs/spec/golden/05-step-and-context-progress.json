@@ -1,6 +1,6 @@
 {
   "name": "step-and-context-progress",
-  "description": "RunStarted/StepStarted/StepCompleted → currentStep；PrepareCompleted → assembledPromptTokens；ActTurnCompleted → transcriptTurns。覆盖 Run/Step/Context 分支。",
+  "description": "RunStarted/StepStarted/StepCompleted → currentStep；PrepareCompleted → assembledPromptTokens；ActTurnCompleted → transcriptTurns。覆盖 Run/Step/Context 分支。本用例事件流里不含任何 task 事件（连 taskId 都没有），run 起止不写 task 状态（正主是 TASK_STARTED），故 taskStatus 保持默认值 UNKNOWN——这是刻意的，不是漏标。",
   "runId": "s1",
   "events": [
     { "id": "evt_0001", "runId": "run_1", "sequence": 1, "sessionId": "s1",
@@ -23,7 +23,7 @@
   ],
   "expected": {
     "sessionStatus": "RUNNING",
-    "taskStatus": "ACTIVE",
+    "taskStatus": "UNKNOWN",
     "currentStep": "observe",
     "assembledPromptTokens": 1234,
     "transcriptTurns": 3
