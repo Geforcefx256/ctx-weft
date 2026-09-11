@@ -7,6 +7,7 @@ Phase 4 版本：完整 SessionRegistry + TaskManager + AgentLifecycleManager �
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -78,6 +79,7 @@ from ctx_weft.core.models.task import NormalTaskSettings, Task
 from ctx_weft.core.models.errors import (
     AgentNotFound,
     AgentNotRunningError,
+    SessionAlreadyExistsError,
     crash_error_code,
     crash_run_outcome,
 )
@@ -623,8 +625,8 @@ class CtxWeftRuntime:
         self._capability_cache = CapabilityCache()
 
         # Per-run 控制信号 registry：session_id → {task_id → RunTokens}。随派发登记、随 run
-        # 注销（_SessionTaskRunner.execute），被顶替旧 TM 的 inflight 一样在册——pause/cancel
-        # 经 registry 必达全部在途 run（spec 2026-07-05）。
+        # 注销（_SessionTaskRunner.execute）——pause/cancel 经 registry 必达全部在途 run
+        # （spec 2026-07-05）。
         self._run_tokens: dict[str, dict[str, RunTokens]] = {}
         # pause 弃子进行中的 session：新派发 run 的 PauseToken 出生即 paused
         # （root agent 任务被重排后，新 run 在 act 首个 checkpoint 立即 park）。
@@ -1263,6 +1265,10 @@ class CtxWeftRuntime:
         from ctx_weft.core.utils.content import content_to_text
 
         sid = session_id or generate_id("ses")
+        # 单例：这条路径自己建一个 TM 跑到底——session 若已有主，就会与既有 TM 并存。
+        # 入口即拒，先于下面任何持久化。
+        if self._session_in_memory(sid):
+            raise SessionAlreadyExistsError(sid)
         ctx = ProviderContext(session_id=sid, tenant_id=tenant_id)
         # 入口即拒、不落库：格式/blob 门控须在任何持久化（Session/Task/事件）之前完成
         # （spec 2026-08-24 Phase 3a）。_resolve_llm 是纯查表，此处先行调用安全——
@@ -1337,8 +1343,14 @@ class CtxWeftRuntime:
         )
         task_manager.set_session(session)
         task_manager.register_task(task)
-        # compat 路径不经 _register_and_drain（没有队列、没有 drain），但一样要登记，
-        # 使 /hitl 等入口在这条路径上也查得到该 session。
+        # compat 路径不经 _register_and_drain（没有队列、没有 drain），但 TM 一样要登记为
+        # 这个 session 的 owner：跑的这段时间里若有别的入口（send_message 冷启动的
+        # recover_agent 等）来找这个 session 的 TM，必须撞上这一个，而不是再建一个与它
+        # 并存（单例，见 `_bind_task_manager`）。跑完在下面的 finally 里摘掉——这个 TM
+        # 没有 runner、没挂回调，留在册里会让之后的续跑拿到一个派发不了的 TM；摘掉之后
+        # 续跑照旧从事件日志重建，与改动前一致。
+        self._bind_task_manager(sid, task_manager)
+        # 同理登记 session，使 /hitl 等入口在这条路径上也查得到该 session。
         self._session_registry.register_session(sid, tenant_id=tenant_id)
 
         for p in self.providers.get_capability_providers():
@@ -1380,6 +1392,9 @@ class CtxWeftRuntime:
             for p in self.providers.get_capability_providers():
                 if isinstance(p, SessionScopedCapabilityProvider):
                     p.deregister_session(sid)
+            # compare-and-pop：只摘自己登记的那个（见上面 _bind_task_manager 处的注释）。
+            if self._task_managers.get(sid) is task_manager:
+                self._task_managers.pop(sid, None)
         return handle, state
 
     # ── Phase 4 full session ─────────────────────────────────────────────────
@@ -1392,6 +1407,11 @@ class CtxWeftRuntime:
         params.resume is True  → resume existing session (root_agent_id recovered from events).
         """
         import dataclasses as _dc
+
+        # 单例（`_bind_task_manager`）：「新建」一个本进程里已经有主的 session_id 会造出
+        # 第二个 TM、第二条 SESSION_CREATED。入口即拒，先于下面任何持久化。
+        if not params.resume and params.session_id and self._session_in_memory(params.session_id):
+            raise SessionAlreadyExistsError(params.session_id)
 
         memory = self.providers.get_memory()
         # 入口即拒、不落库：sm.create_session / sm.resume_session 会立即持久化
@@ -1421,10 +1441,31 @@ class CtxWeftRuntime:
             # 与从前逐字节一致；memory 不可外部化时 `normalized` 就是 params.user_prompt
             # 同一对象，故这一支对纯 event 组合也是无害的。
             params = _dc.replace(params, session_id=sid, user_prompt=normalized)
+
+        # 从「查有没有活 owner」到「新 TM 登记上」之间有好几个 await：同一 session 上的
+        # 另一个入口（并发的 start_session、send_message 冷启动时的 recover_agent 重建）
+        # 若插进来，两边都会以为没有 TM、各建一个。与 `_recover_session_locked` 持同一把
+        # per-session 锁，把这一段串行化。session_id 此刻仍为空（交给 create_session
+        # 现铸）时不可能撞车，不必拿锁。
+        lock_id = params.session_id
+        async with (self._resume_locks.setdefault(lock_id, asyncio.Lock()) if lock_id
+                    else contextlib.nullcontext()):
+            return await self._start_session_locked(
+                params, memory=memory, user_prompt_event_jsonable=user_prompt_event_jsonable,
+            )
+
+    async def _start_session_locked(
+        self, params: SessionStartParams, *, memory: MemoryProvider,
+        user_prompt_event_jsonable: "str | list[dict] | None",
+    ) -> TurnHandle:
+        """`start_session` 在 per-session 锁内的那一半：建/续 session、接线、登记 TM。"""
         sm = self._session_registry
         lm = sm.agent_lifecycle_manager
 
         if not params.resume:
+            # 锁内复查：入口那道判重之后、拿到锁之前，并发的同 id 调用可能已经建好了。
+            if params.session_id and self._session_in_memory(params.session_id):
+                raise SessionAlreadyExistsError(params.session_id)
             session, root_task, task_manager = await sm.create_session(
                 template_id=params.template_id,
                 user_prompt=params.user_prompt,
@@ -1440,6 +1481,16 @@ class CtxWeftRuntime:
                 unattended=params.unattended,
             )
         else:
+            # 有活 owner 就把新 root task 推进它（单例）；没有才由 resume_session 新建。
+            existing = self._task_managers.get(params.session_id) if params.session_id else None
+            # 复用活 owner 时，新 root task 一进队就可能被别处的 drain（并发的 pause /
+            # send_message）派发出去——若那一刻 runner 还是上一轮的，这一轮的 run 结果就
+            # 写进了上一轮的 TurnHandle。所以模板在推 task **之前**解析好，下面拿到 task
+            # 后同步装上新 runner，中间不留 await。
+            template = await self._template_lookup.get_template(
+                params.template_id, None,
+                ctx=ProviderContext(session_id=params.session_id or "", tenant_id=params.tenant_id),
+            )
             session, root_task, task_manager = await sm.resume_session(
                 session_id=params.session_id,
                 event_store=self.event_store,
@@ -1450,6 +1501,7 @@ class CtxWeftRuntime:
                 initial_task_settings=params.initial_task_settings,
                 user_prompt_event_jsonable=user_prompt_event_jsonable,
                 unattended=params.unattended,
+                task_manager=existing,
             )
 
         # `or ""` is defensive only: `Session.root_agent_id` is typed `str | None` for
@@ -1466,11 +1518,12 @@ class CtxWeftRuntime:
             event_bus=self._event_bus,
         )
 
-        template = await self._template_lookup.get_template(
-            params.template_id,
-            None,
-            ctx=ProviderContext(session_id=session.id, tenant_id=params.tenant_id),
-        )
+        if not params.resume:
+            template = await self._template_lookup.get_template(
+                params.template_id,
+                None,
+                ctx=ProviderContext(session_id=session.id, tenant_id=params.tenant_id),
+            )
         task_manager.set_runner(self._make_task_runner(
             session=session,
             template=template,
@@ -1492,13 +1545,18 @@ class CtxWeftRuntime:
         session: "Session",
         task_manager: "TaskManager",
     ) -> None:
-        """Wire up ControlCapabilityProvider, set done callback, launch drain."""
+        """Wire up ControlCapabilityProvider, set done callback, launch drain.
+
+        对同一个 TM 重入是幂等的（重挂回调 + 补一次 drain）——复用活 owner 的几条路径
+        都靠这一点。换一个 TM 进来则由 `_bind_task_manager` 拒绝（单例）。
+        """
+        # 先登记、后接线：换 TM 的非法调用必须在碰任何注册表之前就被拒绝。
+        self._bind_task_manager(session.id, task_manager)
+
         for p in self.providers.get_capability_providers():
             if isinstance(p, ControlCapabilityProvider):
                 p.register_session(session.id, task_manager, session)
                 break
-
-        self._task_managers[session.id] = task_manager
 
         # 纳入 SM 管理。setdefault 语义，重入安全：多轮对话/恢复重建都会走到这里，
         # 已有状态不被重置（新一轮的显式 RUNNING 由 resume_session 负责）。
@@ -1525,9 +1583,10 @@ class CtxWeftRuntime:
 
         # 一次性接线：8 个回调整体装好，装不出半接线的中间态（见 orchestrator/hooks.py）。
         task_manager.set_hooks(TaskManagerHooks(
-            # 归属权谓词：多轮对话里每次 resume 都新建 TM 并覆盖 _task_managers。旧 TM 的
-            # 收尾若迟到（被其慢的 background observe 拖住），必须认出自己已被顶替、变
-            # no-op，否则会冲掉新一轮的会话状态。
+            # 归属权谓词：session 的 TM 是单例，活 owner 不会被顶替；但它可能被逐出
+            # （forget/purge）后又有新 TM 为这个 session 建起来。旧 TM 的收尾若迟到（被其慢
+            # 的 background observe 拖住），必须认出自己已不是 owner、变 no-op，否则会冲掉
+            # 新 TM 的会话状态。
             is_current=lambda tm=task_manager: self._task_managers.get(session.id) is tm,
             # 熔断真终结的三处注入：cancel 挂起 HITL / 协作取消在途 run / memory 闭合。
             # 均 best-effort——trip 序列本身不因缺失或异常而崩溃（TaskManager 侧已兜底）。
@@ -1552,6 +1611,41 @@ class CtxWeftRuntime:
         ))
 
         asyncio.create_task(task_manager.drain())
+
+    def _bind_task_manager(self, session_id: str, task_manager: "TaskManager") -> None:
+        """把 TM 登记为该 session 的 owner——**唯一写 `_task_managers` 的地方**（逐出除外）。
+
+        **一个 session 同一时刻只有一个 TaskManager**。该 session 已有别的 TM 在册时直接
+        抛，绝不覆盖：被覆盖的旧 TM 已派发出去的 run 会照样跑完，而新 TM 的
+        `busy_agents` 只看得见自己的 `_running_tasks`——同 agent 串行这条保证就此失效，
+        同一个 agent_id 上并发出两个 run（它们共用 `CapabilityCache` 里按 agent_id 存的
+        那份工具面，先结束的那个 `evict` 会把另一个的工具清掉）。
+
+        所以要「接着跑」的入口一律复用活 owner，而不是另建一个：`send_message` 的
+        `_start_task_for_agent`、`start_session(resume=True)`、冷 HITL 应答与 `/resume`
+        （`_recover_session_locked`）。只有 session 在内存里没有 TM 时（从未建过、进程
+        重启、已被 forget/purge 逐出）才新建。撞上这里的异常 = 某个入口漏了复用，是 bug。
+        对同一个 TM 重复登记是幂等的。
+        """
+        current = self._task_managers.get(session_id)
+        if current is not None and current is not task_manager:
+            raise RuntimeError(
+                f"session {session_id!r} already has a live TaskManager; a session has "
+                f"exactly one — reuse it instead of creating another"
+            )
+        self._task_managers[session_id] = task_manager
+
+    def _session_in_memory(self, session_id: str) -> bool:
+        """这个 session_id 在本进程里是否已经有主（有 TM，或已登记过 agent）。
+
+        「新建 session」前的判重用：两处任一命中，再建一次都会与既有的那份冲突
+        （第二个 TM / 第二条 SESSION_CREATED）。只看内存——冷的、只在事件日志里的
+        session 不在此列。
+        """
+        return (
+            session_id in self._task_managers
+            or bool(self._agent_lifecycle_manager.agent_ids_of_session(session_id))
+        )
 
     def _release_round(self, session_id: str) -> None:
         """一轮跑完之后的**轻量**清理：只清这一轮的控制信号残余。幂等。
@@ -1975,11 +2069,12 @@ class CtxWeftRuntime:
         session 仍是串行化与资源回收的单位——per-session 锁、owner TM 复用这些
         **实现事实**一行未改，它只是不再是对外的语义单位（spec §6.1）。
 
-        单 owner 架构：若该 agent 所在 session 已有**存活的 owner TM** 且拥有被应答的
-        ``resumed_task_id``，就把应答作为消息投递给它、就地重驱
-        （``_resume_in_existing_tm``），**不重建 TM**——从根上消除"多 TM 顶替/跨 TM
-        双跑"。仅当无存活 owner（真崩溃冷启动 / ``/resume`` / 活 TM 不含该 task）才从
-        事件日志重建。
+        单 owner 架构（session 的 TM 是单例，见 `_bind_task_manager`）：若该 agent 所在
+        session 已有**存活的 owner TM**，一切续跑都在它身上就地进行
+        （``_recover_in_existing_tm``）——冷 HITL 应答把应答投递给它并重排被应答的
+        task，``/resume`` 把它内存里可续跑的 task 重新入队，**绝不重建一个 TM 去顶替它**。
+        仅当内存里没有 TM（进程重启 / 从未建过 / 已被 forget·purge 逐出）才从事件日志
+        重建。
 
         不收 llm_account/llm_model：续跑路径一概不碰模型。换模型走 `set_agent_llm` /
         `set_session_llm`，registry 是模型选择的唯一住所，续跑只负责把已经存在的选择
@@ -2051,29 +2146,22 @@ class CtxWeftRuntime:
         user's reply is injected here as a ``USER_PROMPT`` before drain — then the task
         re-enters act with the reply in the conversation.
         """
-        # ── 复用活 owner（单 owner 架构主路径）─────────────────────────────────────
-        # 冷 HITL 应答且已有存活 TM 拥有该 task → 就地重驱，不重建。避免每次冷应答造新 TM →
-        # 顶替 → 跨 TM 双跑（根因 II）。/resume（无 resumed_task_id）与崩溃冷启动仍走重建。
-        existing = self._task_managers.get(session_id)
-        # `keep_alive` 的调用方（`_start_task_for_agent`）要的只是「一个能塞新 task 的
-        # 活 TM」——已经有了就直接用它，**不重建**。这条和下面那条是同一条纪律的两半：
-        # 下面那条按 `resumed_task_id` 复用（续跑既有 task，要就地重驱），这条按
-        # `keep_alive` 复用（调用方马上自己 push，这里什么都不用做）。语义不同，故
-        # 不合并分支体。
+        # ── 复用活 owner（单例：有活 TM 就绝不重建）──────────────────────────────
+        # session 的 TaskManager 是单例（`_bind_task_manager`）。内存里已有活 owner 时，
+        # 一切续跑都在它身上就地进行；只有内存里没有 TM（进程重启 / 从未建过 / 已被
+        # forget·purge 逐出）才往下走事件日志重建。
         #
-        # 不补这一条的后果是并发下的**无谓顶替**：两个 send_message 同时撞上「TM 不在
-        # 内存里」（冷启动，或持有方 `forget_session` 过），第一个建出 TM_A 并出锁，
-        # 第二个进锁时即便看见 TM_A
-        # 活着也照样建 TM_B 顶掉它——此时第一个还卡在 `_validate_and_normalize_content`
-        # 上没来得及 push，它随后 push 到的 TM_A 已经 `is_current() == False`，那个 task
-        # 永远不会被派发（`inflight` 那道护栏也救不了：它只覆盖「已派发、正在跑」的
-        # task，刚 push 还没派发的不在集合里）。表现是消息发出去了、事件流里有
-        # `TaskCreated`、然后会话一动不动。
-        if keep_alive and existing is not None and existing.is_alive():
-            return
-        if (resumed_task_id is not None and existing is not None
-                and existing.is_alive() and existing.get_task(resumed_task_id) is not None):
-            await self._resume_in_existing_tm(
+        # 从前这里只在「冷 HITL 应答且 owner 持有该 task」与 `keep_alive` 两种情形下复用，
+        # 其余（`/resume`、owner 不含被应答的 task）照样重建一个新 TM 顶替活 owner——旧
+        # TM 已派发的 run 继续跑，新 TM 只避开那几个 task id，却看不见旧 TM 占着哪些
+        # agent，同一个 agent 上于是能并发出两个 run。
+        existing = self._task_managers.get(session_id)
+        if existing is not None and existing.is_alive():
+            # `keep_alive` 的调用方（`_start_task_for_agent`）要的只是「一个能塞新 task
+            # 的活 TM」——已经有了，这里什么都不用做，它马上自己 push。
+            if keep_alive:
+                return
+            await self._recover_in_existing_tm(
                 existing, user_reply=user_reply,
                 resumed_task_id=resumed_task_id, hitl_id=hitl_id,
             )
@@ -2156,15 +2244,10 @@ class CtxWeftRuntime:
             task_max_retries=self._config.task_max_retries,
         )
         task_manager.set_session(session)
-        # 方案 II：若已有活 TM 正在跑（如崩溃后多次冷应答、或进程内 idle-park 后应答），它被本次
-        # 顶替后 drain 会停（_is_current），但其已派发、在跑的协程仍会跑完。新 TM 不得重排这些
-        # 在跑任务，否则同一 task 跨 TM 双跑。把它们并入 restore 的"不派发"集合，交由旧 TM 收尾。
-        existing_tm = self._task_managers.get(session.id)
-        inflight = existing_tm.running_task_ids() if existing_tm is not None and existing_tm.is_alive() else set()
-        if inflight:
-            logger.info("Recovery: session %s has a live TM running %s; new TM will not re-dispatch them",
-                        session.id, sorted(inflight))
-        task_manager.restore(all_tasks, terminal_ids, parked_task_ids=parked_task_ids | inflight)
+        # 走到这里就意味着内存里没有活 owner（有的话上面已经就地复用并 return 了），
+        # 所以不存在「另一个 TM 还在跑着的 task」要避开——从前那道 inflight 过滤正是为
+        # 「新 TM 顶替活 TM」而设，单例之后那种顶替不再发生。
+        task_manager.restore(all_tasks, terminal_ids, parked_task_ids=parked_task_ids)
 
         # 各 agent 取自己的 template_id（AgentInstantiated 事件投影而来）；投影里没有的
         # （存量事件流）回落 session 模板——喂进 registry，registry 就是那份缓存。
@@ -2186,9 +2269,8 @@ class CtxWeftRuntime:
         # 崩溃窗口兜底：已终局的 UserTurn 请求，其答复若还没进过对话，在这里补上。
         await self._inject_resolved_user_turns(
             session, task_manager,
-            # 与 `restore` 用**同一个**集合：只传 parked 会让一个仍被上一个活 TM 跑着的
-            # task 也被补写（复审 Important）。
-            parked_or_inflight_task_ids=parked_task_ids | inflight,
+            # 与 `restore` 用**同一个**集合（复审 Important）。
+            parked_or_inflight_task_ids=parked_task_ids,
             skip_hitl_id=getattr(user_reply, "id", "") if user_reply is not None else "",
         )
 
@@ -2351,6 +2433,57 @@ class CtxWeftRuntime:
             launch_background_observe(state, loop_ctx, boundary=boundary)
         except Exception:
             logger.exception("recover: failed to relaunch task recap for task=%s", task.id)
+
+    async def _recover_in_existing_tm(
+        self,
+        tm: "TaskManager",
+        *,
+        user_reply: "PendingHitl | None",
+        resumed_task_id: str | None,
+        hitl_id: str = "",
+    ) -> None:
+        """活 owner 在世时的续跑——`_recover_session_locked` 在单例下唯一的一条复用路径。
+
+        - 带 ``resumed_task_id``（冷 HITL 应答）：交给 `_resume_in_existing_tm`，重排
+          被应答的那一个 task。活 owner 必然持有本 session 的全部 task（所有 task 都
+          经它创建或由它 restore 进来）；不持有 = 这条不变量破了，抛出而不是另建一个
+          TM 去兜——另建正是单例要消灭的东西。
+        - 不带（``/resume``）：把 owner 内存里可续跑的 task 就地重排
+          （`TaskManager.requeue_resumable`，判据与 `restore()` 同源，读的是内存而非事件
+          重放），再补一次 drain。正在跑的、已在队列里的、还挂着未决 HITL 的都不动，
+          所以对同一个 session 连按几次 ``/resume`` 是幂等的。
+
+        重建路径上那几件崩溃善后（补注入已终局的 UserTurn、重跑被打断的段 recap、
+        「全终态却没收尾」时补发 SessionFinished）这里都不做：owner 活着就说明进程没崩，
+        那些 recap 此刻还在它自己的后台跑着，重跑只会出第二份。
+        """
+        if resumed_task_id is not None:
+            if tm.get_task(resumed_task_id) is None:
+                sid = tm.session.id if tm.session is not None else "?"
+                raise RuntimeError(
+                    f"live TaskManager of session {sid!r} does not own task "
+                    f"{resumed_task_id!r}; the owner holds every task of its session, so "
+                    f"this is a bug — refusing to build a second TaskManager"
+                )
+            await self._resume_in_existing_tm(
+                tm, user_reply=user_reply,
+                resumed_task_id=resumed_task_id, hitl_id=hitl_id,
+            )
+            return
+        session = tm.session
+        if session is None:  # 防御：经 _register_and_drain 登记的 owner 一定注入过 session
+            raise RuntimeError("live TaskManager has no session — cannot resume in place")
+        if user_reply is not None:
+            await self._inject_user_reply(user_reply, session, tm)
+        parked = {
+            r.task_id for r in self.hitl_registry.list_pending(session_id=session.id)
+            if r.task_id
+        }
+        requeued = tm.requeue_resumable(parked)
+        if requeued:
+            logger.info("Recovery: session %s resumed in place on its live TaskManager: %s",
+                        session.id, requeued)
+        self._register_and_drain(session, tm)
 
     async def _resume_in_existing_tm(
         self,

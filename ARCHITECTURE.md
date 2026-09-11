@@ -378,9 +378,9 @@ v2 里「子任务结果怎么到父」有三条，全部落在 memory、由 `Ag
 旧 `recover()` / `recover_session()` 已删除；现在的面：
 
 - `rebuild_session`（`core/runtime.py:1721`）/ `rebuild_all_agents`（`:3593`）/ `rebuild_agent`（`:3573`）/ `rebuild_hitl`（`:3458`）；active session 判定用 `providers/events/_lifecycle.py` 的 `apply_lifecycle` / `replay_lifecycle`（`:45` / `:65`）。
-- `recover_agent(agent_id, ...)`（`core/runtime.py:1950`；per-session resume 锁 `:653`）→ `_recover_session_locked`（`:2029`），**单 owner 架构**：
-  - 有活 owner TM 且含被应答 task → `_resume_in_existing_tm`（`:2355`）就地重驱、不重建；
-  - 否则 `rebuild_view`（`core/control/reducers.py:308`，快照+增量 `read_after`）→ converters 转 dataclass（`core/control/converters.py:21` / `:41`）→ `TaskManager.restore(all_tasks, terminal_ids, parked_task_ids)`（`core/orchestrator/task/manager.py:143`，跳过已废弃的 compact/metadata ephemeral task `:179`）→ `_load_agents_of` 装填 ALM（`:3419`）→ set_runner + `_register_and_drain` 续跑。
+- `recover_agent(agent_id, ...)`（`core/runtime.py:1950`；per-session resume 锁 `:653`）→ `_recover_session_locked`（`:2029`），**单 owner 架构**（session 的 TaskManager 是单例：`_bind_task_manager` 是唯一写 `_task_managers` 的地方，已有别的 TM 在册即抛）：
+  - 内存里有活 owner TM → `_recover_in_existing_tm` 就地续跑、**绝不重建**：冷 HITL 应答走 `_resume_in_existing_tm` 重排被应答的 task；`/resume` 走 `TaskManager.requeue_resumable`（判据同 `restore()`，读内存）；
+  - 内存里没有 TM（进程重启 / 从未建过 / 已被 forget·purge 逐出）→ `rebuild_view`（`core/control/reducers.py:308`，快照+增量 `read_after`）→ converters 转 dataclass（`core/control/converters.py:21` / `:41`）→ `TaskManager.restore(all_tasks, terminal_ids, parked_task_ids)`（`core/orchestrator/task/manager.py:143`，跳过已废弃的 compact/metadata ephemeral task `:179`）→ `_load_agents_of` 装填 ALM（`:3419`）→ set_runner + `_register_and_drain` 续跑。
 
 ### 取消 / 暂停
 

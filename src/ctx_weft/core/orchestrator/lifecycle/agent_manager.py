@@ -91,6 +91,10 @@ class _AgentRecord:
     #: 硬造一个「恢复时刻」当创建时刻是在撒谎。host 侧要精确值可读
     #: AgentInstantiated 事件的 timestamp。
     created_at: datetime | None = None
+    #: 由 `_register_fallback` 就地补出来的占位记录（恢复期缺口：id 还没被装填就先被
+    #: 用到了，session 归属是**猜**的）。`load()` 装填真记录时允许覆盖它——它不代表
+    #: 一个已确认归属的 agent，不参与 agent_id 唯一性判定。
+    placeholder: bool = False
 
 
 @dataclass(frozen=True)
@@ -441,7 +445,8 @@ class AgentLifecycleManager:
         → 回落 `fallback_template_id`；模板解析失败 → `logger.warning` 后用
         `MemoryConfig()`/`LoopConfig()` 默认值继续。**绝不抛**：这条路要在
         恢复路径的每个 session 上都跑通，抛一次就卡住整条恢复链——回落而非
-        报错的口径与 `_register_fallback` 一致。
+        报错的口径与 `_register_fallback` 一致。唯一的例外是**身份冲突**：某个 id 已被
+        另一个 session 的真记录占着 → `DuplicateAgentId`，整批不装（见方法体开头）。
 
         装填完按每个 `AgentView` 折出来的现状发一条 `AGENT_*`（idle/waiting_human/
         interrupted；`terminated`/`running` 不发，见 `_RECOVERY_BROADCAST_BY_STATUS`
@@ -460,6 +465,19 @@ class AgentLifecycleManager:
         再开一个 task，同一个 agent 挂两个（`test_agent_current_task_fold` 正是为这个
         形状写的回归）。内存里那份才是真的：命中就保住它，不被日志折出来的旧值盖掉。
         """
+        # agent_id 全局唯一：一个 id 只属于一个 session。另一个 session 已经登记着同一个
+        # id（非占位记录）时，这份日志与内存里的那份**必有一份是错的**——静默覆盖会把那个
+        # agent 连同它的状态搬进这个 session，而 CapabilityCache 等按 agent_id 存的运行期
+        # 状态也会从此被两个 session 共用。数据完整性问题要响亮：在改动任何记录之前整批
+        # 检查、整批拒绝。这是本方法「绝不抛」纪律唯一的例外——那条纪律防的是恢复期的
+        # 配置缺口（模板解析失败），不是身份冲突。
+        for av in agent_views.values():
+            live = self._agents.get(av.id)
+            if live is not None and not live.placeholder and live.session_id != session_id:
+                raise DuplicateAgentId(
+                    f"agent_id {av.id} is registered to session {live.session_id!r}, "
+                    f"but the event log of session {session_id!r} claims it too"
+                )
         self.register_session(
             session_id, tenant_id=tenant_id, fallback_template_id=fallback_template_id,
         )
@@ -607,7 +625,11 @@ class AgentLifecycleManager:
         击穿「入口即拒、不落库」。传预解析对象消灭这个窗口——全程只解析一次。
         省略则照旧自己解析（子 agent 路径不受影响，它没有相同的两阶段需求）。
         """
-        if agent_id is not None and agent_id in self._agents:
+        # 先定 id、再判重：调用方预铸的与这里现铸的一视同仁（ULID 撞车在实践中不会
+        # 发生，但「agent_id 唯一」是不变量，不该靠概率成立）。判重先于模板解析与任何
+        # emit——撞上了不留半个 agent。
+        agent_id = agent_id or generate_id("agt")
+        if agent_id in self._agents:
             raise DuplicateAgentId(f"agent_id {agent_id} already registered")
         if template is None:
             resolve_ctx = ctx or ProviderContext(session_id=session_id, tenant_id=tenant_id)
@@ -657,7 +679,6 @@ class AgentLifecycleManager:
             # 继承**派生它的那个 agent**（parent_rec，上面 depth 检查已解出），不是 root。
             llm = parent_rec.llm if parent_agent_id is not None else ModelChoice()
 
-        agent_id = agent_id or generate_id("agt")
         self._agents[agent_id] = _AgentRecord(
             session_id=session_id,
             tenant_id=tenant_id,
@@ -874,6 +895,7 @@ class AgentLifecycleManager:
             spawn_depth=0,
             memory_config=MemoryConfig(),
             loop_config=LoopConfig(),
+            placeholder=True,
         )
         self._agents[agent_id] = rec
         return rec

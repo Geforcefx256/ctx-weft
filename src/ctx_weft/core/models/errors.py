@@ -233,6 +233,25 @@ class SessionBusyError(CtxWeftError):
         super().__init__(f"Session {session_id!r} is busy (currently running); try again when idle")
 
 
+class SessionAlreadyExistsError(CtxWeftError):
+    """要**新建**的 session 用了一个本进程里已经有主的 session_id。
+
+    一个 session 同一时刻只能有一个 TaskManager（单例，见
+    `CtxWeftRuntime._bind_task_manager`）。拿一个已存在的 id 再建一次 session，
+    要么再造第二个 TaskManager 与第一个并存，要么往事件库里写第二条
+    SESSION_CREATED——两者都不可接受，所以在任何持久化之前直接拒绝。
+    续聊已有 session 走 `send_message` / `start_session(resume=True)`。"""
+
+    code = "SESSION_ALREADY_EXISTS"
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        super().__init__(
+            f"Session {session_id!r} already exists in this runtime; "
+            f"continue it instead of creating it again"
+        )
+
+
 class UnfinishedTasksError(CtxWeftError):
     """开新一轮（resume_session）被拒：事件里仍有未终结任务。
 

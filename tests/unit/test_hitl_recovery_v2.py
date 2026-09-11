@@ -553,28 +553,32 @@ async def test_new_model_user_turns_are_not_flagged_legacy():
     assert rt.hitl_registry.resolved_for_session(SID)[0].legacy_origin is False
 
 
-async def test_inflight_tasks_are_excluded_from_the_backfill():
-    """补写的跳过集合必须与 `restore` 用同一个：只传 parked 会让一个仍被上一个活
-    TaskManager 跑着的 task 也被补写、状态在两个 TM 之间打架（复审 Important）。"""
+async def test_resume_on_a_live_owner_neither_rebuilds_nor_backfills():
+    """单例：内存里有活 owner 时，`/resume` 就地复用它——不重建一个 TM 去顶替它，也
+    不跑重建路径那套崩溃善后（补注入已终局的 UserTurn）。
 
-    class _LiveTM:
-        #: `recover_agent` 在 registry miss 时先自愈（`rebuild_agent` →
-        #: `rebuild_all_agents` → `_tenant_for_session`），后者会探一次
-        #: `_task_managers[sid].session`——真实 TaskManager 恒有这个属性，这个
-        #: 最小桩必须补上，否则会在自愈路径上撞 AttributeError（`_tenant_for_session`
-        #: 自己的纪律是「绝不抛」，但那份纪律管不到桩缺属性这件事）。
-        session = None
-        #: 同上：`_load_agents_of` 会问一次「哪些 task 还在未提交窗口里」
-        #: （spec 2026-09-09，用于保住热重装时的路由判据）。真 TM 恒有此属性。
-        open_round_task_ids: frozenset[str] = frozenset()
-
-        def is_alive(self) -> bool:
-            return True
-
-        def running_task_ids(self) -> set[str]:
-            return {TID}
+    owner 活着就说明进程没崩。它还在跑的 task 既不能被重排，更不能被补写一轮用户
+    发言——从前这里靠「补写的跳过集合与 restore 共用 inflight」护着（复审
+    Important），那道过滤正是为「新 TM 顶替活 TM」而设；单例之后顶替本身不再发生。"""
+    from ctx_weft.core.models.session import Session
+    from ctx_weft.core.models.task import NormalTaskSettings, Task
+    from ctx_weft.core.orchestrator.task.manager import TaskManager
+    from tests.unit._stub_runner import StubRunner
 
     rt = await _runtime_with_events(_resolved_user_turn_never_injected())
-    rt._task_managers[SID] = _LiveTM()          # 上一个 TM 还在跑 TID
-    await rt.recover_agent(AID)               # 不带 resumed_task_id → 走重建路径
+    live = TaskManager(session_id=SID, event_bus=rt.event_bus, max_concurrent=1)
+    live.set_session(Session(id=SID, tenant_id="default", user_prompt="do it",
+                             status="RUNNING", root_agent_id=AID, token_budget=0))
+    live.set_runner(StubRunner(live, session_id=SID))
+    live.register_task(Task(id=TID, session_id=SID, status="ACTIVE", assigned_agent_id=AID,
+                            creator_agent_id=AID, settings=NormalTaskSettings()))
+    live._running_tasks.add(TID)                # 活 owner 还在跑 TID
+    rt._register_and_drain(live.session, live)
+
+    await rt.recover_agent(AID)               # 不带 resumed_task_id → /resume
+    await asyncio.sleep(0)
+
+    assert rt._task_managers[SID] is live, "活 owner 不得被重建出来的 TM 顶替"
+    assert live.running_task_ids() == {TID} and not live._queue.peek_all(), \
+        "在跑的 task 不得被重排"
     assert await _hitl_reply_prompts(rt) == []

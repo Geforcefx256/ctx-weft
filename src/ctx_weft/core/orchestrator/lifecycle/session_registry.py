@@ -15,7 +15,9 @@ from ctx_weft.core.orchestrator.model import ModelChoice
 from ctx_weft.core.orchestrator.task.manager import TaskManager
 from ctx_weft.core.models.session import Session
 from ctx_weft.core.models.task import Task
-from ctx_weft.core.models.task import NormalTaskSettings
+from ctx_weft.core.models.task import (
+    CompactTaskSettings, MetadataFillerTaskSettings, NormalTaskSettings,
+)
 from ctx_weft.core.utils.clock import now_utc
 from ctx_weft.core.utils.ids import generate_id
 from ctx_weft.protocols.context import ProviderContext
@@ -239,10 +241,16 @@ class SessionRegistry:
         initial_task_settings: NormalTaskSettings | None = None,
         user_prompt_event_jsonable: "str | list[dict] | None" = None,
         unattended: bool = False,
+        task_manager: TaskManager | None = None,
     ) -> tuple[Session, Task, TaskManager]:
         """Resume an existing session: recover root_agent_id from event store, push a new root task.
 
-        ``user_prompt_event_jsonable`` 同 `create_session`：由调用方从原始 content 算好。"""
+        ``user_prompt_event_jsonable`` 同 `create_session`：由调用方从原始 content 算好。
+
+        ``task_manager``：该 session **活着的 owner TM**（调用方从 runtime 取；没有就传
+        None）。session 的 TM 是单例——有活 owner 时新 root task 就推进它，不另建一个
+        去顶替它；没有才新建。活 owner 的内存状态也一并参与下面的「弃轮禁止」判定：
+        未提交窗口里的 task（spec 2026-09-09）还没落盘，只看事件视图会漏掉它们。"""
         from ctx_weft.core.control.reducers import rebuild_view
         user_prompt_event_jsonable = _event_jsonable_or_fallback(
             user_prompt, user_prompt_event_jsonable, "resume_session",
@@ -255,8 +263,8 @@ class SessionRegistry:
                 "no SessionCreated event found in event store."
             )
 
-        # 弃轮禁止：仍有未终结任务时不许开新轮（本方法只建带新 root task 的全新 TM,滞留
-        # 任务会被无声遗弃,之后 recover_agent 全量重建又把它们复活重跑）。调用方应走
+        # 弃轮禁止：仍有未终结任务时不许开新轮（本方法只推一个新 root task，不续跑滞留
+        # 任务——它们会被无声遗弃,之后 recover_agent 全量重建又把它们复活重跑）。调用方应走
         # 恢复路径续跑/收尾。辅助任务（compact/metadata）豁免——restore 也从不重排它们,
         # 阻塞会把会话永久锁死（与 TaskManager.restore 的跳过口径一致）。
         unfinished = [
@@ -265,6 +273,13 @@ class SessionRegistry:
             and (t.settings_raw or {}).get("_type") not in (
                 "CompactTaskSettings", "MetadataFillerTaskSettings")
         ]
+        if task_manager is not None:
+            unfinished += [
+                t.id for t in task_manager.all_tasks()
+                if t.status not in TERMINAL_TASK_STATUSES
+                and not isinstance(t.settings, (CompactTaskSettings, MetadataFillerTaskSettings))
+                and t.id not in unfinished
+            ]
         if unfinished:
             raise UnfinishedTasksError(session_id, unfinished)
 
@@ -282,7 +297,7 @@ class SessionRegistry:
         )
         root_task, task_manager = await self._make_root_task_manager(
             session, user_prompt, initial_task_settings, user_prompt_event_jsonable,
-            unattended=unattended,
+            unattended=unattended, task_manager=task_manager,
         )
 
         logger.info("Session %s resumed (agent=%s)", session_id, sess_proj.root_agent_id)
@@ -308,7 +323,10 @@ class SessionRegistry:
         user_prompt_event_jsonable: "str | list[dict] | None" = None,
         *,
         unattended: bool = False,
+        task_manager: TaskManager | None = None,
     ) -> tuple[Task, TaskManager]:
+        """建 root task 并推进 TaskManager。``task_manager`` 给了就用它（该 session 的
+        活 owner，单例），否则新建一个。"""
         task = Task(
             id=generate_id("tsk"),
             session_id=session.id,
@@ -329,12 +347,13 @@ class SessionRegistry:
             timeout_ms=self.default_task_timeout_ms,
             created_at=now_utc(),
         )
-        task_manager = TaskManager(
-            session_id=session.id,
-            event_bus=self.event_bus,
-            max_concurrent=self.task_max_concurrent,
-            task_max_retries=self.task_max_retries,
-        )
+        if task_manager is None:
+            task_manager = TaskManager(
+                session_id=session.id,
+                event_bus=self.event_bus,
+                max_concurrent=self.task_max_concurrent,
+                task_max_retries=self.task_max_retries,
+            )
         # `push_task` 之前必须先注入 session：`TaskManager._emit` 取
         # `self._session.tenant_id if self._session else "default"`，晚注入会让 root
         # task 的 TaskCreated 落到 default 租户（总账 A5）。runtime 侧后续仍会再调一次

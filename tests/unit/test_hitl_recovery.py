@@ -305,15 +305,19 @@ async def test_recover_emits_paused_hitl_when_wait_mixed_with_question() -> None
 
 
 async def test_recover_does_not_redispatch_task_running_in_live_tm() -> None:
-    """方案 II：已有活 TM 正在跑 X 时，recover 建的新 TM 不得重排 X（否则跨 TM 双跑）。
+    """单例：已有活 TM 正在跑 X 时，`/resume` 就地复用它——不另建 TM，也不重排 X。
 
-    构造：老 TM alive 且 _running_tasks={X}，X 在事件里是 ACTIVE、非 parked、非终态。
-    没有 inflight 过滤时 recover 会重新派发 X（echo 模板 → MockLLM 被调用）；有过滤则 X 被跳过。
+    构造：活 owner 正在跑 X，X 在事件里是 ACTIVE、非 parked、非终态。从前 recover 会
+    建一个新 TM 顶替它，靠 inflight 过滤避开 X；现在根本不建第二个 TM，而活 owner 的
+    `requeue_resumable` 本就跳过在跑的 task。任一处破了，X 都会被再派发一次（echo
+    模板 → MockLLM 被调用），同一个 agent 上并发出两个 run。
     """
     import asyncio
     from datetime import datetime, timezone
     from ctx_weft.core import CtxWeftRuntime
     from ctx_weft.protocols.events import Event, EventType
+    from ctx_weft.core.models.session import Session
+    from ctx_weft.core.models.task import NormalTaskSettings, Task
     from ctx_weft.core.orchestrator.task.manager import TaskManager
     from ctx_weft.providers.llm.mock import MockLLMAdapter, MockResponse
     from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
@@ -325,11 +329,16 @@ async def test_recover_does_not_redispatch_task_running_in_live_tm() -> None:
     runtime = make_runtime(llm=llm, agent_provider=resolver)
     runtime.providers.register_memory(InMemoryMemoryProvider())
 
-    # 老 TM：alive，正在跑 X
+    # 活 owner：经 runtime 真实 wiring 登记，正在跑 X
     old_tm = TaskManager(session_id="ses_1", event_bus=runtime.event_bus, max_concurrent=1)
-    old_tm.set_hooks(TaskManagerHooks(is_current=lambda: True))
+    old_tm.set_session(Session(id="ses_1", tenant_id="default", user_prompt="do it",
+                               status="RUNNING", root_agent_id="agt_root", token_budget=0))
+    old_tm.set_runner(StubRunner(old_tm, session_id="ses_1"))
+    old_tm.register_task(Task(id="tsk_X", session_id="ses_1", status="ACTIVE",
+                              assigned_agent_id="agt_root", creator_agent_id="agt_root",
+                              settings=NormalTaskSettings()))
     old_tm._running_tasks.add("tsk_X")
-    runtime._task_managers["ses_1"] = old_tm
+    runtime._register_and_drain(old_tm.session, old_tm)
 
     ts = datetime(2026, 6, 12, tzinfo=timezone.utc)
 
@@ -352,7 +361,9 @@ async def test_recover_does_not_redispatch_task_running_in_live_tm() -> None:
     await runtime.recover_agent("agt_root")
     await asyncio.sleep(0)
 
-    assert llm.last_request is None, "X 正被老 TM 执行，新 TM 不应重复派发"
+    assert runtime._task_managers["ses_1"] is old_tm, "活 owner 不得被新建的 TM 顶替"
+    assert llm.last_request is None, "X 正被活 owner 执行，不应被重复派发"
+    assert old_tm.running_task_ids() == {"tsk_X"} and not old_tm._queue.peek_all()
 
 
 async def test_cold_answer_reuses_live_owner_instead_of_rebuilding(monkeypatch) -> None:

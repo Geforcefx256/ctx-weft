@@ -95,8 +95,9 @@ class TaskManager:
         #: 一次性接线的 7 个回调（见 hooks.py）。整体替换，不逐字段合并。
         self._hooks = TaskManagerHooks()
         # 归属权谓词：runtime 注入，返回本 TM 是否仍是该 session 的当前 owner。
-        # None = 不受管（永远视为 current，保持旧行为）。被同 session 上更新的 TM
-        # 顶替后返回 False → 迟到的收尾变 no-op（不发 SessionFinished、不清新一轮的控制信号）。
+        # None = 不受管（永远视为 current，保持旧行为）。session 的 TM 是单例，活 owner
+        # 不会被顶替；只有被逐出（forget/purge）之后才返回 False → 迟到的收尾变 no-op
+        # （不发 SessionFinished、不清之后新建的 TM 的控制信号）。
         # pause 弃子窗口标记（runtime.pause_session 置位、_on_idle/_release 复位）：
         # 置位期间任务取消不改 session 状态、run 收尾 staged 直接丢弃。
         self._pause_abandon = False
@@ -1274,12 +1275,19 @@ class TaskManager:
         # 等待所有后台协程完成，确保 RecognizeIntent 等事件全部 emit 后再关闭 SSE 流
         if self._background_asyncio_tasks:
             await asyncio.gather(*list(self._background_asyncio_tasks), return_exceptions=True)
-        # 归属权判定放在 gather **之后**：顶替可能发生在等待后台任务期间（旧 TM 的
-        # background observe 拖久了，用户已开启下一轮、新 TM 接管了 session）。此时本 TM
-        # 已非 owner → 收尾变 no-op，绝不发 SessionFinished、绝不触发 on_session_done，
-        # 否则会冲掉新一轮的 HITL 挂起态、把任务卡在 ACTIVE。
+        # 归属权判定放在 gather **之后**：本 TM 可能在等待后台任务期间被逐出
+        # （forget/purge 之后又有人为这个 session 建了新 TM）。此时本 TM 已非 owner →
+        # 收尾变 no-op，绝不发 SessionFinished、绝不触发 on_session_done。
         if self._hooks.is_current is not None and not self._hooks.is_current():
             logger.info("TaskManager(%s): superseded during session-done; skip callback",
+                        self._session_id)
+            return
+        # 同一个 TM 在 gather 期间接了下一轮（单例：`send_message` /
+        # `start_session(resume=True)` / `/resume` 都复用活 owner，不再另建 TM）。
+        # 上一轮这次迟到的收尾不代表会话走完了——新一轮正在跑或正停在等人，此时回调
+        # 会冲掉新一轮的控制信号（`_release_round` 清 run token 与 pause 闩锁）。
+        if not self.is_done() or self._blocked_or_interrupted():
+            logger.info("TaskManager(%s): next round started during session-done; skip callback",
                         self._session_id)
             return
         if self._hooks.on_session_done is not None:
@@ -1386,6 +1394,50 @@ class TaskManager:
             await self._emit(EventType.TASK_HUMAN_RESOLVED, task_id=task_id,
                               payload={"hitl_id": hitl_id})
 
+    def requeue_resumable(self, parked_task_ids: "set[str] | None" = None) -> list[str]:
+        """`/resume` 撞上**活的 owner**：就地把可续跑的 task 重新入队，不重建 TM。
+
+        session 的 TaskManager 是单例（`CtxWeftRuntime._bind_task_manager`），活 owner
+        在世时不允许再建一个去顶替它，于是「崩溃后从事件日志 `restore()`」的那套判据
+        在这里改读**本 TM 内存里**的状态——owner 活着，内存才是真相：
+
+        - 终态 / 已废弃的辅助 task（compact / metadata）/ 有未决 HITL 的：不动
+          （与 `restore()` 第二趟逐条相同）；
+        - SUSPENDED：只在子任务全终态时重排——尚有活子任务的要留给
+          `_try_resume_parent` 唤醒，提前改状态会把那次唤醒吞掉（见 `restore()`）；
+        - 其余非终态（INTERRUPTED / 被应答后没人驱动的 AWAITING_HUMAN / PENDING 却不在
+          队列里……）：置 PENDING 入队，`dag_deps` 里尚未终态的仍作阻塞。
+
+        另加两道只有活 TM 才需要的闸（与 `resume_task` 同口径）：正在跑的、已在队列
+        里的不重复入队——同一个 task 被派发两次就是同一 agent 上的两个并发 run。
+
+        与 `restore()` 一样不发事件：真正开跑时 drain 发的 `TASK_STARTED` 才是事实。
+        不 drain，drain 交给调用方。返回真正重排了的 task id。
+        """
+        parked = parked_task_ids or set()
+        queued = {e.task_id for e in self._queue.peek_all()}
+        terminal = {tid for tid, t in self._tasks.items() if t.status in TERMINAL_TASK_STATUSES}
+        requeued: list[str] = []
+        for t in self._tasks.values():
+            if (t.id in terminal or t.id in self._running_tasks or t.id in queued
+                    or t.id in parked
+                    or isinstance(t.settings, (CompactTaskSettings, MetadataFillerTaskSettings))):
+                continue
+            if t.status == "SUSPENDED":
+                if not all(cid in terminal for cid in self._children_of.get(t.id, set())):
+                    continue
+                blocked: set[str] = set()
+            else:
+                blocked = {dep for dep in (t.dag_deps or []) if dep not in terminal}
+            t.status = "PENDING"
+            t.retry_count = 0  # 挂起期间的旧计数不带入新一轮 attempt
+            self._queue.push(QueueEntry(
+                task_id=t.id, session_id=self._session_id,
+                priority=t.priority, blocked_by=blocked,
+            ))
+            requeued.append(t.id)
+        return requeued
+
     async def requeue_for_message(self, task_id: str, *, reason: str = "send_message") -> bool:
         """把一个被**外部消息**（`CtxWeftRuntime.send_message`，Task 18）重新激活的
         task 放回队列——发 `TaskRequeued`，**不是** `TaskHumanResolved`。
@@ -1454,8 +1506,9 @@ class TaskManager:
     def is_alive(self) -> bool:
         """本 TM 是否仍是该 session 的当前 owner。
 
-        供 recover_agent 判断"是否有活 TM"，以决定复用还是重建、以及新 TM 要跳过哪些
-        在跑任务。
+        供 recover_agent 判断"是否有活 TM"，以决定复用还是重建。session 的 TM 是单例，
+        活 owner 只会被复用、不会被顶替；它返回 False 只有一种情形：本 TM 已被逐出
+        （forget/purge）。
 
         ⚠ **它只表达「有没有被顶替」，不表达「这一轮跑完没有」**（2026-09-08 生命周期
         改造后的口径收窄）。从前 `_fire_session_done` -> `_release_session` 会把终结的

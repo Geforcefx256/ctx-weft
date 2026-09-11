@@ -6,6 +6,7 @@ from ctx_weft.core.models.errors import (
     AgentNotFound,
     AgentNotRunningError,
     AgentTerminatedError,
+    SessionAlreadyExistsError,
     SessionBusyError,
 )
 from ctx_weft.core.models.task import (
@@ -43,6 +44,7 @@ __all__ = [
     "AgentNotRunningError",
     "AgentBusyError",
     "AgentTerminatedError",
+    "SessionAlreadyExistsError",
     "SessionBusyError",
     # 事件
     "EventStore",

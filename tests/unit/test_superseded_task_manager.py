@@ -1,11 +1,14 @@
-"""被同一 session 上更新的 TaskManager 顶替后，旧 TM 的收尾必须变 no-op。
+"""上一轮迟到的收尾不得冲掉下一轮；session 的 TaskManager 是单例。
 
-复现的 bug：后台 observe 尚未跑完时用户开启下一轮对话 → 旧 TM 的 `_fire_session_done`
+复现的 bug：后台 observe 尚未跑完时用户开启下一轮对话 → 上一轮的 `_fire_session_done`
 迟发 `SessionFinished` + 触发 `_release_session`，冲掉新一轮已进入的 HITL 挂起态，
 任务卡在 ACTIVE、会话显示已结束（详见 session ses_01KWGR112XHFYQYR3HES8D4MYK）。
 
-关键：顶替可能发生在 `_fire_session_done` 等待后台任务（gather）期间，
-所以归属权判定必须放在 gather **之后**。
+当时的形状是「下一轮新建一个 TM 顶替上一轮的」。现在 session 的 TM 是单例
+（`CtxWeftRuntime._bind_task_manager`）：下一轮复用同一个 TM，第二个 TM 登记不上；
+旧 TM 变成「非 owner」只剩一种途径——被逐出（forget/purge）之后又为这个 session
+建了新 TM。两种形状下迟到的收尾都必须 no-op，判定都放在 gather **之后**：
+下一轮/新 TM 可能恰好在等待后台任务期间到来。
 """
 from __future__ import annotations
 
@@ -136,14 +139,15 @@ async def test_current_tm_still_fires_session_finished() -> None:
 # `test_current_tm_still_fires_session_finished` 继续覆盖。
 
 
-async def test_register_and_drain_marks_older_tm_not_current() -> None:
+async def test_register_and_drain_refuses_a_second_tm() -> None:
+    """单例：session 已有活 owner 时，第二个 TM 登记不上——不覆盖、不顶替。
+
+    被覆盖的旧 TM 已派发的 run 会照样跑完，而新 TM 的同 agent 串行判定看不见它们，
+    同一个 agent 上就会并发出两个 run。"""
     rt = make_runtime(llm=MockLLMAdapter(responses=[]),
                         agent_provider=InlineAgentTemplateProvider())
     sess = Session(id="s1", tenant_id="default", user_prompt="x",
                    status="RUNNING", token_budget=0)
-
-    async def _noop_runner(_sid, _tid):
-        return None
 
     tm_old = TaskManager(session_id="s1", event_bus=rt._event_bus, max_concurrent=1)
     tm_old.set_runner(StubRunner(tm_old, _noop_runner))
@@ -151,6 +155,32 @@ async def test_register_and_drain_marks_older_tm_not_current() -> None:
     tm_new.set_runner(StubRunner(tm_new, _noop_runner))
 
     rt._register_and_drain(sess, tm_old)
+    with pytest.raises(RuntimeError, match="already has a live TaskManager"):
+        rt._register_and_drain(sess, tm_new)
+
+    assert rt._task_managers["s1"] is tm_old
+    assert tm_old.is_alive() is True
+    assert tm_new._hooks.is_current is None, "被拒的 TM 不应被接线"
+    # 同一个 TM 重入是幂等的（复用活 owner 的几条路径都靠这一点）。
+    rt._register_and_drain(sess, tm_old)
+    assert rt._task_managers["s1"] is tm_old
+
+
+async def test_evicted_tm_is_no_longer_current() -> None:
+    """活 owner 不会被顶替；被逐出之后，为同一 session 新建的 TM 才能登记，旧的随之
+    不再是 owner（它迟到的收尾因此变 no-op，见下面两条端到端用例）。"""
+    rt = make_runtime(llm=MockLLMAdapter(responses=[]),
+                        agent_provider=InlineAgentTemplateProvider())
+    sess = Session(id="s1", tenant_id="default", user_prompt="x",
+                   status="RUNNING", token_budget=0)
+
+    tm_old = TaskManager(session_id="s1", event_bus=rt._event_bus, max_concurrent=1)
+    tm_old.set_runner(StubRunner(tm_old, _noop_runner))
+    tm_new = TaskManager(session_id="s1", event_bus=rt._event_bus, max_concurrent=1)
+    tm_new.set_runner(StubRunner(tm_new, _noop_runner))
+
+    rt._register_and_drain(sess, tm_old)
+    rt._evict_session_memory("s1")
     rt._register_and_drain(sess, tm_new)
 
     assert tm_old._hooks.is_current is not None and tm_old._hooks.is_current() is False
@@ -265,8 +295,9 @@ async def test_recover_agent_different_sessions_not_serialized(monkeypatch) -> N
 
 
 async def test_slow_prior_turn_bg_observe_does_not_clobber_next_turn() -> None:
-    """端到端复现：第 N 轮 finish_task 后其 background observe 拖久了，第 N+1 轮已开启并
-    进入 HITL 挂起；旧 TM 迟到的收尾必须 no-op——不释放新 TM、不发 SessionFinished。"""
+    """端到端复现：第 N 轮 finish_task 后其 background observe 拖久了，第 N+1 轮已在
+    **同一个 TM** 上开跑（单例：下一轮复用活 owner）；第 N 轮迟到的收尾必须 no-op——
+    不触发 on_session_done（不清新一轮的 pause 闩锁）、不发 SessionFinished。"""
     rt = make_runtime(llm=MockLLMAdapter(responses=[]),
                         agent_provider=InlineAgentTemplateProvider())
     sid = "s1"
@@ -278,36 +309,39 @@ async def test_slow_prior_turn_bg_observe_does_not_clobber_next_turn() -> None:
     rt._event_bus.subscribe(EventType.SESSION_FINISHED, _capture)
 
     # ── 第 N 轮 "6"：任务完成，但其 background observe 慢 ──
-    sess6 = Session(id=sid, tenant_id="default", user_prompt="6", status="RUNNING", token_budget=0)
-    tm6 = _running_tm(rt, sess6, "t6")
+    sess = Session(id=sid, tenant_id="default", user_prompt="6", status="RUNNING", token_budget=0)
+    tm = _running_tm(rt, sess, "t6")
     release = asyncio.Event()
 
     async def _slow_bg():
         await release.wait()
 
-    tm6.track_background(asyncio.create_task(_slow_bg()))
+    tm.track_background(asyncio.create_task(_slow_bg()))
 
     # 任务完成 → is_done → _fire_session_done → gather 阻塞
-    done6 = asyncio.create_task(tm6.on_task_finished("t6", status="FINISHED"))
+    done6 = asyncio.create_task(tm.on_task_finished("t6", status="FINISHED"))
     await asyncio.sleep(0)
     await asyncio.sleep(0)
 
-    # ── 第 N+1 轮 "7"：新 TM 接管；模拟其 HITL 挂起（runtime 侧保留 pause token）──
-    sess7 = Session(id=sid, tenant_id="default", user_prompt="7", status="RUNNING", token_budget=0)
-    tm7 = _running_tm(rt, sess7, "t7")
+    # ── 第 N+1 轮 "7"：同一个 TM 接着跑；模拟其在跑 + runtime 侧保留 pause 闩锁 ──
+    tm.register_task(Task(id="t7", session_id=sid, status="ACTIVE",
+                          assigned_agent_id="a", creator_agent_id="a",
+                          settings=NormalTaskSettings()))
+    tm._running_tasks.add("t7")
     rt._pausing.add(sid)
 
-    # ── 旧轮的慢 bg observe 现在才跑完 → tm6._fire_session_done 从 gather 恢复 ──
+    # ── 旧轮的慢 bg observe 现在才跑完 → _fire_session_done 从 gather 恢复 ──
     release.set()
     await done6
 
-    assert rt._task_managers[sid] is tm7, "被顶替的旧 TM 不得释放掉接管的新 TM"
-    assert sid in rt._pausing, "新一轮的 pause 闩锁不得被旧 TM 迟到收尾清除"
-    assert finished == [], "被顶替的旧 TM 不得发 SessionFinished"
+    assert rt._task_managers[sid] is tm
+    assert sid in rt._pausing, "新一轮的 pause 闩锁不得被上一轮迟到的收尾清除"
+    assert finished == [], "上一轮迟到的收尾不得发 SessionFinished"
 
 
 async def test_probe_prior_turn_finishing_after_supersession() -> None:
-    """探针：强制让旧轮的 on_task_finished 在被顶替**之后**才跑（forced ordering）。
+    """探针：强制让旧 TM 的 on_task_finished 在它被逐出、新 TM 接管**之后**才跑
+    （forced ordering）。单例下「非 owner 的旧 TM」只可能这样出现。
 
     验证关键不变量仍成立：不释放新 TM、不发 SessionFinished、旧轮的 Session 对象
     不被误落定终态。2026-09-04（Task 12，events-v2 §5）起不再断言「连 stale 的
@@ -329,7 +363,8 @@ async def test_probe_prior_turn_finishing_after_supersession() -> None:
     sess6 = Session(id=sid, tenant_id="default", user_prompt="6", status="RUNNING", token_budget=0)
     tm6 = _running_tm(rt, sess6, "t6")
 
-    # 新轮先接管（顶替），旧轮的任务此后才结束
+    # 旧 TM 被逐出、新 TM 接管，旧 TM 的任务此后才结束
+    rt._evict_session_memory(sid)
     sess7 = Session(id=sid, tenant_id="default", user_prompt="7", status="RUNNING", token_budget=0)
     tm7 = _running_tm(rt, sess7, "t7")
     rt._pausing.add(sid)
