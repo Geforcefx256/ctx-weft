@@ -56,6 +56,10 @@ class ProviderRegistry:
         self._operation_store = None
         self._operation_store_registered = False
         self._in_memory_operation_store = None
+        # spec: tool-result-recovery——工具长输出结果存储：显式注册 > 内存默认（同口径）
+        self._tool_result_store = None
+        self._tool_result_store_registered = False
+        self._in_memory_tool_result_store = None
 
     # ── Memory ────────────────────────────────────────────────────────────────
 
@@ -194,6 +198,28 @@ class ProviderRegistry:
     def operation_store_registered(self) -> bool:
         """宿主是否显式注册了持久账本（False = 内存默认，跨进程恢复能力缺失）。"""
         return self._operation_store_registered
+
+    # ── ToolResultStore（spec: tool-result-recovery）─────────────────────────
+
+    def register_tool_result_store(self, store: "object") -> None:
+        """注册工具长输出的可回取结果存储。未注册时 get_tool_result_store() 返回内存
+        默认实现（会话内可回取、LRU 可逐出；跨进程回取需宿主显式注入持久实现）。"""
+        self._tool_result_store = store
+        self._tool_result_store_registered = True
+
+    def get_tool_result_store(self):
+        """取结果存储。两级：显式注册 > InMemoryToolResultStore（惰性单例）。"""
+        if self._tool_result_store is not None:
+            return self._tool_result_store
+        if self._in_memory_tool_result_store is None:
+            from ctx_weft.providers.results import InMemoryToolResultStore
+            self._in_memory_tool_result_store = InMemoryToolResultStore()
+        return self._in_memory_tool_result_store
+
+    @property
+    def tool_result_store_registered(self) -> bool:
+        """宿主是否显式注册了持久结果存储（False = 内存默认，重启后全文逐出）。"""
+        return self._tool_result_store_registered
 
     # ── EventBlobStore ───────────────────────────────────────────────────────
 

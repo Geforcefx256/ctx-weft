@@ -86,6 +86,8 @@ def _estimate_assembled_tokens(prompt, count: Callable[[str], int] | None = None
     count：文本费率经 count 回调走 tokenizer（通常是 ``ctx.llm.tokenizer.count``，已校准）；
     None 回退未校准启发式（纯单测/无 llm 场景）。
     """
+    from ctx_weft.core.utils.estimate import estimate_tools_tokens
+
     c = count or estimate_tokens
     total = c(prompt.system or "")
     for m in prompt.messages:
@@ -93,9 +95,7 @@ def _estimate_assembled_tokens(prompt, count: Callable[[str], int] | None = None
             m.tool_calls, count=count)
         if getattr(m, "reasoning_content", None):
             total += c(m.reasoning_content)
-    for t in getattr(prompt, "tools", None) or []:
-        total += c(t.name) + c(t.description or "")
-        total += c(json.dumps(t.input_schema, ensure_ascii=False))
+    total += estimate_tools_tokens(getattr(prompt, "tools", None), count)
     return total
 
 

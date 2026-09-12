@@ -190,6 +190,69 @@ class _ToolStream:
 # ── CapabilityGateway ─────────────────────────────────────────────────────────
 
 
+async def converge_tool_output(
+    full_text: str,
+    invocation_id: str,
+    store,
+    spill_sink,
+    provider_ctx,
+    *,
+    threshold: int,
+    preview_chars: int,
+    tail_chars: int,
+    restore: bool = False,
+) -> str:
+    """收敛工具长输出（spec: tool-result-recovery）——唯一的收敛实现，四个入口共用。
+
+    live 路径（``restore=False``）：先 ``store.put(全文)``（失败 → 显式「全文不可用」
+    标记，工具结果本身照常回灌）；重放/补写路径（``restore=True``）：store 未命中才以
+    传入全文重新入库（持久账本 × 易失 store 组合下仍可回读，D6）。上下文承载 = 引用 +
+    全长 + 头部预览 + **尾部预览**（错误与结论高发区）。SpillSink（宿主可见文件）为可选
+    增值：成功时路径并列提示，失败不再丢全文（store 已兜底）。未超阈值原样返回。
+    """
+    if threshold <= 0 or len(full_text) <= threshold:
+        return full_text
+
+    original_length = len(full_text)
+    head = full_text[:preview_chars]
+    tail = full_text[len(full_text) - tail_chars:] if tail_chars > 0 else ""
+
+    store_ok = True
+    try:
+        if store is None:
+            store_ok = False
+        elif restore:
+            if await store.get(invocation_id, tail=1, ctx=provider_ctx) is None:
+                await store.put(invocation_id, full_text, ctx=provider_ctx)
+        else:
+            await store.put(invocation_id, full_text, ctx=provider_ctx)
+    except Exception:
+        store_ok = False
+        logger.exception("ToolResultStore write/restore failed for %s", invocation_id)
+
+    header = (
+        f"[Tool output truncated: {original_length} chars exceeded "
+        f"{threshold}-char limit"
+    )
+    from ctx_weft.protocols.results import READ_TOOL_QUALIFIED_NAME
+    parts = [f"{header}; full text available via {READ_TOOL_QUALIFIED_NAME}("
+             f"invocation_id='{invocation_id}', tail=N or offset=N, limit=N)]"
+             if store_ok else
+             f"{header}; full output unavailable: result store write failed]"]
+
+    if spill_sink is not None:
+        try:
+            path = await spill_sink.spill(full_text, provider_ctx, name_hint=invocation_id)
+            parts.append(f"(also saved to {path})")
+        except Exception:
+            logger.exception("CapabilityGateway: spill failed (store already holds full text)")
+
+    body = [f"--- preview (first {len(head)} chars) ---", head]
+    if tail:
+        body += [f"--- tail (last {len(tail)} chars) ---", tail]
+    return "\n".join(parts) + "\n" + "\n".join(body)
+
+
 class CapabilityGateway:
     """统一 capability 调用入口：授权 → 脱敏 → 执行 → 审计 → memory。"""
 
@@ -203,8 +266,10 @@ class CapabilityGateway:
         default_authorizer: Authorizer | None = None,
         spill_threshold: int = 4000,
         spill_preview_chars: int = 1000,
+        spill_tail_chars: int = 1000,
         memory_blob_store: "MemoryBlobStore | None" = None,
         operation_store=None,
+        result_store=None,
     ) -> None:
         self._cache = capability_cache
         self._providers = capability_providers
@@ -227,10 +292,18 @@ class CapabilityGateway:
             from ctx_weft.providers.authorizer import AllowAllAuthorizer
             default_authorizer = AllowAllAuthorizer()
         self._default_authorizer: Authorizer = default_authorizer
-        # 工具输出截断阈值（字符）：超出则委托 SpillSink.spill() 落盘，
-        # result 改为「提示 + 路径 + 预览」。<=0 关闭。
+        # 工具输出截断阈值（字符）：超出则全文入结果存储、上下文换收敛版
+        # （引用 + 全长 + 头尾预览）。<=0 关闭。tail 预览是错误/结论高发区的立即止血。
         self._spill_threshold = spill_threshold
         self._spill_preview_chars = spill_preview_chars
+        self._spill_tail_chars = max(0, spill_tail_chars)
+        # spec: tool-result-recovery——全文可回取存储（put 全文 / get 窗口）。缺省给内存
+        # 实现（与 runtime 的 registry 两级解析同语义：直构 gateway 的测试路径也有回取
+        # 能力，无 store 不会退化成「全文丢弃」）。
+        if result_store is None:
+            from ctx_weft.providers.results import InMemoryToolResultStore
+            result_store = InMemoryToolResultStore()
+        self._result_store = result_store
         # 落盘走 SpillSink（core 不直接碰文件系统、不知道 workspace 在哪）
         self._spill_sink: SpillSink | None = next(
             (p for p in capability_providers if isinstance(p, SpillSink)),
@@ -414,8 +487,15 @@ class CapabilityGateway:
             if existing is not None and existing.status == _OpSt.COMPLETED:
                 # O-T08 前半：同逻辑调用重入——账本已有完整结局，不再打 provider、
                 # 不重复写 memory（首次执行已写 TOOL_RESULT）。
+                # spec: tool-result-recovery——重放统一收敛（D4/D6）：结果进入对话前过
+                # converge（禁全文直灌）；引用身份 = 账本原执行 invocation_id（attempts
+                # 尾项），store 逐出后以账本全文重新入库。
                 result_text = existing.result if isinstance(existing.result, str) else (
                     "[Replayed completed operation result]")
+                ref_inv = (existing.attempts[-1]
+                           if getattr(existing, "attempts", None) else invocation_id)
+                result_text = await self._converge_result(
+                    result_text, ctx, ref_inv, tool_name, cap.spillable, restore=True)
                 logger.info(
                     "CapabilityGateway: operation %s completed in ledger — replaying "
                     "result, provider not re-invoked", op_id)
@@ -540,8 +620,12 @@ class CapabilityGateway:
             # 「(no output)」——那会让模型以为真的什么都没拿到，图却已经在 content 里了。
             # 其余分支（真的什么都没有 / is_error）逐字节保留原行为。
             text = "" if is_error or streamed.parts else "(no output)"
-        # 工具输出过长 → 委托 fs provider 落盘；在 human note / 审计 / memory ingest 之前，使下游拿到截断版。
-        text = await self._maybe_spill(text, ctx, invocation_id, tool_name, cap.spillable)
+        # spec: tool-result-recovery——全文先行，收敛后置：store put（失败显式标记）→
+        # 账本 completed 持**收敛前全文**（修 tool-operations「完整规范化结果」的 spill
+        # 截断偏离）→ 收敛 → human note / 事件 / memory 只见收敛版。
+        full_text = text
+        text = await self._converge_result(
+            full_text, ctx, invocation_id, tool_name, spillable=cap.spillable)
         # 人类备注：文本前置进 text，备注里的图片 part 与工具结果的 part 一起进最终 content。
         # 顺序为「备注图 → 工具图」，与文本顺序一致（[Human note: …] 也在工具输出之前）。
         note_text, note_parts = split_for_tool_result(decision.message)
@@ -570,12 +654,14 @@ class CapabilityGateway:
 
         # ── 步骤⑤：账本 completed（持久确认）——先于 TOOL_RESULT 写与事件（spec §5.3：
         # completed 后 memory 写失败 → 恢复按 operation_memory_result_id(op_id) 幂等补写，
-        # 不再执行工具）。完整结果入账本（非审计截断文本；parts/blob ref 原样）。
+        # 不再执行工具）。完整结果入账本（非审计截断文本；parts/blob ref 原样）——
+        # spec: tool-result-recovery 起 result 恒为**收敛前全文**（此前 spill 截断先于
+        # 账本写入，实际入账的是截断文本，偏离既有条款）。
         if ledger is not None and op_id and ledger_record is not None:
             from ctx_weft.protocols.operations import OperationStatus as _St, OperationUpdate as _Upd2
             ledger_record = await ledger.compare_and_set(
                 op_id, ledger_record.revision,
-                _Upd2(status=_St.COMPLETED, result=text, result_set=True,
+                _Upd2(status=_St.COMPLETED, result=full_text, result_set=True,
                      error=str(metadata.get("error", "")) or None if is_error else None),
                 ctx.provider_ctx)
 
@@ -899,56 +985,26 @@ class CapabilityGateway:
         return await authorizer.on_decision(
             cap, ctx.provider_ctx, arguments, tool_call_id, human)
 
-    async def _maybe_spill(
+    async def _converge_result(
         self,
-        content: str,
+        full_text: str,
         ctx: "LoopContext",
         invocation_id: str,
         tool_name: str,
         spillable: bool = True,
+        *,
+        restore: bool = False,
     ) -> str:
-        """工具输出超阈值时委托 SpillSink 落盘，返回「截断提示 + 路径 + 头部预览」。
-
-        spillable=False の工具（如 read_file）直接原样返回，不做任何截断或落盘。
-        阈值 <=0 或未超出时原样返回。落盘走 SpillSink.spill()——core 不直接碰文件系统。
-        无 SpillSink / 该 session 无可落盘位置（spill 抛错）/ 落盘异常时，回退到硬截断
-        （保留预览，不丢上下文窗口，但全文不可恢复）。
-        """
+        """收敛出口（spec: tool-result-recovery）：`spillable=False` 或未超阈值原样返回；
+        其余走 `converge_tool_output`（全文先行入 store，上下文持收敛版）。restore=True
+        供重放/补写入口：store 未命中才重新入库。"""
         if not spillable:
-            return content
-        if self._spill_threshold <= 0 or len(content) <= self._spill_threshold:
-            return content
-
-        original_length = len(content)
-        preview = content[: self._spill_preview_chars]
-        header = (
-            f"[Tool output truncated: {original_length} chars exceeded "
-            f"{self._spill_threshold}-char limit"
-        )
-
-        provider_ctx = ctx.provider_ctx
-        if self._spill_sink is None:
-            return (
-                f"{header}; no spill sink available, full output dropped]\n"
-                f"--- preview (first {len(preview)} chars) ---\n{preview}"
-            )
-
-        try:
-            path = await self._spill_sink.spill(content, provider_ctx, name_hint=invocation_id)
-        except Exception:
-            logger.exception("CapabilityGateway: spill failed for '%s'", tool_name)
-            return (
-                f"{header}; spill failed, full output dropped]\n"
-                f"--- preview (first {len(preview)} chars) ---\n{preview}"
-            )
-
-        logger.info(
-            "CapabilityGateway: spilled %d-char output of '%s' to %s",
-            original_length, tool_name, path,
-        )
-        return (
-            f"{header}; full output saved to {path}]\n"
-            f"--- preview (first {len(preview)} chars) ---\n{preview}"
+            return full_text
+        return await converge_tool_output(
+            full_text, invocation_id, self._result_store, self._spill_sink,
+            ctx.provider_ctx,
+            threshold=self._spill_threshold, preview_chars=self._spill_preview_chars,
+            tail_chars=self._spill_tail_chars, restore=restore,
         )
 
 

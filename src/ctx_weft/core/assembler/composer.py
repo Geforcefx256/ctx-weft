@@ -100,23 +100,34 @@ Phase 3 (2026-06-30) 移除 ## Task Background blackboard 段，predecessor 结�
 from __future__ import annotations
 
 import dataclasses
+import logging
 import re
 from abc import abstractmethod
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from ctx_weft.protocols import LLMMessage
-from ctx_weft.protocols.capability import qualify
-from ctx_weft.core.utils.content import content_to_text, image_tokens
-from ctx_weft.core.utils.headings import SUBTASKS_REVIEW_HEADING
-from ctx_weft.core.utils.content import (
-    content_with_prefix,
-    content_with_suffix,
-    downgrade_images_to_text,
-)
 from ctx_weft.core.capabilities.control_tools import (
     DELEGATE_TASK_NAME,
     REPORT_TASK_OUTCOME_NAME,
 )
+from ctx_weft.core.utils.content import (
+    content_to_text,
+    content_with_prefix,
+    content_with_suffix,
+    downgrade_images_to_text,
+    image_tokens,
+)
+from ctx_weft.core.utils.headings import SUBTASKS_REVIEW_HEADING
+from ctx_weft.protocols import LLMMessage
+from ctx_weft.protocols.capability import qualify
+
+logger = logging.getLogger(__name__)
+
+# 渲染层有路径的块 kind（spec: context-evidence）：集合外的 kind 在 compose 显式
+# warning（今日即 blackboard——Phase 3 裁定不渲染，但要被看见，不留静默盲区）。
+_RENDERABLE_KINDS = frozenset({
+    "identity", "background", "task_spec", "history",
+    "capabilities", "directive", "guidance", "reference", "summary",
+})
 
 if TYPE_CHECKING:
     from ctx_weft.core.assembler.assembler import (
@@ -143,25 +154,53 @@ _OBSERVE_JUDGMENT_CUE = (
 
 # task compact cue：整体式——坍缩会替掉原始 prompt + 之前所有 `## Progress So Far`，故须概括
 # 整段 task-so-far（不是逐段 recap；逐段 act_recap 契约在 ROLE.md，属 observer）。
+# 结构化 digest（spec: compact-fidelity）：五个固定小节，宽松解析见
+# compact.parse_structured_digest（缺必需节 → 整文降级存档、标 degraded，不中断压缩）。
+# Evidence 小节引用可回取的执行身份——read_tool_output 是 tool-result-recovery 落地的
+# 回读工具；收敛版工具结果里自带的 invocation_id 在本 cue 面前的历史中可见。
 _COMPACTION_INSTRUCTION = (
     "Now act as a memory compactor. Summarize the ENTIRE task execution so far — from the "
     "user's original request through everything done since — into one concise progress digest "
-    "a future turn can continue from. Preserve: the task goal, key facts discovered, decisions "
-    "made, important tool results, current state, and any unfinished threads. This replaces the "
-    "earlier turns, so fold in whatever matters. Output only the digest text, no preamble."
+    "a future turn can continue from. Write it as EXACTLY these five sections, each opened by "
+    "its heading on its own line:\n"
+    "## Goal — the task's objective, one or two sentences.\n"
+    "## Constraints — user-imposed constraints and hard limits that must keep being honored "
+    "(write \"none\" only if truly none).\n"
+    "## Done — what has been completed: key results, decisions made, important tool outputs.\n"
+    "## Remaining — unfinished threads, open problems, and failure causes still to be "
+    "addressed (write \"none\" only if nothing remains).\n"
+    "## Evidence — references to crucial tool outputs a future turn can read back, one per "
+    "line, like `- results__read_tool_output(invocation_id='<id>', tail=200): what it "
+    "contains`; omit this section if no large output matters.\n"
+    "This replaces the earlier turns, so fold in whatever matters (facts discovered, current "
+    "state). Every section except Evidence must be present; keep each section as short as the "
+    "material allows. Output only the digest text, no preamble."
 )
 
 # agent compact cue：概括本 agent 已完成的任务单元——每个任务被要求做什么、结果/关键产出/
 # 教训（含其派发的子任务）。L1 折的是超龄完成单元整体（finish 对 + task 层胶囊），不只是派发
 # 记录，故不得只压派发；旧 digest 随折叠被 supersede，须显式要求延续其内容。当前 task 的执行
-# 细节由 task 域 cue（L3 坍缩）负责，此处忽略。
+# 细节由 task 域 cue（L3 坍缩）负责，此处忽略。与 task 域同构的五小节契约（spec:
+# compact-fidelity）。
 _AGENT_COMPACTION_INSTRUCTION = (
     "Now act as a memory compactor for this agent's work history. Summarize the completed tasks "
     "so far — for each: what it was asked to do and its outcome / key results / lessons, "
-    "including any sub-tasks it delegated — into one concise digest the agent can rely on later. "
-    "This digest replaces the older task records, so fold in whatever matters, and carry forward "
-    "everything an earlier compaction digest in the conversation already preserved. Ignore the "
-    "current still-running task's own execution detail. Output only the digest text, no preamble."
+    "including any sub-tasks it delegated — into one digest the agent can rely on later. Write "
+    "it as EXACTLY these five sections, each opened by its heading on its own line:\n"
+    "## Goal — what this body of work is about, overall.\n"
+    "## Constraints — constraints and hard limits that carried across tasks and must keep "
+    "being honored (write \"none\" only if truly none).\n"
+    "## Done — each completed task with its outcome and key lessons.\n"
+    "## Remaining — threads that earlier digests left open and are still unfinished (write "
+    "\"none\" only if nothing remains).\n"
+    "## Evidence — references to crucial tool outputs a future turn can read back, one per "
+    "line, like `- results__read_tool_output(invocation_id='<id>', tail=200): what it "
+    "contains`; omit this section if no large output matters.\n"
+    "This digest replaces the older task records, so fold in whatever matters, and carry "
+    "forward everything an earlier compaction digest in the conversation already preserved "
+    "(especially its Constraints and Remaining). Ignore the current still-running task's own "
+    "execution detail. Every section except Evidence must be present. Output only the digest "
+    "text, no preamble."
 )
 
 # Capabilities 指针：清单全文随「当前 task」user 回合（cache 前缀内稳定），末条 user 只留
@@ -303,7 +342,7 @@ def _compact_signature(input_schema: object) -> str:
     return ", ".join(parts)
 
 
-def _is_named_skill(block: "ContextBlock", skill_name: str) -> bool:
+def _is_named_skill(block: ContextBlock, skill_name: str) -> bool:
     """capability block 是否就是名为 skill_name 的那个 skill。
 
     只认 qualified 名（``provider__name``），与 PrepareStep 加载 skill 正文时用的
@@ -397,9 +436,9 @@ class Composer(Protocol):
     @abstractmethod
     async def compose(
         self,
-        blocks: list["ContextBlock"],
-        request: "ContextRequest",
-    ) -> "AssembledPrompt":
+        blocks: list[ContextBlock],
+        request: ContextRequest,
+    ) -> AssembledPrompt:
         ...
 
 
@@ -414,10 +453,19 @@ class DefaultComposer(Composer):
 
     async def compose(
         self,
-        blocks: list["ContextBlock"],
-        request: "ContextRequest",
-    ) -> "AssembledPrompt":
+        blocks: list[ContextBlock],
+        request: ContextRequest,
+    ) -> AssembledPrompt:
         from ctx_weft.core.assembler.assembler import AssembledPrompt
+
+        # 未识别 kind 显式留痕（spec: context-evidence）：无渲染路径的块不再静默消失。
+        unsupported = sorted({b.kind for b in blocks} - _RENDERABLE_KINDS)
+        if unsupported:
+            sources = sorted({b.source for b in blocks if b.kind in unsupported})
+            logger.warning(
+                "DefaultComposer: no rendering path for block kind(s) %s "
+                "(sources: %s) — these blocks are dropped from the prompt",
+                unsupported, sources)
 
         # tools 恒为 []：**composer 不再产工具数组**。它此前从 capabilities blocks 的
         # metadata["llm_tool"] 收一份拷贝，与 CapabilityCache 各存一套、装配后再无同步。
@@ -466,7 +514,7 @@ class DefaultComposer(Composer):
 
     # ── Actor ─────────────────────────────────────────────────────────────────
 
-    def _build_actor_system(self, blocks: list["ContextBlock"]) -> str:
+    def _build_actor_system(self, blocks: list[ContextBlock]) -> str:
         """soul + Project Background，--- 分隔。
 
         Resources（skills/tools/agents）与 skill 指令不再进 system，
@@ -485,8 +533,8 @@ class DefaultComposer(Composer):
 
     def _build_actor_messages(
         self,
-        blocks: list["ContextBlock"],
-        request: "ContextRequest",
+        blocks: list[ContextBlock],
+        request: ContextRequest,
     ) -> list[LLMMessage]:
         """Actor messages：历史轮次在前，任务上下文 + 当前消息作为最后一条 user message。
 
@@ -601,11 +649,14 @@ class DefaultComposer(Composer):
             else:
                 merged = self._append_to_last_user(merged, capabilities_text)
                 cap_idx = len(merged) - 1
-        # 末条 user 收尾（act）：guidance（任务锚定/plan 全景/已完成清单/静态指针）——
-        # 动态内容居尾不打穿 prompt cache 前缀。仅 act 渲染 guidance（facet purpose 的
-        # extra 本就不带 act_guidance，此处双保险）；facet 的 role/cue 由
-        # _build_facet_trailing_messages 追加在其后。
+        # 末条 user 收尾（act）：证据（检索/召回）→ guidance（任务锚定/plan 全景/已完成
+        # 清单/静态指针）——动态内容居尾不打穿 prompt cache 前缀。证据逐轮随查询变化，
+        # 落尾部动态区（guidance 之前，guidance 恒收口）。仅 act 渲染证据（facet purpose
+        # 的 trailing cue 自带角色定义，证据非其输入）；空节零渲染。
         if getattr(request, "purpose", None) == "act":
+            evidence_text = self._build_evidence_section(blocks)
+            if evidence_text:
+                merged = self._append_to_last_user(merged, evidence_text)
             guidance = self._first_kind(blocks, "guidance")
             if guidance is not None:
                 merged = self._append_to_last_user(merged, content_to_text(guidance.content))
@@ -701,8 +752,8 @@ class DefaultComposer(Composer):
 
     def _build_facet_trailing_messages(
         self,
-        blocks: list["ContextBlock"],
-        request: "ContextRequest",
+        blocks: list[ContextBlock],
+        request: ContextRequest,
         cue: str,
         extra_sections: list[str] | None = None,
         pre_cue_sections: list[str] | None = None,
@@ -737,7 +788,7 @@ class DefaultComposer(Composer):
         return self._append_to_last_user(messages, "\n\n".join(sections))
 
     def _build_resources_section(
-        self, blocks: list["ContextBlock"], *, current_skill_name: str = "",
+        self, blocks: list[ContextBlock], *, current_skill_name: str = "",
     ) -> str:
         """从 capabilities blocks 按 kind 分组渲染（miniAgents 风格）。
 
@@ -780,7 +831,7 @@ class DefaultComposer(Composer):
     def _render_grouped_section(
         self,
         header: str,
-        blocks: list["ContextBlock"],
+        blocks: list[ContextBlock],
         *,
         action: str,
         noun: str,
@@ -800,14 +851,14 @@ class DefaultComposer(Composer):
         signature=False（skills / sub-agents）：仍是 ``- name: 描述``，这两类没有
         tools 参数那条通路，描述只能由正文承载。
         """
-        def _line(b: "ContextBlock") -> str:
+        def _line(b: ContextBlock) -> str:
             name = b.metadata.get("capability_name", "?")
             if signature:
                 return f"- {name}({_compact_signature(b.metadata.get('input_schema'))})"
             return f"- {name}: {content_to_text(b.content)}"
 
-        ungrouped: list["ContextBlock"] = []
-        grouped: dict[str, list["ContextBlock"]] = {}
+        ungrouped: list[ContextBlock] = []
+        grouped: dict[str, list[ContextBlock]] = {}
         order: list[str] = []
         for b in blocks:
             pname = b.metadata.get("provider_name") or ""
@@ -844,7 +895,7 @@ class DefaultComposer(Composer):
         return "\n".join(lines)
 
     def _build_capabilities_section(
-        self, blocks: list["ContextBlock"], *, current_skill_name: str = "",
+        self, blocks: list[ContextBlock], *, current_skill_name: str = "",
     ) -> str:
         """Capabilities（skills/tools/agents）段，带 ## Capabilities 引导标题。空时返回 ""。"""
         resources_section = self._build_resources_section(
@@ -857,7 +908,33 @@ class DefaultComposer(Composer):
             + resources_section
         )
 
-    def _build_directive_section(self, blocks: list["ContextBlock"]) -> str:
+    def _build_evidence_section(self, blocks: list[ContextBlock]) -> str:
+        """证据段（spec: context-evidence）：检索参考 + 语义召回，含 score 与来源标识。
+
+        两个 source 的块各自成小节；命中内容是回答当前问题的证据，渲染于尾部动态区
+        （调用点在 guidance 之前）。空节零渲染（无命中零开销）。
+        """
+        refs = [b for b in blocks if b.kind == "reference"]
+        sums = [b for b in blocks if b.kind == "summary"]
+        if not refs and not sums:
+            return ""
+
+        def _items(blks: list[ContextBlock]) -> list[str]:
+            lines = []
+            for b in blks:
+                score = b.metadata.get("score")
+                score_s = f"{score:.3f}" if isinstance(score, (int, float)) else "-"
+                lines.append(f"- ({score_s}) {b.source}: {content_to_text(b.content)}")
+            return lines
+
+        sections: list[str] = []
+        if refs:
+            sections.append("### References\n" + "\n".join(_items(refs)))
+        if sums:
+            sections.append("### Recalled Memories\n" + "\n".join(_items(sums)))
+        return "## Retrieved Evidence\n" + "\n\n".join(sections)
+
+    def _build_directive_section(self, blocks: list[ContextBlock]) -> str:
         """当前 task 的 skill 指令段。空时返回 ""。
 
         skill 名并入标题（## Instructions for the current task (skill: <name>)）；
@@ -926,7 +1003,7 @@ class DefaultComposer(Composer):
         out.append(LLMMessage(role="user", content=text))
         return out
 
-    def _history_to_messages(self, history_blocks: list["ContextBlock"]) -> list[LLMMessage]:
+    def _history_to_messages(self, history_blocks: list[ContextBlock]) -> list[LLMMessage]:
         """将 history blocks 转换为真实多轮 LLMMessage 列表。
 
         跨层（task_conversation + agent_experience）按 timestamp 正序归并，seq_no 作 tiebreak。
@@ -934,7 +1011,7 @@ class DefaultComposer(Composer):
         return [m for m, _src, _mtype, _tid in self._history_to_messages_with_sources(history_blocks)]
 
     def _history_to_messages_with_sources(
-        self, history_blocks: list["ContextBlock"]
+        self, history_blocks: list[ContextBlock]
     ) -> list[tuple[LLMMessage, str, str, str]]:
         """同 _history_to_messages，但每条 message 附带来源 block.source、memory event type、task_id。
 
@@ -985,7 +1062,7 @@ class DefaultComposer(Composer):
     # ── Observer ──────────────────────────────────────────────────────────────
 
     def _build_act_system(
-        self, blocks: list["ContextBlock"], request: "ContextRequest"
+        self, blocks: list[ContextBlock], request: ContextRequest
     ) -> str:
         """system = act identity(SOUL) + Project Background。observe/compact/metadata 共用。
 
@@ -1003,8 +1080,8 @@ class DefaultComposer(Composer):
 
     def _build_observer_messages(
         self,
-        blocks: list["ContextBlock"],
-        request: "ContextRequest",
+        blocks: list[ContextBlock],
+        request: ContextRequest,
     ) -> list[LLMMessage]:
         """act 风格完整会话 + 尾部一条 observe user message（仅发送，不入 memory）。
 
@@ -1069,7 +1146,7 @@ class DefaultComposer(Composer):
         )
 
     @staticmethod
-    def _render_bb(blks: list["ContextBlock"]) -> str:
+    def _render_bb(blks: list[ContextBlock]) -> str:
         """渲染 blackboard 结果块为复核清单行。"""
         lines: list[str] = []
         for b in blks:
@@ -1084,9 +1161,9 @@ class DefaultComposer(Composer):
 
     def _first_kind(
         self,
-        blocks: list["ContextBlock"],
+        blocks: list[ContextBlock],
         kind: str,
-    ) -> "ContextBlock | None":
+    ) -> ContextBlock | None:
         for b in blocks:
             if b.kind == kind:
                 return b

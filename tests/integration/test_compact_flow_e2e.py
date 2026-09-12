@@ -43,6 +43,30 @@ def _act_only_template() -> AgentTemplate:
     )
 
 
+
+class _UsageInflatingMock(MockLLMAdapter):
+    """usage 层面抬高 prompt_tokens（act 级 context_limit 命中的确定性触发器）。
+
+    tokenizer/估算路径完全不动——只有回喂的 usage 被替换，prepare 侧不误触 compact。
+    """
+
+    def __init__(self, *args, prompt_tokens_override: int = 0, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._override = prompt_tokens_override
+
+    async def complete(self, request, stream: bool = True):
+        import dataclasses as _dc
+        async for chunk in super().complete(request, stream=stream):
+            if (self._override and chunk.kind == "usage" and chunk.usage is not None):
+                u = chunk.usage
+                u = _dc.replace(
+                    u, prompt_tokens=self._override,
+                    total_tokens=self._override + u.completion_tokens,
+                    input_tokens=max(0, self._override - u.cache_read_tokens - u.cache_write_tokens))
+                chunk = _dc.replace(chunk, usage=u)
+            yield chunk
+
+
 async def test_context_limit_retry_without_recap_keeps_raw_and_defers_to_background_e2e(
         monkeypatch):
     """机械退出 retry 且**无可用 LLM observer** → 判决无摘要 → 段折降级保 raw，摘要交后台。
@@ -69,10 +93,13 @@ async def test_context_limit_retry_without_recap_keeps_raw_and_defers_to_backgro
     tpl = _dc.replace(_act_only_template(),
                       loop_config=LoopConfig(short_segment_token_threshold=0))
     resolver.register(tpl)
-    # context_limit=20 → 0.8*20=16 tokens 阈值，真实 prompt 必超 → act turn1 context_limit 命中
-    # output_reserve=0：effective_limit 不为 reserved_output_tokens 吞光（Task 4 引入）
-    llm = MockLLMAdapter(responses=[MockResponse(text="partial work, not done yet")],
-                         context_limit=20, output_reserve=0)
+    # spec: tool-schema-budget 后，窗口须容得下「地板 + 工具面预留」否则 prepare 期
+    # assemble 直接溢出（20-token 极限窗口不再可行）。act 级 context_limit 命中改由
+    # usage 注入触发（0.8*3000=2400 阈值 < 注入的 2500）：tokenizer 不动，prepare 侧
+    # 估算仍走真实计数、不在压缩处提前分叉。
+    llm = _UsageInflatingMock(
+        responses=[MockResponse(text="partial work, not done yet")],
+        context_limit=3000, output_reserve=0, prompt_tokens_override=2500)
     runtime = make_runtime(llm=llm, agent_provider=resolver)
     runtime.providers.register_memory(InMemoryMemoryProvider())
 

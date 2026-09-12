@@ -387,8 +387,10 @@ async def test_ask_user_cold_path_delivers_an_image_into_the_tool_result() -> No
     ctxp = ProviderContext(session_id=sid, tenant_id="default")
     scope = state.scope
     results = await memory.recall_recent(scope, [MemoryEventType.TOOL_RESULT], 20, ctxp)
-    matching = [r for r in results if r.metadata.get("tool_call_id") == "tc_ask"]
-    assert matching, f"no TOOL_RESULT recorded for tc_ask; got {[r.metadata for r in results]}"
+    # tool_call_id 已是摄入点铸造的内部标识（spec: conversation-integrity）——按 tool_name
+    # 定位 ask_user 的 TOOL_RESULT；raw id（tc_ask）可在 assistant 回合 metadata.raw_id 追溯。
+    matching = [r for r in results if r.metadata.get("tool_name") == "control__ask_user"]
+    assert matching, f"no TOOL_RESULT recorded for ask_user; got {[r.metadata for r in results]}"
     content = matching[0].content
     assert isinstance(content, list), (
         f"TOOL_RESULT content should carry parts (text + image), got {type(content).__name__}"

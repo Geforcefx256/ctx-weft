@@ -77,6 +77,17 @@ class ReconcileStep(Step):
             rec = await ledger.get(op_id, ctx.provider_ctx) if ledger is not None else None
             if (rec is not None and rec.status == OperationStatus.COMPLETED) or (
                     operation_memory_result_id(op_id) in tool_record_ids):
+                if (
+                    rec is not None and rec.status == OperationStatus.COMPLETED
+                    and operation_memory_result_id(op_id) not in tool_record_ids
+                ):
+                    # spec: tool-result-recovery——「账本完成而 memory 缺失」（completed 与
+                    # TOOL_RESULT 写入之间崩溃）：以账本全文经收敛补写（原执行 id 引用），
+                    # 兑现 tool-operations 的补写要求；此前此处直接 continue，dangling 兜底
+                    # 会把这次调用的结果整个剥掉。
+                    await self._backfill_memory(
+                        state, ctx, op_id, rec.result, tc,
+                        gateway=gateway, rec=rec, via="ledger-completed")
                 logger.info("ReconcileStep: op %s completed — reusing, not re-running", op_id)
                 continue
 
@@ -114,7 +125,8 @@ class ReconcileStep(Step):
                     await self._conclude_unverified(
                         state, ctx, op_id, tc, ledger, rec,
                         f"[Operation outcome unverified] 工具 {tc['name']} 的这次调用在"
-                        f"崩溃前没有留下账本记录，无法确定副作用是否已发生。不要重试这次调用。")
+                        f"崩溃前没有留下账本记录，无法确定副作用是否已发生。不要重试这次调用。",
+                        gateway=gateway)
                     continue
             if rec is None:
                 pass  # 控制工具 / 冷 HITL 首执 carve-out（上方已分流其它去作结）
@@ -134,7 +146,8 @@ class ReconcileStep(Step):
                     if not verdict.rerun:
                         # 作结：裁决者查到了真结果、或只能说明查不到——对 core 同一件事。
                         await self._conclude_unverified(
-                            state, ctx, op_id, tc, ledger, rec, verdict.result)
+                            state, ctx, op_id, tc, ledger, rec, verdict.result,
+                            gateway=gateway)
                         continue
                     # 权威判定没跑成 → 同 op_id 重跑安全
 
@@ -185,7 +198,8 @@ class ReconcileStep(Step):
                 "ReconcileStep: adjudicate failed for %s — concluding unverified", op_id)
             return unverified
 
-    async def _conclude_unverified(self, state, ctx, op_id, tc, ledger, rec, result):
+    async def _conclude_unverified(self, state, ctx, op_id, tc, ledger, rec, result, *,
+                                   gateway=None):
         """作结一次不重跑的操作：账本 completed + 把 ``result`` 写成这次调用的工具结果。
 
         与「裁决者查到了真结果」走的是**同一条路**——对 core 而言两者没有区别，差的
@@ -204,22 +218,36 @@ class ReconcileStep(Step):
             except Exception:
                 # 账本写不进去不该拦住「把结果告诉 agent」——后者才是这一步的产出。
                 logger.exception("ReconcileStep: ledger conclude failed for %s", op_id)
-        await self._backfill_memory(state, ctx, op_id, result, tc)
+        await self._backfill_memory(state, ctx, op_id, result, tc,
+                                    gateway=gateway, rec=rec, via="adjudicator")
         logger.info("ReconcileStep: op %s concluded without re-running", op_id)
 
-    async def _backfill_memory(self, state, ctx, op_id, result, tc):
-        """query completed：按确定性 id 补写 TOOL_RESULT。幂等由 memory 的 id 契约保证
-        （同 id ingest = no-op，见 InMemoryMemoryProvider.ingest）。"""
+    async def _backfill_memory(self, state, ctx, op_id, result, tc, *,
+                               gateway=None, rec=None, via="adjudicator"):
+        """补写 TOOL_RESULT（spec: tool-result-recovery——补写统一过收敛，禁全文直灌）。
+
+        幂等由 memory 的 id 契约保证（同 id ingest = no-op）。收敛引用沿用账本原执行
+        invocation_id（attempts 尾项）；store 逐出后以账本全文重新入库（restore 语义）。
+        """
         from ctx_weft.protocols import MemoryEvent, MemoryKind, MemoryScope
         from ctx_weft.protocols.operations import operation_memory_result_id
         from ctx_weft.core.utils.clock import now_utc
+        content = str(result)
+        attempts = getattr(rec, "attempts", None)
+        ref_inv = attempts[-1] if attempts else tc.get("id", "")
+        if gateway is not None:
+            try:
+                content = await gateway._converge_result(  # noqa: SLF001 —— 与本文件既有 gateway 私有件同口径
+                    content, ctx, ref_inv, tc.get("name", ""), spillable=True, restore=True)
+            except Exception:
+                logger.exception("ReconcileStep: converge on backfill failed for %s", op_id)
         await ctx.memory.ingest(MemoryEvent(
             id=operation_memory_result_id(op_id),
             kind=MemoryKind.CONVERSATION_TURN, scope=MemoryScope.TASK,
-            address=state.scope, content=str(result), timestamp=now_utc(),
+            address=state.scope, content=content, timestamp=now_utc(),
             role="tool",
             metadata={"tool_call_id": tc.get("id"), "operation_id": op_id,
-                      "recovered_via": "adjudicator"},
+                      "recovered_via": via},
         ), ctx.provider_ctx)
 
 

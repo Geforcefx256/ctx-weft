@@ -124,6 +124,8 @@
 - **内联（自动）**：PrepareStep 估算 token（对齐 miniAgents 基线）→ 命中阈值 → `escalating_compact` 逐级升级——L0.5 图片降级 → L1 agent 层折 → L2 胶囊降级 → L3 task 层坍缩（`core/loop/steps/prepare.py:155`-`166`）→ 重装配后继续 `→ act`。
 - **主动**：`CtxWeftRuntime.compact_agent(agent_id, *, task_id="")`（`core/runtime.py:2394`）对一个 idle（非 busy）agent 直调 `CompactStep().execute()`（现在**补发 RunStarted/RunFinished 对**），返回 `CompactReceipt`；强制压不受预算门控。
 
+**digest 保真契约（spec: compact-fidelity）**：L1/L3 的 digest 按五固定小节生成（`## Goal / ## Constraints / ## Done / ## Remaining / ## Evidence`，Evidence 可缺）；`summarize_for_compact` 落库前经 `parse_structured_digest` 宽松解析，缺必需节整文降级（落库点 metadata `digest_degraded`）。Evidence 引用可回取的执行身份（tool-result-recovery 的 read_tool_output）。验收三层：CI 管道层（材料传递/解析/落库/降级）+ CI 请求层（cue 契约断言——固定 mock 输出不随 cue 变化，语义不归 mock 证）+ 非 CI 语义层（`benchmarks/compact_fidelity_eval.py`，真模型）。**不可逆边界**：fold 即 supersede，对话文本原文不可恢复——本契约不承诺原文回取；可回取面 = 工具产出（结果存储）+ 图片（ref 机制）。段摘要（act_recap / Progress So Far）不在此契约内。
+
 **recognize_intent（取代已删除的 metadata_filler 后台协程）**：PrepareStep 判定需要时置 pending 标记（`core/loop/steps/prepare.py:178`），**起飞在 act 的提交点**（`core/loop/steps/act.py:304`-`306` `launch_recognize_intent`）——与 ActStep 并发、单发、不进 step 状态机。`MetadataFillerTaskSettings` 仅作 dataclass 残留（反序列化兼容）。
 
 ### Step 状态机

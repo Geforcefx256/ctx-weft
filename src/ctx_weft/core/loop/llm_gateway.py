@@ -206,7 +206,25 @@ def reorder_tool_results_after_calls(messages: list[LLMMessage]) -> list[LLMMess
     存在」查不出这种**错位**。本步按 owner 把每个 tool result 移到其 assistant tool_call 之后，
     并按该 assistant 的 ``tool_calls`` 顺序排列。无 owner（没有任何 assistant 调用该 id）的
     孤儿 tool 原地保留，交 :func:`drop_orphan_tool_results` 处理；只搬不删、不补。
+
+    存量歧义留痕（spec: conversation-integrity）：新数据的 id 在摄入点铸为全局唯一，
+    命中「同一 id 被多个 assistant 携带」只可能来自改造前的裸 wire id 记录——行为维持
+    现状（结果在每个携带者后各发一遍），但 MUST 留痕不静默。
     """
+    owner_counts: dict[str, int] = {}
+    for m in messages:
+        if m.role == "assistant":
+            for tc in m.tool_calls:
+                tcid = tc.get("id")
+                if tcid:
+                    owner_counts[tcid] = owner_counts.get(tcid, 0) + 1
+    dup_ids = [tcid for tcid, n in owner_counts.items() if n > 1]
+    if dup_ids:
+        logger.error(
+            "stream_llm: %d tool_call_id(s) each claimed by multiple assistant messages "
+            "(legacy bare-wire ids? their results will be duplicated after every owner): %s",
+            len(dup_ids), dup_ids,
+        )
     owned_ids = {
         tc.get("id")
         for m in messages
@@ -290,14 +308,15 @@ def _estimate_request_tokens(request: "LLMRequest", count) -> int:
 
     每条消息经 :func:`_estimate_message_tokens` 计全部计费项（文本 + tool_calls 参数 +
     reasoning + 图片 + framing）。含本轮新加的 role="tool" result。``count``：文本费率
-    回调，caller 传 ``tokenizer.count``（已校准）。
+    回调，caller 传 ``tokenizer.count``（已校准）。tools 面费率走单一真源
+    ``estimate_tools_tokens``（与 prepare 首估同口径）。
     """
+    from ctx_weft.core.utils.estimate import estimate_tools_tokens
+
     total = count(request.system or "")
     for m in request.messages:
         total += _estimate_message_tokens(m, count)
-    for t in request.tools:
-        total += count(t.name) + count(t.description or "")
-        total += count(json.dumps(t.input_schema, ensure_ascii=False))
+    total += estimate_tools_tokens(request.tools, count)
     return total
 
 
@@ -308,6 +327,11 @@ def request_prompt_estimate(tokenizer, request: "LLMRequest", loop_guard, baseli
       真实基线 + 仅 ``messages[baseline_msg_count:]``（本轮新增尾段，如工具结果）的估算。
       基线前的历史采信 provider 真实测量值、不重估——避免 len//4 对 CJK 历史大头系统性低估
       （正是它把整份重估压到基线之下、漏掉本轮增量而导致 max_tokens 过大 400 的根因）。
+      **工具面追踪（spec: tool-schema-budget）**：请求的工具面指纹（规范化定义哈希，
+      覆盖 name+description+schema）与 guard 记录的上次指纹不同时，估算计入 schema 差值
+      （新面估算 − 上次面估算）——运行期 pin 大 schema 后估算立即增长；工具面不变时
+      增量行为与旧口径逐字节一致（纯消息增量）。首次记录（旧签名为空）不加减值——
+      真实基线已含当时的工具面。
     - **首次 / 一次性**（无循环内基线）：``max(整份估算, context_tokens)``——整份估算打底，
       并不低于上一步真实测量值（更保守，永不 400；上步后若发生压缩，偏大只是少给输出）。
 
@@ -319,16 +343,42 @@ def request_prompt_estimate(tokenizer, request: "LLMRequest", loop_guard, baseli
     的真实值（正是本函数存在的校准动机场景：启发式低估、被真实基线兜住），若回喂用 floor 后
     的返回值会产出 ratio≈1 的假样本、把伺服系统性拖向 1；估算段是 floor 前的值，不受污染。
     """
+    from ctx_weft.core.utils.estimate import estimate_tools_tokens, tools_signature
+
     ctx_tokens = getattr(loop_guard, "context_tokens", 0) if loop_guard is not None else 0
+
+    def _track_tools() -> int:
+        """指纹变化时返回 schema 差值（新 − 上次），并推进 guard 记录；不变返回 0。
+        首次（旧签名为空）只记录不加值（真实基线已含当时的面）。guard 字段经
+        getattr 读写——SimpleNamespace 测试替身与旧持久化快照都兼容。"""
+        if loop_guard is None:
+            return 0
+        sig = tools_signature(request.tools)
+        last_sig = getattr(loop_guard, "last_tools_signature", "")
+        if sig == last_sig:
+            return 0
+        new_est = estimate_tools_tokens(request.tools, tokenizer.count)
+        delta = 0
+        if last_sig:
+            delta = new_est - getattr(loop_guard, "last_tools_est", 0)
+        try:
+            loop_guard.last_tools_signature = sig
+            loop_guard.last_tools_est = new_est
+        except Exception:  # pragma: no cover —— 只读替身（防御，不影响估算本身）
+            pass
+        return delta
+
     if baseline_msg_count is not None and ctx_tokens > 0:
         delta = sum(
             _estimate_message_tokens(m, tokenizer.count)
             for m in request.messages[baseline_msg_count:]
         )
+        delta += _track_tools()
         request.metadata[PROMPT_EST_BASE_KEY] = ctx_tokens
         request.metadata[PROMPT_EST_SEG_KEY] = delta
         return ctx_tokens + delta
     full = _estimate_request_tokens(request, tokenizer.count)
+    _track_tools()
     request.metadata[PROMPT_EST_BASE_KEY] = 0
     request.metadata[PROMPT_EST_SEG_KEY] = full
     return max(full, ctx_tokens)
@@ -347,6 +397,20 @@ def apply_dynamic_max_tokens(ctx, request: "LLMRequest", loop_guard) -> None:
     used = request.prompt_token_estimate
     if used is None:
         return
+    # spec: tool-schema-budget——发送前超限不硬拒（明示决策，design D4）：估算存在误差，
+    # 硬拒会误伤真实可发请求；超限信号转为 max_tokens 按含工具面的 used 自然收紧 +
+    # WARNING 留痕 + 既有 compact 比例机制在下轮 prepare 触发压缩。provider 400 仍是
+    # 最终防线（且自愈退避在）。
+    reserve = max(0, getattr(loop_guard, "reserved_output_tokens", 0))
+    eff_window = max(0, loop_guard.context_limit - reserve)
+    if used > eff_window:
+        logger.warning(
+            "prompt estimate %d exceeds effective window %d "
+            "(tools_signature=%s, tools_est=%d) — request proceeds with tightened "
+            "max_tokens; compaction will trigger on next prepare if the ratio holds",
+            used, eff_window,
+            getattr(loop_guard, "last_tools_signature", ""),
+            getattr(loop_guard, "last_tools_est", 0))
     llm = ctx.llm
     # margin 比例制：固定值只兜小 prompt 的估算残差，误差随体量按比例放大 → margin 也按比例。
     margin = max(

@@ -78,6 +78,12 @@ Loop Engine          reason → act → observe → finalize
 EventBus             事件总线，所有状态变更的唯一出口
 ```
 
+> **证据供给（2026-09 起，spec: context-evidence）**：知识检索（KnowledgeProvider）与语义召回（recall_semantic）命中的内容渲染进 act prompt 的尾部动态区（`## Retrieved Evidence`，含 score 与来源），不打穿 prompt cache 前缀（当前任务锚回合逐字节稳定）。预算裁剪在来源等级上叠加相关性轴：per-source top-K（`evidence_top_k`，默认 3，0 关闭）**且** score 达 `evidence_score_floor` 的证据提级到与当前任务内容同档——紧张预算下先丢低分证据、再丢陈旧胶囊、后丢达标证据；同档内低分先丢、无 score 的当前任务历史殿后。裁剪丢弃留结构化日志（证据类单列 warning）；装配层遇到无渲染路径的块 kind（如 blackboard）显式 warning，不留静默盲区。
+>
+> **工具面预算口径（2026-09 起，spec: context-budget）**：装配预算先扣工具面预留（名称 + 描述 + 入参 schema，按能力快照现算，`AssembledPrompt.metadata.tools_reserved_tokens` 可读）——工具声明不参与裁剪，预算压力由预留承担；溢出报错仍报真窗口。act 循环内增量估算追踪工具面指纹（覆盖 name+description+schema 的规范化定义哈希——同名工具 schema 更新可感知）：运行期 pin 大 schema 后估算立即增长（`max_tokens` 随之收紧）；工具面不变时增量行为与旧口径一致。发送前超限**不硬拒**（明示决策）：收紧 max_tokens + WARNING 留痕 + 既有比例机制触发下轮压缩。估算与实际 usage 的偏差留工具面分项记录（指纹/估算/实测同现于回喂日志）。
+>
+> **压缩摘要保真（2026-09 起，spec: compact-fidelity）**：task 域（L3 坍缩）与 agent 域（L1 折叠）的压缩 digest 按五个固定小节生成——`## Goal / ## Constraints / ## Done / ## Remaining / ## Evidence`（Evidence 可缺）；落库前宽松解析，缺必需小节整文降级存档（metadata `digest_degraded: true`）、不中断压缩。`## Evidence` 引用可回取的工具产出（`results__read_tool_output(invocation_id=...)`）。验收分三层：管道层与请求层（cue 契约）在 CI（`tests/unit/test_compact_fidelity.py`）；**语义质量层不入 CI**——真模型是否按 cue 保留约束，发布前人工运行 `python benchmarks/compact_fidelity_eval.py`（需真实 LLM key）。**不可逆边界**：对话文本原文在 fold 后不可恢复（既有 supersede 语义不变，本契约不承诺原文回取）；可回取面仅限工具产出（结果存储）与图片（既有 ref 机制）。段摘要（act_recap / Progress So Far）不在本契约范围（逐段生成、消费方为观察锚点，见 ARCHITECTURE）。
+
 这些**协议**是对外的接入面。外部系统只需实现其中一个协议，ctx-weft 自动用上（LLM 详见
 [LLM 接入](#llm-接入) 一节）：
 
@@ -611,6 +617,8 @@ class RunHandle:
 
 ## 事件系统
 
+> **对话配对完整性（2026-09 起，spec: conversation-integrity）**：assistant 回合摄入时把 LLM 分配的 tool_call wire id 替换为内部唯一标识（`tc_{seq36}_{ord36}_{hash12}`，`[a-z0-9_]`、≤64 字符）——模型复用 `call_1` 这类短 id 不再造成跨轮次/跨任务的结果错配。**值域迁移注记**：事件 payload（`CapabilityInvoked` / `CapabilityFinished` / `LLMResponseFinished.tool_calls`）与 HITL 请求中的 `tool_call_id` 从裸 wire id 变为内部标识；原始 id 保留在 assistant 记录 metadata（`tool_calls[].raw_id`，伴随 `op_id`）供追溯。宿主面板若按 id 展示/匹配需知悉；存量记录不迁移（配对行为不回退，重复歧义在发送前留 ERROR 痕迹）。
+>
 > **快照恢复（2026-09 起，spec: snapshot-recovery）**：快照边界 = 已确认提交位置（`committed_head` 一致切面），恢复增量按 position 区间；旧格式快照自动忽略并全量重建，无需手工迁移事件数据（存量库回填用 `scripts/migrate_event_positions.py`）。
 >
 > **执行时长/轮数限制（2026-09 起）**：core **不提供**任务级 deadline 或轮数上限——这是宿主的策略，不是 SDK 的职责。需要超时就在宿主侧计时并调 `cancel_task` / `cancel_agent`；需要 provider 级超时就在 provider 自己的工具实现里做。三个从未被执行的旧字段（`max_turns_per_agent` / `timeout_per_step_sec` / `Task.timeout_ms`）**已删除**——它们声明了限制却无任何运行时消费者，留着只会让宿主以为有防线。`max_turns_per_act` / `max_turns_per_observe` 等**真正生效**的循环上限不受影响。
@@ -672,6 +680,10 @@ async for ev in runtime.event_bus.stream(EventFilter(session_id="ses_xxx")):
 ---
 
 ## 内置 Provider
+
+### 工具长输出的收敛与回取（spec: tool-result-recovery）
+
+工具输出超过 `spill_threshold`（默认 4000 字符）时：全文写入**结果存储**（`ToolResultStore` 协议，registry 显式注册 > `InMemoryToolResultStore` 内存默认——LRU 双上限可逐出，跨进程回取需宿主注册持久实现并经 `register_tool_result_store` 注入），上下文（对话与 memory）只承载**收敛版** = 回取引用 + 全长 + 头部预览 + **尾部预览**（`spill_preview_chars` / `spill_tail_chars`）。模型经 `results:read_tool_output(invocation_id, offset | tail, limit)` 分页/尾部回取全文（runtime 自动注册，act 可用；invocation_id 每次执行一枚，取最新收敛文本里的值）。四个重放/补写入口（账本 completed 短路重放、恢复补写、queryable 重放、宿主 `supply_result`）统一过收敛；结果存储逐出后以账本全文重新入库（账本 completed 恒持收敛前全文）。存储写失败 → 收敛版显式 `[full output unavailable]` 标记；SpillSink（宿主文件落盘）降级为可选增值，成功时路径并列提示。
 
 ### InMemoryMemoryProvider
 

@@ -37,7 +37,9 @@ async def test_summarize_for_compact_returns_llm_text(monkeypatch):
     monkeypatch.setattr(compact_mod, "stream_llm_resilient", _ok)
     state, ctx = _state_ctx()
     out = await compact_mod.summarize_for_compact(state, ctx)
-    assert out == "summary"
+    # spec: compact-fidelity——返回解析后的 digest：散文输出（无五小节）整文落库 + degraded。
+    assert out.text == "summary"
+    assert out.degraded is True
 
 
 async def test_summarize_for_compact_propagates_outage(monkeypatch):

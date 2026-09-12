@@ -5,11 +5,14 @@
 
 from __future__ import annotations
 
+import logging
 from abc import abstractmethod
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from ctx_weft.core.models.errors import ContextOverflowError
 from ctx_weft.core.utils.content import image_part_count
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ctx_weft.core.assembler.assembler import ContextBlock, ContextRequest
@@ -33,40 +36,90 @@ class BudgetStrategy(Protocol):
 class PriorityBudgetStrategy(BudgetStrategy):
     """按 eff_priority 保留（0 永不丢，丢序大→小）；同档按最老先丢、再按体积。
 
-    eff_priority = slot_priority 静态阶梯（见 priority.py 的槽位表）+ 两个动态覆盖：
+    eff_priority = slot_priority 静态阶梯（见 priority.py 的槽位表）+ 动态覆盖：
 
         静态基线 5/6（history）──┬─ task_id == 当前 且 type=user_prompt ──→ 0（pin，不可裁）
                                  ├─ task_id / origin_task_id == 当前 ────→ 4（提级）
                                  └─ 其余（已完成 task）───────────────────→ 维持 5/6
+        证据动态提级（spec: context-evidence）：
+          reference / summary 且「per-source 排名 ≤ evidence_top_k 且 score ≥
+          evidence_score_floor」（AND 语义，K 为硬上界）────→ 4（与当前 task 内容同档）
 
+    丢序（spec: context-evidence）：(-eff_prio, score, 最老 ts, -token)——score 取正号
+    （**低分先丢**；探针教训：-score 在升序遍历下会先丢高分）；无 score 的块记 +inf
+    （同档内最后丢——当前任务历史等无 score 块因此受保护）。证据类丢弃单列 warning。
     丢弃流程：tool_call↔tool_result 先聚成同生共死单元（防孤立 tool result）
-    → 按 (-priority, 最老 timestamp, -token) 排序逐单元丢 → 丢到限内为止；
-    只剩 priority-0 地板仍超限时抛富信息 ContextOverflowError。
-    详见 spec §4.2 / §4.2.1。"""
+    → 逐单元丢 → 丢到限内为止；只剩 priority-0 地板仍超限时抛富信息 ContextOverflowError。
+    详见 spec §4.2 / §4.2.1 / context-evidence。"""
+
+    def __init__(
+        self,
+        *,
+        evidence_top_k: int = 3,
+        evidence_score_floor: float = 0.0,
+    ) -> None:
+        # K=0 关闭提级；floor 默认 0 = 仅按排名（可配置加严门槛）。
+        self._evidence_top_k = evidence_top_k
+        self._evidence_score_floor = evidence_score_floor
+
+    def _promoted_evidence_ids(self, blocks: list["ContextBlock"]) -> set[str]:
+        """per-source top-K ∧ score 达标的证据块 id（提级到 4 的集合）。"""
+        if self._evidence_top_k <= 0:
+            return set()
+        by_source: dict[str, list["ContextBlock"]] = {}
+        for b in blocks:
+            if b.kind in ("reference", "summary") and b.metadata.get("score") is not None:
+                by_source.setdefault(b.source, []).append(b)
+        promoted: set[str] = set()
+        for group in by_source.values():
+            ranked = sorted(
+                group, key=lambda b: b.metadata.get("score", 0.0), reverse=True)
+            for b in ranked[: self._evidence_top_k]:
+                if b.metadata.get("score", 0.0) >= self._evidence_score_floor:
+                    promoted.add(b.id)
+        return promoted
 
     async def apply(
         self,
         blocks: list["ContextBlock"],
         token_limit: int,
         request: "ContextRequest",
+        overflow_limit: int | None = None,
     ) -> list["ContextBlock"]:
+        """按 token_limit（**已扣工具面预留的内容预算**）裁剪。
+
+        overflow_limit（spec: tool-schema-budget）：溢出报错里 ``effective_limit``
+        字段要反映**真窗口**——报错信息用真值、裁剪用扣减值，两者分开传（None = 退化
+        为 token_limit，测试直构路径同旧行为）。
+        """
         total = sum(b.token_estimate for b in blocks)
         if total <= token_limit:
             return blocks
 
-        eff_prio = {b.id: self._effective_priority(b, request) for b in blocks}
+        promoted = self._promoted_evidence_ids(blocks)
+
+        def _eff_priority(b: "ContextBlock") -> int:
+            if b.id in promoted:
+                return 4  # 证据提级（与当前 task 内容同档；不高于它）
+            return self._effective_priority(b, request)
+
+        eff_prio = {b.id: _eff_priority(b) for b in blocks}
         units = self._coalesce_tool_pairs(blocks)
 
         def _unit_prio(u: list["ContextBlock"]) -> int:
             return max(eff_prio[b.id] for b in u)  # 配对成员同 task 同层 → 一致，max 无碍
 
+        def _unit_score(u: list["ContextBlock"]) -> float:
+            # 无 score（含全部既有块）记 +inf：同档内最后丢（当前任务历史受保护）。
+            scores = [b.metadata.get("score") for b in u if b.metadata.get("score") is not None]
+            return min(scores) if scores else float("inf")
+
         def _unit_sort_key(u: list["ContextBlock"]):
-            # 统一键：(-priority, 最老 ts, -总 token)。无 subrank。
-            # -p 降序 → priority 大先丢；ts 升序 → 最老先丢；-tok → 无 ts 档（能力等）大先丢。
+            # 统一键：(-priority, score, 最老 ts, -总 token)。score 正号 = 低分先丢。
             p = _unit_prio(u)
             ts = min((b.metadata.get("timestamp", "") for b in u), default="")
             tok = sum(b.token_estimate for b in u)
-            return (-p, ts, -tok)
+            return (-p, _unit_score(u), ts, -tok)
 
         droppable = sorted(units, key=_unit_sort_key)
         kept_ids = {b.id for b in blocks}
@@ -79,6 +132,19 @@ class PriorityBudgetStrategy(BudgetStrategy):
                 if b.id in kept_ids:
                     kept_ids.discard(b.id)
                     total -= b.token_estimate
+                    # 丢弃留痕（spec: context-evidence）：kind/source/token/当时档位；
+                    # 证据类丢弃单列 warning（「直接回答当前问题的证据被裁」须可见）。
+                    kind = b.kind
+                    if kind in ("reference", "summary"):
+                        logger.warning(
+                            "budget: dropped evidence block kind=%s source=%s "
+                            "tokens=%d eff_priority=%d score=%s",
+                            kind, b.source, b.token_estimate, eff_prio[b.id],
+                            b.metadata.get("score"))
+                    else:
+                        logger.info(
+                            "budget: dropped block kind=%s source=%s tokens=%d eff_priority=%d",
+                            kind, b.source, b.token_estimate, eff_prio[b.id])
 
         if total > token_limit:
             floor = [b for b in blocks if eff_prio[b.id] == 0]
@@ -90,7 +156,7 @@ class PriorityBudgetStrategy(BudgetStrategy):
             sess = getattr(request, "session", None)
             raise ContextOverflowError(
                 required=required,
-                effective_limit=token_limit,
+                effective_limit=overflow_limit if overflow_limit is not None else token_limit,
                 context_limit=getattr(sess, "context_limit", 0),
                 reserved_output_tokens=getattr(sess, "reserved_output_tokens", 0),
                 image_count=n_images,

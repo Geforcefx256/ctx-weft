@@ -23,6 +23,11 @@ class RuntimeConfig:
     # 工具输出落盘（spill）阈值：CapabilityGateway 读取。host 可覆盖。
     spill_threshold: int = 4000
     spill_preview_chars: int = 1000
+    # spec: tool-result-recovery——收敛版尾部预览字符数（错误/结论高发区立即止血）。
+    spill_tail_chars: int = 1000
+    # spec: context-evidence——证据动态提级：per-source top-K（硬上界，0 关闭）∧ score 下限。
+    evidence_top_k: int = 3
+    evidence_score_floor: float = 0.0
     # LLM 瞬时故障自愈预算（stream_llm_resilient 读取；默认=历史安全值）
     llm_self_heal_max_attempts: int = 8
     llm_self_heal_max_duration_sec: float = 300.0

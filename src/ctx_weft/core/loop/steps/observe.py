@@ -28,6 +28,7 @@ from ctx_weft.core.loop.llm_gateway import (
     request_prompt_estimate, resolve_llm_identity, stream_llm_resilient,
 )
 from ctx_weft.core.capabilities.control_tools import REPORT_TASK_OUTCOME_NAME, ControlResult
+from ctx_weft.core.utils.ids import generate_id, mint_turn_call_ids
 
 if TYPE_CHECKING:
     from ctx_weft.core.models.task import Task
@@ -108,6 +109,15 @@ async def run_observe_react(
 
         if accumulated_text:
             last_text = accumulated_text
+
+        # 摄入前铸造内部调用标识（spec: conversation-integrity，与 act._run_llm_turn 同口径）：
+        # observer 回合不入 task 层 memory（工具是 SILENT/控制面），锚仅取唯一性、不持久；
+        # live 消息面（current_messages 的 tool_call↔result 配对）与事件 payload 用同一份值。
+        if tool_calls:
+            tool_calls = [
+                m.call for m in mint_turn_call_ids(
+                    tool_calls, anchor=generate_id("asst"), turn_seq=round_num)
+            ]
 
         # 更新 loop_guard（对齐 miniAgents _run_observer：取 actor/observer 的最大值）
         if usage.prompt_tokens > 0:
