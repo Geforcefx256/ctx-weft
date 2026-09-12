@@ -190,11 +190,17 @@ def serialize_view(view: RunStateView) -> dict[str, Any]:
                 "origin_tool_name": t.origin_tool_name,
                 "settings_raw": t.settings_raw,
                 "dag_deps": t.dag_deps,
+                # spec: task-handoff——四个新字段进快照（inputs / dep_conditions /
+                # error_code / blocked_by_task_id）；旧快照无键 → deserialize 落缺省。
+                "dep_conditions": getattr(t, "dep_conditions", None),
+                "inputs": getattr(t, "inputs", None),
                 "priority": t.priority,
                 "max_retries": t.max_retries,
                 "tenant_id": t.tenant_id,
                 "outputs": t.outputs,
                 "error": t.error,
+                "error_code": getattr(t, "error_code", None),
+                "blocked_by_task_id": getattr(t, "blocked_by_task_id", None),
                 "created_at": _dt(t.created_at),
                 "finished_at": _dt(t.finished_at),
             }
@@ -261,11 +267,16 @@ def deserialize_view(data: dict[str, Any]) -> RunStateView:
             origin_tool_name=t.get("origin_tool_name", ""),
             settings_raw=t.get("settings_raw", {}),
             dag_deps=t.get("dag_deps", []),
+            # 存量快照无键 → None（未声明输入 / 依赖按 any 解释 / 无结局码）。
+            dep_conditions=t.get("dep_conditions"),
+            inputs=t.get("inputs"),
             priority=t.get("priority", 5),
             max_retries=t.get("max_retries", 3),
             tenant_id=t.get("tenant_id", "default"),
             outputs=t.get("outputs"),
             error=t.get("error"),
+            error_code=t.get("error_code"),
+            blocked_by_task_id=t.get("blocked_by_task_id"),
             created_at=_dt(t.get("created_at")),
             finished_at=_dt(t.get("finished_at")),
         )
@@ -607,6 +618,9 @@ def _apply(view: RunStateView, ev: Event) -> None:
                 origin_tool_name=task_data.get("origin_tool_name", ""),
                 settings_raw=task_data.get("settings", {}),
                 dag_deps=task_data.get("dag_deps", []),
+                # spec: task-handoff——存量事件无此二键 → None/缺省（回放语义见各自字段注释）。
+                dep_conditions=task_data.get("dep_conditions"),
+                inputs=task_data.get("inputs"),
                 priority=task_data.get("priority", 5),
                 max_retries=task_data.get("max_retries", 3),
                 tenant_id=ev.tenant_id or "default",
@@ -705,6 +719,17 @@ def _apply(view: RunStateView, ev: Event) -> None:
             elif t in (EventType.TASK_FAILED, EventType.TASK_INTERRUPTED):
                 msg = p.get("error_message")
                 if msg:
+                    task.error = msg
+            elif t == EventType.TASK_CANCELED:
+                # spec: task-handoff——依赖阻塞取消的结局码与阻塞源随 TASK_CANCELED
+                # payload 持久化；不读则回放后只剩 CANCELED、原因不可解释。
+                # 用户侧取消（reason 文本）也顺手折进 error，供恢复后观察面解释。
+                code = p.get("error_code")
+                if code:
+                    task.error_code = code
+                    task.blocked_by_task_id = p.get("blocked_by_task_id") or None
+                msg = p.get("reason") or p.get("error_message")
+                if msg and not task.error:
                     task.error = msg
 
     elif t == EventType.TASK_FINALIZED and ev.task_id:

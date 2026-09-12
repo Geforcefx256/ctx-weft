@@ -39,8 +39,14 @@ class TaskSpecSource:
             else content_to_text(task.user_prompt) if task.user_prompt
             else ""
         )
+        # spec: task-handoff——显式输入走 metadata（composer 两条渲染路径都读它）；
+        # content 仍只是快照，遵守本模块「block 是元数据载体」的契约。
+        inputs = getattr(task, "inputs", None)
         # content 仅作可读快照（debug / token 估算）；composer 实际读 metadata 字段。
         parts = [p for p in (title, description, user_prompt) if p]
+        if inputs:
+            import json as _json
+            parts.append("## Inputs\n" + _json.dumps(inputs, ensure_ascii=False, indent=2))
         content = "\n".join(parts) if parts else "[No task spec]"
 
         yield ContextBlock(
@@ -56,5 +62,6 @@ class TaskSpecSource:
                 "title": title,
                 "description": description,
                 "user_prompt": user_prompt,
+                "inputs": inputs,
             },
         )

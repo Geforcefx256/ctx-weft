@@ -42,17 +42,80 @@ def test_collect_reviews_only_accepts_own_children() -> None:
     ctx = ControlContext(session_id="s1", task_id="T", agent_id="a",
                          task=parent, task_manager=tm, session=None)
     reviews = [
-        {"task_title": "Build C1", "review_status": "reopen", "reasoning": "fix it"},
-        {"task_title": "Build C2", "review_status": "confirmed", "reasoning": "ok"},
-        {"task_title": "Predecessor", "review_status": "reopen", "reasoning": "nope"},
-        {"task_title": "Ghost", "review_status": "reopen", "reasoning": "x"},
+        {"task_id": "C1", "review_status": "reopen", "reasoning": "fix it"},
+        {"task_id": "C2", "review_status": "confirmed", "reasoning": "ok"},
+        {"task_id": "P0", "review_status": "reopen", "reasoning": "nope"},
+        {"task_id": "Ghost", "review_status": "reopen", "reasoning": "x"},
     ]
     reopen, summary = _collect_reviews(reviews, ctx)
 
     assert reopen == {"C1": "fix it"}             # 只有子任务被收集
-    assert "out of scope" in summary
-    assert "'Predecessor'" in summary and "'Ghost'" in summary
-    assert "confirmed 'Build C2'" in summary
+    assert "out of scope" in summary or "invalid" in summary
+    assert "'P0'" in summary and "'Ghost'" in summary
+    assert "confirmed 'Build C2' (C2)" in summary
+
+
+def test_collect_reviews_same_named_children_resolve_by_id() -> None:
+    """spec: task-handoff——同名双子任务按 id 定向生效，对象不随登记顺序漂移。"""
+    tm = TaskManager(session_id="s1")
+    parent = _task("T", "Parent", status="SUSPENDED")
+    c1 = _task("C1", "Same Name")
+    c2 = _task("C2", "Same Name")  # 同名、后注册
+    for t in (parent, c1, c2):
+        tm.register_task(t)
+    tm._children_of["T"] = {"C1", "C2"}
+
+    ctx = ControlContext(session_id="s1", task_id="T", agent_id="a",
+                         task=parent, task_manager=tm, session=None)
+    reopen, summary = _collect_reviews(
+        [{"task_id": "C1", "review_status": "reopen", "reasoning": "redo first"}], ctx,
+    )
+    assert reopen == {"C1": "redo first"}
+    assert c2.status == "FINISHED"
+
+
+def test_collect_reviews_survives_child_rename() -> None:
+    """spec: task-handoff——审核前子任务改名，按既得 id 操作仍命中。"""
+    tm = TaskManager(session_id="s1")
+    parent = _task("T", "Parent", status="SUSPENDED")
+    c1 = _task("C1", "Build C1")
+    for t in (parent, c1):
+        tm.register_task(t)
+    tm._children_of["T"] = {"C1"}
+    c1.title = "Renamed C1"  # 派发后被改名
+
+    ctx = ControlContext(session_id="s1", task_id="T", agent_id="a",
+                         task=parent, task_manager=tm, session=None)
+    reopen, _ = _collect_reviews(
+        [{"task_id": "C1", "review_status": "reopen", "reasoning": "r"}], ctx,
+    )
+    assert reopen == {"C1": "r"}
+
+
+def test_collect_reviews_rejects_legacy_title_entries_others_proceed() -> None:
+    """spec: task-handoff——旧 task_title 条目被条目级校验拒绝，其余合法条目照常生效。"""
+    tm = TaskManager(session_id="s1")
+    parent = _task("T", "Parent", status="SUSPENDED")
+    c1 = _task("C1", "Build C1")
+    c2 = _task("C2", "Build C2")
+    for t in (parent, c1, c2):
+        tm.register_task(t)
+    tm._children_of["T"] = {"C1", "C2"}
+
+    ctx = ControlContext(session_id="s1", task_id="T", agent_id="a",
+                         task=parent, task_manager=tm, session=None)
+    reviews = [
+        {"task_title": "Build C1", "review_status": "reopen", "reasoning": "old style"},
+        {"task_id": "C2", "review_status": "confirmed", "reasoning": "ok"},
+        {"review_status": "confirmed", "reasoning": "no id"},
+        {"task_id": 42, "review_status": "skip", "reasoning": "bad id"},
+    ]
+    reopen, summary = _collect_reviews(reviews, ctx)
+
+    assert reopen == {}                      # 旧式/缺 id/坏 id 全拒
+    assert "confirmed 'Build C2' (C2)" in summary  # 合法条目照常生效
+    assert "task_title" in summary           # 回执说明指出旧字段不再接受
+    assert "'C1'" not in summary.split("confirmed")[0].replace("Build C1", "")  # C1 未被旧式条目操作
 
 
 def test_collect_reviews_skips_reopen_of_unfinished_child() -> None:
@@ -66,10 +129,10 @@ def test_collect_reviews_skips_reopen_of_unfinished_child() -> None:
     ctx = ControlContext(session_id="s1", task_id="T", agent_id="a",
                          task=parent, task_manager=tm, session=None)
     reopen, summary = _collect_reviews(
-        [{"task_title": "Build C1", "review_status": "reopen", "reasoning": "r"}], ctx,
+        [{"task_id": "C1", "review_status": "reopen", "reasoning": "r"}], ctx,
     )
     assert reopen == {}
-    assert "already active 'Build C1'" in summary
+    assert "already active 'Build C1' (C1)" in summary
 
 
 # ── 2. reopen_chain 级联 ─────────────────────────────────────────────────────────

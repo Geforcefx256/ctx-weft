@@ -51,6 +51,8 @@ async def test_task_spec_source_emits_fields_in_metadata():
     assert blk.metadata == {
         "task_id": "t1", "title": "My Title",
         "description": "My Desc", "user_prompt": "hello",
+        # spec: task-handoff——inputs 也走 metadata（composer 两条渲染路径的读取面）
+        "inputs": None,
     }
 
 

@@ -109,6 +109,10 @@ class Task:
     parent_task_id: str | None = None
 
     dag_deps: list[str] = field(default_factory=list)
+    # spec: task-handoff——依赖条件（dep_id → "success" | "any"）。None = 存量/无条件，
+    # 回放与队列重建按 any 解释（历史保真）；新派发由 push_task **写入时物化**为全量
+    # 显式（缺省 success），读取侧永远不需要猜缺省。
+    dep_conditions: dict[str, str] | None = None
     tracking_task_ids: list[str] = field(default_factory=list)
 
     title: str = ""
@@ -130,6 +134,10 @@ class Task:
     # 跨重启之后这一轮要么早已提交、要么根本不在日志里，两种情形都用不到它。
     user_prompt_memory_id: str | None = None
     settings: TaskSettings = field(default_factory=NormalTaskSettings)
+    # spec: task-handoff——派发时声明的显式输入（纯 JSON；超限部分已经 control 工具侧
+    # 规整：分级收敛 + 截断/裁剪标记）。随 TASK_CREATED 持久化、恢复链原样重建；
+    # 投递走 TaskSpecSource metadata → Composer 两条渲染路径的 `## Inputs` 小节。
+    inputs: dict | None = None
     # 纯文本(无 tool call)turn 的处理方式：interactive=暂停等用户 / auto=自治需调 finish_task。
     # root task 由 session_registry 设为 interactive；委派子任务默认 auto（delegate_task/plan 可显式置 interactive）。
     interaction_mode: TaskInteractionMode = "auto"

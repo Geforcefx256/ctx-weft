@@ -43,3 +43,19 @@ def test_observer_cue_no_subtask_section_when_no_children():
     req = _req({"subtask_reviews": []})
     msgs = composer._build_observer_messages(blocks, req)
     assert "tsk_" not in msgs[-1].content
+
+
+def test_observer_cue_renders_blocked_cancel_note():
+    """spec: task-handoff——依赖阻塞取消的子任务在 review 面带解释性 note。"""
+    composer = DefaultComposer()
+    blocks = [ContextBlock(id="b1", source="t", kind="history", target="messages",
+                           content="do the work", priority=3, token_estimate=3,
+                           metadata={"role": "user", "type": "user_prompt", "timestamp": "2026-06-30T00:00:00+00:00"})]
+    req = _req({"subtask_reviews": [
+        {"task_id": "tsk_a", "title": "produce", "outcome": "failed"},
+        {"task_id": "tsk_b", "title": "final", "outcome": "canceled",
+         "note": "blocked by failed/canceled predecessor tsk_a"},
+    ]})
+    cue = composer._build_observer_messages(blocks, req)[-1].content
+    assert "tsk_b" in cue and "canceled" in cue
+    assert "blocked by failed/canceled predecessor tsk_a" in cue

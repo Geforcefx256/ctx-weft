@@ -24,7 +24,7 @@ from ctx_weft.core.orchestrator.task.disposition import (
     RunOutcomeKind,
     disposition_for,
 )
-from ctx_weft.core.orchestrator.task.queue import QueueEntry, TaskQueue
+from ctx_weft.core.orchestrator.task.queue import QueueEntry, TaskQueue, split_deps
 from ctx_weft.core.orchestrator.task.runner import AgentBinding, TaskRunner, effective_agent_id
 from ctx_weft.core.models.session import Session
 from ctx_weft.core.models.status import TaskStatus
@@ -107,6 +107,9 @@ class TaskManager:
         # ── 熔断真终结（failure threshold trip）状态 ──────────────────────────────
         # 幂等闩：trip 后在途任务再失败会重进 FAILED 分支，没有它会重复清场 + 重复发事件。
         self._threshold_tripped: bool = False
+        # spec: task-handoff——永久阻塞扫描的重入闩：处置里的 on_task_finished 会再进
+        # 扫描入口，闩住后由外层不动点循环统一覆盖。
+        self._in_blocked_dispose: bool = False
         # (title, reason) 随 failure_counter 同步积累（FAILED 追加、FINISHED 清空）；
         # 供 FAILURE_THRESHOLD_HIT payload 与 threshold_finalizer 引用。跨崩溃恢复不重建，接受。
         self._recent_failures: list[tuple[str, str]] = []
@@ -180,6 +183,9 @@ class TaskManager:
                 self._children_of.setdefault(t.parent_task_id, set()).add(t.id)
 
         self._queue.seed_completed(terminal_ids)
+        # spec: task-handoff——成功集与终态集分开装填：FINISHED 的才释放 on_success 依赖。
+        succeeded_ids = {t.id for t in all_tasks if t.status == "FINISHED"}
+        self._queue.seed_succeeded(succeeded_ids)
 
         for t in all_tasks:
             if t.status in TERMINAL_TASK_STATUSES:
@@ -202,10 +208,17 @@ class TaskManager:
             else:
                 t.status = "PENDING"
                 t.retry_count = 0
-                blocked = {dep for dep in (t.dag_deps or []) if dep not in terminal_ids}
+                # spec: task-handoff——按条件重建两集：any 依赖对任意终态释放、
+                # success 依赖只对 FINISHED 释放（terminal-but-not-succeeded 的依赖
+                # 保持阻塞，交给恢复期的永久阻塞扫描处置——A 已 FAILED 落盘、
+                # B 的级联取消未落盘的崩溃窗口正是靠那个扫描兜底）。
+                any_deps, success_deps = split_deps(t.dag_deps, t.dep_conditions)
+                any_deps -= terminal_ids
+                success_deps -= succeeded_ids
                 self._queue.push(QueueEntry(
                     task_id=t.id, session_id=self._session_id,
-                    priority=t.priority, blocked_by=blocked,
+                    priority=t.priority,
+                    blocked_by=any_deps, blocked_success=success_deps,
                 ))
 
     async def push_task(
@@ -251,15 +264,27 @@ class TaskManager:
             self._children_of.setdefault(parent_task_id, set()).add(task.id)
         if blocked_by:
             task.dag_deps = list(blocked_by)
+            # spec: task-handoff——写入时物化缺省：新派发的依赖缺省 on_success，
+            # 显式声明（delegate_plan 的 run_if）优先。读取侧（restore/queue）因此
+            # 永远不需要猜缺省——存量事件没有 dep_conditions 才按 any 解释。
+            conds = dict(task.dep_conditions or {})
+            for dep in blocked_by:
+                conds.setdefault(dep, "success")
+            task.dep_conditions = conds
 
+        any_deps, success_deps = split_deps(task.dag_deps, task.dep_conditions)
         entry = QueueEntry(
             task_id=task.id,
             session_id=self._session_id,
             priority=task.priority,
-            blocked_by=set(blocked_by or []),
+            blocked_by=any_deps,
+            blocked_success=success_deps,
         )
         self._queue.push(entry)
-        logger.debug("TaskManager.push_task: %s blocked_by=%s", task.id, blocked_by)
+        logger.debug(
+            "TaskManager.push_task: %s blocked_any=%s blocked_success=%s",
+            task.id, any_deps, success_deps,
+        )
         # 创建即落盘：未跑过的排队 / blocked task 也进事件日志，
         # 崩溃恢复时 restore() 可由 dag_deps 重建依赖链，无需父任务重新 spawn。
         # push_task 是唯一的「新建」路径（retry / resume / active 重排都走 _queue.push），
@@ -827,9 +852,16 @@ class TaskManager:
             task.user_prompt_in_memory = False  # let the driver re-ingest the revised prompt
             if blocked_by is not None:
                 task.dag_deps = list(blocked_by)  # restart 时由 dag_deps 重建依赖链
+                # spec: task-handoff——条件存活：链序不变（同 plan 后继按原顺序重排），
+                # 沿用任务原有的条件声明；存量任务本就无条件（None）→ 继续按 any。
+                old_conds = task.dep_conditions or {}
+                task.dep_conditions = (
+                    {dep: old_conds[dep] for dep in blocked_by if dep in old_conds} or None
+                )
+            any_deps, success_deps = split_deps(task.dag_deps, task.dep_conditions)
             self._queue.push(QueueEntry(
                 task_id=task_id, session_id=self._session_id, priority=task.priority,
-                blocked_by=set(blocked_by or []),
+                blocked_by=any_deps, blocked_success=success_deps,
             ))
         # 把改写后的 prompt 一并落进事件，使崩溃恢复（event replay）能重建修订后的
         # user_prompt。reopen 只在 prompt 尾部追加**文本** section，不可能引入事件流
@@ -987,6 +1019,11 @@ class TaskManager:
             self._clear_running(task_id)
             if status == "FAILED":
                 self._queue.mark_failed(task_id)
+            elif status == "CANCELED":
+                # spec: task-handoff——取消也是「终态但非成功」：只释放 on_any 依赖，
+                # on_success 后继保持阻塞（其善后由永久阻塞扫描处置）。对存量
+                # （全部 any 依赖）行为不变——两种收尾都进 _completed。
+                self._queue.mark_failed(task_id)
             else:
                 self._queue.mark_complete(task_id)
 
@@ -1035,8 +1072,19 @@ class TaskManager:
                 # pause 弃子（_pause_abandon）除外：连带取消不定会话去向，由 root park 决定。
                 # _threshold_tripped 除外：熔断已判会话 FAILED，在途任务迟到的协作取消收尾
                 # 绝不能把终态盖回 CANCELED（trip 序列已先手，见 _trip_failure_threshold）。
-                if not self._pause_abandon and not self._threshold_tripped:
+                # spec: task-handoff——依赖阻塞取消除外：那是计划内部的失败传播，不是
+                # 用户叫停；子任务被阻塞取消后父任务照常唤醒、观察并决定补救/收尾，
+                # 会话终态交给正常收敛路径（同 _pause_abandon 的豁免形态）。
+                if (
+                    not self._pause_abandon
+                    and not self._threshold_tripped
+                    and not (task is not None and task.error_code == TaskErrorCode.BLOCKED_BY_FAILED_DEP)
+                ):
                     self._session.status = "CANCELED"
+
+        # spec: task-handoff——永久阻塞善后的运行期入口：前序 FAILED/CANCELED 落定后，
+        # on_success 后继若已判明永不可满足 → 立即处置（级联到不动点）。
+        await self.dispose_blocked_dependents()
 
         # Try to resume parent
         await self._try_resume_parent(task_id)
@@ -1062,6 +1110,65 @@ class TaskManager:
                     # failure_counter > 0 表示本轮有任务失败（成功时会被重置为 0）
                     self._session.status = self._final_status()
                 await self._fire_session_done()
+
+    def _find_blocked_forever(self) -> "tuple[str, str] | None":
+        """定位一个 on_success 依赖已判明永不可满足的排队任务 → (task_id, 阻塞源 dep_id)。
+
+        判据是**当前状态**而非回调：任何时刻某 success 依赖已 FAILED/CANCELED，
+        该条目就永不可能被释放（没有再让它成功的路径——reopen 会重建条件，那是
+        观察者的决定，不是调度的）。幂等：已终态任务跳过。
+        """
+        for entry in self._queue.peek_all():
+            task = self._tasks.get(entry.task_id)
+            if task is None or task.status in TERMINAL_TASK_STATUSES:
+                continue
+            for dep in entry.blocked_success:
+                dep_task = self._tasks.get(dep)
+                if dep_task is not None and dep_task.status in ("FAILED", "CANCELED"):
+                    return entry.task_id, dep
+        return None
+
+    async def dispose_blocked_dependents(self) -> None:
+        """spec: task-handoff——永久阻塞善后（运行期 + 恢复期共用，幂等）。
+
+        定点迭代至不动点：处置一个被阻塞取消的任务后它自己也成了 CANCELED 终态，
+        依赖它的 on_success 后继随之满足处置条件，重扫直到无新受害者。每个受害者：
+        落 CANCELED + ``BLOCKED_BY_FAILED_DEP`` + 指明阻塞源，发 TASK_CANCELED
+        （payload 带 error_code 与 blocked_by_task_id，投影据此可恢复解释），出队，
+        然后走 on_task_finished 的正规收尾（队列记账 / 父任务唤醒 / drain / 会话判定
+        ——其中会话终态改写被 error_code 豁免，见该分支注释）。
+
+        崩溃窗口兜底：A 的 FAILED 已落盘、B 的级联取消未落盘时进程崩溃，恢复重建
+        依赖后由 runtime 在首次 drain 前调本方法补扫（同一实现、同一幂等）。
+        """
+        if self._in_blocked_dispose:
+            return  # 处置内部的 on_task_finished 再入；外层循环已覆盖其级联
+        self._in_blocked_dispose = True
+        try:
+            while True:
+                found = self._find_blocked_forever()
+                if found is None:
+                    return
+                task_id, dep_id = found
+                task = self._tasks.get(task_id)
+                if task is None:
+                    continue
+                task.status = "CANCELED"
+                task.error_code = TaskErrorCode.BLOCKED_BY_FAILED_DEP
+                task.error = f"blocked by failed/canceled predecessor {dep_id}"
+                task.finished_at = now_utc()
+                self._queue.cancel(task_id)
+                await self._emit(
+                    EventType.TASK_CANCELED, task_id=task_id,
+                    payload={
+                        "error_code": TaskErrorCode.BLOCKED_BY_FAILED_DEP,
+                        "blocked_by_task_id": dep_id,
+                        "reason": f"dependency_failed:{dep_id}",
+                    },
+                )
+                await self.on_task_finished(task_id, status="CANCELED")
+        finally:
+            self._in_blocked_dispose = False
 
     async def _trip_failure_threshold(self) -> None:
         """连败达阈值：真终结——清场 + root 判死 + 会话终态，而非裸终结。
@@ -1615,6 +1722,10 @@ def task_payload(task: Task, *, user_prompt_jsonable: "str | list[dict] | None")
             "priority": task.priority,
             "max_retries": task.max_retries,
             "dag_deps": task.dag_deps,
+            # spec: task-handoff——依赖条件与显式输入随创建事件落盘（None 原样落：
+            # 存量读侧按「未声明」解释，不虚构）。
+            "dep_conditions": task.dep_conditions,
+            "inputs": task.inputs,
             "interaction_mode": task.interaction_mode,
             "unattended": task.unattended,
             "origin_tool_call_id": task.origin_tool_call_id or "",

@@ -2290,9 +2290,12 @@ class CtxWeftRuntime:
                 boundary=info.get("boundary") or "finish",
             )
 
-        self._register_and_drain(session, task_manager)
+        # spec: task-handoff——恢复期的永久阻塞扫描（restore 重建依赖后、首次 drain 前）：
+        # 崩溃窗口里 A 的 FAILED 已落盘、B 的级联取消未落盘时，A 的失败回调不会重放，
+        # 靠这一趟幂等补扫把 B 判定并落终态，否则 B 永久 PENDING。
+        await task_manager.dispose_blocked_dependents()
 
-        # 无可恢复 task（所有 task 已终态）但 session 因崩溃未落终态 → 显式收尾：
+        self._register_and_drain(session, task_manager)
         # gather 重跑的后台 recap 后发 SESSION_FINISHED（终态镜像 on_task_finished）。
         # `keep_alive` 短路这一步：`_start_task_for_agent` 调用这里正是为了拿到一个能塞
         # 新 task 的活 TM，紧接着就要 push——在那之前 finalize 一次（发 SessionFinished、

@@ -42,3 +42,6 @@ class TaskErrorCode(StrEnum):
     BY_THRESHOLD = "TASK_FAILED_BY_THRESHOLD"
     # spec: tool-operations（wp6）——工具副作用结果未知：恢复保守停住等宿主
     # resolve_operation 处置（supply_result / retry_confirmed / cancel_task）。
+    # spec: task-handoff——依赖阻塞取消：on_success 依赖落 FAILED/CANCELED、后继判明
+    # 永不可满足而落 CANCELED 的结局码。区别于用户取消：不改写会话终态、不计失败阈值。
+    BLOCKED_BY_FAILED_DEP = "BLOCKED_BY_FAILED_DEP"
