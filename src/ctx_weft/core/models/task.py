@@ -138,6 +138,18 @@ class Task:
     # 规整：分级收敛 + 截断/裁剪标记）。随 TASK_CREATED 持久化、恢复链原样重建；
     # 投递走 TaskSpecSource metadata → Composer 两条渲染路径的 `## Inputs` 小节。
     inputs: dict | None = None
+    # spec: delivery-acceptance——检查声明 [{checker_id, checker_version, params, required}]，
+    # 随 TASK_CREATED 持久化；版本纳入声明指纹（同 id 升版即指纹变化，旧结论失效）。
+    acceptance_spec: "list[dict] | None" = None
+    # 修正额度已用次数（上限 1，跨崩溃由 TASK_ACCEPTANCE_RETRY_RESERVED 事件重建）。
+    acceptance_repairs_used: int = 0
+    # 有效用户回合标识：仅维护中的任务（mode≠off 且有声明）由四个写点与恢复对账维护
+    # （TASK_INPUT_ADVANCED）。不依赖瞬态 user_prompt_memory_id（恢复后为 None，会漂移）。
+    effective_input_turn_id: "str | None" = None
+    # 最新一次验收记录（整体结论/绑定三元组/缺口/各检查结果），由事件折叠恢复。
+    acceptance: "dict | None" = None
+    # 恢复中声明版本缺失（宿主已升级）：True 时相关检查判 unverified，按模式分档处置。
+    acceptance_unavailable: bool = False
     # 纯文本(无 tool call)turn 的处理方式：interactive=暂停等用户 / auto=自治需调 finish_task。
     # root task 由 session_registry 设为 interactive；委派子任务默认 auto（delegate_task/plan 可显式置 interactive）。
     interaction_mode: TaskInteractionMode = "auto"

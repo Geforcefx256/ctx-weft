@@ -213,6 +213,14 @@ class EventType(StrEnum):
     # ── 操作结果未知（spec: tool-operations，wp6）：副作用可能已发生但结果不可判定——
     #     task 停在 INTERRUPTED 等宿主 resolve_operation。payload 带 revision 供处置。──
     OPERATION_UNCERTAIN = "OperationUncertain"   # payload: {operation_id, tool_name, revision, actions, summary}
+    # ── 交付验收域（spec: delivery-acceptance）：候选-提交分离边界的三条持久化事实。
+    #     CHECKED：一次验收执行的记录（绑定三元组 + 各检查结果 + 缺口 + 候选引用）；
+    #     RETRY_RESERVED：修正额度预占——**必须先于修正生成落盘**（跨崩溃额度保证）；
+    #     INPUT_ADVANCED：有效用户回合标识推进（仅维护中的任务：mode≠off 且有检查声明），
+    #     恢复对账按 memory 重算幂等补发。──
+    TASK_ACCEPTANCE_CHECKED = "TaskAcceptanceChecked"
+    TASK_ACCEPTANCE_RETRY_RESERVED = "TaskAcceptanceRetryReserved"
+    TASK_INPUT_ADVANCED = "TaskInputAdvanced"
 
 
 # 向后兼容：保持 `EVENT_TYPES` 为字符串 frozenset，供 `type not in EVENT_TYPES` 校验。

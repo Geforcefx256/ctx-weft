@@ -59,6 +59,11 @@ def task_from_projection(proj: TaskView) -> Task:
         dag_deps=list(proj.dag_deps),
         dep_conditions=dict(proj.dep_conditions) if proj.dep_conditions else None,
         inputs=dict(proj.inputs) if proj.inputs else None,
+        # spec: delivery-acceptance——验收四字段随投影重建（跨重启可用）。
+        acceptance_spec=list(proj.acceptance_spec) if proj.acceptance_spec else None,
+        acceptance_repairs_used=proj.acceptance_repairs_used,
+        effective_input_turn_id=proj.effective_input_turn_id,
+        acceptance=dict(proj.acceptance) if proj.acceptance else None,
         priority=proj.priority,
         max_retries=proj.max_retries,
         timeout_ms=proj.timeout_ms,

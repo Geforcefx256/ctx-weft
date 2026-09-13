@@ -141,6 +141,11 @@ class LoopContext:
     # 控制令牌（Phase 6）
     cancel_token: CancelToken|None = None
     pause_token: PauseToken|None = None
+    # spec: delivery-acceptance——验收挂点的三件依赖（runtime 注入；None = 未启用 =
+    # FinalizeStep 零行为变化，测试与旧路径无需构造）。
+    acceptance_registry: Any = None
+    acceptance_executor: Any = None
+    acceptance_mode: str = "off"
     # run 级阶段标记（ActStep 维护；曾挂在 CancelToken 上）
     run_phase: RunPhase = field(default_factory=RunPhase)
     # 配置
@@ -235,6 +240,15 @@ async def _persist_user_prompt(state, ctx) -> None:
     )
     task.user_prompt_memory_id = record_id
     task.user_prompt_in_memory = True
+    # spec: delivery-acceptance——有效回合标识推进（四个写点之一；维护条件：
+    # mode≠off 且有检查声明，评审 P2 五轮）。落库成功后立即发事件，把"落库↔事件"
+    # 崩溃窗口交给恢复对账兜底（design D3）。
+    from ctx_weft.core.acceptance.support import maintenance_active
+    mode = getattr(getattr(ctx, "config", None), "acceptance_mode", "off")
+    if maintenance_active(task, mode):
+        await ctx.event_bus.emit(make_event(
+            state, EventType.TASK_INPUT_ADVANCED,
+            payload={"turn_record_id": record_id}))
 
 
 # ── StepDriver ────────────────────────────────────────────────────────────────

@@ -1436,6 +1436,7 @@ class CtxWeftRuntime:
         tenant_id: str = "default",
         llm_account: str | None = None,
         llm_model: str | None = None,
+        acceptance_spec: "list | None" = None,
     ) -> tuple[TurnHandle, LoopState]:
         """单任务测试便利入口：起一个 task 端到端跑完并等它结束（2026-09-04 spec §2）。
 
@@ -1507,8 +1508,21 @@ class CtxWeftRuntime:
             description=content_to_text(user_prompt)[:200],
             user_prompt=user_prompt,
             user_prompt_event_jsonable=user_prompt_event_jsonable,
+            # spec: delivery-acceptance——compat 入口的检查声明（宿主直连时声明验收）。
+            acceptance_spec=acceptance_spec,
             created_at=now_utc(),
         )
+        if acceptance_spec and getattr(self._config, "acceptance_mode", "off") != "off":
+            from ctx_weft.core.acceptance.protocol import normalize_acceptance_spec
+            task.acceptance_spec = normalize_acceptance_spec(acceptance_spec)
+            self._ensure_acceptance()
+            for c in task.acceptance_spec:
+                if not self._acceptance_registry.has(c["checker_id"], c["checker_version"]):
+                    from ctx_weft.core.acceptance.protocol import InvalidAcceptanceSpec
+                    raise InvalidAcceptanceSpec(
+                        f"acceptance_spec declares unregistered checker "
+                        f"({c['checker_id']!r}, {c['checker_version']!r}); register it on "
+                        "runtime.acceptance_registry or fix the declaration")
 
         task_manager = TaskManager(
             session_id=sid,
@@ -1527,30 +1541,37 @@ class CtxWeftRuntime:
                 p.register_session(sid, task_manager, session)
                 break
         try:
-            try:
-                state, handle = await self._execute_task(
-                    session=session,
-                    task=task,
-                    agent=agent,
-                    template=template,
-                    run_id=generate_id("run"),
-                    memory=self.providers.get_memory(),
-                    resolved_model=resolved_model,
-                    task_manager=task_manager,
-                )
-            except Exception as e:
-                # 崩溃入口（与 TaskManager._run_task 的那条同形、同一个工厂）：_run_loop
-                # 重抛，这里交给 TM 落状态发事件，再原样抛给调用方。
-                await task_manager.apply_run_outcome(task.id, crash_run_outcome(e))
-                raise
-            # compat 路径没有队列、不经 _run_task，但一样要有人消费 run 的结局——
-            # 否则 outage / park / 取消在这条路径上没人写 task 状态、没人发 task 事件
-            # （Task 4 之前是 _run_loop 自己写自己发）。兜底同 _run_task。
-            await task_manager.apply_run_outcome(
-                task.id,
-                state.run_outcome or RunOutcome(
-                    kind=RunOutcomeKind.COMPLETED, verdict="success"),
-            )
+            # spec: delivery-acceptance——compat 入口无队列无 drain（评审 P1 二轮）：
+            # 处置为验收修正时**内联再执行一轮**（上限 1），向调用方返回修正后的最终结果。
+            for _compat_attempt in range(2):
+                try:
+                    state, handle = await self._execute_task(
+                        session=session,
+                        task=task,
+                        agent=agent,
+                        template=template,
+                        run_id=generate_id("run"),
+                        memory=self.providers.get_memory(),
+                        resolved_model=resolved_model,
+                        task_manager=task_manager,
+                    )
+                except Exception as e:
+                    # 崩溃入口（与 TaskManager._run_task 的那条同形、同一个工厂）：_run_loop
+                    # 重抛，这里交给 TM 落状态发事件，再原样抛给调用方。
+                    await task_manager.apply_run_outcome(task.id, crash_run_outcome(e))
+                    raise
+                # compat 路径没有队列、不经 _run_task，但一样要有人消费 run 的结局——
+                # 否则 outage / park / 取消在这条路径上没人写 task 状态、没人发 task 事件
+                # （Task 4 之前是 _run_loop 自己写自己发）。兜底同 _run_task。
+                outcome = state.run_outcome or RunOutcome(
+                    kind=RunOutcomeKind.COMPLETED, verdict="success")
+                status = await task_manager.apply_run_outcome(task.id, outcome)
+                acceptance_retry = (
+                    status == "PENDING"
+                    and task.acceptance_repairs_used >= 1
+                    and (outcome.acceptance or {}).get("phase") == "retry")
+                if not acceptance_retry or _compat_attempt == 1:
+                    break
         finally:
             # **不 forget_session**：2026-09-04（Task 12）起这里不再代 TM 报队列状态
             # （`announce_queue_state` 已停发，events-v2 §5），但仍然不 forget——
@@ -1671,11 +1692,44 @@ class CtxWeftRuntime:
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
+    def _ensure_acceptance(self) -> None:
+        """spec: delivery-acceptance——注册表/执行器构造（幂等）。
+
+        内置结构检查器随表预注册；宿主经 runtime.acceptance_registry 注册领域检查器。
+        执行器含 degraded/背压状态，per-runtime 一份。
+        """
+        if getattr(self, "_acceptance_registry", None) is None:
+            from ctx_weft.core.acceptance import AcceptanceExecutor, AcceptanceRegistry
+            self._acceptance_registry = AcceptanceRegistry()
+            self._acceptance_executor = AcceptanceExecutor()
+
+    @property
+    def acceptance_registry(self):
+        """宿主注册验收检查器的入口（(id, version) 双键，见 acceptance.protocol）。"""
+        self._ensure_acceptance()
+        return self._acceptance_registry
+
     def _register_and_drain(
         self,
         session: "Session",
         task_manager: "TaskManager",
     ) -> None:
+        # spec: delivery-acceptance——TM 需知当前模式（off 时输入推进写点静默）与
+        # 派发前声明校验器（(id, version) 可用性；off 不注入）。
+        self._ensure_acceptance()
+        mode = getattr(self._config, "acceptance_mode", "off")
+        task_manager.set_acceptance_mode(mode)
+        if mode != "off":
+            def _validate_decl(spec):
+                from ctx_weft.core.acceptance.protocol import InvalidAcceptanceSpec
+                reg = self._ensure_acceptance() or self._acceptance_registry
+                missing = [c for c in spec if not reg.has(c["checker_id"], c["checker_version"])]
+                if missing:
+                    names = ", ".join(f"({c['checker_id']!r}, {c['checker_version']!r})" for c in missing)
+                    raise InvalidAcceptanceSpec(
+                        f"declares unregistered acceptance checkers: {names}; register them "
+                        "on runtime.acceptance_registry or fix the declaration")
+            task_manager.set_acceptance_validator(_validate_decl)
         """Wire up ControlCapabilityProvider, set done callback, launch drain."""
         for p in self.providers.get_capability_providers():
             if isinstance(p, ControlCapabilityProvider):
@@ -2395,6 +2449,17 @@ class CtxWeftRuntime:
         # 崩溃窗口里 A 的 FAILED 已落盘、B 的级联取消未落盘时，A 的失败回调不会重放，
         # 靠这一趟幂等补扫把 B 判定并落终态，否则 B 永久 PENDING。
         await task_manager.dispose_blocked_dependents()
+        # spec: delivery-acceptance——恢复对账（评审 P1 五轮）：重建后、任何验收判定前，
+        # 从 memory 重算应有回合标识与投影值比对，不一致幂等补发 TASK_INPUT_ADVANCED。
+        # 同时覆盖两个崩溃窗口：消息已落库/事件未落库；撤销已完成/回退事件未落库。
+        from ctx_weft.core.acceptance.support import reconcile_acceptance_inputs
+        mode = getattr(self._config, "acceptance_mode", "off")
+        if mode != "off":
+            await reconcile_acceptance_inputs(
+                task_manager, task_manager.all_tasks(), self.providers.get_memory(),
+                ProviderContext(session_id=session.id, tenant_id=session.tenant_id),
+                session_id=session.id,
+                root_agent_id=session.root_agent_id or "", mode=mode)
 
         self._register_and_drain(session, task_manager)
         # gather 重跑的后台 recap 后发 SESSION_FINISHED（终态镜像 on_task_finished）。
@@ -3026,6 +3091,11 @@ class CtxWeftRuntime:
         # 撤销这一轮时要靠它把这条消息 fold 掉（`_revert_round`）。记在落库那一刻，
         # 不做事后推断——连发两条时「取视图最后一条 user」会撤错人。
         target.user_prompt_memory_id = mem_id
+        # spec: delivery-acceptance——send_message 注入点：有效回合标识推进（写点之二；
+        # 维护中的任务才发；落库↔事件窗口由恢复对账兜底）。
+        _advance = getattr(tm, "advance_input_turn", None)
+        if _advance:
+            await _advance(target.id, mem_id)
         if _suspended_on_live_children(tm, target):
             logger.info(
                 "_inject_user_turn: task %s is SUSPENDED on live children — message "
@@ -3361,6 +3431,11 @@ class CtxWeftRuntime:
                            req.task_id, req.id)
             return
         await self._write_hitl_reply_turn(req, session, target)
+        # spec: delivery-acceptance——HITL 回复写点：有效回合标识推进（维护中的任务才发；
+        # 恢复重放路径不发，崩溃窗口由恢复对账幂等补齐）。
+        _advance = getattr(task_manager, "advance_input_turn", None)
+        if _advance and target.user_prompt_memory_id:
+            await _advance(target.id, target.user_prompt_memory_id)
         if _suspended_on_live_children(task_manager, target):
             logger.info(
                 "_inject_user_reply: task %s is SUSPENDED on live children — reply written, "
@@ -3895,6 +3970,7 @@ class CtxWeftRuntime:
         task_manager: "TaskManager | None",
         pause_token: "PauseToken | None" = None,
     ) -> LoopContext:
+        self._ensure_acceptance()
         return LoopContext(
             assembler=assembler,
             llm=llm,
@@ -3911,6 +3987,10 @@ class CtxWeftRuntime:
             waiter=HitlWaiter(self.hitl_registry, timeout_sec=self._hitl_timeout_sec),
             pause_token=pause_token,
             config=self._config,
+            # spec: delivery-acceptance——FinalizeStep 验收挂点依赖（off 时 gate 静默）。
+            acceptance_registry=getattr(self, "_acceptance_registry", None),
+            acceptance_executor=getattr(self, "_acceptance_executor", None),
+            acceptance_mode=getattr(self._config, "acceptance_mode", "off"),
             # 出网前 rehydrate ref→base64 用（Phase 3b）；未注册时是 NullMemoryBlobStore，
             # rehydrate_content 据其 can_externalize=False 原样返回、零开销。
             blob_store=self.providers.get_memory_blob_store(),
@@ -4291,6 +4371,22 @@ class _SessionTaskRunner:
             return None
         sess_id = self._session.id
         tenant_id = self._session.tenant_id
+
+        # spec: delivery-acceptance——派发前 (id, version) 校验（fresh 响亮拒绝；恢复中
+        # 缺版本降级 unverified、按模式分档，不阻断执行——spec 恢复分档场景）。
+        mode = getattr(self._runtime._config, "acceptance_mode", "off")
+        if mode != "off" and getattr(t, "acceptance_spec", None):
+            from ctx_weft.core.acceptance.protocol import InvalidAcceptanceSpec
+            reg = self._runtime.acceptance_registry
+            missing = [c for c in t.acceptance_spec
+                       if not reg.has(c["checker_id"], c["checker_version"])]
+            if missing:
+                if not t.started_at:
+                    names = ", ".join(f"({c['checker_id']!r}, {c['checker_version']!r})" for c in missing)
+                    raise InvalidAcceptanceSpec(
+                        f"task {task_id!r} declares unregistered acceptance checkers: {names}; "
+                        "register them on runtime.acceptance_registry or fix the declaration")
+                t.acceptance_unavailable = True  # 恢复任务：检查在 finalize 判 unverified
 
         match t.settings:
             case NormalTaskSettings(use_subagent=True) as s:

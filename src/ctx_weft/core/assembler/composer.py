@@ -1122,8 +1122,11 @@ class DefaultComposer(Composer):
             lines = [f"{SUBTASKS_REVIEW_HEADING} (confirm / reopen via `task_reviews`, referencing the exact task_id):"]
             for r in reviews:
                 note = r.get("note")
+                acc = r.get("acceptance")
                 suffix = f" — {note}" if note else ""
-                lines.append(f"- {r['task_id']} — {r.get('title', '')} [{r.get('outcome', '')}]{suffix}")
+                acc_tag = f" (accepted: {acc})" if acc else ""
+                lines.append(f"- {r['task_id']} — {r.get('title', '')} "
+                             f"[{r.get('outcome', '')}{acc_tag}]{suffix}")
             extra_sections.append("\n".join(lines))
 
         # finish_task 的产出走 SILENT，不入 task 层、不在重建的对话里——但 observer 须看到 actor

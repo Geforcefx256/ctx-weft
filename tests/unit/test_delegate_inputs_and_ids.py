@@ -152,3 +152,19 @@ async def test_push_task_emits_null_inputs_for_legacy_shape():
         id="c1", session_id="s1", status="PENDING", title="x",
     ))
     assert payload["inputs"] is None
+
+
+def test_delegate_acceptance_declaration_reaches_child():
+    """spec: delivery-acceptance——delegate 声明必需检查，随子任务契约。"""
+    tm = _FakeTM()
+    spec = [{"checker_id": "acme.total", "checker_version": "1", "params": {}, "required": True}]
+    delegate_task(title="t", task_prompt="p", acceptance=spec, ctx=_ctx(tm))
+    assert tm.staged[0].acceptance_spec == spec
+    delegate_plan(tasks=[{"title": "a", "acceptance": spec}], ctx=_ctx(tm))
+    assert tm.staged[-1].acceptance_spec == spec
+
+
+def test_delegate_bad_acceptance_shape_rejects():
+    tm = _FakeTM()
+    res = delegate_task(title="t", task_prompt="p", acceptance="not-a-list", ctx=_ctx(tm))
+    assert tm.staged == [] and res.content.startswith("Cannot delegate")

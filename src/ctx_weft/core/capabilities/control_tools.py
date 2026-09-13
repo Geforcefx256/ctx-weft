@@ -186,6 +186,9 @@ def delegate_task(
         "to finish).",
     ] = False,
     inputs: Annotated[dict, "Optional input data for the sub-task"] = None,
+    acceptance: Annotated[
+        list, "Optional required checks: [{checker_id, checker_version, params, required}].",
+    ] = None,
     *,
     ctx: ControlContext = None,
 ) -> ControlResult:
@@ -200,6 +203,13 @@ def delegate_task(
         normalized_inputs = normalize_task_inputs(inputs)
     except InvalidTaskInputs as e:
         return ControlResult(content=f"Cannot delegate sub-task {title!r}: {e}")
+    # spec: delivery-acceptance——子任务必需检查声明（形状校验；(id,version) 可用性
+    # 在 push_task 派发前由注入校验器把关）。
+    try:
+        from ctx_weft.core.acceptance.protocol import normalize_acceptance_spec
+        normalized_acceptance = normalize_acceptance_spec(acceptance) or None
+    except Exception as e:
+        return ControlResult(content=f"Cannot delegate sub-task {title!r}: {e}")
 
     child = TaskModel(
         id=generate_id("tsk"),
@@ -212,6 +222,7 @@ def delegate_task(
         description=description,
         user_prompt=task_prompt or description,
         inputs=normalized_inputs,
+        acceptance_spec=normalized_acceptance,
         origin_tool_call_id=ctx.tool_call_id or None,
         origin_tool_name=DELEGATE_TASK_NAME,  # 保真：actor 确实调了 delegate_task → finalize 铸框用真名
         interaction_mode=_child_mode(bool(interactive), ctx.task),
@@ -259,6 +270,7 @@ def delegate_plan(
             "a plain-text turn pauses and waits for the user instead of requiring control__finish_task), "
             "inputs (object, optional JSON data handed to the sub-task verbatim — shown to it "
             "under a dedicated '## Inputs' section; keep it small), "
+            "acceptance (array, optional required checks, same shape as delegate_task), "
             "run_if (str, when this task may start relative to its predecessor: 'success' "
             "(default — only after the predecessor FINISHED) or 'any' (cleanup-style: start "
             "once the predecessor reached any terminal state, including failure))."
@@ -279,7 +291,7 @@ def delegate_plan(
 
     # spec: task-handoff——先整单校验再铸造：inputs 规整与 run_if 合法性任何一项不过，
     # 整个调用拒绝、零子任务创建（不留下半截 plan）。
-    prepared: list[tuple[dict, dict | None, str]] = []  # (spec, inputs, run_if)
+    prepared: list[tuple[dict, dict | None, str, list | None]] = []  # (spec, inputs, run_if, acceptance)
     for idx, spec in enumerate(tasks):
         if not isinstance(spec, dict):
             continue
@@ -296,12 +308,19 @@ def delegate_plan(
             return ControlResult(content=(
                 f"Cannot delegate plan: task {idx + 1} ({title!r}): {e}"
             ))
-        prepared.append((spec, normalized_inputs, run_if))
+        try:
+            from ctx_weft.core.acceptance.protocol import normalize_acceptance_spec
+            normalized_acceptance = normalize_acceptance_spec(spec.get("acceptance")) or None
+        except Exception as e:
+            return ControlResult(content=(
+                f"Cannot delegate plan: task {idx + 1} ({title!r}): {e}"
+            ))
+        prepared.append((spec, normalized_inputs, run_if, normalized_acceptance))
 
     titles: list[str] = []
     child_ids: list[str] = []
     prev_ids: list[str] = []
-    for spec, normalized_inputs, run_if in prepared:
+    for spec, normalized_inputs, run_if, normalized_acceptance in prepared:
         title = spec.get("title", "subtask")
         child = TaskModel(
             id=generate_id("tsk"),
@@ -314,6 +333,7 @@ def delegate_plan(
             description=spec.get("description", ""),
             user_prompt=spec.get("task_prompt") or spec.get("description", ""),
             inputs=normalized_inputs,
+            acceptance_spec=normalized_acceptance,
             origin_tool_call_id=generate_id("tcall"),
             tracking_task_ids=list(prev_ids),
             # spec: task-handoff——本任务对前序的依赖条件（run_if）。物化进

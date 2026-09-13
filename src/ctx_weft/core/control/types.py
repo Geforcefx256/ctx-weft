@@ -70,6 +70,12 @@ class TaskView:
     dep_conditions: "dict[str, str] | None" = None
     # spec: task-handoff——派发时声明的显式输入（纯 JSON，已规整），随 TASK_CREATED 落盘。
     inputs: "dict[str, Any] | None" = None
+    # spec: delivery-acceptance——检查声明（含版本）/修正额度/有效回合标识/最新验收记录，
+    # 均随事件折叠恢复（TASK_CREATED + 三条验收域事件）。
+    acceptance_spec: "list[dict[str, Any]] | None" = None
+    acceptance_repairs_used: int = 0
+    effective_input_turn_id: "str | None" = None
+    acceptance: "dict[str, Any] | None" = None
     priority: int = 5
     max_retries: int = 3
     timeout_ms: int = 60_000

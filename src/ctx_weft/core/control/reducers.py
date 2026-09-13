@@ -194,6 +194,11 @@ def serialize_view(view: RunStateView) -> dict[str, Any]:
                 # error_code / blocked_by_task_id）；旧快照无键 → deserialize 落缺省。
                 "dep_conditions": getattr(t, "dep_conditions", None),
                 "inputs": getattr(t, "inputs", None),
+                # spec: delivery-acceptance——验收四字段进快照。
+                "acceptance_spec": getattr(t, "acceptance_spec", None),
+                "acceptance_repairs_used": getattr(t, "acceptance_repairs_used", 0),
+                "effective_input_turn_id": getattr(t, "effective_input_turn_id", None),
+                "acceptance": getattr(t, "acceptance", None),
                 "priority": t.priority,
                 "max_retries": t.max_retries,
                 "timeout_ms": t.timeout_ms,
@@ -272,6 +277,11 @@ def deserialize_view(data: dict[str, Any]) -> RunStateView:
             # 存量快照无键 → None（未声明输入 / 依赖按 any 解释 / 无结局码）。
             dep_conditions=t.get("dep_conditions"),
             inputs=t.get("inputs"),
+            # spec: delivery-acceptance——旧快照无键 → 缺省（无声明 / 0 / None / 无记录）。
+            acceptance_spec=t.get("acceptance_spec"),
+            acceptance_repairs_used=t.get("acceptance_repairs_used", 0),
+            effective_input_turn_id=t.get("effective_input_turn_id"),
+            acceptance=t.get("acceptance"),
             priority=t.get("priority", 5),
             max_retries=t.get("max_retries", 3),
             timeout_ms=t.get("timeout_ms", 60_000),
@@ -607,6 +617,8 @@ def _apply(view: RunStateView, ev: Event) -> None:
                 # spec: task-handoff——存量事件无此二键 → None/缺省（回放语义见各自字段注释）。
                 dep_conditions=task_data.get("dep_conditions"),
                 inputs=task_data.get("inputs"),
+                # spec: delivery-acceptance——检查声明随创建落盘；存量无键 → None。
+                acceptance_spec=task_data.get("acceptance_spec"),
                 priority=task_data.get("priority", 5),
                 max_retries=task_data.get("max_retries", 3),
                 timeout_ms=task_data.get("timeout_ms", 60_000),
@@ -719,6 +731,32 @@ def _apply(view: RunStateView, ev: Event) -> None:
                 msg = p.get("reason") or p.get("error_message")
                 if msg and not task.error:
                     task.error = msg
+
+    elif t == EventType.TASK_ACCEPTANCE_CHECKED and ev.task_id:
+        # spec: delivery-acceptance——最新验收记录折叠（绑定三元组 + 缺口 + 各检查结果）。
+        task = view.tasks.get(ev.task_id)
+        if task is not None:
+            task.acceptance = {
+                "verdict": p.get("verdict"), "results": p.get("results", []),
+                "findings": p.get("findings", []),
+                "output_fingerprint": p.get("output_fingerprint", ""),
+                "input_snapshot_id": p.get("input_snapshot_id", ""),
+                "acceptance_spec_version": p.get("acceptance_spec_version", ""),
+                "attempt": p.get("attempt"), "candidate_ref": p.get("candidate_ref"),
+            }
+
+    elif t == EventType.TASK_ACCEPTANCE_RETRY_RESERVED and ev.task_id:
+        # 修正额度预占的持久化形态：重启不得重置或超额（跨崩溃额度保证）。
+        task = view.tasks.get(ev.task_id)
+        if task is not None:
+            task.acceptance_repairs_used = max(task.acceptance_repairs_used,
+                                               int(p.get("repairs_used", 0)))
+
+    elif t == EventType.TASK_INPUT_ADVANCED and ev.task_id:
+        # 有效用户回合标识推进：最后写生效（恢复对账幂等补发安全）。
+        task = view.tasks.get(ev.task_id)
+        if task is not None:
+            task.effective_input_turn_id = p.get("turn_record_id")
 
     elif t == EventType.TASK_FINALIZED and ev.task_id:
         task = view.tasks.get(ev.task_id)

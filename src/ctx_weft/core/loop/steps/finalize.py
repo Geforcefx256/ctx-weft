@@ -682,6 +682,90 @@ async def _synthesize_dispatch_pair(memory, scope, task, act_recap: str, task_su
             register_close_synth(task.id, tool_call_id, scope, outcome, raw_fold_scope)
 
 
+async def _delivery_acceptance_gate(state, ctx, task, mode: str) -> "dict | None":
+    """spec: delivery-acceptance——候选-提交分离边界的执行体。
+
+    顺序为定案：①首次启用初始化（缺 effective_input_turn_id 时经 memory 重算并落
+    TASK_INPUT_ADVANCED）→ ②计算不可用检查器集合（恢复后版本缺失）→ ③跑一次验收
+    （必需先结构后领域 + 提示性只记录）→ ④候选引用（小直存/超限外存）→ ⑤发
+    TASK_ACCEPTANCE_CHECKED → ⑥仅 required 模式产生决策（retry / failed / None）。
+    shadow 模式执行①-⑤但永远返回 None（行为矩阵：记录不改变交付）。
+    """
+    from ctx_weft.core.acceptance.support import (
+        candidate_of, compose_gap_hint, findings_equal, recompute_effective_turn,
+        run_acceptance_pass,
+    )
+    from ctx_weft.core.acceptance.protocol import InvalidAcceptanceSpec
+
+    # ① 首次启用初始化（与恢复对账同一原语：从 memory 重算并幂等落盘）
+    if task.effective_input_turn_id is None:
+        recalced = await recompute_effective_turn(ctx.memory, ctx.provider_ctx, state.scope)
+        if recalced is not None:
+            task.effective_input_turn_id = recalced
+            await ctx.event_bus.emit(make_event(
+                state, EventType.TASK_INPUT_ADVANCED, payload={"turn_record_id": recalced}))
+
+    # ② 恢复中版本缺失 → 该检查判 unverified（off 不进此函数；shadow 记录、required 阻止成功）
+    unavailable: set = set()
+    for check in (task.acceptance_spec or []):
+        try:
+            ctx.acceptance_registry.resolve(check["checker_id"], check["checker_version"])
+        except InvalidAcceptanceSpec:
+            unavailable.add((check["checker_id"], check["checker_version"]))
+            task.acceptance_unavailable = True
+
+    # ③ 一次验收
+    record = await run_acceptance_pass(
+        registry=ctx.acceptance_registry, executor=ctx.acceptance_executor,
+        spec=task.acceptance_spec or [], candidate=candidate_of(task, state.extra),
+        task=task, mode=mode, unavailable_checkers=unavailable)
+    previous = task.acceptance
+    record["repairs_used_after"] = task.acceptance_repairs_used
+
+    # ④ 候选引用：小直存，超限外存（memory 记录 id，恢复可解引用取回）
+    import json as _json
+    body = candidate_of(task, state.extra)["final_body"]
+    candidate_ref: dict = {"inline": None, "record_id": None}
+    if isinstance(body, str) and len(body) <= 4000:
+        candidate_ref["inline"] = body
+    else:
+        record_id = await ctx.memory.ingest(
+            MemoryEvent(kind=MemoryKind.CONVERSATION_TURN, scope=MemoryScope.TASK,
+                        address=state.scope, content=body, timestamp=now_utc(),
+                        role="assistant",
+                        metadata={"task_id": task.id, "acceptance_candidate": True}),
+            ctx.provider_ctx)
+        candidate_ref["record_id"] = record_id
+
+    # ⑤ 持久化记录（先于任何修正生成落盘——跨崩溃额度保证的①②③序）
+    from ctx_weft.core.acceptance.support import acceptance_event_payload
+    payload = acceptance_event_payload(record)
+    payload["candidate_ref"] = candidate_ref
+    await ctx.event_bus.emit(make_event(state, EventType.TASK_ACCEPTANCE_CHECKED, payload=payload))
+    task.acceptance = record
+
+    if mode != "required":
+        return None  # shadow：到此为止，交付决策不变
+    if record["overall"] == "passed":
+        return None
+    if record["overall"] == "unverified":
+        return {"phase": "failed", "verdict": "unverified", "findings": record["findings"],
+                "error_message": "required acceptance check(s) unverified (checker fault/timeout/unavailable)"}
+    # failed：修正可行性（额度 / 缺口非重复 / 预算未被限额熔断）
+    limit_codes = {TaskErrorCode.TASK_DEADLINE_EXCEEDED, TaskErrorCode.STEP_DEADLINE_EXCEEDED,
+                   TaskErrorCode.PROVIDER_DEADLINE_EXCEEDED, TaskErrorCode.ACTOR_TURN_LIMIT}
+    budget_ok = task.error_code not in limit_codes
+    repeated = bool(previous and previous.get("overall") == "failed"
+                    and findings_equal(previous.get("findings", []), record["findings"]))
+    if task.acceptance_repairs_used == 0 and budget_ok and not repeated:
+        return {"phase": "retry", "verdict": "failed", "findings": record["findings"],
+                "repairs_used_after": task.acceptance_repairs_used + 1,
+                "attempt": record["attempt"], "error_message": compose_gap_hint(record["findings"])}
+    return {"phase": "failed", "verdict": "failed", "findings": record["findings"],
+            "error_message": "required acceptance checks failed and repair is unavailable "
+                             "(budget exhausted / repeated gap / repairs used)"}
+
+
 class FinalizeStep(Step):
     name = "finalize"
 
@@ -715,6 +799,28 @@ class FinalizeStep(Step):
             outcome = "fail"
             task.observer_outcome = "fail"
             task.error_code = TaskErrorCode.RETRY_EXHAUSTED
+
+        # spec: delivery-acceptance——成功候选必经验收边界（required 门禁；shadow 只记录；
+        # off 零行为）。候选 = 分开的 final_body/final_summary（design D2），检查、指纹与
+        # 提交同一份。验收失败时 success 不再是终态：retry → 一次修正（额度预占在 TM）；
+        # failed → 落失败终态（TASK_ACCEPTANCE_FAILED）。
+        if outcome == "success" and getattr(task, "acceptance_spec", None):
+            mode = getattr(ctx, "acceptance_mode", "off") or "off"
+            if mode != "off" and ctx.acceptance_registry is not None and ctx.acceptance_executor is not None:
+                gate = await _delivery_acceptance_gate(state, ctx, task, mode)
+                if gate is not None:
+                    if gate["phase"] == "retry":
+                        outcome = "retry"  # 复用既有 retry 收尾形态（无 finish 副作用、清 outputs）
+                    else:
+                        outcome = "fail"
+                        task.observer_outcome = "fail"
+                        task.error_code = TaskErrorCode.TASK_ACCEPTANCE_FAILED
+                        task.error = gate.get("error_message", "")
+                    import dataclasses as _dc
+                    run_outcome = _dc.replace(
+                        run_outcome, verdict=outcome, outputs=None,
+                        error=task.error or "", error_code=task.error_code or "",
+                        acceptance=gate)
 
         terminal = outcome in ("success", "fail")
         # 汇报给 parent（blackboard + cross_agent bubble）= 最终输出 + task_summary（process report 作用）；

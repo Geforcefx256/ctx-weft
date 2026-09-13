@@ -151,6 +151,36 @@ class TaskManager:
     def register_task(self, task: Task) -> None:
         self._tasks[task.id] = task
 
+    def _acceptance_mode(self) -> str:
+        return getattr(self, "_acceptance_mode_cfg", "off") or "off"
+
+    def set_acceptance_mode(self, mode: str) -> None:
+        """runtime 注入当前验收模式（off/shadow/required）；off 时写点全部静默。"""
+        self._acceptance_mode_cfg = mode
+
+    def set_acceptance_validator(self, fn) -> None:
+        """runtime 注入声明校验器（(id, version) 可用性）；push_task 派发前调用。
+
+        恢复路径（restore/register）不经 push_task，因此存量任务不受派发前拒绝影响
+        ——版本缺失在 finalize 按 unverified 分档处置（spec 恢复分档场景）。
+        """
+        self._acceptance_validator = fn
+
+    async def advance_input_turn(self, task_id: str, record_id: "str | None") -> bool:
+        """spec: delivery-acceptance——有效回合标识推进事件（维护中的任务才发）。
+
+        供 runtime 的 send_message / HITL 回复注入点与恢复对账共用；最后写生效，
+        恢复对账幂等补发安全。返回是否实际发射。
+        """
+        from ctx_weft.core.acceptance.support import maintenance_active
+        task = self._tasks.get(task_id)
+        if task is None or not maintenance_active(task, self._acceptance_mode()):
+            return False
+        await self._emit(EventType.TASK_INPUT_ADVANCED, task_id=task_id,
+                         payload={"turn_record_id": record_id})
+        task.effective_input_turn_id = record_id
+        return True
+
     def restore(
         self,
         all_tasks: list[Task],
@@ -190,6 +220,13 @@ class TaskManager:
         for t in all_tasks:
             if t.status in TERMINAL_TASK_STATUSES:
                 continue
+            # spec: delivery-acceptance——修正轮中断恢复：缺口从投影重建进一次性投递通道
+            # （spec 场景"恢复后缺口上下文重建"）。
+            if t.acceptance_repairs_used and t.acceptance and t.acceptance.get("verdict") == "failed":
+                from ctx_weft.core.acceptance.support import compose_gap_hint
+                hint = compose_gap_hint(t.acceptance.get("findings", []))
+                if hint:
+                    t.next_step_hint = hint
             if isinstance(t.settings, (CompactTaskSettings, MetadataFillerTaskSettings)):
                 continue  # obsolete ephemeral helpers — never re-scheduled (recovery is condition-based)
             # HITL-park：有未决 HITL → 保持挂起、不入队，**不论 ACTIVE 还是 SUSPENDED**。
@@ -255,6 +292,11 @@ class TaskManager:
         """
         # 统一用 TaskManager 级别的 max_retries，覆盖 Task 模型的硬编码默认值
         task.max_retries = self._task_max_retries
+        # spec: delivery-acceptance——派发前 (id, version) 校验（新任务响亮拒绝；
+        # 校验器由 runtime 注入，off 模式不注入）。
+        validator = getattr(self, "_acceptance_validator", None)
+        if validator is not None and getattr(task, "acceptance_spec", None):
+            validator(task.acceptance_spec)
         # 开窗**必须先于**下面那条 TASK_CREATED——晚一步它就已经落盘了。
         if provisional:
             self.begin_round(task.id, owns_task=True)
@@ -717,6 +759,15 @@ class TaskManager:
                 # **处置表不 mutate**：新的 retry_count 只在 payload 里，必须在这里写回，
                 # 否则重试预算永不消耗、同一个 task 无限重排（旧路径是先 `+= 1` 再写 payload）。
                 task.retry_count = disp.payload["retry_count"]
+            if disp.event_type == "TaskAcceptanceRetryReserved":
+                # spec: delivery-acceptance——预占事件即额度持久化（先于修正生成，跨崩溃
+                # 不重置）；缺口经 next_step_hint 一次性投递（瞬态通道，持久事实在事件里）。
+                task.acceptance_repairs_used = int(disp.payload.get(
+                    "repairs_used", task.acceptance_repairs_used + 1))
+                from ctx_weft.core.acceptance.support import compose_gap_hint
+                hint = compose_gap_hint(disp.payload.get("findings", []))
+                if hint:
+                    task.next_step_hint = hint
             if outcome.kind is RunOutcomeKind.INTERRUPTED:
                 # 成因随 task 走：`disp.payload` 里的 error_code 只随这一条事件走一次，
                 # `get_task(task_id)` 等后续内存态查询要看的是 task 对象上的这份存档
@@ -1727,6 +1778,8 @@ def task_payload(task: Task, *, user_prompt_jsonable: "str | list[dict] | None")
             # 存量读侧按「未声明」解释，不虚构）。
             "dep_conditions": task.dep_conditions,
             "inputs": task.inputs,
+            # spec: delivery-acceptance——检查声明随创建事件落盘（None 原样落）。
+            "acceptance_spec": task.acceptance_spec,
             "interaction_mode": task.interaction_mode,
             "unattended": task.unattended,
             "origin_tool_call_id": task.origin_tool_call_id or "",

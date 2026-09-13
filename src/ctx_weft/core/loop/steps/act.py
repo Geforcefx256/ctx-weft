@@ -369,6 +369,17 @@ async def _discard_round_if_uncommitted(state: LoopState, ctx: LoopContext) -> N
             # 记录没了，落库标志也要跟着回落：这个 task 若被重排（本路径下不会，但
             # 语义上必须自洽），`_persist_user_prompt` 应当重新写一条，而不是以为写过了。
             state.task.user_prompt_in_memory = False
+            # spec: delivery-acceptance——撤销/弃轮重算（写点之四）：被 fold 的回合不再
+            # 在视图里，重算值天然是回退值；维护中的任务才发（评审 P2 五轮）。
+            from ctx_weft.core.acceptance.support import maintenance_active, recompute_effective_turn
+            from ctx_weft.core.loop.driver import EventType as _Evt, make_event as _mk
+            _mode = getattr(getattr(ctx, "config", None), "acceptance_mode", "off")
+            if maintenance_active(state.task, _mode):
+                surviving = await recompute_effective_turn(
+                    ctx.memory, ctx.provider_ctx, state.scope)
+                state.task.effective_input_turn_id = surviving
+                await ctx.event_bus.emit(_mk(
+                    state, _Evt.TASK_INPUT_ADVANCED, payload={"turn_record_id": surviving}))
 
     raise RoundDiscarded(state.task.id)
 

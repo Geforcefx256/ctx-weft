@@ -51,3 +51,6 @@ class TaskErrorCode(StrEnum):
     # spec: task-handoff——依赖阻塞取消：on_success 依赖落 FAILED/CANCELED、后继判明
     # 永不可满足而落 CANCELED 的结局码。区别于用户取消：不改写会话终态、不计失败阈值。
     BLOCKED_BY_FAILED_DEP = "BLOCKED_BY_FAILED_DEP"
+    # spec: delivery-acceptance——必需检查未通过且修正终止（缺口重复/额度耗尽/预算不足/
+    # 检查器故障）的失败结局码。执行可能成功，但交付未通过业务验收。
+    TASK_ACCEPTANCE_FAILED = "TASK_FAILED_ACCEPTANCE"

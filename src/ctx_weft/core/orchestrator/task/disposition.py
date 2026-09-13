@@ -51,6 +51,10 @@ class RunOutcome:
     retriable: bool = False
     hitl_id: str = ""            # AWAITING_HUMAN
     spawn_titles: tuple[str, ...] = ()   # SUSPENDED_ON_CHILDREN
+    # spec: delivery-acceptance——验收层结论（只产生结论与建议，不写状态；状态仍由
+    # 本表落定）。None = 本次 run 无验收参与。phase: "retry"（一次修正已预占）或
+    # "failed"（修正终止，落失败终态）；findings 为结构化缺口。
+    acceptance: "dict | None" = None
 
 
 @dataclass(frozen=True)
@@ -120,6 +124,26 @@ def disposition_for(
             "reason": outcome.reason,
             "error_code": outcome.error_code,
             "error_message": outcome.error,
+            "retry_count": retry_count,
+        })
+
+    # spec: delivery-acceptance——验收处置优先于 observer 判决的常规落定（成功候选
+    # 未过必需检查时，success 不再是终态）。两个出口与落盘顺序定案（design D4）：
+    # retry → TaskAcceptanceRetryReserved（额度预占事件即计数持久化，先于修正生成）；
+    # failed → TaskFailed（error_code=TASK_ACCEPTANCE_FAILED，缺口随 payload 上抛）。
+    if outcome.kind is RunOutcomeKind.COMPLETED and outcome.acceptance:
+        acc = outcome.acceptance
+        if acc.get("phase") == "retry":
+            return Disposition("PENDING", "TaskAcceptanceRetryReserved", {
+                "repairs_used": acc.get("repairs_used_after", 1),
+                "findings": acc.get("findings", []),
+                "attempt": acc.get("attempt"),
+            })
+        return Disposition("FAILED", "TaskFailed", {
+            "error_code": TaskErrorCode.TASK_ACCEPTANCE_FAILED,
+            "error_message": acc.get("error_message", "required acceptance checks failed"),
+            "acceptance_verdict": acc.get("verdict"),
+            "findings": acc.get("findings", []),
             "retry_count": retry_count,
         })
 

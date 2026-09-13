@@ -347,6 +347,11 @@ class ObserveStep(Step):
                 # 区分于用户取消），父观察面据此知道「没跑是因为前序失败」。
                 if child.status == "CANCELED" and child.error_code:
                     entry["note"] = child.error or child.error_code
+                # spec: delivery-acceptance——子任务验收状态随结果上抛（带标注）：
+                # 父观察面可见 passed / failed / unverified，而非只有执行状态。
+                acc = getattr(child, "acceptance", None)
+                if isinstance(acc, dict) and acc.get("verdict"):
+                    entry["acceptance"] = acc["verdict"]
                 subtask_reviews.append(entry)
         request = ContextRequest(
             purpose="observe",

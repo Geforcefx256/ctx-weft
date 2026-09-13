@@ -59,3 +59,17 @@ def test_observer_cue_renders_blocked_cancel_note():
     cue = composer._build_observer_messages(blocks, req)[-1].content
     assert "tsk_b" in cue and "canceled" in cue
     assert "blocked by failed/canceled predecessor tsk_a" in cue
+
+
+def test_observer_cue_renders_acceptance_annotation():
+    """spec: delivery-acceptance——子任务验收状态随结果上抛（带标注）。"""
+    composer = DefaultComposer()
+    blocks = [ContextBlock(id="b1", source="t", kind="history", target="messages",
+                           content="do the work", priority=3, token_estimate=3,
+                           metadata={"role": "user", "type": "user_prompt", "timestamp": "2026-06-30T00:00:00+00:00"})]
+    req = _req({"subtask_reviews": [
+        {"task_id": "tsk_a", "title": "produce", "outcome": "finished", "acceptance": "passed"},
+        {"task_id": "tsk_b", "title": "final", "outcome": "failed", "acceptance": "failed"},
+    ]})
+    cue = composer._build_observer_messages(blocks, req)[-1].content
+    assert "accepted: passed" in cue and "accepted: failed" in cue
