@@ -169,9 +169,9 @@ async def test_result_write_failure_then_reconcile_reruns_side_effect(tmp_path):
     with patch("ctx_weft.core.loop.steps.reconcile.resolve_and_bind", new=AsyncMock()):
         await ReconcileStep().execute(state, ctx)
 
-    # wp6 翻转后契约（spec: tool-operations）：默认 manual → 副作用保持 1 次，
-    # 不盲重跑（unknown 等宿主 resolve_operation——tests/unit/test_resolve_operation.py）
+    # wp6 翻转后契约（spec: tool-operations）：默认 reviewed → 副作用保持 1 次，
+    # 不盲重跑。作结写成工具结果后循环继续，不停机（见 test_operation_recovery_policy）
     external_effects = _read_effects(db)
     assert external_effects == 1, (
-        f"manual policy must NOT re-run the completed side effect (got {external_effects})")
+        f"reviewed policy must NOT re-run the completed side effect (got {external_effects})")
     assert len(set(tool.invocations)) == 1

@@ -57,15 +57,13 @@ async def test_reconcile_invokes_only_dangling_tool_calls() -> None:
                           cancel_token=None, event_bus=_NullBus(),
                           capability_providers=[], capability_cache=None)
 
-    # wp6（spec: tool-operations）翻转：无账本身份的 dangling 默认 unknown——不再
-    # 自动重执行（保守停住，等宿主 resolve_operation）。tc2 不被 invoke，task 带
-    # TOOL_OUTCOME_UNKNOWN，outcome 停在 None（短路，不再继续后续 dangling）。
+    # wp6（spec: tool-operations）：无账本身份的 dangling **不自动重执行**——tc2 不被
+    # invoke。但也不停机：作结「无从查证」写成工具结果，循环继续到 prepare，由 agent
+    # 在任务上下文里决定怎么办（结果不确定是一种工具结果，不是一种控制流）。
     state.sequence_counter = 0
     outcome = await ReconcileStep().execute(state, ctx)
-    assert invoked == []
-    assert outcome.next_step is None
-    from ctx_weft.core.models.discriminators import TaskErrorCode
-    assert state.task.error_code == TaskErrorCode.TOOL_OUTCOME_UNKNOWN
+    assert invoked == [], "无账本身份的副作用工具不得自动重跑"
+    assert outcome.next_step == "prepare", "不停机——把结果交给 agent 继续"
 
 
 async def test_reconcile_no_dangling_routes_to_prepare() -> None:

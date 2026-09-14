@@ -189,10 +189,6 @@ _ALLOWED_STATUS_WRITE_FILES: frozenset[str] = frozenset({
 #: 结构性质，不依赖额外测试维持。
 _ALLOWED_STATUS_WRITES: frozenset[tuple[str, str]] = frozenset({
     ((_SRC / "core" / "orchestrator" / "lifecycle" / "agent_manager.py").as_posix(), "apply_input"),
-    # spec: tool-operations（wp6）——resolve_operation 是宿主处置接口（编排层合法
-    # 写点）：cancel 置 CANCELED / supply·retry 重排 PENDING。状态机的「唯一入口
-    # 是 TM」指 task 生命周期事件流；宿主显式处置是旁路但合法的终局动作。
-    ((_SRC / "core" / "runtime.py").as_posix(), "resolve_operation"),
 })
 
 
@@ -459,7 +455,4 @@ def test_exemption_table_is_empty_by_design():
     """
     assert _ALLOWED_STATUS_WRITES == frozenset({
         ((_SRC / "core" / "orchestrator" / "lifecycle" / "agent_manager.py").as_posix(), "apply_input"),
-        # wp6（spec: tool-operations）：宿主处置接口 resolve_operation——cancel/
-        # supply/retry 对 task 终局与重排的显式合法写点（理由见上方表定义处注释）。
-        ((_SRC / "core" / "runtime.py").as_posix(), "resolve_operation"),
     })

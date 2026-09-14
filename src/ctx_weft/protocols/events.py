@@ -210,9 +210,6 @@ class EventType(StrEnum):
     # ── 观察者背压（spec: event-commit）：观察者队列溢出丢弃的实时通报。transient
     #     不落库——补读走持久日志（payload 带 position 区间，read_range 可回放）──
     EVENTS_DROPPED = "EventsDropped"          # payload: {subscriber_id, position, dropped}
-    # ── 操作结果未知（spec: tool-operations，wp6）：副作用可能已发生但结果不可判定——
-    #     task 停在 INTERRUPTED 等宿主 resolve_operation。payload 带 revision 供处置。──
-    OPERATION_UNCERTAIN = "OperationUncertain"   # payload: {operation_id, tool_name, revision, actions, summary}
 
 
 # 向后兼容：保持 `EVENT_TYPES` 为字符串 frozenset，供 `type not in EVENT_TYPES` 校验。

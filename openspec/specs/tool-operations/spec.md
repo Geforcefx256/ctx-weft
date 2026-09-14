@@ -47,7 +47,9 @@
 
 裁决能力 SHALL 由 `isinstance(provider, OperationAdjudicator)` **发现**，MUST NOT 要求在 capability 上声明——该接口是 Provider 级的，用 capability 级字段声明会制造「声明了却没实现」这一类本不必存在的失败模式。
 
-恢复时按状态×策略分派：`completed` 复用结果不重执行；`prepared` 且从未进入 `started` 可首次执行（仍先重新检查授权）；`started + idempotent` 以同 operation_id 重试；`started + reviewed` 走裁决链——Provider 实现 `OperationAdjudicator` 则调用之，`completed` 直接复用外部结果不再执行、`definitely_not_started`（仅权威否定）方可重跑、`unknown` 置 `unknown`；未实现裁决接口则直接置 `unknown`（默认形态，不是配置错误）。一切结果不定情形一律置 `unknown` 不自动执行；`waiting_human` 经既有 HumanResumable 协议恢复，不从头重新 invoke。Reconcile 的完成匹配 SHALL 以账本 operation_id 为判据，MUST NOT 再以 tool_call_id 集合判定（防 call_1 复用串扰）。无账本身份的存量 dangling SHALL 默认置 `unknown`，不得以随机生成的 id 自动执行副作用工具。控制工具单独核验：delegate 以 operation_id 找回已创建子任务（确认丢失重入不生成第二棵子树）、finish/metadata 同身份幂等、ask_user 复用已有请求；MUST NOT 对控制工具整体标记 `idempotent` 后省略验证。
+恢复时按状态×策略分派：`completed` 复用结果不重执行；`prepared` 且从未进入 `started` 可首次执行（仍先重新检查授权）；`started + idempotent` 以同 operation_id 重试；`started + reviewed` 问裁决者，它 SHALL 只回答**该不该重跑**（`Adjudication.rerun`）：`rerun=True` 以同 operation_id 重跑；`rerun=False` 把裁决者给出的 `result` 写成这次调用的工具结果并作结。Provider 未实现裁决接口时 core SHALL 代为作结「无从查证」，同样不重跑。
+
+「结果无法确定」SHALL 表现为一种**工具结果**，MUST NOT 成为一种控制流：MUST NOT 因此停机、MUST NOT 要求宿主介入才能续跑、MUST NOT 为它设立专属错误码/事件类型/处置 API。裁决者判不了时用 `result` 的**文本**说明查到了什么、查不到什么——那是内容不是状态，core 不替它组织措辞，也不据此分支。重复调用的防护归 Provider 自理：core 的承诺止于「不自行重跑」，agent 下一轮主动再调是一次新的逻辑调用。一切结果不定情形一律不自动执行；`waiting_human` 经既有 HumanResumable 协议恢复，不从头重新 invoke。Reconcile 的完成匹配 SHALL 以账本 operation_id 为判据，MUST NOT 再以 tool_call_id 集合判定（防 call_1 复用串扰）。无账本身份的存量 dangling SHALL 默认置 `unknown`，不得以随机生成的 id 自动执行副作用工具。控制工具单独核验：delegate 以 operation_id 找回已创建子任务（确认丢失重入不生成第二棵子树）、finish/metadata 同身份幂等、ask_user 复用已有请求；MUST NOT 对控制工具整体标记 `idempotent` 后省略验证。
 
 #### Scenario: reviewed 且无裁决者时不重跑
 

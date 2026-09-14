@@ -902,93 +902,6 @@ class CtxWeftRuntime:
         """None = 健康；否则返回隔离原因（storage_unavailable）。"""
         return self._storage_unavailable.get(session_id)
 
-    # ── 操作结果未知处置（spec: tool-operations，wp6）────────────────────────────
-
-    async def resolve_operation(
-        self,
-        operation_id: str,
-        *,
-        decision: str,
-        result: object = None,
-        expected_revision: int,
-    ) -> str:
-        """宿主处置一个 unknown 操作（spec §5.5）。返回处置后的 task_id。
-
-        - ``supply_result``：宿主已核实外部结果 → 账本 CAS completed + 按确定性 id
-          幂等补写 TOOL_RESULT + task 重排续跑。provider 不被调用。
-        - ``retry_confirmed``：宿主显式承担重复执行风险 → CAS 回 started（attempt 记
-          ``resolve:retry_confirmed`` 审计）+ task 重排；原 operation_id 不变。
-        - ``cancel_task``：task 终态 CANCELED；**不声称撤销已发生的外部动作**。
-        ``expected_revision`` 取自 OperationUncertain payload——CAS 不匹配即拒绝
-        （双宿主并发处置恰好一个成功）。
-        """
-        from ctx_weft.protocols.operations import (
-            OperationStatus, OperationUpdate, RevisionConflict)
-
-        if decision not in ("supply_result", "retry_confirmed", "cancel_task"):
-            raise ValueError(f"unknown decision {decision!r}")
-        ops = self.providers.get_operation_store()
-        ctx0 = ProviderContext(session_id="", tenant_id="default")
-        rec = await ops.get(operation_id, ctx0)
-        if rec is None:
-            raise KeyError(f"operation {operation_id!r} not found in ledger")
-        if rec.status != OperationStatus.UNKNOWN:
-            raise ValueError(
-                f"operation {operation_id!r} is {rec.status}, not unknown — nothing to resolve")
-
-        async def _cas(update: OperationUpdate) -> None:
-            nonlocal rec
-            try:
-                rec = await ops.compare_and_set(
-                    operation_id, expected_revision, update, ctx0)
-            except RevisionConflict as exc:
-                raise RuntimeError(
-                    f"revision mismatch for {operation_id!r} — another client already "
-                    f"resolved it (expected {expected_revision}, current {rec.revision})"
-                ) from exc
-
-        if decision == "supply_result":
-            await _cas(OperationUpdate(status=OperationStatus.COMPLETED,
-                                       result=result, result_set=True))
-            # 确定性 id 幂等补写 memory（TOOL_RESULT）——memory 的 id 契约保证 no-op
-            from ctx_weft.protocols import MemoryEvent, MemoryKind, MemoryScope
-            from ctx_weft.protocols.operations import operation_memory_result_id
-            from ctx_weft.core.utils.clock import now_utc
-            memory = self.providers.get_memory()
-            await memory.ingest(MemoryEvent(
-                id=operation_memory_result_id(operation_id),
-                kind=MemoryKind.CONVERSATION_TURN, scope=MemoryScope.TASK,
-                address=MemoryAddress(session_id=rec.session_id,
-                                       task_id=rec.task_id or None, agent_id=rec.agent_id),
-                content=str(result), timestamp=now_utc(), role="tool",
-                metadata={"operation_id": operation_id, "resolved_via": "supply_result"},
-            ), ProviderContext(session_id=rec.session_id, tenant_id=rec.tenant_id))
-        elif decision == "retry_confirmed":
-            await _cas(OperationUpdate(status=OperationStatus.STARTED,
-                                       append_attempt="resolve:retry_confirmed"))
-        # cancel_task：不动账本（unknown 留痕）；task 终态化在下方
-
-        task_id = self._task_id_of(rec)
-        tm = self._task_managers.get(rec.session_id)
-        task = tm.get_task(task_id) if tm is not None else None
-        if task is not None:
-            if decision == "cancel_task":
-                task.status = "CANCELED"
-                task.error = (f"operation {operation_id} cancelled by host; external "
-                              f"side effects (if any) are NOT undone")
-            else:
-                task.status = "PENDING"
-                task.error_code = None
-                task.error = None
-        if tm is not None and decision != "cancel_task":
-            tm.drain()  # type: ignore[func-returns-value]
-        return task_id
-
-    @staticmethod
-    def _task_id_of(rec) -> str:
-        """账本记录 → 所属 task_id（wp6 起随 OperationRecord 持久化）。"""
-        return getattr(rec, "task_id", "") or ""
-
     def clear_storage_isolation(self, session_id: str) -> None:
         """宿主确认存储恢复后解除隔离（恢复流程须先按 batch_id 收口未知提交）。"""
         if self._storage_unavailable.pop(session_id, None) is not None:
@@ -4392,16 +4305,7 @@ class _SessionTaskRunner:
     # ── helpers（原闭包内嵌函数）───────────────────────────────────────────────
 
     async def _reconcile_or(self, t: "Task", agent: "Agent", base: str) -> str:
-        """base initial_step；若该 task 最近 assistant turn 有 dangling tool_call → reconcile。
-
-        闸门（spec: tool-operations，wp6）：unknown 中断的 task 未经 resolve_operation
-        不得续跑——recover_agent 不得绕过宿主决策重跑工具。
-        """
-        from ctx_weft.core.models.discriminators import TaskErrorCode as _TEC
-        if getattr(t, "error_code", None) == _TEC.TOOL_OUTCOME_UNKNOWN:
-            raise RuntimeError(
-                f"task {t.id} is interrupted with TOOL_OUTCOME_UNKNOWN — resolve the "
-                f"uncertain operation via runtime.resolve_operation() before resuming")
+        """base initial_step；若该 task 最近 assistant turn 有 dangling tool_call → reconcile。"""
         from ctx_weft.protocols.context import ProviderContext as _PCtx
         from ctx_weft.protocols.memory import MemoryAddress as _Scope
         sess_id = self._session.id

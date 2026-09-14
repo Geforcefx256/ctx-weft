@@ -126,7 +126,7 @@ async def test_ot06_completed_memory_write_crash_ledger_backfills(tmp_path):
     ), pctx)
 
     # O-T06 核心：账本 completed + memory 无 TOOL_RESULT → 恢复路径按确定性 id
-    # 幂等补写（resolve_operation 的 supply_result 在 unknown 态走同一条补写；
+    # 幂等补写（裁决作结与恢复补写走同一条路径；
     # completed 态由 reconcile 的双通道完成判定直接跳过重执行——这里钉补写原语本身）
     from ctx_weft.protocols.memory import MemoryEvent
     rid_tool = operation_memory_result_id(op_id)

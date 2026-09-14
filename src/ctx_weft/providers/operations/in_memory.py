@@ -90,16 +90,10 @@ class InMemoryOperationStore:
 
 _LEGAL = {
     OperationStatus.PREPARED: {OperationStatus.STARTED, OperationStatus.COMPLETED},
-    OperationStatus.STARTED: {
-        OperationStatus.COMPLETED, OperationStatus.WAITING_HUMAN, OperationStatus.UNKNOWN,
-    },
-    OperationStatus.WAITING_HUMAN: {
-        OperationStatus.STARTED, OperationStatus.COMPLETED, OperationStatus.UNKNOWN,
-    },
-    # wp6 宿主处置出口：supply_result→completed / retry_confirmed→started；
-    # 取消保持 unknown 留痕。
-    OperationStatus.UNKNOWN: {OperationStatus.COMPLETED, OperationStatus.STARTED},
-    OperationStatus.COMPLETED: set(),        # 终态
+    OperationStatus.STARTED: {OperationStatus.COMPLETED, OperationStatus.WAITING_HUMAN},
+    OperationStatus.WAITING_HUMAN: {OperationStatus.STARTED, OperationStatus.COMPLETED},
+    # 终态——**含「结果无法确定」这一种结局**：那是 result 的内容，不是另一个状态。
+    OperationStatus.COMPLETED: set(),
 }
 
 

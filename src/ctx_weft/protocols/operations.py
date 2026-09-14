@@ -34,7 +34,6 @@ __all__ = [
     "operation_memory_result_id",
     "RecoveryPolicy",
     "normalize_recovery_policy",
-    "AdjudicationOutcome",
     "Adjudication",
     "OperationAdjudicator",
 ]
@@ -45,9 +44,11 @@ class OperationStatus(StrEnum):
 
     PREPARED = "prepared"            # 身份已持久、尚未执行（prepared→started 之前无外部副作用）
     STARTED = "started"              # provider 调用进行中（副作用可能已发生）
-    COMPLETED = "completed"          # 结局已确认（含 outcome=error 的确认失败）
+    # 这次逻辑调用已有最终结果——**含「结果无法确定」这一种结果**。曾经另有一个
+    # UNKNOWN 状态承载后者，但它的两个消费方（停机闸门、宿主 resolve_operation）都
+    # 已删除；结论本身住在 result 文本里，状态再分一档没有消费者。
+    COMPLETED = "completed"
     WAITING_HUMAN = "waiting_human"  # 停在人工节点（HITL park）
-    UNKNOWN = "unknown"              # 无法判定业务结果（WP6 消费：停住等宿主处置）
 
 
 # ── 恢复策略与裁决（spec: tool-operations，wp6）───────────────────────────────
@@ -104,7 +105,7 @@ def normalize_recovery_policy(value: object) -> RecoveryPolicy:
 class OperationRecord:
     """一条逻辑调用的账本行。
 
-    合法转移：prepared→started→completed；started/waiting_human→unknown（WP6）。
+    合法转移：prepared→started→completed；waiting_human 见状态机表。
     ``revision`` 乐观锁：每次 CAS +1，compare_and_set 期望值不匹配即拒绝。
     ``result``：完整规范化结果（str | ContentParts 列表 | blob ref 字符串）——非审计
     事件的截断文本（两条通道目的不同，不合并）。``args_hash``：授权后参数指纹
@@ -198,32 +199,51 @@ def operation_memory_result_id(operation_id: str) -> str:
 # ── 裁决接口（spec: tool-operations，wp6）─────────────────────────────────────
 
 
-class AdjudicationOutcome(StrEnum):
-    """裁决一次不确定操作的三态结论（方案 §5.4）。
-
-    ``DEFINITELY_NOT_STARTED`` 是**权威否定**——查得到完整执行记录才算；
-    「暂时查不到」必须归 UNKNOWN，不得用否定冒充（否则会重跑已发生的副作用）。
-    """
-
-    COMPLETED = "completed"                    # 外部已完成（携带结果）
-    DEFINITELY_NOT_STARTED = "definitely_not_started"
-    UNKNOWN = "unknown"
-
-
 @dataclass
 class Adjudication:
-    """裁决返回：结论 + COMPLETED 时的外部结果（Provider 结果结构）。"""
+    """裁决结论。core 只需要两件事：**该不该重跑**，以及不重跑时这次调用的结果写什么。
 
-    outcome: AdjudicationOutcome
-    result: Any = None
+    这里刻意**不是**「发生了什么」的枚举（曾经是 completed / definitely_not_started /
+    unknown 三态）。那问的是事实，而事实在不确定时无法断言，于是不得不留一个
+    ``unknown`` 兜住「这个问题我答不了」——core 再拿着那个 unknown 去发明一整套停机
+    等人的控制面。
+
+    换成「该不该重跑」之后不需要第三态：那是**建议**不是断言，不知道的时候答
+    ``rerun=False`` 既不用猜、也正是想要的答案。而「为什么不重跑」——查到了真结果、
+    还是压根查不到——是 ``result`` 的**内容**，由知情的裁决者自己写，core 不替它组织措辞。
+    """
+
+    rerun: bool
+    result: Any = None        # rerun=False 时写入 capability result
+
+    @classmethod
+    def rerun_safe(cls) -> "Adjudication":
+        """权威判定「这次没跑成」——同 operation_id 重跑是安全的。"""
+        return cls(rerun=True)
+
+    @classmethod
+    def conclude(cls, result: Any) -> "Adjudication":
+        """不重跑，把 ``result`` 作为这次调用的结果。
+
+        无论是查到了外部真实结果，还是只能说明「查不到、副作用可能已发生」——
+        对 core 都是同一件事，区别全在文本里。
+        """
+        return cls(rerun=False, result=result)
 
 
 @runtime_checkable
 class OperationAdjudicator(Protocol):
     """Provider 可选实现：替 core 裁决一次结果不确定的操作。
 
-    实现即生效——**无需在 capability 上声明**。判不了的操作返回
-    ``AdjudicationOutcome.UNKNOWN``，core 自动落到人工处置。
+    实现即生效——**无需在 capability 上声明**。未实现时 core 按「无从查证」作结，
+    同样不重跑。
+
+    ``adjudicate`` 判不了时返回 ``Adjudication.conclude(<说明文本>)``：说清查到了什么、
+    查不到什么，那段文本会成为这次工具调用的结果，交给 agent 在任务上下文里处理。
+    core **不会**因此停机等人——「不确定」是一种工具结果，不是一种控制流。
+
+    重复调用的防护归 Provider 自理：core 的承诺止于「不自行重跑」；agent 下一轮主动
+    再调一次是一次**新的逻辑调用**（新 operation_id），与崩溃恢复无关。
     """
 
     async def adjudicate(

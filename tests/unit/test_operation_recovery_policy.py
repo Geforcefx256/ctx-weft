@@ -107,16 +107,15 @@ async def _mk_fixture(policy="reviewed", ledger_status: OperationStatus | None =
     return tool, ops, bus, state, ctx, op_id
 
 
-async def test_reviewed_started_goes_unknown_not_rerun():
+async def test_reviewed_started_concludes_without_rerun():
+    """H3 的核心性质：不重跑。但**不停机**——作结写成工具结果，循环继续。"""
     tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="reviewed")
     outcome = await ReconcileStep().execute(state, ctx)
     assert tool.executions == 0, "reviewed + started MUST NOT re-execute"
-    assert state.task.error_code == TaskErrorCode.TOOL_OUTCOME_UNKNOWN
+    assert outcome.next_step == "prepare", "不确定是工具结果，不是控制流——不停机"
     rec = await ops.get(op_id, ctx.provider_ctx)
-    assert rec.status == OperationStatus.UNKNOWN
-    uncertain = [e for e in bus.events if e.type == EventType.OPERATION_UNCERTAIN]
-    assert uncertain and uncertain[0].payload["operation_id"] == op_id
-    assert uncertain[0].payload["revision"] == rec.revision   # 处置接口的乐观锁输入
+    assert rec.status == OperationStatus.COMPLETED, "已作结（结论内容在 result 里）"
+    assert "unverified" in str(rec.result), rec.result
 
 
 async def test_idempotent_started_reruns_exactly_once():
@@ -129,13 +128,13 @@ async def test_idempotent_started_reruns_exactly_once():
     assert rec.attempts == ["inv_first", rec.attempts[-1]] or len(rec.attempts) == 2
 
 
-async def test_legacy_no_ledger_record_goes_unknown():
-    """存量无身份（WP5 前的数据）：保守 unknown，不以随机 id 执行副作用。"""
+async def test_legacy_no_ledger_record_concludes_without_rerun():
+    """存量无身份（WP5 前的数据）：不以随机 id 执行副作用，作结后继续。"""
     tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="idempotent",
                                                           ledger_status=None)
-    await ReconcileStep().execute(state, ctx)
-    assert tool.executions == 0
-    assert state.task.error_code == TaskErrorCode.TOOL_OUTCOME_UNKNOWN
+    outcome = await ReconcileStep().execute(state, ctx)
+    assert tool.executions == 0, "无账本身份的副作用工具不得自动重跑"
+    assert outcome.next_step == "prepare"
 
 
 async def test_prepared_runs_first_execution():
@@ -209,35 +208,71 @@ class _AdjudicatingTool(_EffectTool):
         return self.verdict
 
 
-async def test_adjudicator_completed_backfills_without_executing():
-    """裁决者给权威「已完成」→ 回填账本，provider 不被执行。"""
-    from ctx_weft.protocols.operations import Adjudication, AdjudicationOutcome
+async def test_adjudicator_conclusion_backfills_without_executing():
+    """裁决者说不重跑 → 它给的 result 成为这次调用的结果，provider 不被执行。"""
+    from ctx_weft.protocols.operations import Adjudication
 
-    adj = _AdjudicatingTool(Adjudication(AdjudicationOutcome.COMPLETED, result="外部已完成"))
+    adj = _AdjudicatingTool(Adjudication.conclude("外部已完成：流水号 TX-9981"))
     _, ops, bus, state, ctx, op_id = await _mk_fixture(tool=adj)
 
     await ReconcileStep().execute(state, ctx)
     assert adj.adjudications == 1, "reviewed 必须先问裁决者"
-    assert adj.executions == 0, "权威已完成 → 绝不执行"
-    assert (await ops.get(op_id, ctx.provider_ctx)).status == OperationStatus.COMPLETED
+    assert adj.executions == 0, "rerun=False → 绝不执行"
+    rec = await ops.get(op_id, ctx.provider_ctx)
+    assert rec.status == OperationStatus.COMPLETED
+    assert rec.result == "外部已完成：流水号 TX-9981"
 
 
-async def test_adjudicator_unknown_escalates_to_host():
-    """裁决者判不了 → 落到链尾的人工处置，不是重跑。"""
-    from ctx_weft.protocols.operations import Adjudication, AdjudicationOutcome
+async def test_adjudicator_rerun_safe_reexecutes():
+    """裁决者说重跑安全 → 同 op_id 重跑。"""
+    from ctx_weft.protocols.operations import Adjudication
 
-    adj = _AdjudicatingTool(Adjudication(AdjudicationOutcome.UNKNOWN))
+    adj = _AdjudicatingTool(Adjudication.rerun_safe())
     _, ops, bus, state, ctx, op_id = await _mk_fixture(tool=adj)
 
     await ReconcileStep().execute(state, ctx)
     assert adj.adjudications == 1
+    assert adj.executions == 1, "权威判定没跑成 → 重跑"
+
+
+async def test_adjudicator_says_it_cannot_tell():
+    """「我不知道」由裁决者用文本表达——core 一视同仁：不重跑、写结果、继续。
+
+    这正是砍掉三态枚举的理由：查到真结果和查不到，对 core 是同一条路。
+    """
+    from ctx_weft.protocols.operations import Adjudication
+
+    adj = _AdjudicatingTool(Adjudication.conclude(
+        "查不到这笔交易的记录；网关侧索引可能延迟，副作用可能已发生。不要重试。"))
+    _, ops, bus, state, ctx, op_id = await _mk_fixture(tool=adj)
+
+    outcome = await ReconcileStep().execute(state, ctx)
     assert adj.executions == 0, "判不了就不许跑"
-    assert (await ops.get(op_id, ctx.provider_ctx)).status == OperationStatus.UNKNOWN
+    assert outcome.next_step == "prepare", "不停机，交给 agent"
+    rec = await ops.get(op_id, ctx.provider_ctx)
+    assert rec.status == OperationStatus.COMPLETED
+    assert "不要重试" in str(rec.result), "裁决者的措辞原样成为工具结果"
 
 
-async def test_reviewed_without_adjudicator_escalates_not_errors():
-    """没有裁决者是**默认形态**而非配置错误：直接落到人，不报错、不重跑。"""
+async def test_reviewed_without_adjudicator_concludes_not_errors():
+    """没有裁决者是**默认形态**而非配置错误：core 代为作结「无从查证」，不报错、不重跑。"""
     tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="reviewed")
-    await ReconcileStep().execute(state, ctx)
+    outcome = await ReconcileStep().execute(state, ctx)
     assert tool.executions == 0
-    assert (await ops.get(op_id, ctx.provider_ctx)).status == OperationStatus.UNKNOWN
+    assert outcome.next_step == "prepare"
+    rec = await ops.get(op_id, ctx.provider_ctx)
+    assert rec.status == OperationStatus.COMPLETED
+    assert "unverified" in str(rec.result)
+
+
+def test_no_uncertainty_control_plane():
+    """「不确定」不再有专属控制面：错误码 / 事件类型 / 宿主处置 API 全部不存在。"""
+    from ctx_weft.core.models.discriminators import TaskErrorCode
+    from ctx_weft.core.runtime import CtxWeftRuntime
+    from ctx_weft.protocols.events import EventType
+    from ctx_weft.protocols.operations import OperationStatus
+
+    assert not hasattr(TaskErrorCode, "TOOL_OUTCOME_UNKNOWN")
+    assert not hasattr(EventType, "OPERATION_UNCERTAIN")
+    assert not hasattr(CtxWeftRuntime, "resolve_operation")
+    assert not hasattr(OperationStatus, "UNKNOWN")

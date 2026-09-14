@@ -9,17 +9,19 @@ TOOL_RESULT。直接把含 dangling 的消息序列喂给 LLM 会非法报错。
     ——判据是**逻辑身份**（op_id），与 wire id 无关：call_1 复用不再串扰。
 
   未完成的 → 按「状态 × recovery_policy」分派（design D2）。策略只有两类：
-    None（存量无身份）        → unknown（保守停住——方案明令不用随机 id 执行副作用）
+    None（存量无身份）        → 作结「无从查证」（不用随机 id 去碰副作用工具）
     PREPARED                  → gateway.invoke（首执；此前无副作用，授权链自然重查）
     STARTED + idempotent      → invoke（同 op_id 重跑安全）
-    STARTED + reviewed        → 裁决链（core 绝不自行重跑）：
-                                  provider 实现 OperationAdjudicator → 调它
-                                    completed               → 入账本 + 补 memory，不执行
-                                    definitely_not_started  → invoke（权威否定才算）
-                                    unknown                 → 置 unknown
-                                  未实现 → 直接置 unknown（默认形态，不是配置错误）
+    STARTED + reviewed        → 问裁决者，它只回答**该不该重跑**：
+                                  rerun=True   → invoke（权威判定没跑成）
+                                  rerun=False  → 作结：把它给的 result 写成工具结果
+                                provider 未实现裁决接口 → core 代为作结「无从查证」
     WAITING_HUMAN             → 既有 HITL 恢复路径（不 invoke）
     COMPLETED                 → 不应到达（完成判定已滤）；防御性跳过
+
+  「不重跑」的两种由来——查到了真结果 / 查不到——对 core 是**同一条路**，区别全在
+  result 文本里。结果不确定是一种工具结果，不是一种控制流：不停机、不发专属事件、
+  不需要宿主介入，agent 下一轮读到它自行决定。
 
   置 unknown = 账本 CAS unknown + task INTERRUPTED(TOOL_OUTCOME_UNKNOWN)
   + OperationUncertain 事件（revision 供 resolve_operation）+ 短路停止后续 dangling。
@@ -58,7 +60,7 @@ class ReconcileStep(Step):
 
         from ctx_weft.protocols.operations import (
             OperationStatus, OperationUpdate, operation_id_for,
-            operation_memory_result_id, AdjudicationOutcome, normalize_recovery_policy,
+            operation_memory_result_id, Adjudication, normalize_recovery_policy,
             RecoveryPolicy,
         )
 
@@ -107,12 +109,15 @@ class ReconcileStep(Step):
                     # provider 从未启动）= 「prepared 且从未进入 started」——首执安全。
                     pass
                 else:
-                    # 存量无身份（WP5 之前的数据）或账本未接线的外部副作用工具：保守 unknown
-                    await self._mark_unknown(state, ctx, op_id, tc["name"], ledger, rec,
-                                              reason="no-ledger-record")
-                    return StepOutcome(next_step=None)
+                    # 存量无身份（WP5 之前的数据）或账本未接线的外部副作用工具：
+                    # 不重跑，作结说明无从查证——不用随机 id 去碰副作用工具。
+                    await self._conclude_unverified(
+                        state, ctx, op_id, tc, ledger, rec,
+                        f"[Operation outcome unverified] 工具 {tc['name']} 的这次调用在"
+                        f"崩溃前没有留下账本记录，无法确定副作用是否已发生。不要重试这次调用。")
+                    continue
             if rec is None:
-                pass  # 控制工具 / 冷 HITL 首执 carve-out（上方已分流其它到 unknown）
+                pass  # 控制工具 / 冷 HITL 首执 carve-out（上方已分流其它去作结）
             elif rec.status == OperationStatus.WAITING_HUMAN:
                 logger.info("ReconcileStep: op %s waiting_human — HITL path resumes", op_id)
                 continue  # 既有 HITL 恢复路径处理
@@ -124,30 +129,14 @@ class ReconcileStep(Step):
                     pass  # 控制工具 started：幂等状态迁移（同上 carve-out 理由）
                 elif policy == RecoveryPolicy.IDEMPOTENT:
                     pass  # 重跑安全 → 同 op_id 重试
-                else:  # RecoveryPolicy.REVIEWED —— core 绝不自行重跑，走裁决链
+                else:  # RecoveryPolicy.REVIEWED —— core 绝不自行决定
                     verdict = await self._adjudicate(gateway, op_id, tc, state, ctx)
-                    if verdict is not None and verdict.outcome == AdjudicationOutcome.COMPLETED:
-                        # 裁决者给出权威「已完成」：入账本 + 补 memory，不执行
-                        await ledger.compare_and_set(
-                            op_id, rec.revision,
-                            OperationUpdate(status=OperationStatus.COMPLETED,
-                                            result=verdict.result, result_set=True),
-                            ctx.provider_ctx)
-                        await self._backfill_memory(state, ctx, op_id, verdict.result, tc)
+                    if not verdict.rerun:
+                        # 作结：裁决者查到了真结果、或只能说明查不到——对 core 同一件事。
+                        await self._conclude_unverified(
+                            state, ctx, op_id, tc, ledger, rec, verdict.result)
                         continue
-                    if (verdict is not None
-                            and verdict.outcome == AdjudicationOutcome.DEFINITELY_NOT_STARTED):
-                        pass  # 权威否定 → 重跑安全
-                    else:
-                        # 无裁决者 / 裁决者判不了 → 链尾：落到人
-                        await self._mark_unknown(
-                            state, ctx, op_id, tc["name"], ledger, rec,
-                            reason=("adjudicator-unknown" if verdict is not None
-                                    else "no-adjudicator"))
-                        return StepOutcome(next_step=None)
-            else:  # UNKNOWN 状态（宿主未处置）——闸门：不绕过决策
-                logger.info("ReconcileStep: op %s already unknown — awaiting host resolution", op_id)
-                return StepOutcome(next_step=None)
+                    # 权威判定没跑成 → 同 op_id 重跑安全
 
             logger.info(
                 "ReconcileStep: executing op %s (tool %s, ledger=%s, policy=%s)",
@@ -169,82 +158,54 @@ class ReconcileStep(Step):
     async def _adjudicate(self, gateway, op_id, tc, state, ctx):
         """裁决链第一环：provider 若实现 OperationAdjudicator 就交它裁。
 
-        返回 None = **没有裁决者**（provider 找不到、未实现接口、或裁决抛错）——
-        调用方据此落到链尾的人工处置。没有裁决者不是错误配置，是默认形态：绝大多数
-        provider 无从查证外部真值，本就该交给人。
+        **恒返回 Adjudication**：provider 找不到、未实现接口、或裁决抛错时，core 代为
+        作结「无从查证」——同样不重跑。没有裁决者不是错误配置而是默认形态：绝大多数
+        provider 无从查证外部真值。
+
+        这里是 core 唯一还替人组织措辞的地方，但没有别的选择；它说的也是实话——
+        「没人能查证」，而不是「查了查不到」。
         """
-        from ctx_weft.protocols.operations import OperationAdjudicator
+        from ctx_weft.protocols.operations import Adjudication, OperationAdjudicator
         _cache = getattr(gateway, "_cache", None)
         cap = _cache.get_by_qualified_name(
             state.agent.id, tc["name"], state.task.id) if _cache is not None else None
         _find = getattr(gateway, "_find_provider", None)
         provider = _find(cap.id) if (cap is not None and _find is not None) else None
+        unverified = Adjudication.conclude(
+            f"[Operation outcome unverified] 工具 {tc['name']} 在执行中被中断，"
+            f"provider 未提供结果查证能力，无法确定副作用是否已发生。"
+            f"operation_id: {op_id}。不要重试这次调用。")
         if provider is None or not isinstance(provider, OperationAdjudicator):
-            logger.info(
-                "ReconcileStep: op %s has no adjudicator — escalating to host", op_id)
-            return None
+            logger.info("ReconcileStep: op %s has no adjudicator — concluding unverified", op_id)
+            return unverified
         try:
             return await provider.adjudicate(op_id, ctx.provider_ctx)
         except Exception:
-            logger.exception("ReconcileStep: adjudicate failed for %s — escalating", op_id)
-            return None
+            logger.exception(
+                "ReconcileStep: adjudicate failed for %s — concluding unverified", op_id)
+            return unverified
 
-    async def _mark_unknown(self, state, ctx, op_id, tool_name, ledger, rec, *, reason):
-        """置 unknown：账本 CAS + task INTERRUPTED + OperationUncertain 事件（带 revision）。"""
-        from ctx_weft.core.loop.driver import make_event
-        from ctx_weft.core.models.discriminators import TaskErrorCode
-        from ctx_weft.core.models.task import Task as _T
-        from ctx_weft.protocols.events import EventType
+    async def _conclude_unverified(self, state, ctx, op_id, tc, ledger, rec, result):
+        """作结一次不重跑的操作：账本 completed + 把 ``result`` 写成这次调用的工具结果。
+
+        与「裁决者查到了真结果」走的是**同一条路**——对 core 而言两者没有区别，差的
+        只是 result 的内容。不发专属事件、不改 task 状态、不停机：**结果不确定是一种
+        工具结果，不是一种控制流**。agent 下一轮读到它，在任务上下文里决定怎么办。
+        """
         from ctx_weft.protocols.operations import OperationStatus, OperationUpdate
 
-        revision = 0
         if ledger is not None and rec is not None:
             try:
-                updated = await ledger.compare_and_set(
+                await ledger.compare_and_set(
                     rec.operation_id, rec.revision,
-                    OperationUpdate(status=OperationStatus.UNKNOWN,
-                                    error=f"outcome uncertain ({reason})"),
+                    OperationUpdate(status=OperationStatus.COMPLETED,
+                                    result=result, result_set=True),
                     ctx.provider_ctx)
-                revision = updated.revision
             except Exception:
-                logger.exception("ReconcileStep: ledger unknown-mark failed for %s", op_id)
-
-        state.task.error_code = TaskErrorCode.TOOL_OUTCOME_UNKNOWN
-        state.task.error = f"operation {op_id} ({tool_name}) outcome uncertain ({reason})"
-        # 事件构造容忍 SimpleNamespace 测试替身（make_event 要 LoopState 全字段）：
-        # 逐字段 getattr 兜底，身份字段尽量真实。
-        from ctx_weft.core.utils.ids import generate_id
-        from ctx_weft.core.utils.clock import now_utc as _now
-        from ctx_weft.protocols.events import Event
-        try:
-            await ctx.event_bus.emit(make_event(state, EventType.OPERATION_UNCERTAIN, payload={
-                "operation_id": op_id,
-                "tool_name": tool_name,
-                "revision": revision,
-                "actions": ["supply_result", "retry_confirmed", "cancel_task"],
-                "reason": reason,
-                "summary": f"side effect may have occurred; ledger={getattr(rec, 'status', None)}",
-            }))
-        except Exception:
-            await ctx.event_bus.emit(Event(
-                id=generate_id("evt"), run_id=getattr(state, "run_id", "") or "",
-                sequence=0,
-                session_id=getattr(getattr(state, "session", None), "id", "") or "",
-                type=EventType.OPERATION_UNCERTAIN, timestamp=_now(),
-                task_id=getattr(getattr(state, "task", None), "id", "") or None,
-                agent_id=getattr(getattr(state, "agent", None), "id", "") or None,
-                payload={
-                    "operation_id": op_id,
-                    "tool_name": tool_name,
-                    "revision": revision,
-                    "actions": ["supply_result", "retry_confirmed", "cancel_task"],
-                    "reason": reason,
-                    "summary": "side effect may have occurred",
-                }))
-        logger.error(
-            "ReconcileStep: op %s (%s) outcome uncertain [%s] — task %s INTERRUPTED, "
-            "awaiting resolve_operation",
-            op_id, tool_name, reason, state.task.id)
+                # 账本写不进去不该拦住「把结果告诉 agent」——后者才是这一步的产出。
+                logger.exception("ReconcileStep: ledger conclude failed for %s", op_id)
+        await self._backfill_memory(state, ctx, op_id, result, tc)
+        logger.info("ReconcileStep: op %s concluded without re-running", op_id)
 
     async def _backfill_memory(self, state, ctx, op_id, result, tc):
         """query completed：按确定性 id 补写 TOOL_RESULT。幂等由 memory 的 id 契约保证
