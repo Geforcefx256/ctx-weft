@@ -79,7 +79,7 @@ async def test_synthesize_writes_only_finish_pair_no_body_mirror():
     assert turns[-2].metadata.get("tool_calls", [{}])[0].get("name", "").endswith("finish_task")
     # 反转契约：finish 对 assistant.content = act_recap（过程复述，≠ 答复）；tool.content = task_summary
     assert turns[-2].content.startswith("PDF转换执行过程：成功转换了文件")
-    assert turns[-1].content == "[task: PPTX转PDF] PDF成功完成转换"  # tool 槽带归属前缀
+    assert turns[-1].content == "[task: 'PPTX转PDF' (t1)] PDF成功完成转换"  # tool 槽带归属前缀
     assert all(r.metadata.get("origin_task_id") == "t1" for r in turns)
 
     # body 留 task 层（UP + 段摘要原样保留，未被镜像/supersede）
@@ -122,6 +122,6 @@ async def test_finish_pair_marker_and_report():
     assert tcs[0]["input"] == {}   # finish_task 无参收尾标记
     # 反转契约：assistant.content = act_recap（过程复述），tool.content = task_summary
     assert turns[-2].content.startswith("PDF转换执行过程摘要")
-    assert turns[-1].content == "[task: PPTX转PDF] 成功转换"  # tool 槽带归属前缀
+    assert turns[-1].content == "[task: 'PPTX转PDF' (t1)] 成功转换"  # tool 槽带归属前缀
     # tool_call 配对
     assert turns[-1].metadata.get("tool_call_id") == tcs[0]["id"]

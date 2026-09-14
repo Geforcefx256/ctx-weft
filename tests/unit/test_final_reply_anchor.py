@@ -13,6 +13,8 @@ raw 删掉、也不另产段摘要 —— 答复在胶囊里无处安放。补�
 
 from __future__ import annotations
 
+from ctx_weft.core.utils.task_ref import task_ref_parts
+
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -147,18 +149,25 @@ async def test_anchor_wraps_reply_with_notes() -> None:
 
     anchor = (await _agent_turns(mem))[1]
     assert anchor.content == (
-        f"{FINAL_REPLY_NOTE.format(title='抽取配置解析')}\n\n{_REPLY}\n\n{FINAL_REPLY_CLOSING_NOTE}"
+        f"{FINAL_REPLY_NOTE.format(ref=task_ref_parts('t1', '抽取配置解析'))}\n\n{_REPLY}\n\n{FINAL_REPLY_CLOSING_NOTE}"
     ), f"锚点 = 提示词 + outputs 正文 + 收束尾注；实得 {anchor.content!r}"
 
 
-async def test_root_task_without_title_uses_untitled_note() -> None:
+async def test_root_task_without_title_falls_back_to_bare_id() -> None:
+    """无标题 → 称呼退化为裸 id（仍是可用句柄）；UNTITLED 变体只在连 id 都没有时才用。"""
     mem = InMemoryMemoryProvider()
     scope = _sc("t1")
     await _seed_long_conv(mem, scope)
 
     await _close(mem, _task(title=""), scope)
 
-    assert (await _agent_turns(mem))[1].content.startswith(FINAL_REPLY_NOTE_UNTITLED)
+    assert (await _agent_turns(mem))[1].content.startswith(
+        FINAL_REPLY_NOTE.format(ref="t1"))
+
+
+def test_untitled_note_used_only_when_nothing_identifies_the_task() -> None:
+    from ctx_weft.core.loop.steps.finalize import _final_reply_block
+    assert _final_reply_block(task_ref_parts("", ""), "x").startswith(FINAL_REPLY_NOTE_UNTITLED)
 
 
 async def test_task_layer_keeps_no_anchor_record() -> None:

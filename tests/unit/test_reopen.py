@@ -186,3 +186,44 @@ async def test_parent_not_dragged_into_child_cascade() -> None:
     assert parent.status == "SUSPENDED"   # parent 不是其子任务的后续 → 不被重开
     assert c1.status == "PENDING"
     assert c2.status == "PENDING"
+
+
+def test_collect_reviews_reports_missing_reasoning_instead_of_dropping() -> None:
+    """spec: task-handoff——条目合法、在权限范围内但缺 reasoning → 进 denied 并说明。
+
+    此前这条是**静默 continue**：既不进 applied 也不进 denied，模型收到的回执里它就
+    这么消失了——而 schema 明写 `reasoning (str, required)`。承诺了契约就得在违约时说话。
+    """
+    tm = TaskManager(session_id="s1")
+    parent = _task("T", "Parent", status="SUSPENDED")
+    c1 = _task("C1", "Build C1")
+    for t in (parent, c1):
+        tm.register_task(t)
+    tm._children_of["T"] = {"C1"}
+    ctx = ControlContext(session_id="s1", task_id="T", agent_id="a",
+                         task=parent, task_manager=tm, session=None)
+
+    reopen, summary = _collect_reviews(
+        [{"task_id": "C1", "review_status": "reopen", "reasoning": ""}], ctx)
+
+    assert reopen == {}
+    assert "Ignored" in summary and "reasoning" in summary
+    assert "'Build C1' (C1)" in summary      # 拒绝说明指名道姓，模型能直接重发
+
+
+def test_collect_reviews_reports_unknown_review_status() -> None:
+    """同上：第四种 review_status 此前也从三个分支间掉落，无任何反馈。"""
+    tm = TaskManager(session_id="s1")
+    parent = _task("T", "Parent", status="SUSPENDED")
+    c1 = _task("C1", "Build C1")
+    for t in (parent, c1):
+        tm.register_task(t)
+    tm._children_of["T"] = {"C1"}
+    ctx = ControlContext(session_id="s1", task_id="T", agent_id="a",
+                         task=parent, task_manager=tm, session=None)
+
+    reopen, summary = _collect_reviews(
+        [{"task_id": "C1", "review_status": "rejected", "reasoning": "no good"}], ctx)
+
+    assert reopen == {}
+    assert "Ignored" in summary and "review_status" in summary and "rejected" in summary

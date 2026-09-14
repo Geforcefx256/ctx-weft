@@ -83,6 +83,7 @@ from ctx_weft.core.models.errors import (
 )
 from ctx_weft.core.utils.clock import now_utc
 from ctx_weft.core.utils.ids import generate_id
+from ctx_weft.core.utils.task_ref import task_ref
 from ctx_weft.protocols import (
     AgentTemplate,
     Capability,
@@ -1944,7 +1945,7 @@ class CtxWeftRuntime:
                     memory, parent_scope, t, provider_ctx)
                 await _put_dispatch_result(
                     memory, parent_scope, t,
-                    f"Sub-task '{t.title}' was cancelled mid-run (session failure threshold hit); "
+                    f"Sub-task {task_ref(t)} was cancelled mid-run (session failure threshold hit); "
                     f"its partial execution below is incomplete.",
                     ts, provider_ctx, replace=True, tool_call_id=tool_call_id,
                 )
@@ -1963,7 +1964,7 @@ class CtxWeftRuntime:
                     task_id=root_task.id, agent_id=session.root_agent_id,
                 )
                 summary = "Failure threshold hit — consecutive failures: " + "; ".join(
-                    f"{i}) {title}: {reason}" for i, (title, reason) in enumerate(failures, start=1)
+                    f"{i}) {ref}: {reason}" for i, (ref, reason) in enumerate(failures, start=1)
                 )
                 await _synthesize_dispatch_pair(
                     memory, scope, root_task,

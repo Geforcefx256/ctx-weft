@@ -117,6 +117,7 @@ from ctx_weft.core.utils.content import (
     image_tokens,
 )
 from ctx_weft.core.utils.headings import SUBTASKS_REVIEW_HEADING
+from ctx_weft.core.utils.task_ref import task_ref_parts
 from ctx_weft.protocols import LLMMessage
 from ctx_weft.protocols.capability import qualify
 
@@ -235,7 +236,8 @@ _BACKGROUND_BOUNDARY_DESC = {
     "plain_text": "you replied in prose and yielded the floor, pausing for the user's input",
     "finish": "the task was closed out with finish_task",
     "normal": "the task ended normally with its final output",
-    "dispatch": "you delegated a sub-task, and this task is suspended until it completes",
+    "dispatch": "you delegated a sub-task, and this task is suspended until it completes "
+                "(the dispatch pair above names it)",
     # 机械判决路径（observe 无可用 LLM observer / 已取消）：结局由规则定，摘要全靠这次
     # 后台观察补 —— 段可能刚结束、也可能马上要重跑，故措辞不预设收尾。**非 close 边界**
     # （不进 _CLOSE_BOUNDARIES）：不写 _close_report，走段折。
@@ -564,7 +566,7 @@ class DefaultComposer(Composer):
         # ## Current Message 框另按 _latest_task_user_index 跟随该 task 最新一条（见
         # _frame_current_message）。
         current_task_user_idx = self._current_task_user_index(history_pairs, getattr(task, "id", ""))
-        spec_title, spec_desc, spec_prompt = self._task_spec_fields(blocks, task)
+        spec_title, spec_desc, spec_prompt, spec_ref = self._task_spec_fields(blocks, task)
         parts: list[str] = []
 
         if not task.user_prompt_in_memory:
@@ -577,9 +579,9 @@ class DefaultComposer(Composer):
             # daemon 或手工装配路径开始命中这个分支，图片会在此静默丢失，需要照 else 分支的
             # 做法改成保 parts，而不是在这里加一行注释就当没看见。
             if spec_title and spec_desc:
-                parts.append(f"## Current Task\n{spec_title}\n{spec_desc}")
+                parts.append(f"## Current Task\n{spec_ref}\n{spec_desc}")
             elif spec_title:
-                parts.append(f"## Current Task\n{spec_title}")
+                parts.append(f"## Current Task\n{spec_ref}")
             if spec_prompt:
                 parts.append(
                     f"## Current Message\n{spec_prompt}\n\n"
@@ -611,9 +613,9 @@ class DefaultComposer(Composer):
         ):
             cue = (getattr(request, "extra", None) or {}).get("act_resume_cue", "")
             if not cue:
-                task_ref = f"the task: {spec_title}" if spec_title else "the task above"
+                subject = f"the task: {spec_ref}" if spec_title else "the task above"
                 cue = (
-                    f"You are still working on {task_ref}, resuming from the state recorded "
+                    f"You are still working on {subject}, resuming from the state recorded "
                     "above. Review what has already been done and continue with only the "
                     "remaining work."
                 )
@@ -710,12 +712,12 @@ class DefaultComposer(Composer):
         latest = self._latest_task_user_index(history_pairs, task_id)
         if latest is None:
             latest = anchor
-        spec_title, spec_desc, _ = self._task_spec_fields(blocks, task)
+        spec_title, spec_desc, _, spec_ref = self._task_spec_fields(blocks, task)
         prefix = ""
         if spec_title and spec_desc:
-            prefix = f"## Current Task\n{spec_title}\n{spec_desc}\n\n"
+            prefix = f"## Current Task\n{spec_ref}\n{spec_desc}\n\n"
         elif spec_title:
-            prefix = f"## Current Task\n{spec_title}\n\n"
+            prefix = f"## Current Task\n{spec_ref}\n\n"
         if anchor != latest:
             # 首条原文冠 ## Opening Message（开启此 task 的消息）：与最新一条的
             # ## Current Message 区分，也把原文和随后追加的 directive/capabilities 分隔开。
@@ -1078,7 +1080,8 @@ class DefaultComposer(Composer):
             for r in reviews:
                 note = r.get("note")
                 suffix = f" — {note}" if note else ""
-                lines.append(f"- {r['task_id']} — {r.get('title', '')} [{r.get('outcome', '')}]{suffix}")
+                ref = task_ref_parts(r.get("task_id", "") or "", r.get("title", "") or "")
+                lines.append(f"- {ref} [{r.get('outcome', '')}]{suffix}")
             extra_sections.append("\n".join(lines))
 
         # finish_task 的产出走 SILENT，不入 task 层、不在重建的对话里——但 observer 须看到 actor
@@ -1121,18 +1124,6 @@ class DefaultComposer(Composer):
             facet_fallback=_OBSERVER_ROLE_FALLBACK,
         )
 
-    @staticmethod
-    def _render_bb(blks: list[ContextBlock]) -> str:
-        """渲染 blackboard 结果块为复核清单行。"""
-        lines: list[str] = []
-        for b in blks:
-            title = b.metadata.get("title", "")
-            outcome = b.metadata.get("outcome", "")
-            body = content_to_text(b.content)
-            head = f"{title} [{outcome}]" if title else (f"[{outcome}]" if outcome else "")
-            lines.append(f"- {head}: {body}" if head else f"- {body}")
-        return "\n".join(lines)
-
     # ── 共用工具 ──────────────────────────────────────────────────────────────
 
     def _first_kind(
@@ -1145,24 +1136,31 @@ class DefaultComposer(Composer):
                 return b
         return None
 
-    def _task_spec_fields(self, blocks, task) -> tuple[str, str, str]:
-        """当前 task 的 spec 字段 (title, description, user_prompt)。
+    def _task_spec_fields(self, blocks, task) -> tuple[str, str, str, str]:
+        """当前 task 的 spec 字段 (title, description, user_prompt, ref)。
 
         优先取 TaskSpecSource 产的 task_spec block 的 metadata；无块时回退直读 task
         （兼容手构 blocks / 未注册 TaskSpecSource 的调用）。block 是元数据载体，
         composer 用它去就地装饰当前消息，而非把它当独立消息渲染。
+
+        ``ref`` 是 `task_ref` 的规范称呼（标题 + id），供 `## Current Task` 框使用：
+        id 一直就在 block 的 metadata 里（`task_spec` source 始终在写 ``task_id``），
+        此前只是没被取出来渲染，于是任务连自己的 id 都不知道。
         """
         blk = self._first_kind(blocks, "task_spec") if blocks else None
         if blk is not None:
             md = blk.metadata
+            title = md.get("title", "") or ""
             return (
-                md.get("title", "") or "",
+                title,
                 md.get("description", "") or "",
                 md.get("user_prompt", "") or "",
+                task_ref_parts(md.get("task_id", "") or "", title),
             )
         title = task.title or ""
         description = task.description or ""
         up = task.user_prompt
         user_prompt = up if isinstance(up, str) else (content_to_text(up) if up else "")
-        return title, description, user_prompt
+        return title, description, user_prompt, task_ref_parts(
+            getattr(task, "id", "") or "", title)
 

@@ -32,8 +32,9 @@ def test_delegate_task_ack_carries_child_id():
     tm = _FakeTM()
     res = delegate_task(title="load", task_prompt="p", ctx=_ctx(tm))
     assert len(tm.staged) == 1
-    # ack 里出现的 id 就是 staged 子任务的 id——模型后续 task_reviews 的稳定句柄。
-    assert f"(task_id: {tm.staged[0].id})" in res.content
+    # ack 同时给标题与 id：id 是后续 task_reviews 的稳定句柄，标题让模型对得上刚派的是哪个。
+    child = tm.staged[0]
+    assert f"{child.title!r} ({child.id})" in res.content
 
 
 # ── delegate_plan ────────────────────────────────────────────────────────────
@@ -43,8 +44,8 @@ def test_delegate_plan_ack_carries_ids_in_spec_order():
     tm = _FakeTM()
     res = delegate_plan(tasks=[{"title": "a"}, {"title": "b"}, {"title": "c"}], ctx=_ctx(tm))
     assert len(tm.staged) == 3
-    ids = [c.id for c in tm.staged]
-    assert ", ".join(ids) in res.content
+    for i, c in enumerate(tm.staged, start=1):
+        assert f"{i}. {c.title!r} ({c.id})" in res.content
 
 
 def test_delegate_plan_chains_each_task_on_the_previous():

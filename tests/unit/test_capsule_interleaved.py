@@ -98,8 +98,8 @@ async def test_synthesize_writes_only_finish_pair():
     assert caps[-2].content.startswith("最终答复")  # + PROCESS_RECAP_NOTE
     assert tool_calls[0]["input"] == {}
     assert caps[-1].role == "tool"
-    # tool 槽 = `[task: <title>] ` 归属前缀 + 过程报告
-    assert caps[-1].content.startswith("[task: 测试任务] Process Report:")
+    # tool 槽 = `[task: '<title>' (<id>)] ` 归属前缀 + 过程报告
+    assert caps[-1].content.startswith("[task: '测试任务' (t1)] Process Report:")
     assert all(c.metadata.get("origin_task_id") == "t1" for c in caps)
 
     # body 不镜像、留 task 层
@@ -190,7 +190,7 @@ def test_dispatch_ack_carries_no_child_payload():
 # ── finish 对 tool 槽标明归属 task（消灭匿名 finish）───────────────────────
 
 async def test_finish_tool_content_names_owning_task():
-    """finish 对的 tool 槽带 `[task: <title>]` 前缀标明归属。
+    """finish 对的 tool 槽带 `[task: '<title>' (<id>)]` 前缀标明归属。
 
     assistant 槽是无参收尾标记（`finish_task{}`，反转契约），自身不带任何归属信息；
     归属补在 tool 槽，经 tool_call_id 配对回其 assistant。
@@ -202,14 +202,14 @@ async def test_finish_tool_content_names_owning_task():
     await _synthesize_dispatch_pair(mem, asc, task, "过程复述", "综合总结", "success", _ctx())
 
     tool_content = (await _caps(mem, asc))[-1].content
-    assert tool_content.startswith("[task: 测试任务] "), (
+    assert tool_content.startswith("[task: '测试任务' (t1)] "), (
         f"finish tool content must name its owning task; got {tool_content!r}"
     )
     assert "综合总结" in tool_content
 
 
 async def test_finish_tool_content_names_task_before_fail_marker():
-    """归属标记与 fail 标记共存，归属在前：`[task: X] [outcome=fail] …`。"""
+    """归属标记与 fail 标记共存，归属在前：`[task: 'X' (id)] [outcome=fail] …`。"""
     mem = InMemoryMemoryProvider()
     asc = _agent_scope()
     task = _task()
@@ -218,13 +218,17 @@ async def test_finish_tool_content_names_task_before_fail_marker():
     await _synthesize_dispatch_pair(mem, asc, task, "失败报告", "", "fail", _ctx())
 
     tool_content = (await _caps(mem, asc))[-1].content
-    assert tool_content.startswith("[task: 测试任务] [outcome=fail] "), (
+    assert tool_content.startswith("[task: '测试任务' (t1)] [outcome=fail] "), (
         f"expected task marker before fail marker; got {tool_content!r}"
     )
 
 
 async def test_finish_tool_content_without_title_keeps_fail_marker():
-    """title 为空（旧数据/未命名 task）→ 只留 fail 标记，不产空的 `[task: ]`。"""
+    """title 为空（旧数据/未命名 task）→ 归属标记退化为裸 id，仍标明归属。
+
+    改造前这里是「不产标记」；现在 id 恒在手上，印出来比留空有用——归属标记存在的
+    理由就是消歧，而空标记消不了任何歧。
+    """
     mem = InMemoryMemoryProvider()
     asc = _agent_scope()
     task = _task()
@@ -234,7 +238,7 @@ async def test_finish_tool_content_without_title_keeps_fail_marker():
     await _synthesize_dispatch_pair(mem, asc, task, "失败报告", "", "fail", _ctx())
 
     tool_content = (await _caps(mem, asc))[-1].content
-    assert tool_content.startswith("[outcome=fail] "), (
+    assert tool_content.startswith("[task: t1] [outcome=fail] "), (
         f"empty title must not emit an empty task marker; got {tool_content!r}"
     )
 
@@ -257,8 +261,8 @@ async def test_adjacent_finish_pairs_are_distinguishable():
 
     tools = [c for c in await _caps(mem, asc) if c.role == "tool"]
     assert len(tools) == 2, f"expected 2 finish tool slots; got {len(tools)}"
-    assert "[task: 补 TokenStore 单测]" in tools[0].content
-    assert "[task: 抽取 TokenStore]" in tools[1].content
+    assert "[task: '补 TokenStore 单测'" in tools[0].content
+    assert "[task: '抽取 TokenStore'" in tools[1].content
 
 
 # ── 无幸存 task 层记录时 finish 对仍写出 ─────────────────────────────────
@@ -325,7 +329,7 @@ async def test_embedded_process_report_in_outputs():
     # 验证 tool content 从完整分隔符后切割，即只含 "real report"
     # 而非 "draft\\n\\nProcess Report: real report"（前缀为归属标记，见 _finish_report_prefix）
     tool_content = finish_tool.content
-    assert tool_content == "[task: 测试任务] Process Report: real report", (
+    assert tool_content == "[task: '测试任务' (t1)] Process Report: real report", (
         f"tool content should be 'Process Report: real report' (+ task marker) but got "
         f"{tool_content!r}; old split logic would include embedded separator content"
     )

@@ -249,10 +249,12 @@ async def test_delegate_plan_returns_envelope_ack() -> None:
     from ctx_weft.core.capabilities.control_tools import delegate_plan, _PLAN_DISPATCH_ACK
     tm = _FakeTM()
     res = delegate_plan(tasks=[{"title": "a"}, {"title": "b"}], ctx=_ctx(tm, "tc_plan"))
-    # spec: task-handoff——ack 前缀保持信封语义，尾部追加与 spec 顺序对应的 id 列表
-    assert res.content.startswith(_PLAN_DISPATCH_ACK.rstrip("via start_task.").rstrip())
-    ids = [c.id for c in tm.staged]
-    assert ", ".join(ids) in res.content
+    # spec: task-handoff——ack 前缀保持信封语义，尾部逐条追加「标题 + id」
+    # 回执从常量拼（不重打字面量），后接逐条「标题 + id」清单。
+    # 注意 removesuffix 而非 rstrip：rstrip 收的是**字符集**，拿它当去后缀用是巧合通过。
+    assert res.content.startswith(_PLAN_DISPATCH_ACK.removesuffix("."))
+    for i, c in enumerate(tm.staged, start=1):
+        assert f"{i}. {c.title!r} ({c.id})" in res.content
 
 
 @pytest.mark.asyncio

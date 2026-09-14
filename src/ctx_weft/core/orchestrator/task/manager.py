@@ -25,6 +25,7 @@ from ctx_weft.core.orchestrator.task.disposition import (
     disposition_for,
 )
 from ctx_weft.core.orchestrator.task.queue import QueueEntry, TaskQueue
+from ctx_weft.core.utils.task_ref import task_ref, task_ref_parts
 from ctx_weft.core.orchestrator.task.runner import AgentBinding, TaskRunner, effective_agent_id
 from ctx_weft.core.models.session import Session
 from ctx_weft.core.models.status import TaskStatus
@@ -771,12 +772,12 @@ class TaskManager:
             ),
             key=lambda t: as_utc(t.created_at) if t.created_at else _epoch,
         )
-        head_title = head.title or head_id
+        head_ref = task_ref(head)   # 上游任务的规范称呼（标题 + id），注入后继 prompt
 
         prev_id: str | None = None
         for t in [head, *successors]:
             blocked = None if prev_id is None else [prev_id]
-            upstream = None if t.id == head_id else (head_title, reason)
+            upstream = None if t.id == head_id else (head_ref, reason)
             await self.reopen_task(t.id, reason, blocked_by=blocked, upstream=upstream)
             prev_id = t.id
         return True
@@ -800,7 +801,7 @@ class TaskManager:
         FINISHED with stale output.
 
         `blocked_by` gates re-execution until the given tasks complete (used by
-        reopen_chain to keep plan order). `upstream=(head_title, head_reason)` marks a
+        reopen_chain to keep plan order). `upstream=(head_ref, head_reason)` marks a
         cascade-reopened successor: instead of a direct revision note it gets an
         "upstream task revised" instruction pointing at the predecessor's updated result
         (delivered via the blackboard subscription once the predecessor re-finishes).
@@ -1025,7 +1026,9 @@ class TaskManager:
             if status == "FAILED":
                 self._session.failure_counter += 1
                 self._recent_failures.append((
-                    (task.title if task and task.title else task_id),
+                    # 标题 + id：这份清单会被渲进 root 的 finish 对（runtime 的阈值收尾），
+                    # 同名任务只印标题时读者分不清是哪一个失败了几次。
+                    task_ref(task) if task else task_ref_parts(task_id, ""),
                     ((task.error or task.process_report or "") if task else "")[:200],
                 ))
                 threshold = self._session.failure_threshold

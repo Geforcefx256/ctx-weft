@@ -97,11 +97,12 @@ async def test_delegate_ack_id_drives_review_reopen_by_id():
         tm, parent, [{"title": "step one"}, {"title": "step two"}],
     )
     assert len(children) == 2
-    ack_ids = [c.id for c in children]
-    assert ", ".join(ack_ids) in res.content          # ack 的 id 列表就是真实子任务 id
+    # ack 逐条给「标题 + id」，且 id 就是真实子任务 id
+    for i, c in enumerate(children, start=1):
+        assert f"{i}. {c.title!r} ({c.id})" in res.content
 
     # 子任务完成（step one FINISHED），observer 用 ack 里的 id 发起 reopen
-    c1 = ack_ids[0]
+    c1 = children[0].id
     c1_task = tm.get_task(c1)
     c1_task.status = "FINISHED"
     c1_task.outputs = "done"

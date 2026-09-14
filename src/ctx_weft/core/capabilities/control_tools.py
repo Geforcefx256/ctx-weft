@@ -19,6 +19,7 @@ from ctx_weft.core.capabilities.schema import extract_schema
 from ctx_weft.core.utils.clock import now_utc
 from ctx_weft.core.utils.headings import SUBTASKS_REVIEW_HEADING
 from ctx_weft.core.utils.ids import generate_id
+from ctx_weft.core.utils.task_ref import task_ref
 from ctx_weft.core.models.task import NormalTaskSettings
 from ctx_weft.protocols.capability import (
     CapabilityEvent,
@@ -226,10 +227,9 @@ def delegate_task(
 
     ctx.task.suspend_requested = True     # 路由意图；task 落 SUSPENDED 归 TaskManager
     ctx.task.actor_done = True
-    # spec: task-handoff——ack 回传子任务 id：模型后续的审核/引用一律用这个稳定句柄。
-    return ControlResult(
-        content=f"Sub-task '{title}' scheduled (task_id: {child.id})."
-    )
+    # spec: task-handoff——回执带标题 + id：id 是模型后续审核/引用的稳定句柄，标题让
+    # 它对得上自己刚派的是哪一个。
+    return ControlResult(content=f"Sub-task {task_ref(child)} scheduled.")
 
 
 @control_tool(purposes=["act"])
@@ -269,7 +269,7 @@ def delegate_plan(
     prepared: list[dict] = [spec for spec in tasks if isinstance(spec, dict)]
 
     titles: list[str] = []
-    child_ids: list[str] = []
+    child_refs: list[str] = []
     prev_ids: list[str] = []
     for spec in prepared:
         title = spec.get("title", "subtask")
@@ -302,17 +302,19 @@ def delegate_plan(
             blocked_by=[prev_ids[-1]] if prev_ids else None,
         )
         prev_ids.append(child.id)
-        child_ids.append(child.id)
+        child_refs.append(task_ref(child))
         titles.append(title)
 
     if isinstance(ctx.task.settings, NormalTaskSettings):
         ctx.task.settings.spawn_titles = titles
     ctx.task.suspend_requested = True     # 路由意图；task 落 SUSPENDED 归 TaskManager
     ctx.task.actor_done = True
-    # spec: task-handoff——ack 回传与 spec 顺序对应的 id 列表（审核/引用的稳定句柄）。
+    # spec: task-handoff——回执逐条给「标题 + id」，而不是一串裸 id：只给 id 列表的话
+    # 模型得靠位置去对应自己刚传的 spec 顺序，同名任务更是无从分辨。
+    # 句子本体从 `_PLAN_DISPATCH_ACK` 拼，不重打字面量（重打两处必然漂）。
+    listing = "; ".join(f"{i}. {ref}" for i, ref in enumerate(child_refs, start=1))
     return ControlResult(content=(
-        "Plan created. Its sub-tasks will now be started one by one via start_task "
-        f"(task_ids in order: {', '.join(child_ids)})."
+        f"{_PLAN_DISPATCH_ACK.rstrip('.')}, in this order: {listing}."
     ))
 
 
@@ -377,13 +379,15 @@ def _collect_reviews(
         task_id = review.get("task_id")
         unknown = set(review) - allowed_keys
         if not isinstance(task_id, str) or not task_id:
-            denied.append(f"entry without valid 'task_id' ({sorted(review)}); "
-                          "reference sub-tasks by their task_id")
+            # 「旧式条目」的真实形态就走这一支——`{task_title, review_status, reasoning}`
+            # 没有 task_id，够不到下面那个 unknown 分支。所以引导语必须写在这里。
+            denied.append(f"entry without a valid string 'task_id' ({sorted(review)}); "
+                          "reference sub-tasks by their task_id — 'task_title' is no "
+                          "longer accepted")
             continue
         if unknown:
             denied.append(f"{task_id!r} (unknown field(s) {sorted(unknown)}; "
-                          "use exactly task_id / review_status / reasoning — 'task_title' "
-                          "is no longer accepted)")
+                          "use exactly task_id / review_status / reasoning)")
             continue
         review_status = review.get("review_status", "")
         reasoning = review.get("reasoning", "")
@@ -391,20 +395,29 @@ def _collect_reviews(
         if target is None:
             denied.append(f"{task_id!r}")  # 非自己的子任务（含前序 / 其它）→ 越权
             continue
-        title = target.title or task_id
+        ref = task_ref(target)
+        # 以下两条此前是**静默 continue**：条目合法、在权限范围内，却既不进 applied 也不进
+        # denied，模型收到的回执里它就这么消失了。而 schema 明写 `reasoning (str, required)`
+        # 且只枚举三种 review_status——承诺了契约就得在违约时说话。
         if not reasoning:
+            denied.append(f"{ref} (missing 'reasoning'; it is required — for 'reopen' it "
+                          "becomes the revision instruction)")
+            continue
+        if review_status not in ("reopen", "confirmed", "skip"):
+            denied.append(f"{ref} (unknown review_status {review_status!r}; "
+                          "use 'confirmed' | 'reopen' | 'skip')")
             continue
         if review_status == "reopen":
             if target.status == "FINISHED":
                 reopen[target.id] = reasoning
-                applied.append(f"reopened {title!r} ({task_id}) (+ its plan successors)")
+                applied.append(f"reopened {ref} (+ its plan successors)")
             else:
                 # 已是 PENDING/进行中，本来就会跑，无需 reopen
-                applied.append(f"already active {title!r} ({task_id})")
+                applied.append(f"already active {ref}")
         elif review_status == "confirmed":
-            applied.append(f"confirmed {title!r} ({task_id})")
-        elif review_status == "skip":
-            applied.append(f"skipped {title!r} ({task_id})")
+            applied.append(f"confirmed {ref}")
+        else:  # skip（枚举已在上面校验过，这里不会有第四种）
+            applied.append(f"skipped {ref}")
 
     parts: list[str] = []
     if applied:
@@ -460,11 +473,13 @@ def report_task_outcome(
         f"'{SUBTASKS_REVIEW_HEADING}' section in the context. You may NOT review anything "
         "else (upstream/predecessor tasks appear as read-only conversation context); "
         "such entries are rejected. "
-        f"Each entry is an object with exactly these fields: task_id (str, the id shown as "
-        f"'{SUBTASKS_REVIEW_HEADING}' entries — NOT the title), "
-        "review_status ('confirmed'|'reopen'|'skip'), reasoning (str, required). "
-        "Entries missing task_id or carrying other fields (e.g. the old 'task_title') are "
-        "rejected individually. "
+        f"Each entry is an object with exactly these fields: task_id (str — the id in "
+        f"parentheses after each title under '{SUBTASKS_REVIEW_HEADING}', NOT the title "
+        "itself), review_status ('confirmed'|'reopen'|'skip'), reasoning (str, required). "
+        "An entry is rejected individually — and the receipt says why — if it has no "
+        "string task_id (including old-style entries keyed by 'task_title'), carries any "
+        "other field, names a task that is not your own sub-task, omits reasoning, or "
+        "uses a review_status outside the three values above. "
         "'reopen' re-runs that FINISHED sub-task from scratch: its previous output is "
         "automatically shown to the re-run and your 'reasoning' becomes the revision "
         "instruction — so write 'reasoning' as concrete, actionable feedback (what is "

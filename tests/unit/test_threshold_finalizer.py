@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+from ctx_weft.core.utils.task_ref import task_ref
+
 import pytest
 
 from ctx_weft.core import CtxWeftRuntime
@@ -64,7 +66,7 @@ async def _seed_running_ack(memory, session, child: Task) -> None:
                                    task_id=child.parent_task_id, agent_id=child.creator_agent_id)
     ts, tcid = await _ensure_dispatch_frame(memory, parent_scope, child, provider_ctx)
     await _put_dispatch_result(
-        memory, parent_scope, child, _dispatch_running_ack(child.title), ts, provider_ctx,
+        memory, parent_scope, child, _dispatch_running_ack(task_ref(child)), ts, provider_ctx,
         replace=False, tool_call_id=tcid,
     )
 

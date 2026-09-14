@@ -115,7 +115,7 @@ async def test_a1_slot_hit_uses_background_report() -> None:
 
     finish_tool = await _get_finish_tool(mem, asc)
     assert finish_tool is not None, "finish tool record must exist"
-    assert finish_tool.content == "[task: 测试任务] 好报告_sum", (
+    assert finish_tool.content == "[task: '测试任务' (t1)] 好报告_sum", (
         f"slot hit: finish tool content must be '好报告_sum' (+ task marker); got {finish_tool.content!r}"
     )
     finish_asst = await _get_finish_asst(mem, asc)
@@ -206,7 +206,7 @@ async def test_a1_placeholder_then_async_replace() -> None:
     new_finish_asst = active_asst_recs[0]
     # 归属前缀须**存活**替换：_replace_finish_report 整条重写 tool 槽，漏传 title 就会把
     # finalize 合成占位时打上的 `[task: …]` 标记抹掉。
-    assert new_finish_tool.content == "[task: 测试任务] 好报告_sum", (
+    assert new_finish_tool.content == "[task: '测试任务' (t1)] 好报告_sum", (
         f"new finish tool content must be '好报告_sum' (+ task marker preserved across the "
         f"bg replace); got {new_finish_tool.content!r}"
     )
@@ -284,7 +284,7 @@ async def test_slot_hit_replaces_report_no_raw_mirror() -> None:
     # agent 层只有 finish 对（无 body 镜像）
     assert len(recs) == 2 and {r.role for r in recs} == {"assistant", "tool"}
     finish_tool = await _get_finish_tool(mem, asc)
-    assert finish_tool.content == "[task: 测试任务] 真实段总结", (
+    assert finish_tool.content == "[task: '测试任务' (t1)] 真实段总结", (
         f"slot hit: tool content must be '真实段总结' (+ task marker); got {finish_tool.content!r}"
     )
     finish_asst = await _get_finish_asst(mem, asc)
@@ -345,8 +345,8 @@ async def test_synthesize_dispatch_pair_two_segments() -> None:
     assert call["name"].endswith("finish_task")
     # finish_task 退化为无参收尾标记（不再塞 input.result）
     assert call["input"] == {}
-    # tool 槽 = `[task: <title>] ` 归属前缀 + task_summary（process report）
-    assert tool and tool[0].content == "[task: 测试任务] 整段：A→B→验证，已就绪"
+    # tool 槽 = `[task: '<title>' (<id>)] ` 归属前缀 + task_summary（process report）
+    assert tool and tool[0].content == "[task: '测试任务' (t1)] 整段：A→B→验证，已就绪"
     # 同 tool_call_id、同 timestamp（相邻）
     tcid = asst[0].metadata["tool_calls"][0]["id"]
     assert tool[0].metadata["tool_call_id"] == tcid
