@@ -147,9 +147,13 @@ class _PlanDispatchProvider(ToolCapabilityProvider):
 
 @pytest.mark.asyncio
 async def test_gateway_delegate_plan_still_eager_writes_envelope() -> None:
-    """delegate_plan 的 envelope 框 + 配对 ack 仍由 gateway eager 写（per-child 框才走 finalize 铸）——
-    2026-07-03 只移除了 delegate_task 的 eager 写，plan envelope 不受影响。"""
-    from ctx_weft.core.capabilities.control_tools import _PLAN_DISPATCH_ACK
+    """delegate_plan 的 envelope 框由 gateway eager 写（per-child 框才走 finalize 铸）——
+    2026-07-03 只移除了 delegate_task 的 eager 写，plan envelope 不受影响。
+
+    配对 ack 则在**执行之后**写，内容是工具的真回执（spec: task-handoff）：那份逐条
+    带「标题 + id」的清单因此进入持久化对话，而不是只活在当轮；此前落库的是一句不含
+    任何 id 的常量。
+    """
     mem = InMemoryMemoryProvider()
     cache = CapabilityCache()
     cap = ToolCapability(id="control:delegate_plan", name="delegate_plan", description="plan")
@@ -178,7 +182,9 @@ async def test_gateway_delegate_plan_still_eager_writes_envelope() -> None:
              and any(tc.get("id") == "tc_plan" for tc in (r.metadata.get("tool_calls") or []))]
     ack = [r for r in turns if r.role == "tool" and r.metadata.get("tool_call_id") == "tc_plan"]
     assert len(frame) == 1, "plan envelope 框须 eager 写"
-    assert ack and ack[0].content == _PLAN_DISPATCH_ACK, "plan envelope 配对 ack 须 eager 写"
+    # provider 替身回的就是 "Plan scheduled."——落库的 ack 是它，不是任何常量
+    assert ack and ack[0].content == "Plan scheduled.", (
+        f"plan envelope 的配对 ack 须落工具真回执；got {[r.content for r in ack]}")
 
 
 @pytest.mark.asyncio

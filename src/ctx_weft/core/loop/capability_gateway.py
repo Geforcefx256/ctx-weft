@@ -48,7 +48,6 @@ from ctx_weft.core.capabilities.control_tools import (
     ASK_USER_NAME,
     ASK_USER_UNATTENDED_RESULT,
     PROVIDER_NAME as CONTROL,
-    _PLAN_DISPATCH_ACK,
 )
 from ctx_weft.core.hitl.service import UnattendedHitl
 from ctx_weft.protocols.filesystem import SpillSink
@@ -722,20 +721,9 @@ class CapabilityGateway:
                     ),
                     ctx.provider_ctx,
                 )
-                # envelope: 给 plan 框写一条配对的 ack tool result，避免该框悬挂(被 legalize 剥掉)。
-                await self._memory.ingest(
-                    MemoryEvent(
-                        kind=MemoryKind.CONVERSATION_TURN, scope=MemoryScope.AGENT,
-                        address=_tool_scope(state),
-                        content=_PLAN_DISPATCH_ACK,
-                        timestamp=now_utc(),
-                        role="tool",
-                        metadata={"origin_task_id": state.task.id,
-                                  "parent_task_id": state.task.parent_task_id,
-                                  "tool_call_id": tool_call_id},
-                    ),
-                    ctx.provider_ctx,
-                )
+                # 配对的 ack tool result 不在这里写——见 `_record_result` 的 plan envelope
+                # 分支。此刻工具还没执行、子任务尚不存在，能写的只有一句不含任何 id 的
+                # 常量；而那条才是被持久化、被此后每一次对话重建重放的版本。
         elif not is_silent:
             await self._memory.ingest(
                 MemoryEvent(
@@ -866,7 +854,28 @@ class CapabilityGateway:
             "result_length": len(redacted),
             "tool_call_id": tool_call_id,
         }, origin=EventOrigin.LOOP_CAPABILITY_GATEWAY))
-        if not is_dispatch and not is_silent:
+        if is_dispatch and tool_name in _PLAN_DISPATCH_TOOLS:
+            # envelope: 给 `_record_invocation` eager 写的 plan 框补配对 ack，避免该框
+            # 悬挂（被 legalize 剥掉）。**写在执行之后**，`content` 就是工具的真回执
+            # ——逐条带「标题 + id」，于是重建对话里「我派发了哪几个」有稳定句柄可循；
+            # 改造前这里写的是不含 id 的 `_PLAN_DISPATCH_ACK` 常量，回执里那份 id 清单
+            # 只活在当轮。窗口从「两次相邻 ingest」变成「一次工具调用」，而
+            # delegate_plan 是纯进程内 staging（微秒级）；工具报错时落的是真错误，
+            # 也好过一句假的「Plan created」。
+            await self._memory.ingest(
+                MemoryEvent(
+                    kind=MemoryKind.CONVERSATION_TURN, scope=MemoryScope.AGENT,
+                    address=_tool_scope(state),
+                    content=content,
+                    timestamp=now_utc(),
+                    role="tool",
+                    metadata={"origin_task_id": state.task.id,
+                              "parent_task_id": state.task.parent_task_id,
+                              "tool_call_id": tool_call_id},
+                ),
+                ctx.provider_ctx,
+            )
+        elif not is_dispatch and not is_silent:
             await self._memory.ingest(
                 MemoryEvent(
                     kind=MemoryKind.CONVERSATION_TURN, scope=MemoryScope.TASK,

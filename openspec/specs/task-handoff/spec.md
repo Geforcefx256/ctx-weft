@@ -6,9 +6,15 @@
 
 ## Requirements
 
-### Requirement: 任务操作以稳定 ID 配对
+### Requirement: 任务的称呼恒为「标题 + ID」，操作恒以 ID 配对
 
-对子任务的审核操作（confirm / reopen / skip，经 `report_task_outcome` 的 `task_reviews`）MUST 以 `task_id` 配对目标；同名、标题修改、登记顺序变化 MUST NOT 改变操作对象。`task_reviews` 条目 MUST 以 `task_id` 引用目标；缺 `task_id`、`task_id` 非字符串或携带未知字段（含旧 `task_title`）的条目 MUST 被拒绝并在回执中说明原因，其余合法条目照常生效；引用非当前任务直接派生子任务的 id 时 MUST 拒绝并说明越权。`delegate_task` 与 `delegate_plan` 的成功回执 MUST 返回子任务 id（plan 为与 spec 顺序对应的 id 列表）。
+**操作面**：对子任务的审核操作（confirm / reopen / skip，经 `report_task_outcome` 的 `task_reviews`）MUST 以 `task_id` 配对目标；同名、改名、登记顺序变化 MUST NOT 改变操作对象。条目 MUST 逐条校验：缺 `task_id`、`task_id` 非字符串、携带未知字段（含旧 `task_title`）、引用非本任务直接派生的子任务、缺 `reasoning`、`review_status` 超出三值——任一不合 MUST 被拒绝并在回执中说明原因，其余合法条目照常生效。**MUST NOT 静默丢弃任何条目**：工具 schema 承诺了的契约，违约时必须说话。
+
+**认知面**：任何指名引用某个任务的**模型可见文本** SHALL 同时给出该任务的标题与 id，形式全仓统一（`'标题' (id)`；无标题退化为裸 id）。覆盖：act 每回合的任务树与已完成子任务清单、任务锚定行与续跑 cue、`## Current Task` 框、派发对的 running/终态回执与派发框、finish 对的归属前缀与最终回复锚点、取消收尾、reopen 注入后继的上游说明、失败阈值汇总、observe 的可审核清单、两个派发工具的回执。
+
+理由是这两面本是一件事：模型用标题建立心智模型、用 id 执行操作，若两者分居两张脸，模型就得在中间做一次**没有凭据的映射**。标题也不是稳定标识——同名任务在叙述面无法区分，改名让旧引用落空。
+
+`delegate_task` 与 `delegate_plan` 的成功回执 MUST 给出子任务的标题与 id（plan 为与 spec 顺序对应的有序清单，**不得**只给裸 id 列表——那要求模型靠位置推断对应关系）。`delegate_plan` 落进持久化对话的配对 ack MUST 是工具的真实回执而非固定文案，使该清单在对话重建后仍可取。
 
 #### Scenario: 同名子任务审核对象不漂移
 - **WHEN** 存在两个同名子任务，审核条目指定其中之一的 `task_id`
@@ -26,9 +32,21 @@
 - **WHEN** 审核条目携带旧 `task_title` 字段或缺 `task_id`
 - **THEN** 该条目被拒绝且回执说明须以 `task_id` 引用，其余合法条目照常生效
 
-#### Scenario: 派发回执返回子任务 id
+#### Scenario: 不合格条目一律有反馈
+- **WHEN** 条目合法且在权限范围内，但缺 `reasoning` 或 `review_status` 超出三值
+- **THEN** 该条目被拒绝并在回执中指名说明，不被静默丢弃
+
+#### Scenario: 派发回执给出标题与 id
 - **WHEN** `delegate_task` 或 `delegate_plan` 成功派发
-- **THEN** 回执包含子任务 id（plan 为有序 id 列表），模型可据此在后续操作中引用
+- **THEN** 回执含子任务的标题与 id（plan 为与 spec 顺序对应的有序清单），模型可据此在后续操作中引用
+
+#### Scenario: 派发清单活过对话重建
+- **WHEN** `delegate_plan` 派发后父任务挂起，其后对话被重建
+- **THEN** 重建出的配对 ack 仍含各子任务的标题与 id
+
+#### Scenario: 执行面与审核面称呼一致
+- **WHEN** actor 在 act 回合看到任务树 / 已完成子任务清单，observer 随后在 `## Your sub-tasks` 审核同一子任务
+- **THEN** 两处对该子任务的称呼形式相同，且都同时含标题与 id
 
 ### Requirement: 依赖只在前序成功时放行
 
