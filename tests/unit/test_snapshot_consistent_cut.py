@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 import pytest
 
 from ctx_weft.core.control.reducers import reduce_events, rebuild_view
+from ctx_weft.core.utils.ids import generate_id
 from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.providers.events import InMemoryEventStore, InProcessEventBus
 from ctx_weft.providers.events.persister import attach_persistence
@@ -154,3 +155,129 @@ async def test_legacy_and_corrupt_snapshots_ignored():
         assert sorted(restored.tasks) == ["a"], (
             f"bad snapshot must be ignored: pos={bad_snap.last_commit_position} "
             f"ver={bad_snap.projection_version} → {sorted(restored.tasks)}")
+
+
+# ── 折叠策略：常态增量 + 重锚点（spec: snapshot-recovery）────────────────────
+#
+# H2 的修复在游标定义里，与折叠策略无关。这一组钉住策略本身：写路径默认 O(delta)，
+# 全量折只在「无可用基底 / 链深到顶 / 本进程首次」时作为重锚发生。
+
+
+async def test_first_write_in_process_is_anchor(env):
+    """服务刚起来的第一张快照是全量重锚——纠正上一进程可能留下的偏差。"""
+    store = env
+    bus = _make_bus(store)
+    await bus.emit(_ev(1, task_id="a"))
+    await _emit_run_finished(bus, 2)
+    snap = await store.load_latest_snapshot("s1")
+    assert snap.chain_depth == 0, "本进程首张快照必须是重锚"
+
+
+async def test_steady_state_writes_are_incremental(env):
+    """同一进程内的后续快照走增量：chain_depth 逐张 +1。"""
+    store = env
+    bus = _make_bus(store)
+    await bus.emit(_ev(1, task_id="a"))
+    await _emit_run_finished(bus, 2)                      # 重锚 depth=0
+    depths = []
+    for n in (3, 5, 7):
+        await bus.emit(_ev(n, task_id=f"t{n}"))
+        await _emit_run_finished(bus, n + 1)
+        depths.append((await store.load_latest_snapshot("s1")).chain_depth)
+    assert depths == [1, 2, 3], f"后续写入应为增量链，实得 {depths}"
+
+
+async def test_incremental_blob_equals_full_fold(env):
+    """增量写出来的 blob 必须逐字段等于「从日志全量折」——这是两路等价的前提。"""
+    from ctx_weft.core.control.reducers import deserialize_view
+
+    store = env
+    bus = _make_bus(store)
+    for n in (1, 3, 5, 7, 9):
+        await bus.emit(_ev(n, task_id=f"t{n}"))
+        await _emit_run_finished(bus, n + 1)
+
+    snap = await store.load_latest_snapshot("s1")
+    assert snap.chain_depth > 0, "本例要覆盖的是增量路径"
+    incremental = deserialize_view(snap.state_blob)
+    full = reduce_events(
+        [se.event for se in await store.read_range(
+            "s1", after_position=0, through_position=snap.last_commit_position)],
+        run_id="s1")
+
+    assert sorted(incremental.tasks) == sorted(full.tasks)
+    for tid in full.tasks:
+        i_t, f_t = incremental.tasks[tid], full.tasks[tid]
+        assert i_t.status == f_t.status, tid
+        assert i_t.title == f_t.title, tid
+        assert i_t.assigned_agent_id == f_t.assigned_agent_id, tid
+    assert sorted(incremental.agents) == sorted(full.agents)
+    for aid in full.agents:
+        assert incremental.agents[aid].status == full.agents[aid].status, aid
+    assert incremental.events_total == full.events_total
+
+
+async def test_two_route_equivalence_holds_under_incremental_writes(env):
+    """E5 在增量写下同样成立——恢复的两条路径仍逐字段等价。"""
+    store = env
+    bus = _make_bus(store)
+    for n in (1, 3, 5, 7, 9, 11):
+        await bus.emit(_ev(n, task_id=f"t{n}"))
+        await _emit_run_finished(bus, n + 1)
+    await bus.emit(_ev(13, task_id="t13"))                # 快照之后的增量
+
+    restored = await rebuild_view(store, "s1")            # 快照 + delta
+    full = reduce_events([se.event for se in await store.read_range("s1")], "s1")
+    assert sorted(restored.tasks) == sorted(full.tasks)
+    for tid in full.tasks:
+        assert restored.tasks[tid].status == full.tasks[tid].status, tid
+
+
+async def test_chain_depth_cap_forces_reanchor(env, monkeypatch):
+    """链深到顶强制一次全量重锚，把往返有损的累积限制在常数级。"""
+    monkeypatch.setattr(SnapshotWriter, "MAX_CHAIN_DEPTH", 3)
+    store = env
+    bus = _make_bus(store)
+    await bus.emit(_ev(1, task_id="a"))
+    await _emit_run_finished(bus, 2)                      # depth 0（重锚）
+    seen = [0]
+    for n in (3, 5, 7, 9, 11):
+        await bus.emit(_ev(n, task_id=f"t{n}"))
+        await _emit_run_finished(bus, n + 1)
+        seen.append((await store.load_latest_snapshot("s1")).chain_depth)
+    # 0,1,2,3 之后基底达上限 → 下一张重锚回 0，再继续增量
+    assert seen == [0, 1, 2, 3, 0, 1], f"链深上限未生效：{seen}"
+
+
+async def test_unusable_base_rejected_so_writer_reanchors(env):
+    """坏基底一律不认（判据与恢复侧共用），writer 因此重锚而不是基于坏快照做增量。
+
+    直接测 `_usable_base` 而不走端到端：`load_latest_snapshot` 的「最新」判据是
+    (snapshot_at, id)，同毫秒写入时由 id 决胜——端到端断言会变成跟时钟赛跑。
+    """
+    import dataclasses
+
+    store = env
+    bus = _make_bus(store)
+    await bus.emit(_ev(1, task_id="a"))
+    await _emit_run_finished(bus, 2)
+    good = await store.load_latest_snapshot("s1")
+    head = await store.committed_head("s1")
+
+    writer = SnapshotWriter(store, None, every_n_events=1)
+    writer._anchored.add("s1")                       # 装成「本进程已重锚过」
+
+    assert await writer._usable_base("s1", head) is not None, "健康基底应被接受"
+
+    for bad, why in (
+        (dataclasses.replace(good, projection_version=99), "版本不匹配"),
+        (dataclasses.replace(good, last_commit_position=head + 999), "位置超前"),
+        (dataclasses.replace(good, last_commit_position=None), "存量快照无 position"),
+        (dataclasses.replace(good, chain_depth=SnapshotWriter.MAX_CHAIN_DEPTH), "链深到顶"),
+    ):
+        await store.save_snapshot(dataclasses.replace(bad, id=generate_id("snp")))
+        assert await writer._usable_base("s1", head) is None, f"{why} 的基底必须被拒"
+
+    # 未在本进程重锚过的 session 同样不认基底（服务刚起来那一张必须是全量）
+    fresh = SnapshotWriter(store, None, every_n_events=1)
+    assert await fresh._usable_base("s1", head) is None

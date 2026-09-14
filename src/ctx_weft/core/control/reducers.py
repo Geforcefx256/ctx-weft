@@ -312,6 +312,39 @@ def deserialize_view(data: dict[str, Any]) -> RunStateView:
 _PROJECTION_VERSION = 1
 
 
+def snapshot_is_usable(
+    snapshot: Any, head: int, *, max_chain_depth: int | None = None,
+) -> bool:
+    """该快照能否作为增量基底（spec: snapshot-recovery）。
+
+    **恢复侧与写入侧共用这一套判据**——两边各写一遍是漂移的现成来源：判据一旦分叉，
+    writer 会基于一张 reader 根本不认的快照做增量，两路等价就此失守。
+
+    四条硬判据（任一不满足 → 不可用，调用方全量重建）：
+
+    1. 有快照；
+    2. 带 ``last_commit_position``——缺它就是改造前的存量快照，位置不可猜；
+    3. ``projection_version`` 与当前实现一致——apply 语义变过则旧 blob 不可复用；
+    4. 位置不超前于 ``head``——引用未来位置说明数据异常。
+
+    ``max_chain_depth``：仅**写入侧**传。快照链每增量一次深一层，达到上限即强制一次
+    全量重锚，把「serialize/deserialize 往返有损」这类逐次累积的偏差限制在常数级内。
+    恢复侧不传——读一张已存在的快照时，链深不影响这一次读取的正确性，那是写入策略。
+    """
+    if snapshot is None:
+        return False
+    if getattr(snapshot, "last_commit_position", None) is None:
+        return False
+    if getattr(snapshot, "projection_version", 1) != _PROJECTION_VERSION:
+        return False
+    if snapshot.last_commit_position > head:
+        return False
+    if (max_chain_depth is not None
+            and getattr(snapshot, "chain_depth", 0) >= max_chain_depth):
+        return False
+    return True
+
+
 async def rebuild_view(event_store: Any, session_id: str) -> RunStateView:
     """按快照+增量或全量回放重建 RunStateView（spec: snapshot-recovery，wp4 改造）。
 
@@ -336,12 +369,7 @@ async def rebuild_view(event_store: Any, session_id: str) -> RunStateView:
         snapshot = None
 
     head = await event_store.committed_head(session_id)
-    if (
-        snapshot is not None
-        and snapshot.last_commit_position is not None
-        and snapshot.projection_version == _PROJECTION_VERSION
-        and snapshot.last_commit_position <= head
-    ):
+    if snapshot_is_usable(snapshot, head):
         view = deserialize_view(snapshot.state_blob)
         delta = await event_store.read_range(
             session_id,

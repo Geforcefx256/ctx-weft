@@ -75,10 +75,10 @@
 | `TaskManager` | `core/orchestrator/task/manager.py:54` | 任务队列与调度：`drain` `:502`、`_run_task` `:536`、`apply_run_outcome` `:638`、`reopen_chain` `:707` / `reopen_task` `:746`、`restore` `:143`（崩溃恢复重建）、`track_background` `:119`、未提交窗口 `begin_round` `:281` / `commit_round` / `discard_round` |
 | `ContextAssembler` | `core/assembler/assembler.py:238` | 多 Source 取数 → budget 裁剪 → composer 拼 prompt（`assemble` `:246`） |
 | `CapabilityGateway` | `core/loop/capability_gateway.py:193` | capability 解析、鉴权/HITL、参数校验、`invoke` `:236`、memory 写入 + 事件 |
-| `CapabilityCache` | `core/capabilities/cache.py:28` | **per-session 共享**能力缓存（含 pin / clear_pins / available `:140`-`:170`）；run 结束 `evict`（`core/runtime.py:3898`），pin 清理挂 task 终态（`core/runtime.py:1539`） |
+| `CapabilityCache` | `core/capabilities/cache.py:28` | **per-session 共享**能力缓存（含 pin / clear_pins / available `:140`-`:170`）；run 结束 `evict`（`core/runtime.py:3907`），pin 清理挂 task 终态（`core/runtime.py:1548`） |
 | `StepDriver` | `core/loop/driver.py:253` | 按 `initial_step` 起步，`run` `:270` 循环执行 Step，发 StepStarted/Completed/Failed |
 | `EventBus` / `InProcessEventBus` | `protocols/events.py:320` / `providers/events/bus/in_process/bus.py:41` | `emit` `:53`、`subscribe` `:115`（支持 provisional）、未提交窗口 `begin/commit/discard_provisional` `:141`-`:155`、`stream` `:157`。进程内 emit **同步 drain**、不跨进程 |
-| `EventStore` / `InMemory` + SQL | `protocols/events.py:406` / `providers/events/store/in_memory/store.py:22` / `providers/events/store/sql/` | `append` `:34`、`list_active_session_ids` `:51`、`read_after` `:54`（增量回放）、快照读写 `:75` / `:88` |
+| `EventStore` / `InMemory` + SQL | `protocols/events.py:477` / `providers/events/store/in_memory/store.py:29` / `providers/events/store/sql/` | `append` `:107`、`append_batch` `:46`、`read_range` `:118`、`committed_head` `:134`、`list_active_session_ids` `:138`、快照读写 `:148` / `:161` |
 | HITL 三件套 | `core/hitl/registry.py:183`（决定缓存）、`core/hitl/service.py:80`（`open` `:96` / `resolve` `:158` / `cancel` `:179`）、`core/hitl/reply_intake.py:29`（人类答复入核） | 人工介入请求/应答；等待协程栈在 `core/loop/hitl_waiter.py` |
 
 **构造期自动注册的内置 Capability**（`CtxWeftRuntime.__init__`，`core/runtime.py:575`-`590`）：
@@ -87,7 +87,7 @@
 - `SkillExecutorCapabilityProvider`（`core/capabilities/skill_executor.py:151`）— 把 LLM 的 skill 调用路由到对应 `SkillCapabilityProvider`；`mark_dirty` `:167` 重建索引。
 - `MediaCapabilityProvider`（`core/media/capability.py:341`）— `media:get_image` 等媒体工具。
 
-构造期还硬校验**至少一个 `AgentCapabilityProvider`**（`core/runtime.py:594`-`603`）。
+构造期还硬校验**至少一个 `AgentCapabilityProvider`**（`core/runtime.py:608`-`603`）。
 
 ---
 
@@ -104,7 +104,7 @@
 
 ### Step 注册表与跳转
 
-`_build_step_driver(initial_step)`（`core/runtime.py:3720`）注册 **8 个** Step：
+`_build_step_driver(initial_step)`（`core/runtime.py:3729`）注册 **8 个** Step：
 
 | Step | 源码（name= 行） | 作用 | `next_step` |
 |------|------------------|------|-------------|
@@ -117,12 +117,12 @@
 | `recognize_intent` | `core/loop/steps/recognize_intent.py:99` | 旁路意图识别：回填 root task 的 title/description/session goal（`update_task_metadata`） | `None`（单发） |
 | `reconcile` | `core/loop/steps/reconcile.py:23` | resume 后补 dangling tool_call：已有结果的复用、悬挂的经 gateway 重执行 | `"prepare"` |
 
-**`initial_step` 的选定**（`_SessionTaskRunner.assemble` 里的 `_reconcile_or`，`core/runtime.py:4163`）：最近 assistant turn 有 dangling tool_call → `"reconcile"`（探测函数 `_task_has_dangling_tool_call` `core/runtime.py:480`），否则 `"prepare"`。`AgentBinding.initial_step` 默认 `"prepare"`（`core/orchestrator/task/runner.py:34`）。
+**`initial_step` 的选定**（`_SessionTaskRunner.assemble` 里的 `_reconcile_or`，`core/runtime.py:4172`）：最近 assistant turn 有 dangling tool_call → `"reconcile"`（探测函数 `_task_has_dangling_tool_call` `core/runtime.py:480`），否则 `"prepare"`。`AgentBinding.initial_step` 默认 `"prepare"`（`core/orchestrator/task/runner.py:34`）。
 
 **compact 的两个触发面**：
 
 - **内联（自动）**：PrepareStep 估算 token（对齐 miniAgents 基线）→ 命中阈值 → `escalating_compact` 逐级升级——L0.5 图片降级 → L1 agent 层折 → L2 胶囊降级 → L3 task 层坍缩（`core/loop/steps/prepare.py:155`-`166`）→ 重装配后继续 `→ act`。
-- **主动**：`CtxWeftRuntime.compact_agent(agent_id, *, task_id="")`（`core/runtime.py:2385`）对一个 idle（非 busy）agent 直调 `CompactStep().execute()`（现在**补发 RunStarted/RunFinished 对**），返回 `CompactReceipt`；强制压不受预算门控。
+- **主动**：`CtxWeftRuntime.compact_agent(agent_id, *, task_id="")`（`core/runtime.py:2394`）对一个 idle（非 busy）agent 直调 `CompactStep().execute()`（现在**补发 RunStarted/RunFinished 对**），返回 `CompactReceipt`；强制压不受预算门控。
 
 **recognize_intent（取代已删除的 metadata_filler 后台协程）**：PrepareStep 判定需要时置 pending 标记（`core/loop/steps/prepare.py:178`），**起飞在 act 的提交点**（`core/loop/steps/act.py:304`-`306` `launch_recognize_intent`）——与 ActStep 并发、单发、不进 step 状态机。`MetadataFillerTaskSettings` 仅作 dataclass 残留（反序列化兼容）。
 
@@ -178,7 +178,7 @@ ASCII 版（同一张图）：
 
 ### `_run_loop`：生命周期与错误语义
 
-`_run_loop`（`core/runtime.py:3735`）包裹 driver：
+`_run_loop`（`core/runtime.py:3744`）包裹 driver：
 
 - 入口先 `await` 在途后台 recap（`:3766`-`3772`），再发 `RunStarted`（带 run_id + initial_step）。
 - `RoundDiscarded`（`:3787`）→ 整轮抹掉（未提交窗口 discard，见 §7）。
@@ -233,7 +233,7 @@ class StepOutcome:               # 每个 Step 的统一返回
 
 ## 5. 上下文装配（ContextAssembler）
 
-`_build_assembler`（`core/runtime.py:3633`）固定装配 **8 个** Source + budget + composer：
+`_build_assembler`（`core/runtime.py:3642`）固定装配 **8 个** Source + budget + composer：
 
 ```python
 ContextAssembler(                    # core/assembler/assembler.py:238
@@ -266,7 +266,7 @@ ContextAssembler(                    # core/assembler/assembler.py:238
 
 ## 6. 能力解析与调用（CapabilityGateway）
 
-`_build_gateway`（`core/runtime.py:3668`）每次 run 新建 `CapabilityGateway`（`core/loop/capability_gateway.py:193`），注入：capability_cache、capability_providers、memory、event_bus、provider_authorizers、spill 阈值、memory_blob_store。
+`_build_gateway`（`core/runtime.py:3677`）每次 run 新建 `CapabilityGateway`（`core/loop/capability_gateway.py:193`），注入：capability_cache、capability_providers、memory、event_bus、provider_authorizers、spill 阈值、memory_blob_store。
 
 ActStep 一次工具调用（最终走 `CapabilityGateway.invoke` `:236`）的链路：
 
@@ -299,7 +299,7 @@ ActStep 一次工具调用（最终走 `CapabilityGateway.invoke` `:236`）的�
 
 `TaskManager._run_task`（`core/orchestrator/task/manager.py:536`）：assemble 失败 → `commit_round` + `_handle_task_failure(reason=ASSEMBLY_FAILURE)`；成功 → TM 回填 `assigned_agent_id` / `started_at` 并**由 TM 发 TASK_STARTED**（`:575`）→ execute → `commit_round` → `apply_run_outcome`（处置表）→ `_flush_staged`（子任务入队）→ `_settle`。`RoundDiscarded` → `discard_round` 整轮抹掉（未提交窗口：`begin_round` `:281` / `commit_round` / `discard_round`——夭折轮的事件不进日志）。
 
-`_register_and_drain`（`core/runtime.py:1490`）：注册 ControlCapabilityProvider → 装一次性 `TaskManagerHooks`（`core/orchestrator/task/hooks.py:48`：is_current / cancel_pending_hitl / cancel_inflight / revert_round / threshold_finalizer / cancel_finalizer / on_session_done / on_session_idle / on_task_terminal）→ `asyncio.create_task(task_manager.drain())`。（2026-09-08 生命周期改造：一轮跑完**不拆 TM / 不摘 agent record**，只做 `_release_round` 轻清理 `core/runtime.py:1556`。）
+`_register_and_drain`（`core/runtime.py:1499`）：注册 ControlCapabilityProvider → 装一次性 `TaskManagerHooks`（`core/orchestrator/task/hooks.py:48`：is_current / cancel_pending_hitl / cancel_inflight / revert_round / threshold_finalizer / cancel_finalizer / on_session_done / on_session_idle / on_task_terminal）→ `asyncio.create_task(task_manager.drain())`。（2026-09-08 生命周期改造：一轮跑完**不拆 TM / 不摘 agent record**，只做 `_release_round` 轻清理 `core/runtime.py:1565`。）
 
 ### drain 调度
 
@@ -307,7 +307,7 @@ ActStep 一次工具调用（最终走 `CapabilityGateway.invoke` `:236`）的�
 
 ### `_SessionTaskRunner.assemble`（原 `_resolve` 的显式化）
 
-`core/runtime.py:4000`（工厂 `_make_task_runner` `:1924`）。`assemble`（`:4033`）按 `task.settings` 分派：
+`core/runtime.py:4009`（工厂 `_make_task_runner` `:1924`）。`assemble`（`:4033`）按 `task.settings` 分派：
 
 | 分支 | agent 来源 | initial_step |
 |------|-----------|--------------|
@@ -320,7 +320,7 @@ ActStep 一次工具调用（最终走 `CapabilityGateway.invoke` `:236`）的�
 
 ### RunTokens（取消/暂停的执行面）
 
-每次派发在 per-run registry `_run_tokens[session_id][task_id]` 登记一对 `RunTokens`（`CancelToken` + `PauseToken`，`core/control/tokens.py`），run 结束注销（登记 `core/runtime.py:796` / 注销 `:820`，由 `_SessionTaskRunner.execute` `:4132` 驱动）；root run 的出生信号分流 born-pause / born-cancel。`StepDriver` 每轮检查 token。
+每次派发在 per-run registry `_run_tokens[session_id][task_id]` 登记一对 `RunTokens`（`CancelToken` + `PauseToken`，`core/control/tokens.py`），run 结束注销（登记 `core/runtime.py:805` / 注销 `:820`，由 `_SessionTaskRunner.execute` `:4132` 驱动）；root run 的出生信号分流 born-pause / born-cancel。`StepDriver` 每轮检查 token。
 
 ---
 
@@ -339,7 +339,7 @@ ActStep 一次工具调用（最终走 `CapabilityGateway.invoke` `:236`）的�
 
 | 记录（Kind/Scope/role） | 写入位置 | 说明 |
 |------------------------|---------|------|
-| `CONVERSATION_TURN / TASK / user` | `driver._persist_user_prompt` `core/loop/driver.py:208`；runtime 侧 `_ingest_user_turn` `core/runtime.py:3273`；suspend 兜底 `core/loop/steps/suspend.py:32` | raw 原样（多模态无损）；`## Current Task/Message` 框架渲染期生成 |
+| `CONVERSATION_TURN / TASK / user` | `driver._persist_user_prompt` `core/loop/driver.py:208`；runtime 侧 `_ingest_user_turn` `core/runtime.py:3282`；suspend 兜底 `core/loop/steps/suspend.py:32` | raw 原样（多模态无损）；`## Current Task/Message` 框架渲染期生成 |
 | `CONVERSATION_TURN / TASK / assistant` | `act._ingest_assistant_turn` `core/loop/steps/act.py:515`；打断半截 `_commit_interrupted_partial` `core/loop/steps/act.py:790` | 一轮完整输出（tool_calls 排除 dispatch/silent 入 metadata） |
 | `TOOL_AUDIT / TASK` | gateway `_record_invocation` `core/loop/capability_gateway.py:512`→`:561` | 一次 capability 调用审计 |
 | `CONVERSATION_TURN / TASK / tool` | gateway `_record_result` `:669`→`:688`；打断补挂 `core/loop/steps/act.py:723` | 工具结果对话回合（silent 工具不写） |
@@ -372,7 +372,7 @@ v2 里「子任务结果怎么到父」有三条，全部落在 memory、由 `Ag
 
 ## 10. 会话生命周期与崩溃恢复
 
-### 新建 / 续聊（`start_session`，`core/runtime.py:1387`）
+### 新建 / 续聊（`start_session`，`core/runtime.py:1396`）
 
 `SessionStartParams.create(...)` → `TurnHandle`（`events()` `:308` / `wait_for_finish()` `:315`）。create/resume 分派到 `SessionRegistry.create_session`（`core/orchestrator/lifecycle/session_registry.py:128`，发 SESSION_CREATED，因果序 Session→Agent→Task）或 `resume_session`（`:231`，回放 `rebuild_view` + **UnfinishedTasksError 弃轮禁止** `:262`）。续跑走 `_register_and_drain`（§7）。
 
@@ -380,10 +380,10 @@ v2 里「子任务结果怎么到父」有三条，全部落在 memory、由 `Ag
 
 旧 `recover()` / `recover_session()` 已删除；现在的面：
 
-- `rebuild_session`（`core/runtime.py:1721`）/ `rebuild_all_agents`（`:3593`）/ `rebuild_agent`（`:3573`）/ `rebuild_hitl`（`:3458`）；active session 判定用 `providers/events/_lifecycle.py` 的 `apply_lifecycle` / `replay_lifecycle`（`:45` / `:65`）。
-- `recover_agent(agent_id, ...)`（`core/runtime.py:1950`；per-session resume 锁 `:653`）→ `_recover_session_locked`（`:2029`），**单 owner 架构**：
+- `rebuild_session`（`core/runtime.py:1730`）/ `rebuild_all_agents`（`:3593`）/ `rebuild_agent`（`:3573`）/ `rebuild_hitl`（`:3458`）；active session 判定用 `providers/events/_lifecycle.py` 的 `apply_lifecycle` / `replay_lifecycle`（`:45` / `:65`）。
+- `recover_agent(agent_id, ...)`（`core/runtime.py:1959`；per-session resume 锁 `:653`）→ `_recover_session_locked`（`:2029`），**单 owner 架构**：
   - 有活 owner TM 且含被应答 task → `_resume_in_existing_tm`（`:2355`）就地重驱、不重建；
-  - 否则 `rebuild_view`（`core/control/reducers.py:308`，快照+增量 `read_after`）→ converters 转 dataclass（`core/control/converters.py:21` / `:41`）→ `TaskManager.restore(all_tasks, terminal_ids, parked_task_ids)`（`core/orchestrator/task/manager.py:143`，跳过已废弃的 compact/metadata ephemeral task `:179`）→ `_load_agents_of` 装填 ALM（`:3419`）→ set_runner + `_register_and_drain` 续跑。
+  - 否则 `rebuild_view`（`core/control/reducers.py:315`，快照+增量 `read_range`）→ converters 转 dataclass（`core/control/converters.py:21` / `:41`）→ `TaskManager.restore(all_tasks, terminal_ids, parked_task_ids)`（`core/orchestrator/task/manager.py:143`，跳过已废弃的 compact/metadata ephemeral task `:179`）→ `_load_agents_of` 装填 ALM（`:3419`）→ set_runner + `_register_and_drain` 续跑。
 
 ### 取消 / 暂停
 
@@ -402,9 +402,9 @@ v2 里「子任务结果怎么到父」有三条，全部落在 memory、由 `Ag
 - **Event 字段**：`agent_id`、`origin`（`EventOrigin` 17 值 `:217`-`:248`）、`schema_version`；`EventFilter` 支持 agent_id 轴。
 - **总线**：`InProcessEventBus`（`providers/events/bus/in_process/bus.py:41`），`emit` `:53` 进程内**同步 drain**（结局走返回值的根因，见 §1）；`subscribe` `:115` / `stream` `:157`；未提交窗口 `begin/commit/discard_provisional` `:141`-`:155`（夭折轮的事件不进日志）。
 - **持久化**：单一入口 `attach_persistence`（best_effort 兼容路径）/ `CommitGate`（required，见上条）——persister 订阅先于 SnapshotWriter（顺序契约）；`snapshot_every_n=0` 默认不接快照。
-- **快照一致切面（spec: snapshot-recovery，change reliability-wp4）**：SnapshotWriter 写快照时三步取界——`C = committed_head(session)` → `read_range(0..C)` 全量折 → 存 `last_commit_position=C` + `projection_version`（触发事件只是信号不是边界）。恢复 `rebuild_view` 按序选路：快照有 position 且版本匹配且不超前 → `read_range((cursor, head])` 增量；否则（legacy/损坏/版本不匹配/超前）忽略快照全量回放重建。全量与快照+增量共用同一 apply 语义（E5 两路等价）。`read_after(id)` 为纯 legacy API（生产无调用点——ID 铸造序 ≠ 提交序正是 H2 根因）。
+- **快照一致切面（spec: snapshot-recovery，change reliability-wp4）**：SnapshotWriter 写快照时三步取界——`C = committed_head(session)` → 折出 `0..C` 的投影 → 存 `last_commit_position=C` + `projection_version`（触发事件只是信号不是边界）。**折叠策略：常态增量**（`read_range((S.cursor, C])` 应用到最新可用快照上，`O(delta)`——写入内联于 emit，每次全量折会随会话增长阻塞主循环）；**全量折降为重锚点**，在「无可用基底 / 链深达 `MAX_CHAIN_DEPTH` / 进程启动后首次」时各触发一次，让快照周期性重新对齐日志。基底可用性判据与恢复路径共用 `reducers.snapshot_is_usable`，不写两遍。两种模式下 blob 恒等于 `fold(0..C)`——`reduce_events` 就是 `apply_events` 在空 view 上的调用，左折叠可结合，等价性不依赖折叠策略。恢复 `rebuild_view` 按序选路：快照有 position 且版本匹配且不超前 → `read_range((cursor, head])` 增量；否则（legacy/损坏/版本不匹配/超前）忽略快照全量回放重建。全量与快照+增量共用同一 apply 语义（E5 两路等价）。**恢复没有按事件 ID 取增量的路径**——ID 铸造序 ≠ 提交序正是 H2 根因，该读法已从 `EventStore` 移除。
 - **顺序与因果**：`sequence` 来自 `LoopState.sequence_counter`（`core/loop/driver.py:190`-`:204`，同 run 内单调递增）；`id` 是 `evt_ULID`（`core/utils/event.py new_event`）；类型白名单校验同在 `new_event`（`:57`）。`causation_id` 串因果链。
 - **提交门与通知分离（spec: event-commit，change reliability-wp3）**：`event_commit_policy="required"`（默认，RuntimeConfig）下，`CtxWeftRuntime` 构造期把 `CommitGate`（`core/events/commit_gate.py`）经 `EventBus.attach_commit_gate` 接进 emit 路径——**先确认提交（WP2 的 append_batch）、再 fanout**；窗口外单事件走单事件批（batch_id=event.id），未提交窗口在 `commit_provisional` 时**整批一次**提交（round batch_id，失败缓冲保留、同 id 重试恰好一次）。`subscribe(..., required=True)` 的必要消费者（ALM/SessionRegistry）异常穿出 emit、推测态照看；观察者（stream 订阅者）队列溢出的丢弃以 `EventsDropped` 元事件通报（transient、payload 带 position，可按 `read_range` 补读）。派生事件经 contextvar 继承窗口归属，不逃逸。存储失败：会话标记 `storage_unavailable`（`runtime.storage_health()` 可查）+ `PersistenceUnavailableError` 显式抛出（`wait_for_finish` 轮询健康、TM 三处前置分支停推进不发终态事件）；`best_effort` 显式退回旧 `attach_persistence` 路径（吞错 + 启动告警）。微基准：required 单事件提交路径较旧 persister 路径 -20%（in-memory）。
 - **「事件流即单一事实源」的两个限定**：① 未提交窗口——夭折轮（RoundDiscarded）的事件被 discard，不进日志；② TRANSIENT 集合跳过持久化。除这两点外没有旁路状态。
 - **执行限制（spec: execution-limits，change reliability-wp7）**：`ExecutionLimits`（RuntimeConfig opt-in，默认全 None = 零行为变化）——task/step/provider 三级 deadline + actor 轮数，monotonic 计量、park/resume 排除 HITL 与等子任务时段、跨 retry 累计。超限 → INTERRUPTED + 四专用错误码（TASK/STEP/PROVIDER_DEADLINE_EXCEEDED、ACTOR_TURN_LIMIT）；provider 超时后 cancel 安全网 + cleanup 宽限，仍不合作则标记并拒绝同会话后续副作用。旧字段（max_turns_per_agent / timeout_per_step_sec / Task.timeout_ms）发去重 DeprecationWarning、不激活。
-- **有序提交（spec: event-log，change reliability-wp2）**：`EventStore`（`protocols/events.py`）的**必需**方法——并入协议本体，不另立 `OrderedEventStore` 平行协议、也不是可选扩展。两层强制：三者均为 `@abstractmethod`（显式继承的实现由 ABC 在实例化时拦下），Runtime 构造期再以 `supports_ordered_commit(store)` 校验一道（拦鸭子类型 store；`hasattr` 会把只继承抽象桩的 store 误判为已实现，故不可代替）。恢复路径**没有**按 ID 排序的回落分支——按 ID 排序的 store 不是「功能少一点」，而是恢复语义错误。两个 store 实现（in_memory / sql）提供 `append_batch`（原子批次 + batch_id 幂等，`EventConflictError` 拒绝异内容重放）、`read_range(after, through)` 与 `committed_head`——`position` 是存储层在提交时分配的位置（同会话唯一递增，与 ULID 铸造序无关）。SQL 侧经会话 head 行同事务原子 UPDATE 串行化分配（`event_session_head` / `event_batches` 两张新表，禁无锁 MAX+1）；`append` 改道单事件批次（batch_id=event.id），既有调用方零改动；`read_by_session` / `read_session_events_of_types` 改按 position 序（存量 NULL 行排前按 id 序），`read_after(id)` 保留 legacy。**地基已铺、暂未启用**：persister 仍逐条 append（行为零变化），提交门（WP3）与快照 position 截断（WP4）在其上启用；存量库回填走 `scripts/migrate_event_positions.py`（默认 dry-run；分配的是 (session_id, event.id) 确定性顺序，非历史提交顺序）。
+- **有序提交（spec: event-log，change reliability-wp2）**：`EventStore`（`protocols/events.py`）的**必需**方法——并入协议本体，不另立 `OrderedEventStore` 平行协议、也不是可选扩展。两层强制：三者均为 `@abstractmethod`（显式继承的实现由 ABC 在实例化时拦下），Runtime 构造期再以 `supports_ordered_commit(store)` 校验一道（拦鸭子类型 store；`hasattr` 会把只继承抽象桩的 store 误判为已实现，故不可代替）。恢复路径**没有**按 ID 排序的回落分支——按 ID 排序的 store 不是「功能少一点」，而是恢复语义错误。两个 store 实现（in_memory / sql）提供 `append_batch`（原子批次 + batch_id 幂等，`EventConflictError` 拒绝异内容重放）、`read_range(after, through)` 与 `committed_head`——`position` 是存储层在提交时分配的位置（同会话唯一递增，与 ULID 铸造序无关）。SQL 侧经会话 head 行同事务原子 UPDATE 串行化分配（`event_session_head` / `event_batches` 两张新表，禁无锁 MAX+1）；`append` 改道单事件批次（batch_id=event.id），既有调用方零改动；`read_by_session` / `read_session_events_of_types` 按 position 序（存量 NULL 行排前按 id 序），按事件 ID 取增量的 `read_after` 已删除。提交门（WP3）与快照 position 截断（WP4）建在这套地基上、**均已启用**；存量库回填走 `scripts/migrate_event_positions.py`（默认 dry-run；分配的是 (session_id, event.id) 确定性顺序，非历史提交顺序）。

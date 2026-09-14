@@ -424,6 +424,10 @@ class RunSnapshot:
     # 旧快照/旧实现读出为 None/1 → 恢复路径忽略快照走全量回放重建（不猜测位置）。
     last_commit_position: int | None = None
     projection_version: int = 1
+    #: 快照链深度：0 = 从日志全量重锚，n = 在上一张之上连续增量 n 次。写入侧据此
+    #: 在到顶时强制重锚（见 SnapshotWriter.MAX_CHAIN_DEPTH）；恢复侧不读它。
+    #: 旧快照读出 0，等价于「当作刚重锚过」——保守但安全，最多多重锚一次。
+    chain_depth: int = 0
 
 
 # ── 提交位置、批次与存储错误（spec: event-log / event-commit）──────────────────

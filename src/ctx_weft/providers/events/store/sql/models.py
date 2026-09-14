@@ -103,5 +103,6 @@ class SnapshotModel(Base):
     snapshot_reason: Mapped[str] = mapped_column(String(64), default="")
     # spec: snapshot-recovery——存量行为 NULL/1 → 恢复忽略该快照走全量回放。
     last_commit_position: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    chain_depth: Mapped[int | None] = mapped_column(Integer, nullable=True)
     projection_version: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, server_default=func.now())

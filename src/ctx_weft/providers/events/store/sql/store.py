@@ -306,6 +306,7 @@ class SqlEventStore(EventStore):
                 snapshot_reason=snapshot.snapshot_reason,
                 last_commit_position=snapshot.last_commit_position,
                 projection_version=snapshot.projection_version,
+                chain_depth=snapshot.chain_depth,
                 created_at=snapshot.snapshot_at,
             ))
             await db.flush()          # 让新行参与下面的「保留最新」排序
@@ -353,6 +354,7 @@ class SqlEventStore(EventStore):
                 snapshot_at=row.created_at,
                 last_commit_position=row.last_commit_position,
                 projection_version=row.projection_version if row.projection_version is not None else 1,
+                chain_depth=row.chain_depth if row.chain_depth is not None else 0,
             )
 
 
@@ -417,6 +419,9 @@ async def open_sqlite_event_store(
             if "projection_version" not in snap_cols:
                 await conn.execute(text(
                     "ALTER TABLE event_snapshots ADD COLUMN projection_version INTEGER"))
+            if "chain_depth" not in snap_cols:
+                await conn.execute(text(
+                    "ALTER TABLE event_snapshots ADD COLUMN chain_depth INTEGER"))
         yield SqlEventStore(factory, keep_snapshots=keep_snapshots)
     finally:
         await engine.dispose()
