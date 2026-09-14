@@ -1,7 +1,11 @@
-"""内存 ToolResultStore（默认实现，spec: tool-result-recovery）。
+"""ResultsCapabilityProvider 的默认后备存储（spec: tool-result-recovery）。
 
-进程内可用；LRU 双上限（条数 + 总字节）逐出最旧——被逐出的键 get 返回 None，调用方
-转显式未命中信息。跨进程恢复场景宿主应注册持久实现（runtime 据注册标志如实报告）。
+**不是一个 core 协议的实现**——core 只认 `SpillSink`。这是
+`ResultsCapabilityProvider` 内部用来放全文的容器，形状（`put` / 窗口 `get`）由该
+provider 自己定义；宿主要跨进程回取，按同一形状注入自己的实现即可。
+
+进程内可用；LRU 双上限（条数 + 总字节）逐出最旧——被逐出的键 get 返回 None，
+provider 转显式未命中信息。
 """
 
 from __future__ import annotations
@@ -10,10 +14,8 @@ import threading
 from collections import OrderedDict
 from typing import Any
 
-from ctx_weft.protocols.results import ToolResultStore
 
-
-class InMemoryToolResultStore(ToolResultStore):
+class InMemoryToolResultStore:
     """LRU 有界全文存储。窗口切片纯内存操作，无锁竞争热点（put/get 均持同一锁）。"""
 
     def __init__(

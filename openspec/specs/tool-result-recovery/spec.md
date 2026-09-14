@@ -6,9 +6,13 @@
 
 ## Requirements
 
-### Requirement: 全文入结果存储且可窗口回读
+### Requirement: 全文交 SpillSink，收敛版承载引用
 
-工具输出超过收敛阈值时，执行链 SHALL 在丢弃任何内容之前把全文写入结果存储，键为本次执行身份（invocation_id），后续同键重写以最新执行为准。结果存储 SHALL 支持窗口读取：按 offset/limit 分页与从末尾直读（tail）。宿主未注册持久实现时 runtime SHALL 提供内存默认（会话内可回取），声明跨进程恢复能力时 SHALL 如实报告该默认的易失性。
+工具输出超过收敛阈值时，执行链 SHALL 在丢弃任何内容之前把全文交给 `SpillSink`（core 对「超长输出去哪」的**唯一**契约），并把它返回的引用嵌入收敛版。SHALL NOT 为此另立第二个存储协议——「能不能被模型回读」是 sink **实现的能力**，不是 core 契约的分支。
+
+引用的措辞 SHALL 由 sink 决定（只有存进去的一方知道怎么取回来）：落盘实现给路径，可回读实现给工具调用形态。无 sink 或 spill 抛错时收敛版 SHALL 显式标注「不可取回」，MUST NOT 留下一个取不回来的引用。
+
+宿主可注册一个**可回读的** sink（内置 `ResultsCapabilityProvider`：全文入 LRU，并自带 `read_tool_output` 工具）。该 provider 同时是 `SpillSink` 与 `ToolCapabilityProvider`，注册一次两个角色齐备——存与取住在同一个对象里，不存在「注册了回读工具却没注册对应存储」的错配。未注册任何 sink 时超长输出硬截断。
 
 #### Scenario: 大输出尾部证据可找回
 

@@ -24,7 +24,10 @@ from ctx_weft.protocols.capability import (
     ToolCapability,
     ToolCapabilityProvider,
 )
-from ctx_weft.protocols.results import READ_TOOL_QUALIFIED_NAME
+from ctx_weft.providers.capability_results import (
+    READ_TOOL_QUALIFIED_NAME,
+    ResultsCapabilityProvider,
+)
 from ctx_weft.providers.capability_results import ResultsCapabilityProvider
 from ctx_weft.providers.events import InProcessEventBus
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
@@ -89,16 +92,23 @@ class _Big(ToolCapabilityProvider):
     async def cancel(self, invocation_id, ctx) -> None: return None
 
 
-def _harness(provider, *, store=None, ledger=None, threshold=1000):
+def _harness(provider, *, store=None, ledger=None, threshold=1000, sink=True):
+    """`sink=True` 注册一个可回读的 SpillSink（ResultsCapabilityProvider）。
+
+    core 只认 SpillSink——「能不能回读」由宿主注册哪种实现决定，不是 core 的协议分支。
+    """
     bus = InProcessEventBus()
     mem = InMemoryMemoryProvider()
     cache = CapabilityCache()
     cache.put("agt_1", [provider._cap()])
+    providers = [provider]
+    if sink:
+        providers.append(ResultsCapabilityProvider(store))
     gw = CapabilityGateway(
-        capability_cache=cache, capability_providers=[provider],
+        capability_cache=cache, capability_providers=providers,
         memory=mem, event_bus=bus, spill_threshold=threshold,
         spill_preview_chars=100, spill_tail_chars=120,
-        result_store=store, operation_store=ledger,
+        operation_store=ledger,
     )
     scope = MemoryAddress(session_id="s1", task_id="tsk_1", agent_id="agt_1")
     state = LoopState(
@@ -163,7 +173,7 @@ async def test_tail_evidence_reachable_via_read_tool_output():
     res = await gw.invoke("mcp__b__dump", {}, state, ctx)
     assert tail_marker in res.content                       # 尾部预览直接呈现
     inv_id = res.invocation_id
-    reader = ResultsCapabilityProvider(lambda: store)
+    reader = ResultsCapabilityProvider(store)
 
     async def _read(args):
         out = ""
@@ -209,7 +219,7 @@ async def test_completed_shortcircuit_replay_converges_and_reputs():
     store2 = InMemoryToolResultStore()
     gw2, *_ = _harness(_Big("unused"), store=store2, ledger=ledger)
     # gateway 默认 store 是独立实例——把重放 gateway 指向被清空的 store2：
-    gw2._result_store = store2
+    gw2._spill_sink = ResultsCapabilityProvider(store2)
     # 同一逻辑调用重入 = 同一个内部标识（旧设计靠 provider_ctx 另传身份才做得到）。
     replay = await gw2.invoke("mcp__b__dump", {}, state, ctx, tool_call_id=OP_A)
 
@@ -231,12 +241,12 @@ class _FailingStore(InMemoryToolResultStore):
 
 
 @pytest.mark.asyncio
-async def test_store_write_failure_marks_unavailability():
+async def test_spill_failure_marks_unrecoverable():
+    """sink 存不下 → 显式「不可取回」，不留一个取不回来的引用骗模型。"""
     provider = _Big("w" * 3_000)
     gw, mem, state, ctx, _ = _harness(provider, store=_FailingStore())
     res = await gw.invoke("mcp__b__dump", {}, state, ctx)
-    assert "full output unavailable" in res.content
-    assert "result store write failed" in res.content
+    assert "not recoverable" in res.content
     assert "w" * 100 in res.content          # 头部预览仍在（不静默、不空转）
 
 
@@ -267,10 +277,10 @@ async def test_reconcile_backfill_converges_ledger_result():
 
 
 @pytest.mark.asyncio
-async def test_pure_converge_no_sink_no_store_still_bounded():
-    """纯函数直调：无 store（None）→ 显式不可用；尾部预览仍在。"""
+async def test_pure_converge_without_sink_still_bounded():
+    """纯函数直调：无 sink → 显式不可取回；头尾预览仍在，输出仍有界。"""
     out = await converge_tool_output(
-        "q" * 2_500 + "END_MARK", "inv_x", None, None, None,
+        "q" * 2_500 + "END_MARK", "inv_x", None, None,
         threshold=1000, preview_chars=50, tail_chars=60)
-    assert "full output unavailable" in out
+    assert "not recoverable" in out
     assert "END_MARK" in out

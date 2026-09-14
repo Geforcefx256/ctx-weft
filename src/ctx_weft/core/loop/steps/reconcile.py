@@ -237,7 +237,7 @@ class ReconcileStep(Step):
         if gateway is not None:
             try:
                 content = await gateway._converge_result(  # noqa: SLF001 —— 与本文件既有 gateway 私有件同口径
-                    content, ctx, ref_inv, tc.get("name", ""), spillable=True, restore=True)
+                    content, ctx, ref_inv, tc.get("name", ""), spillable=True)
             except Exception:
                 logger.exception("ReconcileStep: converge on backfill failed for %s", op_id)
         await ctx.memory.ingest(MemoryEvent(

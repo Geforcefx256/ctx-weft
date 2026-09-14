@@ -560,14 +560,6 @@ class CtxWeftRuntime:
         self._config = config or RuntimeConfig()
         self._llm = llm  # fallback for backward compat / tests
         self.providers = providers or ProviderRegistry()
-        # spec: tool-result-recovery——回读工具是核心回取通路（收敛文本里的引用指向它），
-        # 构造期自动注册；store 经 getter 惰性两级解析（显式注册 > 内存默认）。
-        from ctx_weft.providers.capability_results import ResultsCapabilityProvider
-        if not any(
-            getattr(p, "name", "") == "results" for p in self.providers.get_capability_providers()
-        ):
-            self.providers.register_capability(
-                ResultsCapabilityProvider(self.providers.get_tool_result_store))
         # 默认实现只在 host 没给时才解析——避免「默认」从运行期选择退化成 import 期耦合。
         if event_bus is None:
             from ctx_weft.providers.events import InProcessEventBus
@@ -3778,8 +3770,6 @@ class CtxWeftRuntime:
             memory_blob_store=self.providers.get_memory_blob_store(),
             # spec: tool-operations（wp5）——操作账本：显式注册 > 内存默认（registry 惰性）
             operation_store=self.providers.get_operation_store(),
-            # spec: tool-result-recovery——全文可回取存储（同口径两级解析）
-            result_store=self.providers.get_tool_result_store(),
         )
 
     def _build_loop_ctx(

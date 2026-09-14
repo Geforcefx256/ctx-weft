@@ -32,7 +32,7 @@ from ctx_weft.providers.capability_results import ResultsCapabilityProvider
 from ctx_weft.providers.llm.tokenizer import HeuristicTokenizer
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from ctx_weft.providers.results import InMemoryToolResultStore
-from ctx_weft.protocols.results import READ_TOOL_QUALIFIED_NAME
+from ctx_weft.providers.capability_results import READ_TOOL_QUALIFIED_NAME
 
 
 CONSTRAINT_MARK = "[CONSTRAINT_TOKEN_X7]"
@@ -324,7 +324,7 @@ async def test_evidence_reference_readback_roundtrip(monkeypatch):
     # store 里有该执行的全文（B 的收敛写入；这里直接布景同一键）。
     store = InMemoryToolResultStore()
     await store.put("inv_evidence_1", "HEAD..." + "TAIL_EVIDENCE_9876543210", None)
-    reader = ResultsCapabilityProvider(lambda: store)
+    reader = ResultsCapabilityProvider(store)
 
     # digest 的 Evidence 节引用了 inv_evidence_1 → 经回读工具实际取回内容。
     assert "inv_evidence_1" in digest.sections.get("Evidence", "")

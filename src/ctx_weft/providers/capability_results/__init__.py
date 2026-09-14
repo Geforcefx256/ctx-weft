@@ -2,7 +2,8 @@
 
 from ctx_weft.providers.capability_results.provider import (
     PROVIDER_NAME,
+    READ_TOOL_QUALIFIED_NAME,
     ResultsCapabilityProvider,
 )
 
-__all__ = ["PROVIDER_NAME", "ResultsCapabilityProvider"]
+__all__ = ["PROVIDER_NAME", "READ_TOOL_QUALIFIED_NAME", "ResultsCapabilityProvider"]

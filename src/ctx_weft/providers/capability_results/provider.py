@@ -1,14 +1,24 @@
-"""ResultsCapabilityProvider：工具长输出的回读工具（spec: tool-result-recovery）。
+"""ResultsCapabilityProvider：一个**可回读的 SpillSink**（spec: tool-result-recovery）。
 
-`read_tool_output(invocation_id, offset | tail, limit)`——对收敛过的工具输出按窗口
-回取（分页 / 末尾直读）。核心回取通路（非 extras）：runtime 构造期自动注册，收敛文本
-中的引用指向的 qualified 名由 `protocols.results.READ_TOOL_QUALIFIED_NAME` 同源钉死。
+core 对「工具输出超长怎么办」只有一个契约——`SpillSink.spill()`：把全文交出去、拿回
+一个引用。本 provider 是它的一种实现：全文落进进程内 LRU，并额外提供
+`read_tool_output(invocation_id, offset | tail, limit)` 让模型按窗口取回来。
+
+宿主二选一（或都不选）：
+  - `FilesystemToolsProvider` —— 落盘成文件，宿主自己去读；模型取不回来。
+  - 本 provider —— 落进内存，**模型能通过工具取回**；进程退出即失。
+两者都靠 `isinstance(p, SpillSink)` 被 gateway 发现，注册一次即生效。**都不注册**则
+超长输出硬截断（与改造前无 sink 时同行为）。
+
+刻意**不另立 ToolResultStore 协议**：那与 SpillSink 是同一职责（把全文存到别处）的
+第二套说法，只会让宿主面对两个语义重叠的注册点。「能不能回读」是**实现的能力**，
+不是**契约的分支**——回读由本 provider 自带的工具提供，而非由 core 的协议规定。
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from typing import Any
 
 from ctx_weft.protocols.capability import (
@@ -18,11 +28,14 @@ from ctx_weft.protocols.capability import (
     ToolCapabilityProvider,
 )
 from ctx_weft.protocols.context import ProviderContext
+from ctx_weft.protocols.filesystem import SpillSink
 from ctx_weft.providers._tooldecl import make_tool_registry
 
 logger = logging.getLogger(__name__)
 
 PROVIDER_NAME = "results"
+#: 回读工具的 qualified 名。收敛提示里的引用由 `spill()` 生成，与此同源。
+READ_TOOL_QUALIFIED_NAME = f"{PROVIDER_NAME}__read_tool_output"
 
 tool, _RESULT_TOOLS, _RESULT_IMPLS = make_tool_registry(PROVIDER_NAME)
 
@@ -58,14 +71,36 @@ async def read_tool_output(
     raise NotImplementedError("declaration only — dispatched via ResultsCapabilityProvider")
 
 
-class ResultsCapabilityProvider(ToolCapabilityProvider):
-    """提供 read_tool_output（唯一工具）。store 经构造注入的 getter 惰性解析
-    （registry 两级解析在注册后仍可换实现）。"""
+class ResultsCapabilityProvider(ToolCapabilityProvider, SpillSink):
+    """可回读的 SpillSink：`spill()` 收全文，`read_tool_output` 按窗口取回。
+
+    两个角色住在同一个对象里是有意的——只有存进去的那一方知道怎么取回来；拆成两个
+    注册点只会制造「注册了回读工具却没注册对应存储」这类错配。
+
+    ``store`` 默认 `InMemoryToolResultStore`（LRU 双上限）；宿主要跨进程回取就按同一
+    形状注入自己的实现——那是**本实现的构造参数**，不是 core 的协议。
+    """
 
     name = PROVIDER_NAME
 
-    def __init__(self, store_getter: Callable[[], Any]) -> None:
-        self._store_getter = store_getter
+    def __init__(self, store: Any = None) -> None:
+        if store is None:
+            from ctx_weft.providers.results import InMemoryToolResultStore
+            store = InMemoryToolResultStore()
+        self._store = store
+
+    # ── SpillSink ─────────────────────────────────────────────────────────────
+
+    async def spill(self, content: str, ctx: ProviderContext, *, name_hint: str = "") -> str:
+        """收下全文，返回**给模型看的取回说明**（gateway 原样嵌进截断提示）。
+
+        ``name_hint`` 是本次执行的 invocation_id——它同时是回读键，所以说明里直接写成
+        可照抄的调用形态。存不下就抛（SpillSink 契约），gateway 据此回退硬截断。
+        """
+        key = name_hint or "unknown"
+        await self._store.put(key, content, ctx=ctx)
+        return (f"{READ_TOOL_QUALIFIED_NAME}("
+                f"invocation_id='{key}', tail=N or offset=N, limit=N)")
 
     async def info(self, ctx: ProviderContext) -> CapabilityProviderInfo:
         return CapabilityProviderInfo(
@@ -117,9 +152,7 @@ class ResultsCapabilityProvider(ToolCapabilityProvider):
         参数默认首页。limit/tail 钳制硬上限；未命中/异常 → 显式不可用（可区分空输出）。"""
         if not invocation_id:
             return "[read_tool_output requires a non-empty invocation_id]"
-        store = self._store_getter()
-        if store is None:
-            return _UNAVAILABLE.format(invocation_id=invocation_id)
+        store = self._store
         if limit is not None:
             limit = max(1, min(int(limit), _MAX_READ_CHARS))
         if tail is not None:

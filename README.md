@@ -683,7 +683,11 @@ async for ev in runtime.event_bus.stream(EventFilter(session_id="ses_xxx")):
 
 ### 工具长输出的收敛与回取（spec: tool-result-recovery）
 
-工具输出超过 `spill_threshold`（默认 4000 字符）时：全文写入**结果存储**（`ToolResultStore` 协议，registry 显式注册 > `InMemoryToolResultStore` 内存默认——LRU 双上限可逐出，跨进程回取需宿主注册持久实现并经 `register_tool_result_store` 注入），上下文（对话与 memory）只承载**收敛版** = 回取引用 + 全长 + 头部预览 + **尾部预览**（`spill_preview_chars` / `spill_tail_chars`）。模型经 `results:read_tool_output(invocation_id, offset | tail, limit)` 分页/尾部回取全文（runtime 自动注册，act 可用；invocation_id 每次执行一枚，取最新收敛文本里的值）。四个重放/补写入口（账本 completed 短路重放、恢复补写、queryable 重放、宿主 `supply_result`）统一过收敛；结果存储逐出后以账本全文重新入库（账本 completed 恒持收敛前全文）。存储写失败 → 收敛版显式 `[full output unavailable]` 标记；SpillSink（宿主文件落盘）降级为可选增值，成功时路径并列提示。
+工具输出超过 `spill_threshold`（默认 4000 字符）时：全文交给 **`SpillSink`**（core 对「超长输出去哪」的唯一契约，靠 `isinstance` 从已注册 provider 里发现），上下文（对话与 memory）只承载**收敛版** = sink 返回的引用 + 全长 + 头部预览 + **尾部预览**（`spill_preview_chars` / `spill_tail_chars`）。
+
+宿主注册哪种 sink 决定能力上限：`FilesystemToolsProvider` 落盘成文件（宿主自己读，模型取不回）；**`ResultsCapabilityProvider`** 落进内存 LRU 并自带 `results__read_tool_output(invocation_id, offset | tail, limit)` 工具，**模型能分页/尾部取回全文**（invocation_id 每次执行一枚，取最新收敛文本里的值）。该 provider 同时是 SpillSink 与 ToolCapabilityProvider，注册一次两个角色齐备。**都不注册**则超长输出硬截断。
+
+四个重放/补写入口（账本 completed 短路重放、恢复补写、裁决作结、宿主补录）统一过收敛——重放时再 spill 一次即可：可回读的 sink 借此在逐出/重启后重新入库，落盘的 sink 重写同名文件无害。无 sink 或 spill 抛错 → 收敛版显式标注 `not recoverable`，不留取不回来的引用。
 
 ### InMemoryMemoryProvider
 
