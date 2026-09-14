@@ -483,8 +483,11 @@ class EventStore(Protocol):
        `append_batch` / `read_range` / `committed_head`。
        **有序提交是底线，不是可选项**——理由见下节。
     2. **可选扩展**（默认 `raise NotImplementedError`，core 捕获后降级为全量 replay）：
-       `list_active_session_ids` / `read_after` / `read_session_events_of_types` /
+       `list_active_session_ids` / `read_session_events_of_types` /
        `save_snapshot` / `load_latest_snapshot`。
+
+    读取一律按 position：**不存在**「按事件 ID 取增量」的 API。ID 铸造序 ≠ 提交序，
+    那种游标正是 H2 的根因（详见下节）。
 
     ## 有序提交为何必选（spec: event-log；WP3 提交门 / WP4 快照切面的地基）
 
@@ -568,19 +571,6 @@ class EventStore(Protocol):
 
     async def list_active_session_ids(self) -> list[str]:
         """返回有 SessionCreated 但无终态事件的 session ID 列表（用于启动时 crash recovery）。"""
-        raise NotImplementedError
-
-    async def read_after(self, session_id: str, after_event_id: str) -> list[Event]:
-        """**[legacy]** 加载 session 中 id > after_event_id 的增量事件（ULID 字典序）。
-
-        ⚠️ **core 已无调用点，且 MUST NOT 用于快照增量**（spec: snapshot-recovery）：
-        ID 铸造序 ≠ 提交序，按 ID 当游标会让延迟提交的旧 ID 永久落在游标之外
-        （可靠性方案 H2）。恢复一律走 `read_range(after_position, through_position)`。
-        保留本方法只为宿主自有的「某 id 之后发生了什么」这类只读查询。
-
-        `after_event_id` 不存在于本 session 时，字面语义已蕴含：返回 id 大于它的
-        **全部**事件，不是空列表——这是纯过滤，不是"从标记处扫描、找不到就返回空"。
-        """
         raise NotImplementedError
 
     async def read_session_events_of_types(

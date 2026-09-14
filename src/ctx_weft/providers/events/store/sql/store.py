@@ -237,19 +237,6 @@ class SqlEventStore(EventStore):
             head = await db.get(SessionHeadModel, session_id)
             return head.next_position if head else 0
 
-    async def read_after(self, session_id: str, after_event_id: str) -> list[Event]:
-        # legacy 口径保留（spec: event-log）：按 id（ULID 字典序）过滤，新版快照恢复不再用。
-        async with self._factory() as db:
-            result = await db.execute(
-                select(EventModel)
-                .where(
-                    EventModel.session_id == session_id,
-                    EventModel.id > after_event_id,
-                )
-                .order_by(EventModel.id)
-            )
-            return [_row_to_event(r) for r in result.scalars().all()]
-
     async def read_session_events_of_types(
         self, session_id: str, types: "tuple[str, ...]",
     ) -> list[Event]:

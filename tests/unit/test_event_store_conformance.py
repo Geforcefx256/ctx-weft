@@ -66,7 +66,7 @@ def _ev(
     payload: dict | None = None,
     **kw,
 ) -> Event:
-    """事件 id 用 ULID 字典序等价的零填充串——read_after 的排序契约靠它。"""
+    """事件 id 用 ULID 字典序等价的零填充串——便于断言里按序比对。"""
     return Event(
         id=f"evt_{seq:04d}",
         run_id=kw.pop("run_id", "r1"),
@@ -131,43 +131,6 @@ async def test_read_by_session_isolates_sessions(store):
 
 async def test_read_by_session_unknown_returns_empty(store):
     assert await store.read_by_session("nope") == []
-
-
-# ── read_after ───────────────────────────────────────────────────────────────
-
-
-async def test_read_after_returns_strictly_later(store):
-    for seq in (1, 2, 3):
-        await store.append(_ev(seq))
-    got = await store.read_after("s1", "evt_0001")
-    assert [e.sequence for e in got] == [2, 3]
-
-
-async def test_read_after_last_event_returns_empty(store):
-    await store.append(_ev(1))
-    assert await store.read_after("s1", "evt_0001") == []
-
-
-async def test_read_after_absent_marker_returns_everything_later(store):
-    """标记不在 store 里时返回 id 大于它的全部事件，而不是空。
-
-    这条路径是活的：rebuild_view 拿快照的 last_event_id 调 read_after
-    （core/control/reducers.py:337）。快照引用了一个不在 store 里的 id 时，
-    「静默返回空」会丢掉整段 delta——view 退化成只剩快照，且不可观测。
-    协议口径是过滤式的（id > after_event_id），不是从标记处扫描。
-    """
-    for seq in (1, 2, 3):
-        await store.append(_ev(seq))
-    got = await store.read_after("s1", "evt_0000")   # 不存在的标记，排在全部之前
-    assert [e.sequence for e in got] == [1, 2, 3]
-
-
-async def test_read_after_absent_marker_sorted_after_all_returns_empty(store):
-    """标记不在 store 里、但字典序排在全部事件之后时，过滤式语义自然返回空。"""
-    for seq in (1, 2, 3):
-        await store.append(_ev(seq))
-    got = await store.read_after("s1", "evt_9999")
-    assert got == []
 
 
 # ── read_session_events_of_types ─────────────────────────────────────────────

@@ -220,6 +220,8 @@ def test_single_event_protocol_no_parallel_ordered_protocol():
     """有序提交并进 EventStore，不另立第二个 Protocol（避免两套 store 契约）。"""
     import ctx_weft.protocols.events as mod
     assert not hasattr(mod, "OrderedEventStore")
+    # 按事件 ID 取增量的 API 已彻底移除（H2 的作案工具）
+    assert not hasattr(mod.EventStore, "read_after")
     for name in ("append_batch", "read_range", "committed_head"):
         assert hasattr(mod.EventStore, name)
 
@@ -229,7 +231,7 @@ def test_ordered_commit_methods_are_mandatory():
     assert EventStore.__abstractmethods__ >= {
         "append", "read_by_session", "append_batch", "read_range", "committed_head"}
     # 可选扩展仍是可选：不在 abstractmethods 里
-    for name in ("read_after", "save_snapshot", "load_latest_snapshot",
+    for name in ("save_snapshot", "load_latest_snapshot",
                  "list_active_session_ids", "read_session_events_of_types"):
         assert name not in EventStore.__abstractmethods__
 
@@ -278,7 +280,7 @@ def test_runtime_rejects_store_without_ordered_commit():
         """只有旧接口的 store——WP2 之前的形态。"""
         async def append(self, event): ...
         async def read_by_session(self, session_id): return []
-        async def read_after(self, session_id, after_event_id): return []
+        # 没有 append_batch / read_range / committed_head
 
     for policy in ("required", "best_effort"):
         with pytest.raises(ValueError, match="未实现有序提交"):

@@ -327,8 +327,8 @@ async def rebuild_view(event_store: Any, session_id: str) -> RunStateView:
        引用未来位置（数据异常）→ ``read_range(0..head)`` 全量折。
        忽略坏快照是性能降级不是数据丢失（日志是真相）。
 
-    ``read_after(id)`` **不在本函数的任何路径上**：ID 铸造序 ≠ 提交序，按 ID 当游标
-    正是 H2 的根因。
+    「按事件 ID 取增量」这种读法已从 `EventStore` 彻底移除：ID 铸造序 ≠ 提交序，
+    按 ID 当游标正是 H2 的根因。
     """
     try:
         snapshot = await event_store.load_latest_snapshot(session_id)

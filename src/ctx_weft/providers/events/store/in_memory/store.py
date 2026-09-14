@@ -138,19 +138,6 @@ class InMemoryEventStore(EventStore):
     async def list_active_session_ids(self) -> list[str]:
         return list(self._active)
 
-    async def read_after(self, session_id: str, after_event_id: str) -> list[Event]:
-        # legacy 口径（spec: event-log 保留不动）：按 id（ULID）排序过滤，不依赖提交序。
-        #
-        # ⚠️ after_event_id 不存在于本 session 时，返回 id 大于它的**全部**事件，
-        # 不是空列表——协议口径是过滤式的（"id > after_event_id"），不是"从标记处
-        # 扫描"。这条路径是活的：core/control/reducers.py 的 rebuild_view 拿快照的
-        # last_event_id 调本方法；快照引用了一个不在 store 里的 id 时（事件流被截断、
-        # 快照来自别处、或存储不一致），静默返回空会让 view 退化成只剩快照、且这个
-        # 数据损失不可观测。多回放一段最坏只是重复折叠（reduce_events 幂等），比
-        # 静默丢 delta 安全。
-        events = sorted(self._stored.get(session_id, []), key=lambda se: se.event.id)
-        return [se.event for se in events if se.event.id > after_event_id]
-
     async def read_session_events_of_types(
         self, session_id: str, types: tuple[str, ...],
     ) -> list[Event]:

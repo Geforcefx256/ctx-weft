@@ -2,7 +2,7 @@
 
 覆盖：
 1. InMemoryEventStore.save_snapshot / load_latest_snapshot 往返，且只保留每 session 最新一张。
-2. rebuild_view 在有快照时走「deserialize(snapshot) + read_after(delta)」，
+2. rebuild_view 在有快照时走「deserialize(snapshot) + read_range(delta)」，
    结果与全量 reduce_events 完全一致——即快照不改变恢复语义，只省回放量。
 3. 无快照时 rebuild_view 退回全量回放（向后兼容）。
 """
@@ -24,7 +24,7 @@ def _ts() -> datetime:
 
 
 def _ev(seq: int, type_: str, **payload) -> Event:
-    """构造一个 session=s1 的事件；id 单调，便于 read_after 切分。"""
+    """构造一个 session=s1 的事件；id 单调，便于断言里按序比对。"""
     task_id = payload.pop("task_id", None)
     return Event(
         id=f"evt_{seq:04d}",
