@@ -78,19 +78,12 @@ class ActStep(Step):
 
         for turn_num in range(1, max_turns + 1):
             await _interrupt_checkpoint(state, ctx)
-            # spec: execution-limits（wp7）——轮边界检查点：check（超限抛）+ 本次逻辑
-            # LLM 请求预占一轮（崩溃恢复不超支；consume 在 _run_llm_turn 兑现）
-            if ctx.execution_budget is not None:
-                ctx.execution_budget.reserve_turn()
-                ctx.execution_budget.check()
             await ctx.event_bus.emit(make_event(
                 state, EventType.ACT_TURN_STARTED, payload={"turn": turn_num}))
 
             # 1) 单轮 LLM：流式累积文本 / reasoning / tool_calls / usage（软打断在内部 park）
             sent_msg_count = len(current_messages)  # 本轮发送条数（append 前）→ 下轮增量基线
             turn = await _run_llm_turn(state, ctx, prompt, current_messages, turn_num, baseline_msg_count)
-            if ctx.execution_budget is not None:
-                ctx.execution_budget.consume_turn()   # 逻辑请求计次（自愈在内部不重计）
 
             # 2) token 记账 + context_limit 判定
             context_limit_hit = await _account_tokens(state, ctx, turn.usage)

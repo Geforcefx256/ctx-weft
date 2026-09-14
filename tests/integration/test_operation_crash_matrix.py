@@ -98,7 +98,6 @@ async def test_ot06_completed_memory_write_crash_ledger_backfills(tmp_path):
     组件级（真退出形态的等价物）：直接构造 completed 账本 + 空 memory → 新 runtime
     的 reconcile/裁决链语义——这里用更直接的方式验证「账本有结局 → memory 可补」。
     """
-    from ctx_weft.core.control.execution_budget import ExecutionLimits  # noqa: F401
     mem = InMemoryMemoryProvider()
     from ctx_weft.protocols.memory import MemoryKind
     scope = MemoryAddress(session_id="s1", task_id="t1", agent_id="a1")

@@ -42,8 +42,3 @@ class TaskErrorCode(StrEnum):
     BY_THRESHOLD = "TASK_FAILED_BY_THRESHOLD"
     # spec: tool-operations（wp6）——工具副作用结果未知：恢复保守停住等宿主
     # resolve_operation 处置（supply_result / retry_confirmed / cancel_task）。
-    # spec: execution-limits（wp7）——opt-in 执行限制的四态超限码（不混淆 USER_CANCEL）
-    TASK_DEADLINE_EXCEEDED = "TASK_INTERRUPTED_TASK_DEADLINE_EXCEEDED"
-    STEP_DEADLINE_EXCEEDED = "TASK_INTERRUPTED_STEP_DEADLINE_EXCEEDED"
-    PROVIDER_DEADLINE_EXCEEDED = "TASK_INTERRUPTED_PROVIDER_DEADLINE_EXCEEDED"
-    ACTOR_TURN_LIMIT = "TASK_INTERRUPTED_ACTOR_TURN_LIMIT"

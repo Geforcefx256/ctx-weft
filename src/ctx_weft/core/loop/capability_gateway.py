@@ -62,10 +62,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-
-class _ProviderDeadlineExceeded(Exception):
-    """provider 活动时间超限（spec: execution-limits）。由 ActStep 收敛为工具错误。"""
-
 _REDACT_HEADERS = frozenset({"authorization", "cookie", "x-api-key", "x-auth-token"})
 
 # 无人值守撞上 HITL 时的两句措辞（`ask_user` 例外，它的文本住在 control_tools）。
@@ -209,7 +205,6 @@ class CapabilityGateway:
         spill_preview_chars: int = 1000,
         memory_blob_store: "MemoryBlobStore | None" = None,
         operation_store=None,
-        limits=None,
     ) -> None:
         self._cache = capability_cache
         self._providers = capability_providers
@@ -226,10 +221,6 @@ class CapabilityGateway:
         # spec: tool-operations（wp5）——操作账本（None = 调用方未接线，operation_id
         # 存在也旁路；runtime 构造期从 registry 解析注入）。
         self._operation_store = operation_store
-        # spec: execution-limits（wp7）——执行限制（None = 未注入，零行为变化）
-        # 与不合作 provider 名单（超时且宽限后仍未收尾）
-        self._limits = limits
-        self._uncooperative_providers: set = set()
         self._event_bus = event_bus
         self._provider_authorizers: dict[str, Authorizer] = provider_authorizers or {}
         if default_authorizer is None:
@@ -718,50 +709,9 @@ class CapabilityGateway:
         事件消费循环与错误/取消处理分别由 `_stream_events` / `_stream_events_safe` 承担，
         `resume` 复用同一对 helper——不重复写这段循环（spec §2 的编排约束）。
         """
-        # spec: execution-limits（wp7）——provider 活动时间上限（progress 不续命）。
-        # 不合作 provider（此前超时未收尾）在同会话被拒绝：超时不证明副作用未发生，
-        # 不能假装 asyncio 能终止不合作的 Python 代码。
-        if provider in self._uncooperative_providers:
-            # _ToolStream 形态（非 InvocationResult）——与 _stream_tool 的返回契约一致，
-            # 下游 6b 的 needs_human_ask / _record_result 正常消费
-            return _ToolStream(
-                texts=[f"[Error: provider for '{cap_id}' previously exceeded its "
-                       f"cleanup grace and is marked uncooperative — further "
-                       f"side-effecting calls in this session are refused. Host "
-                       f"must isolate the provider process.]"],
-                is_error=True)
-        limits = getattr(self._limits, "provider_timeout_sec", None)
-        grace = getattr(self._limits, "cleanup_grace_sec", 5.0)
-        stream = provider.invoke(cap_id, execution_args, provider_ctx)
-        if limits is None:
-            return await self._stream_events_safe(
-                stream, provider, provider_ctx, state, invocation_id)
-        try:
-            return await asyncio.wait_for(
-                self._stream_events_safe(
-                    stream, provider, provider_ctx, state, invocation_id),
-                timeout=limits)
-        except asyncio.TimeoutError:
-            # 取消防护网 + 宽限等待；仍未收尾 → 标记不合作。suppress 兜 CancelledError
-            # （3.11+ 是 BaseException，裸 suppress(Exception) 拦不住取消链的尾巴）。
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await provider.cancel(invocation_id, provider_ctx)
-            try:
-                await asyncio.wait_for(self._drain_quietly(stream), timeout=grace)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                self._uncooperative_providers.add(provider)
-                logger.error(
-                    "provider for '%s' exceeded cleanup grace %.1fs — marked "
-                    "uncooperative; session side effects refused until host isolates",
-                    cap_id, grace)
-            raise _ProviderDeadlineExceeded(
-                f"provider '{cap_id}' exceeded {limits}s active-time limit")
-
-    async def _drain_quietly(self, events) -> None:
-        """宽限期静默排空（防 unhandled iterator warning；含取消尾巴）。"""
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            async for _ in events:
-                pass
+        return await self._stream_events_safe(
+            provider.invoke(cap_id, execution_args, provider_ctx), provider,
+            provider_ctx, state, invocation_id)
 
     async def _stream_events_safe(
         self, events, provider, provider_ctx, state, invocation_id,

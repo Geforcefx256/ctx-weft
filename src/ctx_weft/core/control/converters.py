@@ -59,8 +59,6 @@ def task_from_projection(proj: TaskView) -> Task:
         dag_deps=list(proj.dag_deps),
         priority=proj.priority,
         max_retries=proj.max_retries,
-        timeout_ms=proj.timeout_ms,
-        budget_consumed=proj.budget_consumed,
         settings=deserialize_settings(proj.settings_raw),
         interaction_mode=proj.interaction_mode,  # type: ignore[arg-type]
         unattended=proj.unattended,

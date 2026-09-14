@@ -335,8 +335,6 @@ template = AgentTemplate(
     loop_config=LoopConfig(
         max_turns_per_act=10,       # 单个 ActStep 最多多少轮 LLM 调用
         max_turns_per_observe=5,
-        max_turns_per_agent=20,
-        timeout_per_step_sec=120,
         failure_threshold=3,
         max_spawn_depth=4,          # 子 agent 最大嵌套深度
         compact_token_ratio=0.8,    # token 占 context_limit 比例超过则压缩
@@ -615,7 +613,7 @@ class RunHandle:
 
 > **快照恢复（2026-09 起，spec: snapshot-recovery）**：快照边界 = 已确认提交位置（`committed_head` 一致切面），恢复增量按 position 区间；旧格式快照自动忽略并全量重建，无需手工迁移事件数据（存量库回填用 `scripts/migrate_event_positions.py`）。
 >
-> **执行限制（2026-09 起，spec: execution-limits）**：`RuntimeConfig.execution_limits = ExecutionLimits(...)` opt-in 注入——`task/step/provider_active_timeout_sec` + `max_actor_turns_per_task`（默认全 None = 不限制）。计量语义：等 HITL/子任务不计 active time；actor turns 按逻辑 LLM 请求计；跨 retry 累计；monotonic clock。超限 → INTERRUPTED + 专用错误码。**旧字段**（`max_turns_per_agent` / `timeout_per_step_sec` / `Task.timeout_ms`）从未被执行——已发 DeprecationWarning，不激活、不映射，请迁移到 `ExecutionLimits`。
+> **执行时长/轮数限制（2026-09 起）**：core **不提供**任务级 deadline 或轮数上限——这是宿主的策略，不是 SDK 的职责。需要超时就在宿主侧计时并调 `cancel_task` / `cancel_agent`；需要 provider 级超时就在 provider 自己的工具实现里做。三个从未被执行的旧字段（`max_turns_per_agent` / `timeout_per_step_sec` / `Task.timeout_ms`）**已删除**——它们声明了限制却无任何运行时消费者，留着只会让宿主以为有防线。`max_turns_per_act` / `max_turns_per_observe` 等**真正生效**的循环上限不受影响。
 
 > **提交策略（2026-09 起，spec: event-commit）**：默认 `event_commit_policy="required"`——事件先经提交门确认存储写入、再对外通知（存储失败显式抛 `PersistenceUnavailableError` 并隔离会话）。**自定义 EventBus 必须实现 `attach_commit_gate` 扩展**，否则 required 模式构造期失败；不接受该约束的宿主可显式配置 `RuntimeConfig(event_commit_policy="best_effort")` 退回旧的吞错路径（启动告警、不可靠恢复）。
 

@@ -1614,7 +1614,6 @@ def task_payload(task: Task, *, user_prompt_jsonable: "str | list[dict] | None")
             "user_prompt": prompt or "",
             "priority": task.priority,
             "max_retries": task.max_retries,
-            "timeout_ms": task.timeout_ms,
             "dag_deps": task.dag_deps,
             "interaction_mode": task.interaction_mode,
             "unattended": task.unattended,

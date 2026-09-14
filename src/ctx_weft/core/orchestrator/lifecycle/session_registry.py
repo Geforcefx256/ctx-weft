@@ -21,23 +21,6 @@ from ctx_weft.core.utils.ids import generate_id
 from ctx_weft.protocols.context import ProviderContext
 
 
-_TIMEOUT_MS_WARNED = False
-
-
-def _timeout_ms_field(default_ms: int) -> int:
-    """spec: execution-limits（wp7）——Task.timeout_ms 从未被执行：非默认值时发一次
-    去重 DeprecationWarning（值照常透传，行为不变）。"""
-    global _TIMEOUT_MS_WARNED
-    if default_ms != 60_000 and not _TIMEOUT_MS_WARNED:
-        _TIMEOUT_MS_WARNED = True
-        import warnings
-        warnings.warn(
-            "Task.timeout_ms / default_task_timeout_ms is declared but never "
-            "enforced; it will be removed in a future breaking release. Migrate to "
-            "RuntimeConfig.execution_limits (ExecutionLimits.task_active_timeout_sec).",
-            DeprecationWarning, stacklevel=2)
-    return default_ms
-
 
 if TYPE_CHECKING:
     from ctx_weft.protocols import ContentPart
@@ -97,7 +80,6 @@ class SessionRegistry:
     event_bus: EventBus
     task_max_concurrent: int = 4
     task_max_retries: int = 3
-    default_task_timeout_ms: int = 60_000
 
     #: session_id → 容器状态（tenant + 成员 agent 集合）。
     _states: dict[str, _SessionState] = field(default_factory=dict, init=False, repr=False)
@@ -345,7 +327,6 @@ class SessionRegistry:
             # 后台作业没有人会发下一条消息，interactive 的纯文本 park 就是永久挂起——
             # 没有人来应答，那条 HITL 也永远不会被终局。
             interaction_mode="auto" if unattended else "interactive",
-            timeout_ms=_timeout_ms_field(self.default_task_timeout_ms),
             created_at=now_utc(),
         )
         task_manager = TaskManager(

@@ -49,22 +49,6 @@ logger = logging.getLogger(__name__)
 
 
 
-_DEPRECATED_WARNED: set[str] = set()
-
-
-def _deprecated_field(cast, name: str, raw: dict, default):
-    """spec: execution-limits（wp7）——旧字段解析 + 进程内去重 DeprecationWarning。
-    值照常解析（行为不变——这两个字段从未被执行，激活即破坏既有任务）。"""
-    if name in raw and name not in _DEPRECATED_WARNED:
-        _DEPRECATED_WARNED.add(name)
-        import warnings
-        warnings.warn(
-            f"LoopConfig.{name} is declared but never enforced; it will be removed "
-            f"in a future breaking release. Migrate to "
-            f"RuntimeConfig.execution_limits (ExecutionLimits) for enforceable limits.",
-            DeprecationWarning, stacklevel=2)
-    return cast(raw.get(name, default))
-
 class TemplateLoader:
     """解析 template 目录（SOUL.md + ROLE.md）→ AgentTemplate。"""
 
@@ -200,8 +184,6 @@ def _parse_loop_config(raw: dict) -> LoopConfig:
     return LoopConfig(
         max_turns_per_act=int(raw.get("max_turns_per_act", 50)),
         max_turns_per_observe=int(raw.get("max_turns_per_observe", 5)),
-        max_turns_per_agent=_deprecated_field(int, "max_turns_per_agent", raw, 20),
-        timeout_per_step_sec=_deprecated_field(int, "timeout_per_step_sec", raw, 120),
         # 这是**配置 schema 的字段名**（模板作者面向），不是判别值。它与
         # CancelReason.FAILURE_THRESHOLD 今天恰好同名，但两者是各自独立演进的契约：
         # 前者对模板作者、后者对 host。若把 key 绑上枚举，日后改判别值的名字会让

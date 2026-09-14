@@ -145,9 +145,6 @@ class LoopContext:
     run_phase: RunPhase = field(default_factory=RunPhase)
     # 配置
     config: Any = None
-    # 执行预算（spec: execution-limits，wp7）：per-task 计量器；None = 未注入限制
-    # （零行为变化——budget.check() 调用点全部容忍 None）
-    execution_budget: Any = None
     # TaskManager 引用（Phase 5+）；PrepareStep compact dispatch 用；None 时退化为 inline compact
     task_manager: TaskManager|None = None
     # HITL：管账的 service 与管栈的 waiter 分开持有——旧实现把两者塞进一个对象，
@@ -318,11 +315,6 @@ class StepDriver:
             step = self.steps.get(next_step_name)
             if step is None:
                 raise ValueError(f"Step '{next_step_name}' not registered")
-
-            # 步边界检查点（spec: execution-limits，wp7）：超限抛 ExecutionLimitExceeded
-            # → _run_loop 置 error_code 走 INTERRUPTED。未注入 budget 时零开销。
-            if ctx.execution_budget is not None:
-                ctx.execution_budget.check()
 
             # 每步开始前写 state.origin（driver 发的三条 STEP_* 事件覆盖为 LOOP_DRIVER）
             state.origin = _STEP_ORIGIN.get(step.name, EventOrigin.LOOP_DRIVER)

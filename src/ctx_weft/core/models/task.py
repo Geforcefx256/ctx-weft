@@ -158,10 +158,8 @@ class Task:
 
     retry_count: int = 0
     max_retries: int = 3
-    timeout_ms: int = 60_000
     # spec: execution-limits（wp7→wp8）——已消费执行预算的持久化快照
     # （snapshot() 产物：{active_sec, turns}）；None = 从未计量（行为同无 persisted）
-    budget_consumed: "dict | None" = None
 
     compensation: dict[str, Any] | None = None
     priority: int = 5
