@@ -24,7 +24,7 @@ from ctx_weft.core.orchestrator.task.disposition import (
     RunOutcomeKind,
     disposition_for,
 )
-from ctx_weft.core.orchestrator.task.queue import QueueEntry, TaskQueue, split_deps
+from ctx_weft.core.orchestrator.task.queue import QueueEntry, TaskQueue
 from ctx_weft.core.orchestrator.task.runner import AgentBinding, TaskRunner, effective_agent_id
 from ctx_weft.core.models.session import Session
 from ctx_weft.core.models.status import TaskStatus
@@ -182,8 +182,9 @@ class TaskManager:
                 self._parent_map[t.id] = t.parent_task_id
                 self._children_of.setdefault(t.parent_task_id, set()).add(t.id)
 
-        self._queue.seed_completed(terminal_ids)
-        # spec: task-handoff——成功集与终态集分开装填：FINISHED 的才释放 on_success 依赖。
+        # spec: task-handoff——只有 FINISHED 释放后继。终态但未成功的前序留在各条目的
+        # blocked_by 里，交给恢复期的永久阻塞扫描处置（A 已 FAILED 落盘、B 的级联取消
+        # 未落盘的崩溃窗口正是靠那一趟兜底）。
         succeeded_ids = {t.id for t in all_tasks if t.status == "FINISHED"}
         self._queue.seed_succeeded(succeeded_ids)
 
@@ -208,17 +209,10 @@ class TaskManager:
             else:
                 t.status = "PENDING"
                 t.retry_count = 0
-                # spec: task-handoff——按条件重建两集：any 依赖对任意终态释放、
-                # success 依赖只对 FINISHED 释放（terminal-but-not-succeeded 的依赖
-                # 保持阻塞，交给恢复期的永久阻塞扫描处置——A 已 FAILED 落盘、
-                # B 的级联取消未落盘的崩溃窗口正是靠那个扫描兜底）。
-                any_deps, success_deps = split_deps(t.dag_deps, t.dep_conditions)
-                any_deps -= terminal_ids
-                success_deps -= succeeded_ids
+                blocked = {dep for dep in (t.dag_deps or []) if dep not in succeeded_ids}
                 self._queue.push(QueueEntry(
                     task_id=t.id, session_id=self._session_id,
-                    priority=t.priority,
-                    blocked_by=any_deps, blocked_success=success_deps,
+                    priority=t.priority, blocked_by=blocked,
                 ))
 
     async def push_task(
@@ -264,27 +258,15 @@ class TaskManager:
             self._children_of.setdefault(parent_task_id, set()).add(task.id)
         if blocked_by:
             task.dag_deps = list(blocked_by)
-            # spec: task-handoff——写入时物化缺省：新派发的依赖缺省 on_success，
-            # 显式声明（delegate_plan 的 run_if）优先。读取侧（restore/queue）因此
-            # 永远不需要猜缺省——存量事件没有 dep_conditions 才按 any 解释。
-            conds = dict(task.dep_conditions or {})
-            for dep in blocked_by:
-                conds.setdefault(dep, "success")
-            task.dep_conditions = conds
 
-        any_deps, success_deps = split_deps(task.dag_deps, task.dep_conditions)
         entry = QueueEntry(
             task_id=task.id,
             session_id=self._session_id,
             priority=task.priority,
-            blocked_by=any_deps,
-            blocked_success=success_deps,
+            blocked_by=set(task.dag_deps or []),
         )
         self._queue.push(entry)
-        logger.debug(
-            "TaskManager.push_task: %s blocked_any=%s blocked_success=%s",
-            task.id, any_deps, success_deps,
-        )
+        logger.debug("TaskManager.push_task: %s blocked_by=%s", task.id, entry.blocked_by)
         # 创建即落盘：未跑过的排队 / blocked task 也进事件日志，
         # 崩溃恢复时 restore() 可由 dag_deps 重建依赖链，无需父任务重新 spawn。
         # push_task 是唯一的「新建」路径（retry / resume / active 重排都走 _queue.push），
@@ -444,9 +426,9 @@ class TaskManager:
                          "reason": "discarded_before_first_chunk"},
             )
 
-        # ④ 队列与登记复位。用 `cancel` + `unmark_running` 而**不是** `mark_complete` /
-        #    `mark_failed`：后两者会把 task_id 塞进 `_completed`（给依赖解阻塞用的
-        #    「已了结」集合）。一轮没发生过的 task 不该出现在那里。
+        # ④ 队列与登记复位。用 `cancel` + `unmark_running` 而**不是** `mark_complete`：
+        #    后者会把 task_id 塞进 `_succeeded`（给依赖解阻塞用的「已成功」集合）。
+        #    一轮没发生过的 task 不该出现在那里。
         self._queue.cancel(task_id)
         self._queue.unmark_running(task_id)
         self._running_agents.pop(task_id, None)
@@ -834,7 +816,7 @@ class TaskManager:
         prompt = build_reopen_prompt(task, reason, upstream)
 
         async with self._lock:
-            self._queue.unmark_completed(task_id)
+            self._queue.unmark_succeeded(task_id)
             self._queue.unmark_running(task_id)
             task.status = "PENDING"
             task.actor_done = False
@@ -852,16 +834,9 @@ class TaskManager:
             task.user_prompt_in_memory = False  # let the driver re-ingest the revised prompt
             if blocked_by is not None:
                 task.dag_deps = list(blocked_by)  # restart 时由 dag_deps 重建依赖链
-                # spec: task-handoff——条件存活：链序不变（同 plan 后继按原顺序重排），
-                # 沿用任务原有的条件声明；存量任务本就无条件（None）→ 继续按 any。
-                old_conds = task.dep_conditions or {}
-                task.dep_conditions = (
-                    {dep: old_conds[dep] for dep in blocked_by if dep in old_conds} or None
-                )
-            any_deps, success_deps = split_deps(task.dag_deps, task.dep_conditions)
             self._queue.push(QueueEntry(
                 task_id=task_id, session_id=self._session_id, priority=task.priority,
-                blocked_by=any_deps, blocked_success=success_deps,
+                blocked_by=set(blocked_by or []),
             ))
         # 把改写后的 prompt 一并落进事件，使崩溃恢复（event replay）能重建修订后的
         # user_prompt。reopen 只在 prompt 尾部追加**文本** section，不可能引入事件流
@@ -1017,12 +992,9 @@ class TaskManager:
 
         async with self._lock:
             self._clear_running(task_id)
-            if status == "FAILED":
-                self._queue.mark_failed(task_id)
-            elif status == "CANCELED":
-                # spec: task-handoff——取消也是「终态但非成功」：只释放 on_any 依赖，
-                # on_success 后继保持阻塞（其善后由永久阻塞扫描处置）。对存量
-                # （全部 any 依赖）行为不变——两种收尾都进 _completed。
+            if status in ("FAILED", "CANCELED"):
+                # spec: task-handoff——终态但非成功，**不解锁任何后继**：它们依赖的是
+                # 这个任务的产出，而产出不存在。后继的善后由永久阻塞扫描处置。
                 self._queue.mark_failed(task_id)
             else:
                 self._queue.mark_complete(task_id)
@@ -1112,17 +1084,17 @@ class TaskManager:
                 await self._fire_session_done()
 
     def _find_blocked_forever(self) -> "tuple[str, str] | None":
-        """定位一个 on_success 依赖已判明永不可满足的排队任务 → (task_id, 阻塞源 dep_id)。
+        """定位一个依赖已判明永不可满足的排队任务 → (task_id, 阻塞源 dep_id)。
 
-        判据是**当前状态**而非回调：任何时刻某 success 依赖已 FAILED/CANCELED，
-        该条目就永不可能被释放（没有再让它成功的路径——reopen 会重建条件，那是
-        观察者的决定，不是调度的）。幂等：已终态任务跳过。
+        判据是**当前状态**而非回调：任何时刻某依赖已 FAILED/CANCELED，该条目就永不
+        可能被释放（没有再让它成功的路径——reopen 会把依赖链整个重排，那是观察者的
+        决定，不是调度的）。幂等：已终态任务跳过。
         """
         for entry in self._queue.peek_all():
             task = self._tasks.get(entry.task_id)
             if task is None or task.status in TERMINAL_TASK_STATUSES:
                 continue
-            for dep in entry.blocked_success:
+            for dep in entry.blocked_by:
                 dep_task = self._tasks.get(dep)
                 if dep_task is not None and dep_task.status in ("FAILED", "CANCELED"):
                     return entry.task_id, dep
@@ -1152,7 +1124,9 @@ class TaskManager:
                 task_id, dep_id = found
                 task = self._tasks.get(task_id)
                 if task is None:
-                    continue
+                    # `_find_blocked_forever` 已过滤过；真到这里说明登记表被并发改动，
+                    # 必须 break 而非 continue——重扫会原样再返回同一条，成死循环。
+                    break
                 task.status = "CANCELED"
                 task.error_code = TaskErrorCode.BLOCKED_BY_FAILED_DEP
                 task.error = f"blocked by failed/canceled predecessor {dep_id}"
@@ -1722,9 +1696,6 @@ def task_payload(task: Task, *, user_prompt_jsonable: "str | list[dict] | None")
             "priority": task.priority,
             "max_retries": task.max_retries,
             "dag_deps": task.dag_deps,
-            # spec: task-handoff——依赖条件随创建事件落盘（None 原样落：存量读侧
-            # 按「未声明」解释，不虚构）。
-            "dep_conditions": task.dep_conditions,
             "interaction_mode": task.interaction_mode,
             "unattended": task.unattended,
             "origin_tool_call_id": task.origin_tool_call_id or "",

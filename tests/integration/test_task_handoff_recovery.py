@@ -124,11 +124,11 @@ async def test_delegate_ack_id_drives_review_reopen_by_id():
     assert tm.get_task(c1).status == "PENDING"        # 按 id 命中、链路重排
 
 
-# ── 4.4 计划断裂：step2 失败 → step3 取消（带原因）、清理步照常 ──────────────
+# ── 4.4 计划断裂：step2 失败 → 其后各步级联取消（带原因），会话不被误标 ──────
 
 
 @pytest.mark.asyncio
-async def test_plan_break_cancels_successors_and_runs_cleanup():
+async def test_plan_break_cancels_all_successors():
     bus = _CapturingBus()
     tm = _tm(bus)
     parent = _parent()
@@ -138,12 +138,12 @@ async def test_plan_break_cancels_successors_and_runs_cleanup():
         {"title": "produce"},
         {"title": "transform"},
         {"title": "final"},
-        {"title": "cleanup", "run_if": "any"},
+        {"title": "cleanup"},
     ])
     produce, transform, final, cleanup = ordered
-    # flush 后 push_task 物化的条件（链序 produce→transform→final→cleanup）
-    assert final.dep_conditions == {transform.id: "success"}
-    assert cleanup.dep_conditions == {final.id: "any"}
+    # plan 是严格串行链：produce→transform→final→cleanup
+    assert final.dag_deps == [transform.id]
+    assert cleanup.dag_deps == [final.id]
 
     produce.status = "FINISHED"
     await tm.on_task_finished(produce.id, status="FINISHED")
@@ -153,9 +153,12 @@ async def test_plan_break_cancels_successors_and_runs_cleanup():
     assert final.status == "CANCELED"
     assert final.error_code == "BLOCKED_BY_FAILED_DEP"
     assert final.error and transform.id in final.error
-    assert cleanup.status == "PENDING"               # 清理步不受阻
+    # 级联到不动点：cleanup 依赖 final，final 被取消后它同样永不可满足
+    assert cleanup.status == "CANCELED"
+    assert cleanup.error_code == "BLOCKED_BY_FAILED_DEP"
+    assert cleanup.error and final.id in cleanup.error
     assert tm.session.status != "CANCELED"            # 会话不被误标
-    assert not any(e.task_id == final.id for e in tm._queue.peek_all())
+    assert not any(e.task_id in (final.id, cleanup.id) for e in tm._queue.peek_all())
 
 
 # ── 5.2 行为变更专项回归 ─────────────────────────────────────────────────────

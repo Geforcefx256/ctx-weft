@@ -247,10 +247,10 @@ def delegate_plan(
             "use_subagent (bool), subagent_template (str), "
             "inherit_memory (bool, default true), "
             "interactive (bool, default false — true makes the task human-interactive: "
-            "a plain-text turn pauses and waits for the user instead of requiring control__finish_task), "
-            "run_if (str, when this task may start relative to its predecessor: 'success' "
-            "(default — only after the predecessor FINISHED) or 'any' (cleanup-style: start "
-            "once the predecessor reached any terminal state, including failure))."
+            "a plain-text turn pauses and waits for the user instead of requiring control__finish_task). "
+            "Tasks run strictly in order and each one starts ONLY if its predecessor succeeded — "
+            "if a step fails, the rest are canceled. Put independent work in separate "
+            "control__delegate_task calls instead, so one failure does not cancel the others."
         ),
     ],
     *,
@@ -266,25 +266,12 @@ def delegate_plan(
     if ctx is None or ctx.task_manager is None or ctx.task is None:
         return ControlResult(content=_PLAN_DISPATCH_ACK)
 
-    # spec: task-handoff——先整单校验再铸造：run_if 合法性不过则整个调用拒绝、
-    # 零子任务创建（不留下半截 plan）。
-    prepared: list[tuple[dict, str]] = []  # (spec, run_if)
-    for idx, spec in enumerate(tasks):
-        if not isinstance(spec, dict):
-            continue
-        title = spec.get("title", "subtask")
-        run_if = spec.get("run_if", "success")
-        if run_if not in ("success", "any"):
-            return ControlResult(content=(
-                f"Cannot delegate plan: task {idx + 1} ({title!r}) declares invalid "
-                f"run_if {run_if!r}; use 'success' or 'any'."
-            ))
-        prepared.append((spec, run_if))
+    prepared: list[dict] = [spec for spec in tasks if isinstance(spec, dict)]
 
     titles: list[str] = []
     child_ids: list[str] = []
     prev_ids: list[str] = []
-    for spec, run_if in prepared:
+    for spec in prepared:
         title = spec.get("title", "subtask")
         child = TaskModel(
             id=generate_id("tsk"),
@@ -298,9 +285,6 @@ def delegate_plan(
             user_prompt=spec.get("task_prompt") or spec.get("description", ""),
             origin_tool_call_id=generate_id("tcall"),
             tracking_task_ids=list(prev_ids),
-            # spec: task-handoff——本任务对前序的依赖条件（run_if）。物化进
-            # dep_conditions，push_task 落盘、restore/reopen 重建。
-            dep_conditions={prev_ids[-1]: run_if} if prev_ids else None,
             interaction_mode=_child_mode(bool(spec.get("interactive", False)), ctx.task),
             # 同 delegate_task：继承而非声明；interaction_mode 由 `_child_mode` 接住。
             unattended=ctx.task.unattended,

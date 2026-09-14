@@ -30,28 +30,36 @@
 - **WHEN** `delegate_task` 或 `delegate_plan` 成功派发
 - **THEN** 回执包含子任务 id（plan 为有序 id 列表），模型可据此在后续操作中引用
 
-### Requirement: 依赖条件区分前序成败
+### Requirement: 依赖只在前序成功时放行
 
-任务依赖 MUST 支持两种条件：`on_success`（前序 FINISHED 才放行）与 `on_any`（前序到达任一终态即放行）。本变更之后新派发的依赖缺省条件 MUST 为 `on_success`；存量事件回放中未声明条件的依赖 MUST 按 `on_any` 解释（历史保真）。前序失败或被取消时，`on_success` 后继 MUST NOT 被派发，且 MUST 落 CANCELED 终态并附专用错误码（BLOCKED_BY_FAILED_DEP）与阻塞源任务标识；`on_any` 后继 MUST 照常派发。因依赖取消落终态的任务 MUST NOT 改写会话终态（不将会话标为 CANCELED），且 MUST 保留父任务唤醒与后续调度。永久阻塞判定 MUST 在运行期（前序失败/取消后）与恢复期（重建依赖后、首次调度前）各执行一次幂等扫描，确保崩溃窗口内漏落的级联取消在恢复后被补齐。阻塞取消的原因（错误码与阻塞源任务）MUST 随终态事件 payload 持久化并进入任务投影，恢复回放后仍可解释。因条件不满足而落终态的任务 MUST NOT 阻塞会话的完成判定。依赖条件 MUST 在任务链重开（reopen）重建后保持原语义。`delegate_plan` 的任务 spec MUST 支持显式声明条件（`run_if: "success" | "any"`，缺省 success）。
+任务依赖 MUST 只有一种放行语义：**前序 FINISHED 才放行**。依赖边只由 `delegate_plan` 产生（其任务 spec 是严格串行链，每步依赖前一步），而模型在那里声明的就是「这个要在那个之后」——「之后」预设的是前序**做成了**。可并行的工作走多次 `delegate_task`，彼此不产生边，也就无从配置条件。因此 MUST NOT 引入依赖条件枚举（`run_if` / on_any 之类）：条件不是边的一个属性，是边的定义本身。
 
-#### Scenario: 前序失败不放行成果依赖
-- **WHEN** 任务 A 落 FAILED，任务 B 以 on_success 依赖 A
-- **THEN** B 不被执行，落 CANCELED 终态且错误码为 BLOCKED_BY_FAILED_DEP
+前序落 FAILED 或 CANCELED 时，其后继 MUST NOT 被派发，且 MUST 落 CANCELED 终态并附专用错误码（`BLOCKED_BY_FAILED_DEP`）与阻塞源任务标识；判定 MUST 级联至不动点（被取消的后继本身也是某些任务的阻塞源）。无依赖边的兄弟任务 MUST NOT 受彼此成败影响。
 
-#### Scenario: 清理任务在前序失败后仍执行
-- **WHEN** 任务 A 落 FAILED，任务 C 声明 on_any 依赖 A
-- **THEN** C 被正常派发执行
+因依赖取消落终态的任务 MUST NOT 改写会话终态（不将会话标为 CANCELED），MUST NOT 计入失败阈值，且 MUST 保留父任务唤醒与后续调度。永久阻塞判定 MUST 在运行期（前序失败/取消后）与恢复期（重建依赖后、首次调度前）各执行一次幂等扫描，确保崩溃窗口内漏落的级联取消在恢复后被补齐。阻塞取消的原因（错误码与阻塞源任务）MUST 随终态事件 payload 持久化并进入任务投影，恢复回放后仍可解释。因依赖不满足而落终态的任务 MUST NOT 阻塞会话的完成判定。
 
-#### Scenario: 前序成功时两种条件均放行
+#### Scenario: 前序失败不放行后继
+- **WHEN** 任务 A 落 FAILED，任务 B 依赖 A
+- **THEN** B 不被执行，落 CANCELED 终态且错误码为 BLOCKED_BY_FAILED_DEP，error 指明阻塞源 A
+
+#### Scenario: 前序成功则放行
 - **WHEN** 任务 A 落 FINISHED
-- **THEN** on_success 与 on_any 后继均被放行
+- **THEN** 依赖 A 的后继被放行
+
+#### Scenario: 级联至不动点
+- **WHEN** A 失败致 B 阻塞取消，而 C 依赖 B
+- **THEN** C 同样落 CANCELED，其阻塞源标识指向 B
+
+#### Scenario: 无边的兄弟任务互不影响
+- **WHEN** 任务 A 落 FAILED，任务 X 与 A 之间无依赖边
+- **THEN** X 保持可调度，不被取消
 
 #### Scenario: 依赖取消不终结会话
-- **WHEN** 某子任务因 on_success 依赖失败而落 CANCELED（BLOCKED_BY_FAILED_DEP）
-- **THEN** 会话不被标记为 CANCELED，父任务在子任务全部终态后照常唤醒
+- **WHEN** 某子任务因依赖失败而落 CANCELED（BLOCKED_BY_FAILED_DEP）
+- **THEN** 会话不被标记为 CANCELED，不计入失败阈值，父任务在子任务全部终态后照常唤醒
 
 #### Scenario: 崩溃窗口的恢复期补扫
-- **WHEN** 任务 A 的 FAILED 已持久化、其 on_success 后继 B 的级联取消尚未持久化时进程崩溃，随后恢复
+- **WHEN** 任务 A 的 FAILED 已持久化、其后继 B 的级联取消尚未持久化时进程崩溃，随后恢复
 - **THEN** 恢复期的幂等扫描将 B 判定并落终态，B 不会永久滞留 PENDING
 
 #### Scenario: 重启后阻塞原因可解释
@@ -59,17 +67,5 @@
 - **THEN** 任务的阻塞原因与阻塞源任务标识仍可从投影读到，父任务观察面可解释
 
 #### Scenario: 条件断裂不滞留会话
-- **WHEN** 某计划的 on_success 后继因前序失败全部落终态
+- **WHEN** 某计划的后继因前序失败全部落终态
 - **THEN** 不存在永久 PENDING 的任务，会话可到达完成/空闲判定
-
-#### Scenario: 存量回放保真
-- **WHEN** 回放本变更之前持久化的事件流，依赖未带条件字段
-- **THEN** 依赖按 on_any 语义解锁，恢复行为与历史版本一致
-
-#### Scenario: 重开后条件存活
-- **WHEN** 审核触发任务链 reopen、依赖关系重建
-- **THEN** 重建后的依赖保持原条件语义（on_success 仍 on_success）
-
-#### Scenario: 清理步的显式声明
-- **WHEN** 模型在 `delegate_plan` 的任务 spec 中声明 `run_if: "any"`
-- **THEN** 该任务的依赖按 on_any 处理，其余未声明的任务按 on_success

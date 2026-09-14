@@ -190,9 +190,8 @@ def serialize_view(view: RunStateView) -> dict[str, Any]:
                 "origin_tool_name": t.origin_tool_name,
                 "settings_raw": t.settings_raw,
                 "dag_deps": t.dag_deps,
-                # spec: task-handoff——三个新字段进快照（dep_conditions /
-                # error_code / blocked_by_task_id）；旧快照无键 → deserialize 落缺省。
-                "dep_conditions": getattr(t, "dep_conditions", None),
+                # spec: task-handoff——两个新字段进快照（error_code /
+                # blocked_by_task_id）；旧快照无键 → deserialize 落缺省。
                 "priority": t.priority,
                 "max_retries": t.max_retries,
                 "tenant_id": t.tenant_id,
@@ -266,8 +265,6 @@ def deserialize_view(data: dict[str, Any]) -> RunStateView:
             origin_tool_name=t.get("origin_tool_name", ""),
             settings_raw=t.get("settings_raw", {}),
             dag_deps=t.get("dag_deps", []),
-            # 存量快照无键 → None（依赖按 any 解释 / 无结局码）。
-            dep_conditions=t.get("dep_conditions"),
             priority=t.get("priority", 5),
             max_retries=t.get("max_retries", 3),
             tenant_id=t.get("tenant_id", "default"),
@@ -616,8 +613,6 @@ def _apply(view: RunStateView, ev: Event) -> None:
                 origin_tool_name=task_data.get("origin_tool_name", ""),
                 settings_raw=task_data.get("settings", {}),
                 dag_deps=task_data.get("dag_deps", []),
-                # spec: task-handoff——存量事件无此键 → None（回放语义见字段注释）。
-                dep_conditions=task_data.get("dep_conditions"),
                 priority=task_data.get("priority", 5),
                 max_retries=task_data.get("max_retries", 3),
                 tenant_id=ev.tenant_id or "default",

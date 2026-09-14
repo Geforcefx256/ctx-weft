@@ -1,4 +1,4 @@
-"""spec: task-handoff——delegate 工具的 run_if 声明与 ack 回传子任务 id。"""
+"""spec: task-handoff——delegate 工具的 ack 回传子任务 id（模型后续操作的稳定句柄）。"""
 
 from __future__ import annotations
 
@@ -47,24 +47,11 @@ def test_delegate_plan_ack_carries_ids_in_spec_order():
     assert ", ".join(ids) in res.content
 
 
-def test_delegate_plan_run_if_materialized_into_dep_conditions():
+def test_delegate_plan_chains_each_task_on_the_previous():
+    """plan 的边即「按顺序做」：每一步 blocked_by 前一步（放行条件是前序成功）。"""
     tm = _FakeTM()
-    delegate_plan(tasks=[
-        {"title": "a"},
-        {"title": "b"},                      # 缺省 success
-        {"title": "cleanup", "run_if": "any"},
-    ], ctx=_ctx(tm))
+    delegate_plan(tasks=[{"title": "a"}, {"title": "b"}, {"title": "c"}], ctx=_ctx(tm))
     a, b, c = tm.staged
-    assert b.dep_conditions == {a.id: "success"}
-    assert c.dep_conditions == {b.id: "any"}
-    assert a.dep_conditions is None  # 首任务无前序
-
-
-def test_delegate_plan_invalid_run_if_rejects_whole_plan():
-    tm = _FakeTM()
-    res = delegate_plan(tasks=[
-        {"title": "a"},
-        {"title": "b", "run_if": "whenever"},
-    ], ctx=_ctx(tm))
-    assert tm.staged == []
-    assert "invalid run_if" in res.content
+    assert a.tracking_task_ids == []
+    assert b.tracking_task_ids == [a.id]
+    assert c.tracking_task_ids == [a.id, b.id]

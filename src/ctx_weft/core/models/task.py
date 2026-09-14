@@ -109,10 +109,6 @@ class Task:
     parent_task_id: str | None = None
 
     dag_deps: list[str] = field(default_factory=list)
-    # spec: task-handoff——依赖条件（dep_id → "success" | "any"）。None = 存量/无条件，
-    # 回放与队列重建按 any 解释（历史保真）；新派发由 push_task **写入时物化**为全量
-    # 显式（缺省 success），读取侧永远不需要猜缺省。
-    dep_conditions: dict[str, str] | None = None
     tracking_task_ids: list[str] = field(default_factory=list)
 
     title: str = ""

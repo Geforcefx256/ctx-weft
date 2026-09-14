@@ -65,9 +65,6 @@ class TaskView:
     origin_tool_name: str = ""
     settings_raw: dict[str, Any] = field(default_factory=dict)
     dag_deps: list[str] = field(default_factory=list)
-    # spec: task-handoff——依赖条件（dep_id → "success"|"any"）；None = 存量事件未声明
-    # （队列重建按 any 解释）。新派发写入时物化，随 TASK_CREATED 落盘。
-    dep_conditions: "dict[str, str] | None" = None
     priority: int = 5
     max_retries: int = 3
     # spec: execution-limits（wp8）——budget 已消费量投影
