@@ -8,17 +8,17 @@
 
 ### Requirement: 稳定逻辑调用身份
 
-每个工具调用 SHALL 拥有跨重启稳定的 `operation_id`，由 `(tenant_id, session_id, agent_id, assistant_record_id, tool_ordinal)` 确定性派生；`assistant_record_id` MUST 在执行前持久化（assistant 回合入 memory 的记录 id）。`invocation_id` 保留为单次执行尝试身份（取消用）；`tool_call_id` 仅为 LLM wire 配对字段，MUST NOT 用作恢复匹配依据。普通执行、热 HITL resume、冷恢复 SHALL 引用同一 operation_id；两条内容相同的合法调用 MUST 得到不同 operation_id（不误去重）；模型复用同一 tool_call_id MUST NOT 使旧结果覆盖新调用。silent/dispatch 类控制工具 SHALL 同样拥有账本身份（不入对话 ≠ 不入账本）。
+每个工具调用 SHALL 拥有跨重启稳定的 `operation_id`，**它即该调用在摄入点铸造的内部 tool_call 标识**（`tc_...`，见 capability `conversation-integrity`）——随 assistant 回合一同持久化，恢复时**读出**而非重算。SHALL NOT 另立第二条由 `(tenant, session, agent, record_id, ordinal)` 派生的身份：铸造落地之后消息里的 `tool_call_id` 本身已唯一且跨重启稳定，两条同源身份只会制造「必须保持一致」的隐式约束。`invocation_id` 保留为单次执行尝试身份（取消用）。未经铸造的裸 wire id（宿主直构 / 测试替身）MUST NOT 用作账本键——判据是「是否内部标识」，不匹配则账本全程旁路。普通执行、热 HITL resume、冷恢复 SHALL 引用同一 operation_id；两条内容相同的合法调用 MUST 得到不同 operation_id（不误去重）；模型复用同一 tool_call_id MUST NOT 使旧结果覆盖新调用。silent/dispatch 类控制工具 SHALL 同样拥有账本身份（不入对话 ≠ 不入账本）。
 
 #### Scenario: 同一调用跨重启身份不变
 
 - **WHEN** 一次工具调用在崩溃后经冷恢复重入
-- **THEN** 恢复路径读到与首次执行相同的 operation_id（同一 assistant_record_id + ordinal 派生）
+- **THEN** 恢复路径读到与首次执行相同的 operation_id（同一条 tool_call 的内部标识，随消息落库）
 
 #### Scenario: 两次合法同参调用不去重
 
 - **WHEN** 两条 assistant 消息都用 call_1 且参数相同
-- **THEN** 两个不同 operation_id（不同 record_id/ordinal），各自完整执行
+- **THEN** 两个不同 operation_id（铸造时 anchor/ordinal 不同），各自完整执行
 
 #### Scenario: call_1 复用不串扰
 

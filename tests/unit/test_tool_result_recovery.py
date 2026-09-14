@@ -12,6 +12,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from ctx_weft.core.utils.ids import mint_call_id
+
 from ctx_weft.core.capabilities.cache import CapabilityCache
 from ctx_weft.core.loop.capability_gateway import CapabilityGateway, converge_tool_output
 from ctx_weft.core.loop.driver import LoopContext, LoopState
@@ -122,9 +124,7 @@ async def test_converge_ledger_full_context_converged_with_tail():
     provider = _Big(big)
     gw, mem, state, ctx, scope = _harness(provider, store=store, ledger=ledger)
 
-    # 铸 operation 身份（act 路径口径），使账本 completed 生效。
-    ctx.provider_ctx.operation_id = "op_test_1"
-    res = await gw.invoke("mcp__b__dump", {}, state, ctx, tool_call_id="tc_1_0_a")
+    res = await gw.invoke("mcp__b__dump", {}, state, ctx, tool_call_id=OP_A)
 
     # 上下文 = 收敛版：引用 + 全长 + 头预览 + 尾预览（尾部止血）。
     assert tail_marker in res.content                       # 尾部证据直接可见
@@ -136,7 +136,7 @@ async def test_converge_ledger_full_context_converged_with_tail():
     tool_rec = [r for r in recs if r.role == "tool"][0]
     assert tool_rec.content == res.content
     # 账本 completed = 收敛前全文（修 tool-operations 偏离）。
-    op_rec = await ledger.get("op_test_1", ctx.provider_ctx)
+    op_rec = await ledger.get(OP_A, ctx.provider_ctx)
     assert op_rec.result == big
     assert len(op_rec.result) == len(big)
     # store 持全文，可窗口回读。
@@ -185,6 +185,11 @@ async def test_tail_evidence_reachable_via_read_tool_output():
     assert "".join(chunks) == big
 
 
+#: 合法的内部标识（账本键 = tool_call_id；裸 wire id 会走旁路）。
+OP_A = mint_call_id(anchor="recA", ordinal=0, raw_id="call_1", turn_seq=1)
+OP_B = mint_call_id(anchor="recB", ordinal=0, raw_id="call_1", turn_seq=9)
+
+
 # ── 重放：统一收敛 + 持久账本重放入库 ────────────────────────────────────────
 
 
@@ -196,8 +201,7 @@ async def test_completed_shortcircuit_replay_converges_and_reputs():
     provider = _Big(big)
     gw, mem, state, ctx, _ = _harness(provider, store=store, ledger=ledger)
 
-    ctx.provider_ctx.operation_id = "op_replay_1"
-    first = await gw.invoke("mcp__b__dump", {}, state, ctx, tool_call_id="tc_1_0_a")
+    first = await gw.invoke("mcp__b__dump", {}, state, ctx, tool_call_id=OP_A)
     first_inv = first.invocation_id
     assert READ_TOOL_QUALIFIED_NAME in first.content
 
@@ -206,8 +210,8 @@ async def test_completed_shortcircuit_replay_converges_and_reputs():
     gw2, *_ = _harness(_Big("unused"), store=store2, ledger=ledger)
     # gateway 默认 store 是独立实例——把重放 gateway 指向被清空的 store2：
     gw2._result_store = store2
-    ctx.provider_ctx.operation_id = "op_replay_1"
-    replay = await gw2.invoke("mcp__b__dump", {}, state, ctx, tool_call_id="tc_9_0_b")
+    # 同一逻辑调用重入 = 同一个内部标识（旧设计靠 provider_ctx 另传身份才做得到）。
+    replay = await gw2.invoke("mcp__b__dump", {}, state, ctx, tool_call_id=OP_A)
 
     assert READ_TOOL_QUALIFIED_NAME in replay.content      # 收敛版，非全文直灌
     assert replay.content.count("z" * 100) < 10
@@ -248,14 +252,13 @@ async def test_reconcile_backfill_converges_ledger_result():
     ledger = InMemoryOperationStore()
     provider = _Big(big)
     gw, mem, state, ctx, scope = _harness(provider, store=store, ledger=ledger)
-    ctx.provider_ctx.operation_id = "op_bf_1"
-    res = await gw.invoke("mcp__b__dump", {}, state, ctx)   # 原执行（attempts 落账本）
+    res = await gw.invoke("mcp__b__dump", {}, state, ctx, tool_call_id=OP_B)  # 原执行
 
-    rec = await ledger.get("op_bf_1", ctx.provider_ctx)
+    rec = await ledger.get(OP_B, ctx.provider_ctx)
     step = ReconcileStep()
-    tc = {"id": "tc_1_0_r", "name": "mcp__b__dump", "input": {}}
+    tc = {"id": OP_B, "name": "mcp__b__dump", "input": {}}
     await step._backfill_memory(
-        state, ctx, "op_bf_1", rec.result, tc, gateway=gw, rec=rec, via="ledger-completed")
+        state, ctx, OP_B, rec.result, tc, gateway=gw, rec=rec, via="ledger-completed")
 
     recs = await mem.load_view(scope, MemoryScope.TASK, ctx.provider_ctx)
     bf = [r for r in recs if r.metadata.get("recovered_via") == "ledger-completed"][0]

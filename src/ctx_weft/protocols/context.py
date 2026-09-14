@@ -110,9 +110,6 @@ class ProviderContext:
     - tenant_id（多租户预留）
     - trace_id（全链路追踪）
     - invocation_id（capability invoke 时分配，用于 cancel）
-    - operation_id（跨重启稳定的逻辑调用身份，spec: tool-operations——调用侧从
-      assistant_record_id+ordinal 确定性派生后注入；gateway 据此走操作账本。
-      None = 裸调（单测/宿主直构），账本全程旁路）
     - 时间戳
     """
 
@@ -123,7 +120,6 @@ class ProviderContext:
     agent_template_id: str = ""  # 该 agent 的模板 id；授权按模板维度做策略（AllowListAuthorizer）
     trace_id: str | None = None
     invocation_id: str | None = None
-    operation_id: str | None = None
     request_id: str | None = None
     timestamp: datetime | None = None  # None 时 provider 自填 now
     skill_name: str = ""  # 供 SkillExecutorCapabilityProvider 读取

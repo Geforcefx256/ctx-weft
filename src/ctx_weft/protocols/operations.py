@@ -1,15 +1,18 @@
 """工具操作账本协议（spec: tool-operations；change reliability-wp5，方案 §5.3）。
 
-区分三个身份（H3 的根因修复面）：
+区分两个身份（H3 的根因修复面）：
 
-- ``tool_call_id`` —— LLM wire 配对字段。模型复用 ``call_1`` 是常态，MUST NOT 用作
-  恢复匹配依据。
+- ``operation_id`` —— 跨重启稳定的**逻辑调用**身份，**即该次调用的内部 tool_call
+  标识**（``tc_...``，由 ``core/utils/ids.mint_call_id`` 在摄入点铸造）。两条内容
+  相同的合法调用得到不同 id（不误去重）；同一逻辑调用经普通执行 / 热 HITL resume /
+  冷恢复重入，读到同一个 id——因为它**随消息落库**，恢复时直接读出来而不是重算。
 - ``invocation_id`` —— 单次**执行尝试**身份（gateway 每次分配，provider 据此登记
-  在途句柄供 cancel）。
-- ``operation_id`` —— 跨重启稳定的**逻辑调用**身份（本模块），由
-  ``(tenant, session, agent, assistant_record_id, tool_ordinal)`` 确定性派生。
-  两条内容相同的合法调用得到不同 id（不误去重）；同一逻辑调用经普通执行 / 热 HITL
-  resume / 冷恢复重入，读到同一个 id。
+  在途句柄供 cancel）。一次逻辑调用可有多次尝试。
+
+曾经这里是三个：LLM 的裸 wire ``tool_call_id`` 不可信（模型复用 ``call_1`` 是常态），
+于是账本另造了一条 ``operation_id`` 五元组派生。摄入点铸造落地之后，消息里的
+``tool_call_id`` 本身已经唯一、跨重启稳定、可直接读取——第二条身份失去了存在理由，
+两者合并为一。
 
 账本与工具副作用**不组成分布式事务**（方案明令不据此声称 exactly-once）；它把
 「副作用是否已发生、结果是什么」变成可判定事实，供 WP6 的恢复策略表消费。
@@ -30,7 +33,6 @@ __all__ = [
     "OperationRecord",
     "OperationUpdate",
     "OperationStore",
-    "operation_id_for",
     "operation_memory_result_id",
     "RecoveryPolicy",
     "normalize_recovery_policy",
@@ -175,24 +177,13 @@ class RevisionConflict(Exception):
     """CAS 期望 revision 不匹配——后到者被拒，状态机不倒退不跳跃。"""
 
 
-def operation_id_for(
-    tenant_id: str, session_id: str, agent_id: str,
-    assistant_record_id: str, tool_ordinal: int,
-) -> str:
-    """确定性派生：同一逻辑调用跨进程/跨重启必然同值（ULID 做不到）。
-
-    截断 24 hex（96 bit）：同会话内 record_id 已是 ULID，碰撞概率可忽略；``op_`` 前缀
-    保可读。同参两次合法调用因 record_id/ordinal 不同必然异 id（O-T09）。
-    """
-    digest = hashlib.sha1(
-        f"{tenant_id}|{session_id}|{agent_id}|{assistant_record_id}|{tool_ordinal}".encode()
-    ).hexdigest()[:24]
-    return f"op_{digest}"
-
-
 def operation_memory_result_id(operation_id: str) -> str:
     """TOOL_RESULT 的 memory 记录 id 由 operation_id 确定性派生（spec §5.3）：
-    completed 后 memory 写失败时，恢复路径按同一 id 幂等补写。"""
+    completed 后 memory 写失败时，恢复路径按同一 id 幂等补写。
+
+    ``operation_id`` 即该次调用的内部 tool_call 标识（``tc_...``，见
+    ``core/utils/ids.mint_call_id``）——前缀等长，切掉 3 字符换 ``res_``。
+    """
     return f"res_{operation_id[3:]}"
 
 

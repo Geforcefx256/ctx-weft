@@ -31,10 +31,15 @@ from ctx_weft.protocols.capability import (
     ToolCapabilityProvider,
 )
 from ctx_weft.protocols.events import Event, EventType
+from ctx_weft.core.utils.ids import mint_call_id
+
+#: 摄入点铸造的内部标识——既是 tool_call id 也是账本键。
+TC1 = mint_call_id(anchor="rec1", ordinal=0, raw_id="tc1", turn_seq=0)
+TC_DEL = mint_call_id(anchor="rec1", ordinal=1, raw_id="tc_del", turn_seq=0)
+
 from ctx_weft.protocols.operations import (
     OperationRecord,
     OperationStatus,
-    operation_id_for,
     operation_memory_result_id,
 )
 from ctx_weft.providers.events.store.sql.store import open_sqlite_event_store
@@ -109,10 +114,10 @@ async def test_ot06_completed_memory_write_crash_ledger_backfills(tmp_path):
         __import__("ctx_weft.protocols.memory", fromlist=["MemoryEvent"]).MemoryEvent(
             kind=MemoryKind.CONVERSATION_TURN, scope=MemoryScope.TASK, address=scope,
             content="", timestamp=datetime.now(UTC), role="assistant",
-            metadata={"tool_calls": [{"id": "tc1", "name": "fx__act", "input": {}}]},
+            metadata={"tool_calls": [{"id": TC1, "name": "fx__act", "input": {}}]},
         ), pctx)
 
-    op_id = operation_id_for("default", "s1", "a1", rid, 0)
+    op_id = TC1
     ops = InMemoryOperationStore()
     await ops.prepare(OperationRecord(
         operation_id=op_id, tenant_id="default", session_id="s1", agent_id="a1",
@@ -196,21 +201,18 @@ async def test_ot14_delegate_completed_reentry_no_duplicate_children():
         memory=mem, event_bus=bus, operation_store=ops_store)
     ctx.capability_gateway = gw
 
-    op_id = operation_id_for("default", "s1", "a1", "rec1", 0)
     # 首次调用：delegate → stage 一个 child → 账本 completed
-    ctx.provider_ctx.operation_id = op_id
     res1 = await gw.invoke("control__delegate_task",
                            {"title": "sub", "task_prompt": "do it",
                             "use_subagent": True}, state, ctx,
-                           tool_call_id="tc_del")
+                           tool_call_id=TC_DEL)
     assert len(staged) == 1
 
-    # 重入（同 op_id——crash 后 reconcile 重入的形态）：gateway completed 短路
-    ctx.provider_ctx.operation_id = op_id
+    # 重入（同一个内部标识——crash 后 reconcile 重入的形态）：gateway completed 短路
     res2 = await gw.invoke("control__delegate_task",
                            {"title": "sub", "task_prompt": "do it",
                             "use_subagent": True}, state, ctx,
-                           tool_call_id="tc_del")
+                           tool_call_id=TC_DEL)
     # O-T14 核心断言：不生成第二棵子树
     assert len(staged) == 1, (
         f"O-T14: completed delegate reentry must not stage a second child "

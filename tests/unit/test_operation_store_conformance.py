@@ -9,12 +9,12 @@ from __future__ import annotations
 import pytest
 
 from ctx_weft.protocols.context import ProviderContext
+from ctx_weft.core.utils.ids import mint_call_id
 from ctx_weft.protocols.operations import (
     OperationRecord,
     OperationStatus,
     OperationUpdate,
     RevisionConflict,
-    operation_id_for,
 )
 from ctx_weft.providers.operations import InMemoryOperationStore
 
@@ -23,7 +23,8 @@ _CTX = ProviderContext(session_id="s1", tenant_id="t1")
 
 def _rec(ordinal: int = 0, **over) -> OperationRecord:
     base = dict(
-        operation_id=operation_id_for("t1", "s1", "a1", "rec1", ordinal),
+        operation_id=mint_call_id(anchor="rec1", ordinal=ordinal,
+                                  raw_id=f"call_{ordinal}", turn_seq=0),
         tenant_id="t1", session_id="s1", agent_id="a1",
         assistant_record_id="rec1", tool_ordinal=ordinal,
         tool_name="mcp:web:fetch", args_hash="hash1",

@@ -34,6 +34,7 @@ import logging
 
 from ctx_weft.core.loop.driver import LoopContext, LoopState, Step, StepOutcome
 from ctx_weft.core.loop.steps._capabilities import resolve_and_bind
+from ctx_weft.core.utils.ids import is_internal_call_id
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,7 @@ class ReconcileStep(Step):
         await resolve_and_bind(state, ctx)
 
         from ctx_weft.protocols.operations import (
-            OperationStatus, OperationUpdate, operation_id_for,
+            OperationStatus, OperationUpdate,
             operation_memory_result_id, Adjudication, normalize_recovery_policy,
             RecoveryPolicy,
         )
@@ -67,10 +68,9 @@ class ReconcileStep(Step):
         for tc in dangling:
             if ctx.cancel_token is not None and ctx.cancel_token.is_cancelled:
                 ctx.cancel_token.raise_if_cancelled()
-            # 同一逻辑调用跨重启同 id：用原回合的 record_id + ordinal 派生（spec: tool-operations）
-            op_id = operation_id_for(
-                getattr(state.session, "tenant_id", "default"), state.session.id,
-                state.agent.id, tc.get("_record_id", ""), tc.get("_ordinal", 0))
+            # 账本键 = 该调用的内部标识：它随 assistant 回合落库，恢复时**读出来**
+            # 而不是重算（铸造之前才需要五元组派生）。裸 wire id → None → 账本旁路。
+            op_id = tc.get("id", "") if is_internal_call_id(tc.get("id", "")) else ""
 
             # ── 双通道完成判定（D1）：账本 / 确定性 memory id ─────────────────────
             ledger = getattr(gateway, "_operation_store", None)
@@ -155,7 +155,6 @@ class ReconcileStep(Step):
                 "ReconcileStep: executing op %s (tool %s, ledger=%s, policy=%s)",
                 op_id, tc["name"],
                 rec.status if rec is not None else "no-record", policy)
-            ctx.provider_ctx.operation_id = op_id
             await gateway.invoke(
                 tool_name=tc["name"],
                 arguments=tc.get("input", {}) or {},
@@ -284,14 +283,12 @@ async def _dangling_tool_calls(memory, scope, provider_ctx) -> tuple[list[dict],
                     if r.kind is MemoryKind.CONVERSATION_TURN and r.role == "tool"]
     tool_record_ids = {r.id for r in tool_records}
 
-    from ctx_weft.protocols.operations import operation_id_for, operation_memory_result_id
+    from ctx_weft.protocols.operations import operation_memory_result_id
     dangling: list[dict] = []
     for i, tc in enumerate(tool_calls):
-        op_id = operation_id_for(
-            getattr(provider_ctx, "tenant_id", "default"),
-            scope.session_id, scope.agent_id or "", last_asst.id, i)
-        if operation_memory_result_id(op_id) in tool_record_ids:
+        call_id = tc.get("id", "")
+        # memory 通道的完成判据：确定性 TOOL_RESULT 记录 id 已在视图里 = 已完成。
+        if is_internal_call_id(call_id) and operation_memory_result_id(call_id) in tool_record_ids:
             continue
-        dangling.append(dict(tc, _record_id=last_asst.id, _ordinal=i,
-                             _op_id=op_id))
+        dangling.append(dict(tc, _record_id=last_asst.id, _ordinal=i))
     return dangling, tool_record_ids

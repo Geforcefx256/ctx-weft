@@ -36,7 +36,6 @@ from ctx_weft.protocols import (
     MemoryScope,
     ToolCall,
 )
-from ctx_weft.protocols.operations import operation_id_for
 from ctx_weft.providers.llm.anthropic import _serialize_messages as _anthropic_serialize
 from ctx_weft.providers.llm.openai import _serialize_messages as _openai_serialize
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
@@ -118,13 +117,13 @@ async def test_ingest_adopts_anchor_and_records_companions():
     # 锚被 provider 采纳（record_id == 预铸锚）；两平面取同一份铸造值。
     assert persisted.record_id == anchor
     assert persisted.tool_calls[0]["id"] == minted[0].call.id
-    # 伴随字段：raw wire id 可追溯；op_id 与 _execute_tool_calls 的派生同口径。
+    # 伴随字段：raw wire id 可追溯。id 本身即账本键——不再另挂 op_id。
     rec = await mem.load_view(state.scope, MemoryScope.TASK, ctx.provider_ctx)
     asst = [r for r in rec if r.role == "assistant"][0]
     tc_md = asst.metadata["tool_calls"][0]
     assert tc_md["id"] == minted[0].call.id
     assert tc_md["raw_tool_call_id"] == "call_1"
-    assert tc_md["op_id"] == operation_id_for("default", "s1", "ag1", anchor, 0)
+    assert "op_id" not in tc_md, "账本键就是 tc_md['id']，不再另存一份"
 
 
 @pytest.mark.asyncio

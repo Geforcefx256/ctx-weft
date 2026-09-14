@@ -23,7 +23,8 @@ from ulid import ULID
 
 from ctx_weft.protocols import ToolCall
 
-__all__ = ["generate_id", "mint_call_id", "mint_turn_call_ids", "MintedCall"]
+__all__ = ["generate_id", "is_internal_call_id", "mint_call_id",
+           "mint_turn_call_ids", "MintedCall"]
 
 # 内部调用标识的形态契约（adapter 验收 / 单测共用同一判据）。
 INTERNAL_CALL_ID_RE = re.compile(r"^tc_[0-9a-z]+_[0-9a-z]+_[0-9a-f]{12}$")
@@ -53,6 +54,14 @@ def _base36(n: int) -> str:
         n, r = divmod(n, 36)
         out.append(digits[r])
     return "".join(reversed(out))
+
+
+def is_internal_call_id(value: object) -> bool:
+    """是否为摄入点铸造的内部 tool_call 标识（``tc_...``）。
+
+    账本以它为键——裸 wire id（无铸造的测试替身 / 宿主直构 gateway）判假，账本旁路。
+    """
+    return isinstance(value, str) and bool(INTERNAL_CALL_ID_RE.match(value))
 
 
 def mint_call_id(*, anchor: str, ordinal: int, raw_id: str, turn_seq: int) -> str:

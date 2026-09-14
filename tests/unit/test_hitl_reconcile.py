@@ -9,6 +9,12 @@ HITL 状态的真相源只剩 `fold_hitl_snapshot` → `HitlRegistry` 一条（�
 
 from __future__ import annotations
 
+from ctx_weft.core.utils.ids import mint_call_id
+
+#: 摄入点铸造的内部标识——既是消息里的 tool_call id，也是账本键。
+TC_A = mint_call_id(anchor="recA", ordinal=0, raw_id="tcA", turn_seq=0)
+TC_B = mint_call_id(anchor="recB", ordinal=0, raw_id="tc1", turn_seq=0)
+
 import pytest
 
 
@@ -80,10 +86,10 @@ async def test_reconcile_no_dangling_routes_to_prepare() -> None:
     sc = MemoryAddress(session_id="s1", task_id="t1", agent_id="ag1")
     asst_id = await mem.ingest(MemoryEvent(type=MemoryEventType.LLM_RESPONSE, address=sc, content="",
                                  timestamp=base + timedelta(seconds=1), role="assistant",
-                                 metadata={"tool_calls": [{"id": "tcA", "name": "web", "input": {}}]}), pctx)
-    # wp6：完成判据 = 确定性 memory id（wire 记录不再判 done——防 call_1 串扰）
-    from ctx_weft.protocols.operations import operation_id_for, operation_memory_result_id
-    op_id = operation_id_for("default", "s1", "ag1", asst_id, 0)
+                                 metadata={"tool_calls": [{"id": TC_A, "name": "web", "input": {}}]}), pctx)
+    # 完成判据 = 确定性 memory id（wire 记录不再判 done——防 call_1 串扰）
+    from ctx_weft.protocols.operations import operation_memory_result_id
+    op_id = TC_A
     await mem.ingest(MemoryEvent(type=MemoryEventType.TOOL_RESULT, address=sc, content="out",
                                  timestamp=base + timedelta(seconds=2), role="tool",
                                  id=operation_memory_result_id(op_id),
@@ -118,7 +124,7 @@ async def test_resolve_reconcile_detection_helper() -> None:
                            role=role, metadata=md)
 
     await mem.ingest(ev(MemoryEventType.LLM_RESPONSE, 1, "assistant",
-                        tool_calls=[{"id": "tc1", "name": "web", "input": {}}]), pctx)
+                        tool_calls=[{"id": TC_B, "name": "web", "input": {}}]), pctx)
     # wp6（spec: tool-operations）翻转：完成判据 = 逻辑身份（确定性 memory id），
     # 不再是 wire id 配对——call_1 复用会串扰。旧式 tool 记录（无确定性 id）不再判 done。
     async def _dangling():
@@ -132,11 +138,8 @@ async def test_resolve_reconcile_detection_helper() -> None:
     assert bool(await _dangling()) is True
     # 确定性 id 判 done：按 (record_id, ordinal=0) 派生的 memory id 写 tool 记录
     from ctx_weft.protocols.memory import MemoryEvent
-    from ctx_weft.protocols.operations import operation_id_for, operation_memory_result_id
-    asst = next(r for r in await mem.load_view(sc, __import__(
-        "ctx_weft.protocols", fromlist=["MemoryScope"]).MemoryScope.TASK, pctx)
-        if r.role == "assistant")
-    op_id = operation_id_for("default", "s1", "ag1", asst.id, 0)
+    from ctx_weft.protocols.operations import operation_memory_result_id
+    op_id = TC_B
     await mem.ingest(MemoryEvent(
         type=MemoryEventType.TOOL_RESULT, address=sc, content="done",
         timestamp=base + timedelta(seconds=3), role="tool",

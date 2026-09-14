@@ -71,7 +71,10 @@ async def test_crash_mid_tool_reinvokes_dangling_via_reconcile() -> None:
     tool = _RecordingTool()
     runtime.providers.register_capability(tool)
 
-    sid, tid, aid, tcid = "ses_r", "tsk_r", "agt_root", "tc1"
+    from ctx_weft.core.utils.ids import mint_call_id
+    # tool_call 的 id 是摄入点铸造的内部标识——它同时就是账本键。
+    tcid = mint_call_id(anchor="rec_r", ordinal=0, raw_id="tc1", turn_seq=0)
+    sid, tid, aid = "ses_r", "tsk_r", "agt_root"
     ts = datetime(2026, 6, 13, tzinfo=timezone.utc)
 
     def ev(seq, type_, **payload):
@@ -100,17 +103,15 @@ async def test_crash_mid_tool_reinvokes_dangling_via_reconcile() -> None:
         timestamp=ts, role="assistant",
         metadata={"tool_calls": [{"id": tcid, "name": "test__web", "input": {"url": "x"}}]}), pctx)
 
-    # wp6：账本注入 STARTED 记录（确定性派生同一 op_id）——idempotent 分支的输入。
-    from ctx_weft.protocols.operations import (
-        OperationRecord, OperationStatus, operation_id_for)
+    # 账本注入 STARTED 记录（键 = tool_call 的内部标识）——idempotent 分支的输入。
+    from ctx_weft.protocols.operations import OperationRecord, OperationStatus
     from ctx_weft.providers.operations import InMemoryOperationStore
     ops = runtime.providers.get_operation_store()
     assert isinstance(ops, InMemoryOperationStore)
-    # 找 assistant 回合的 memory record id（op_id 派生输入）——直查 in-memory provider
     view = await mem.load_view(scope, _MEM_TASK_SCOPE, pctx)
     last_asst = next(r for r in reversed(view)
                      if r.kind is _MK.CONVERSATION_TURN and r.role == "assistant")
-    op_id = operation_id_for("default", sid, aid, last_asst.id, 0)
+    op_id = tcid
     from ctx_weft.protocols.context import ProviderContext as _PC
     await ops.prepare(OperationRecord(
         operation_id=op_id, tenant_id="default", session_id=sid, agent_id=aid,

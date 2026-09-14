@@ -570,7 +570,7 @@ async def _ingest_assistant_turn(
 
     anchor（spec: conversation-integrity）：预铸的记录 id，经 MemoryEvent.id 交给 provider
     采纳——它同时是内部调用标识与 operation_id 的派生锚，三者由此同源。minted 携带每个
-    调用的 raw wire id 与 ordinal，随 metadata 落库（raw_tool_call_id 供追溯、op_id 供恢复链复用）；
+    调用的 raw wire id 与 ordinal，随 metadata 落库（raw_tool_call_id 供追溯）；
     两者缺省（旧测试直调 / 无工具回合）时退化为无伴随字段的旧行为。
     """
     from ctx_weft.core.loop.capability_gateway import DISPATCH_TOOLS, SILENT_TOOLS
@@ -581,12 +581,6 @@ async def _ingest_assistant_turn(
         m = by_ordinal.get(i)
         if m is not None:
             d["raw_tool_call_id"] = m.raw_id
-            if anchor:
-                from ctx_weft.protocols.operations import operation_id_for
-                # 与 _execute_tool_calls 的枚举同口径（全列表 index）→ 派生值逐字节一致。
-                d["op_id"] = operation_id_for(
-                    getattr(state.session, "tenant_id", "default"), state.session.id,
-                    state.agent.id, anchor, i)
         asst_tool_dicts.append(d)
     _excluded = DISPATCH_TOOLS | SILENT_TOOLS
     non_dispatch_tool_dicts = [d for d in asst_tool_dicts if d["name"] not in _excluded]
@@ -652,19 +646,9 @@ async def _execute_tool_calls(
     tool_results: list[dict] = []
     ctx.run_phase.in_tool_loop = True
 
-    from ctx_weft.protocols.operations import operation_id_for
-    record_id = state.extra.get("assistant_record_id", "")
     for i, tc in enumerate(tool_calls):
-        # spec: tool-operations（wp5）——调用侧铸稳定逻辑身份（gateway 保持无状态）：
-        # (tenant, session, agent, assistant_record_id, ordinal) 确定性派生 → 跨重启同 id。
-        # record_id 缺失（理论不可达 / 测试替身无 provider_ctx）→ None/跳过 →
-        # gateway 账本旁路（D6 兼容缝），不阻断执行。
-        if ctx.provider_ctx is not None:
-            ctx.provider_ctx.operation_id = (
-                operation_id_for(
-                    getattr(state.session, "tenant_id", "default"), state.session.id,
-                    state.agent.id, record_id, i)
-                if record_id else None)
+        # 账本键就是 tc.id（摄入点铸造的内部标识），gateway 自己从 tool_call_id 取——
+        # 调用侧不再铸第二条身份、也不再经共享 provider_ctx 转移所有权。
         # 工具间命中：软打断 → 本 tc 及之后全部「未开始」→ 补「已取消」+ park；硬取消 → CancelledError。
         if _interrupt_pending(ctx):
             for rest in tool_calls[i:]:

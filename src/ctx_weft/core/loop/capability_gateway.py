@@ -38,7 +38,7 @@ from ctx_weft.core.hitl.registry import HITL_STAGE_AUTHZ, HITL_STAGE_TOOL
 from ctx_weft.protocols.hitl import HITL_OUTCOME_REJECTED, HitlDecision
 from ctx_weft.core.capabilities.cache import CapabilityCache
 from ctx_weft.core.utils.clock import now_utc
-from ctx_weft.core.utils.ids import generate_id
+from ctx_weft.core.utils.ids import generate_id, is_internal_call_id
 from ctx_weft.protocols.capability import (
     AuthorizationDecision, Authorizer, CapabilityProvider, ToolCapabilityProvider, qualify,
 )
@@ -326,13 +326,15 @@ class CapabilityGateway:
         invocation_id = generate_id("inv")
         is_dispatch = tool_name in DISPATCH_TOOLS
         is_silent = tool_name in SILENT_TOOLS  # 不入 task 对话的编排/裁决工具
-        # spec: tool-operations（wp5）——operation_id 取用即清（ownership transfer）：
-        # 调用侧（act/reconcile）为**这一次**调用铸好放进共享 provider_ctx；这里入口
-        # 立即取走并置 None——不清理会泄漏到后续无关 invoke（如后台 observe 的
-        # collect_process_report），命中别的操作 completed 短路、回放错结果（实测回归）。
-        op_id = ctx.provider_ctx.operation_id if ctx.provider_ctx is not None else None
-        if ctx.provider_ctx is not None:
-            ctx.provider_ctx.operation_id = None
+        # spec: tool-operations——账本键即本次调用的**内部 tool_call 标识**：摄入点铸造
+        # 的 `tc_...` 已经唯一、跨重启稳定、随消息落库，直接拿来用即可。
+        #
+        # 非内部标识（裸 wire id：无铸造的测试替身、宿主直构 gateway）→ None → 账本
+        # 全程旁路。判据放在这里而不是调用侧，是因为它同时消掉了旧设计里
+        # `provider_ctx.operation_id` 的所有权转移——那是个共享可变字段，忘了清就会
+        # 泄漏到后续无关 invoke（后台 observe 的 collect_process_report 曾因此命中别的
+        # 操作的 completed 短路、回放错结果）。改成普通入参之后泄漏不可能发生。
+        op_id = tool_call_id if is_internal_call_id(tool_call_id) else None
 
         # 1. Lookup capability（只处理 kind="tool"）。控制工具的全局可达性由 CapabilityCache 的
         # session 全局区保证（get_by_qualified_name 回退），gateway 无需特殊逻辑。

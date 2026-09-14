@@ -25,10 +25,14 @@ from ctx_weft.protocols.capability import (
 )
 from ctx_weft.protocols.events import EventType
 from ctx_weft.protocols.memory import MemoryEvent
+from ctx_weft.core.utils.ids import mint_call_id
+
+#: 摄入点铸造的内部标识——既是消息里的 tool_call id，也是账本键。
+OP = mint_call_id(anchor="rec_fx", ordinal=0, raw_id="call_1", turn_seq=0)
+
 from ctx_weft.protocols.operations import (
     OperationRecord,
     OperationStatus,
-    operation_id_for,
 )
 from ctx_weft.providers.events import InProcessEventBus
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
@@ -94,10 +98,10 @@ async def _mk_fixture(policy="reviewed", ledger_status: OperationStatus | None =
     rid = await mem.ingest(MemoryEvent(
         kind=MemoryKind.CONVERSATION_TURN, scope=MemoryScope.TASK, address=scope,
         content="", timestamp=now_utc(), role="assistant",
-        metadata={"tool_calls": [{"id": "call_1", "name": "fx__act", "input": {"n": 1}}]}),
+        metadata={"tool_calls": [{"id": OP, "name": "fx__act", "input": {"n": 1}}]}),
         pctx)
 
-    op_id = operation_id_for("default", "s1", "a1", rid, 0)
+    op_id = OP        # 账本键就是 tool_call 的内部标识
     if ledger_status is not None:
         await ops.prepare(OperationRecord(
             operation_id=op_id, tenant_id="default", session_id="s1", agent_id="a1",
@@ -152,7 +156,7 @@ async def test_call1_reuse_no_cross_talk():
     """call_1 复用串扰根治：旧 tool 记录的 wire id 不使新调用被误判完成。
 
     场景：上一回合 call_1 已有 tool 记录（wire 通道 done）；本回合复用 call_1——
-    双通道判据按 op_id（record 不同）→ 仍为 dangling，正确进入策略分派。
+    双通道判据按内部标识（与 wire id 无关）→ 仍为 dangling，正确进入策略分派。
     """
     tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="idempotent")
     # 上一回合的 tool 记录（wire id 同为 call_1，但属于别的 record）
@@ -163,7 +167,7 @@ async def test_call1_reuse_no_cross_talk():
         role="tool", metadata={"tool_call_id": "call_1"}), ctx.provider_ctx)
     from ctx_weft.core.loop.steps.reconcile import _dangling_tool_calls
     dangling, _ = await _dangling_tool_calls(ctx.memory, state.scope, ctx.provider_ctx)
-    assert len(dangling) == 1, "op-id judged: reused call_1 must still dangle for the new call"
+    assert len(dangling) == 1, "按内部标识判定：复用的 call_1 不得让新调用误判为已完成"
     await ReconcileStep().execute(state, ctx)
     assert tool.executions == 1
 

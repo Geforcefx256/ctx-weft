@@ -21,10 +21,8 @@ from ctx_weft.protocols.capability import (
     ToolCapability,
     ToolCapabilityProvider,
 )
-from ctx_weft.protocols.operations import (
-    OperationStatus,
-    operation_id_for,
-)
+from ctx_weft.core.utils.ids import mint_call_id
+from ctx_weft.protocols.operations import OperationStatus
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from ctx_weft.providers.operations import InMemoryOperationStore
 
@@ -77,24 +75,19 @@ def _fixture(*, op_store=None):
     return memory, state, ctx, tool, gateway
 
 
-def _set_op(state, ctx, record_id: str, ordinal: int) -> None:
-    ctx.provider_ctx.operation_id = operation_id_for(
-        state.session.tenant_id, state.session.id, state.agent.id, record_id, ordinal)
+
+#: 账本键 = 摄入点铸造的内部 tool_call 标识（gateway 从 invoke 的 tool_call_id 取）。
+OP1 = mint_call_id(anchor="rec1", ordinal=0, raw_id="call_1", turn_seq=0)
 
 
 async def test_full_execution_order_records_completed():
     """五步序：prepare → started → provider（calls=1）→ completed → TOOL_RESULT 事件。"""
     ops = InMemoryOperationStore()
     memory, state, ctx, tool, gateway = _fixture(op_store=ops)
-    _set_op(state, ctx, "rec1", 0)
 
-    res = await gateway.invoke("probe__go", {"x": 1}, state, ctx)
+    res = await gateway.invoke("probe__go", {"x": 1}, state, ctx, tool_call_id=OP1)
     assert res.is_error is False and tool.calls == 1
-    rec = await ops.get(ctx.provider_ctx.operation_id or state.agent.id, ctx.provider_ctx) \
-        if ctx.provider_ctx.operation_id else None
-    # operation_id 取用即清——本地保存引用
-    op_id = operation_id_for("t1", "s1", "a1", "rec1", 0)
-    rec = await ops.get(op_id, ctx.provider_ctx)
+    rec = await ops.get(OP1, ctx.provider_ctx)
     assert rec is not None
     assert rec.status == OperationStatus.COMPLETED
     assert rec.result == "done-1"
@@ -105,28 +98,32 @@ async def test_completed_reentry_short_circuits_no_reinvoke():
     """O-T08 前半：同逻辑调用重入——账本 completed → 不再打 provider，回放结果。"""
     ops = InMemoryOperationStore()
     memory, state, ctx, tool, gateway = _fixture(op_store=ops)
-    op_id = operation_id_for("t1", "s1", "a1", "rec1", 0)
 
-    _set_op(state, ctx, "rec1", 0)
-    first = await gateway.invoke("probe__go", {}, state, ctx)
+    first = await gateway.invoke("probe__go", {}, state, ctx, tool_call_id=OP1)
     assert tool.calls == 1
 
-    _set_op(state, ctx, "rec1", 0)                       # 同逻辑调用重入（如恢复重试）
-    second = await gateway.invoke("probe__go", {}, state, ctx)
+    # 同逻辑调用重入（如恢复重试）——同一个内部标识
+    second = await gateway.invoke("probe__go", {}, state, ctx, tool_call_id=OP1)
     assert tool.calls == 1, "provider must NOT be re-invoked for a completed operation"
     assert second.is_error is False
     assert "done-1" in str(second.content)               # 回放首次结果
 
 
-async def test_bare_call_without_operation_id_bypasses_ledger():
-    """裸调（无 operation_id）账本全程旁路——既有单测/宿主直构零行为变化。"""
+async def test_bare_wire_id_bypasses_ledger():
+    """裸 wire id（未经铸造）账本全程旁路——既有单测/宿主直构零行为变化。
+
+    判据是「是不是内部标识」，不是「有没有传 id」：模型复用的 call_1 不可信，
+    拿它当账本键会让两次不同调用撞同一行。
+    """
     ops = InMemoryOperationStore()
     memory, state, ctx, tool, gateway = _fixture(op_store=ops)
-    ctx.provider_ctx.operation_id = None
-    res = await gateway.invoke("probe__go", {}, state, ctx)
+    res = await gateway.invoke("probe__go", {}, state, ctx, tool_call_id="call_1")
     assert res.is_error is False and tool.calls == 1
-    # 账本空（旁路未写）
-    assert await ops.get("anything", ctx.provider_ctx) is None
+    assert await ops.get("call_1", ctx.provider_ctx) is None
+
+    # 完全不传 id 同样旁路
+    res2 = await gateway.invoke("probe__go", {}, state, ctx)
+    assert res2.is_error is False and tool.calls == 2
 
 
 async def test_ledger_failure_raises_persistence_unavailable():
@@ -138,22 +135,27 @@ async def test_ledger_failure_raises_persistence_unavailable():
 
     memory, state, ctx, tool, gateway = _fixture(op_store=_Broken())
     from ctx_weft.protocols.events import PersistenceUnavailableError
-    _set_op(state, ctx, "rec1", 0)
     try:
-        await gateway.invoke("probe__go", {}, state, ctx)
+        await gateway.invoke("probe__go", {}, state, ctx, tool_call_id=OP1)
         raised = False
     except PersistenceUnavailableError:
         raised = True
     assert raised and tool.calls == 0, "provider must not run when ledger is down"
 
 
-async def test_operation_id_consumed_on_entry_no_leak():
-    """取用即清：invoke 后 provider_ctx.operation_id 为 None——不泄漏给下一个调用。"""
+async def test_identity_is_per_call_not_shared_state():
+    """身份是 invoke 的入参，不是共享可变字段——不可能泄漏给下一个无关调用。
+
+    旧设计经 `provider_ctx.operation_id` 转移所有权，忘了清就会让后台 observe 的
+    collect_process_report 命中别的操作的 completed 短路（实测回归）。改成入参后
+    这个失败模式在结构上不存在。
+    """
     ops = InMemoryOperationStore()
     memory, state, ctx, tool, gateway = _fixture(op_store=ops)
-    _set_op(state, ctx, "rec1", 0)
-    await gateway.invoke("probe__go", {}, state, ctx)
-    assert ctx.provider_ctx.operation_id is None
-    # 下一次不带身份 → 旁路正常执行
+    await gateway.invoke("probe__go", {}, state, ctx, tool_call_id=OP1)
+    assert tool.calls == 1
+
+    # 紧接着一次不带身份的调用：旁路、正常执行、不命中上一次的 completed
     res = await gateway.invoke("probe__go", {}, state, ctx)
     assert res.is_error is False and tool.calls == 2
+    assert not hasattr(ctx.provider_ctx, "operation_id")
