@@ -463,7 +463,7 @@ async def test_terminal_tool_error_does_not_terminate_loop(monkeypatch):
 
     monkeypatch.setattr(_obs_mod, "stream_llm_resilient", _fake_stream)
 
-    ERR = "[Error: invalid arguments for 'control__collect_process_report': unknown parameter(s): 'x']"
+    ERR = "[Error: invalid arguments for 'control__collect_process_report': 'act_recap' is required]"
     OK = "RECAP"
     gw = _FlakyTerminalGateway(ERR, OK)
     state = _make_state()

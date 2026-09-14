@@ -362,28 +362,8 @@ class CapabilityGateway:
                 f"well-formed JSON arguments object]",
                 is_dispatch, is_silent, tool_call_id,
             )
-        # 控制工具严格校验（spec: capability-gateway）：未知顶层参数不静默剥除，而是显式报错
-        # 回灌 LLM 改参重试。控制工具的参数语义是状态机性的——如 finish_task 的交付物在
-        # 收尾回合正文，误传 result= 会被吞掉且 outputs/result 回流/blackboard 全链路静默跳过。
-        # 外部工具（MCP/builtin/skill）不收紧：剥键容错（臆造键、畸形救援碎片）对它们仍是对的。
-        # 资格判定与剥键共用 _declarable_props——strip 不适用的 schema（组合/$ref/显式
-        # additionalProperties）这里同样不拒，两条路径行为严格一致。
-        if str(cap.id).startswith(f"{CONTROL}:"):
-            props = _declarable_props(schema)
-            if props is not None:
-                unknown = [k for k in effective_args if k not in props]
-                if unknown:
-                    declared = ", ".join(sorted(props)) or "(none)"
-                    return await self._error_and_record(
-                        state, ctx, tool_name, invocation_id,
-                        f"[Error: invalid arguments for '{tool_name}': unknown parameter(s): "
-                        f"{', '.join(repr(k) for k in unknown)}; declared parameters: {declared} "
-                        f"— re-send the call with only the declared parameters]",
-                        is_dispatch, is_silent, tool_call_id,
-                    )
         # 剥掉 schema 未声明的顶层键（对任意调用生效）。放在 _raw 兜底之后，避免把哨兵剥空
         # 而丢掉「参数非法」信号；放在 required 校验之前，使「只发了未知键」被剥空后照样触发 required。
-        # 控制工具到此处必然无未知键（上面已拒），strip 对其为恒等操作。
         effective_args = _strip_unknown_keys(effective_args, schema)
         # 参数校验：放在 coerce 之后，看到的是收敛后的类型（3 而非 "3"），不会假阳性。
         # 只拦 required/type/enum（见 _validate_args），失败回灌 LLM 让其改参重试，与 unknown-tool 同出口。
@@ -1042,7 +1022,7 @@ def _coerce_args(arguments: dict[str, Any], schema: dict[str, Any] | None) -> di
 
 
 def _declarable_props(schema: dict[str, Any] | None) -> dict[str, Any] | None:
-    """剥键与控制工具严格校验共用的资格判定：能明确「什么是已知键」时返回
+    """剥键的资格判定：能明确「什么是已知键」时返回
     ``properties``，否则 ``None``（fail-open——不剥、也不拒）。
 
     仅当 schema 自身可判定时才生效：
@@ -1071,8 +1051,7 @@ def _strip_unknown_keys(arguments: dict[str, Any], schema: dict[str, Any] | None
     也避免错碎片被当成合法调用执行。
 
     仅剥顶层，不递归进嵌套对象（组合/``$ref`` 下递归易误删）。
-    资格判定见 ``_declarable_props``；控制工具不走本函数的静默语义——
-    见 invoke() 内的严格检查（spec: capability-gateway）。
+    资格判定见 ``_declarable_props``。
     """
     props = _declarable_props(schema)
     if props is None:

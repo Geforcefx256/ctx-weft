@@ -275,7 +275,6 @@ ActStep 一次工具调用（最终走 `CapabilityGateway.invoke` `:236`）的�
 3. **参数管线**（`:334`-`:388`，按序）——**三通道分离**（spec: capability-gateway）：`original_arguments`（调用方入参，不被修改，审批指纹用）→ `effective_args`（授权/HITL 改写 + 校验后，**未脱敏**，执行通道）→ `audit_args`（`_sanitize` 脱敏副本，只进事件与 TOOL_AUDIT，审计通道）：
    - `_coerce_args`（`:925`）：字符串→schema 声明标量收敛；
    - `_raw` 哨兵（`:341`）：adapter 对「参数没解析成 JSON」的兜底，带畸形原文（截断）直白报错；
-   - **控制工具严格校验**（本仓 2026-09 起，spec: capability-gateway）：`cap.id` 以 `control:` 开头且存在未知顶层参数 → 返回 `[Error: invalid arguments for '{tool}': unknown parameter(s): …; declared parameters: … — re-send the call with only the declared parameters]`（`is_error=True`），**不调 provider**，错误回灌 LLM 同 run 改参重试。资格判定与剥键共用 `_declarable_props`（`:942`，组合关键字/`$ref`/显式 additionalProperties 一律 fail-open）；
    - `_strip_unknown_keys`（`:964`）：对**非控制工具**静默剥未知顶层键（模型臆造键、畸形缓冲救援碎片的容错）；
    - `_validate_args`（`:990`）：只拦 required / type / enum（spec B），失败回灌重试。
 4. **执行与记录**：发 `CAPABILITY_INVOKED`（`:542`，payload 带脱敏副本）；普通非 silent 工具写 `TOOL_AUDIT`（TASK scope，`:587`；`_record_invocation` `:536`）+ 结果写 `role=tool` CONVERSATION_TURN（`_record_result` `:696`）；`SILENT_TOOLS`（report_task_outcome / update_task_metadata / finish_task / collect_process_report）不入 task 对话；派发工具（delegate_plan）eager 写 AGENT 层派发框（`:555`）。执行走 `_stream_tool`（收**未脱敏**的 effective 参数，Provider 永远拿不到 `***`）；工具输出过大 spill 落盘（`_maybe_spill` `:820`）；结果 parts 合法化/图片外部化；`CAPABILITY_FINISHED`（`:706`）。

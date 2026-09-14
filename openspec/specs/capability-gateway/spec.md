@@ -2,34 +2,13 @@
 
 ## Purpose
 
-定义 CapabilityGateway 对工具调用的参数校验行为契约：控制工具（core 自有编排工具）未知参数的显式拒绝与错误回灌、外部工具的容错剥键语义，以及观察循环对终止工具失败的容错重试，保证 LLM 的参数误用可见、可恢复、不静默丢失信息；并固定执行参数与审计参数的三通道分离（Provider 收有效参数、审计只见脱敏副本）。
+定义 CapabilityGateway 对工具调用的参数校验行为契约：工具的容错剥键语义，以及观察循环对终止工具失败的容错重试；并固定执行参数与审计参数的三通道分离（Provider 收有效参数、审计只见脱敏副本）。
 
 ## Requirements
 
-### Requirement: 控制工具未知参数显式拒绝
+### Requirement: 未知参数剥键容错语义
 
-CapabilityGateway 对控制工具（capability id 以 `control:` 为前缀的工具）的调用 SHALL 校验顶层参数：当存在 schema 未声明的顶层键时，SHALL 返回结构化错误结果（`is_error=True`），错误文案 MUST 包含未声明的键名与 schema 已声明的参数清单，并以 LLM 可读的形式引导其只带声明参数重发调用；被调用的工具实现 MUST NOT 被执行。错误结果 SHALL 经既有的工具结果回灌通道进入当前 run 的消息序列，使 LLM 能在同一 run 内改参重试。
-
-校验的适用范围 MUST 与剥键资格判定保持一致：当 schema 含组合关键字（`allOf`/`anyOf`/`oneOf`/`not`）、顶层 `$ref`、或显式允许附加属性（`additionalProperties` 为真值或子 schema）时，SHALL 不作未知参数拒绝（fail-open）。
-
-#### Scenario: finish_task 误带 result 参数被拒
-
-- **WHEN** LLM 调用 `control__finish_task` 并传入未声明的 `result="..."` 参数
-- **THEN** 该调用返回 `is_error=True` 的错误结果，文案含未知键名 `result` 与已声明参数 `deliverables_summary`；finish_task 的实现不被执行；错误内容出现在当前 run 的后续消息序列中供 LLM 重试
-
-#### Scenario: 控制工具全声明参数正常放行
-
-- **WHEN** LLM 调用任一控制工具且所有顶层参数均在 schema 声明
-- **THEN** 调用正常执行，行为与收紧前完全一致
-
-#### Scenario: 剥键不适用的 schema 不拒绝
-
-- **WHEN** 某控制工具的 schema 含组合关键字或显式 `additionalProperties` 允许附加属性，且调用带了 schema 之外可能的顶层键
-- **THEN** 不触发未知参数拒绝（与剥键的 fail-open 判定一致），调用按既有容错语义处理
-
-### Requirement: 非控制工具维持剥键容错语义
-
-CapabilityGateway 对控制工具之外的工具（MCP、builtin、skill 等）的未知顶层参数 SHALL 维持既有剥键行为：未声明键被剥除后仅以声明参数调用工具，不产生错误反馈；参数校验仍仅拦截 required 缺失、type 不符、enum 越界三类约束。
+CapabilityGateway 对工具调用的未知顶层参数 SHALL 维持剥键行为：未声明键被剥除后仅以声明参数调用工具，不产生错误反馈；参数校验仍仅拦截 required 缺失、type 不符、enum 越界三类约束。
 
 #### Scenario: MCP 工具臆造键被静默剥除
 
