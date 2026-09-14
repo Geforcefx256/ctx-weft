@@ -582,6 +582,20 @@ class CtxWeftRuntime:
             from ctx_weft.providers.events import InMemoryEventStore
             event_store = InMemoryEventStore()
         self.event_store = event_store
+        # 有序提交是 EventStore 的必需部分（spec: event-log），**与提交策略无关**：
+        # 恢复路径（rebuild_view / SnapshotWriter）无条件走 position 一致切面，没有
+        # 按 ID 排序的回落分支。这里做的是契约校验而非能力协商——Protocol 的
+        # @abstractmethod 只拦得住显式继承的实现，鸭子类型 store 缺方法要到第一次
+        # 提交才炸，那时错误已经离现场很远。
+        from ctx_weft.protocols.events import supports_ordered_commit
+        if not supports_ordered_commit(self.event_store):
+            raise ValueError(
+                f"EventStore {type(self.event_store).__name__} 未实现有序提交："
+                "append_batch / read_range / committed_head 三者必须齐全（spec: event-log）。"
+                "按事件 ID 排序的 store 不是「功能少一点」，而是恢复语义错误——延迟提交的"
+                "事件会永久落在快照游标之外，两条恢复路径给出不同的世界且不报错"
+                "（可靠性方案 H2）。内置 InMemoryEventStore / SqlEventStore 均已实现；"
+                "自定义 store 请参照 tests/unit/test_ordered_event_store_conformance.py。")
         # 存储不可用健康表（spec: event-commit）：session_id → 原因。CommitGate 失败时
         # **先标记后抛**；公开查询走 storage_health()。内存态——崩溃后由持久日志重建。
         self._storage_unavailable: dict[str, str] = {}
@@ -601,12 +615,6 @@ class CtxWeftRuntime:
                     "EventBus.attach_commit_gate：emit/commit_provisional 在 fanout 前 "
                     "先经 gate 确认存储提交）。InProcessEventBus 已支持；自定义总线请实现"
                     "该扩展，或显式配置 event_commit_policy='best_effort' 并接受丢事件风险。")
-            from ctx_weft.protocols.events import supports_ordered_commit
-            if not supports_ordered_commit(self.event_store):
-                raise ValueError(
-                    "event_commit_policy='required' 需要实现有序提交扩展的事件存储"
-                    "（EventStore.append_batch / read_range / committed_head 三者齐全）；"
-                    "自定义 store 请升级，或显式配置 event_commit_policy='best_effort'。")
             from ctx_weft.core.events.commit_gate import CommitGate
             self._event_bus.attach_commit_gate(CommitGate(
                 self.event_store, on_unavailable=self._mark_storage_unavailable))

@@ -8,7 +8,7 @@
 
 ### Requirement: 同会话提交位置唯一且单调
 
-EventStore 的有序提交扩展（`append_batch` / `read_range` / `committed_head`，并入 `EventStore` 协议本体，不另立平行 Protocol；能力判定走 `supports_ordered_commit(store)`）为同会话的每次成功提交分配 position：同会话内 SHALL 严格递增、永不重用、无空洞之外的无序分配；`committed_head(session_id)` SHALL 返回该会话最新已确认提交的 position。`event.id` 继续作为事件身份，SHALL NOT 被用作提交顺序依据；同 event.id MUST NOT 分属两个 session。
+有序提交（`append_batch` / `read_range` / `committed_head`）是 `EventStore` 的**必需**部分，不是可选扩展、也不另立平行 Protocol：三者均为 `@abstractmethod`，Runtime 构造期再以 `supports_ordered_commit(store)` 校验一道（拦鸭子类型实现），缺一即拒绝启动。恢复路径 SHALL NOT 提供按事件 ID 排序的回落分支。EventStore SHALL 为同会话的每次成功提交分配 position：同会话内 SHALL 严格递增、永不重用、无空洞之外的无序分配；`committed_head(session_id)` SHALL 返回该会话最新已确认提交的 position。`event.id` 继续作为事件身份，SHALL NOT 被用作提交顺序依据；同 event.id MUST NOT 分属两个 session。
 
 #### Scenario: 位置随批次递增
 

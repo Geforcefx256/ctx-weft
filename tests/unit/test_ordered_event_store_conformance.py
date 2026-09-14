@@ -224,22 +224,28 @@ def test_single_event_protocol_no_parallel_ordered_protocol():
         assert hasattr(mod.EventStore, name)
 
 
-def test_supports_ordered_commit_rejects_inherited_stubs():
-    """只继承协议桩的 store 判为不支持——hasattr 会误判，这正是换掉它的理由。
+def test_ordered_commit_methods_are_mandatory():
+    """三个方法是 @abstractmethod，与 append / read_by_session 同档——不是可选扩展。"""
+    assert EventStore.__abstractmethods__ >= {
+        "append", "read_by_session", "append_batch", "read_range", "committed_head"}
+    # 可选扩展仍是可选：不在 abstractmethods 里
+    for name in ("read_after", "save_snapshot", "load_latest_snapshot",
+                 "list_active_session_ids", "read_session_events_of_types"):
+        assert name not in EventStore.__abstractmethods__
 
-    required 模式的构造期检查依赖这条：误判会把错误推迟到第一次 emit 才炸。
-    """
+
+def test_subclass_missing_ordered_commit_cannot_instantiate():
+    """第一层强制：显式继承 EventStore 而不实现三方法 → ABC 在实例化时就拒绝。"""
     class StubStore(EventStore):
         async def append(self, event): ...
         async def read_by_session(self, session_id): return []
 
-    stub = StubStore()
-    assert hasattr(stub, "append_batch")          # 继承自协议，恒为真
-    assert not supports_ordered_commit(stub)      # 但不是真实现
+    with pytest.raises(TypeError, match="append_batch"):
+        StubStore()
 
 
 def test_supports_ordered_commit_accepts_duck_typed_store():
-    """不继承协议、自带三个方法的鸭子类型 store 判为支持。"""
+    """鸭子类型 store（不继承协议，绕过 ABC）自带三个方法 → 契约校验放行。"""
     class DuckStore:
         async def append_batch(self, session_id, batch_id, events): ...
         async def read_range(self, session_id, **kw): return []
@@ -249,8 +255,34 @@ def test_supports_ordered_commit_accepts_duck_typed_store():
 
 
 def test_supports_ordered_commit_requires_all_three():
-    """部分实现不算支持——半可用的提交门比不支持更难诊断。"""
+    """第二层强制：鸭子类型绕过 ABC，部分实现由构造期校验拦下。
+
+    半可用的提交门比完全没有更难诊断——所以三缺一即判不合格。
+    """
     class PartialStore:
         async def append_batch(self, session_id, batch_id, events): ...
 
     assert not supports_ordered_commit(PartialStore())
+
+
+def test_runtime_rejects_store_without_ordered_commit():
+    """构造期响亮拒绝：按 ID 排序的 store 不是「功能少一点」，是恢复语义错误。
+
+    鸭子类型 store 绕过 ABC，所以这道校验是第二层网；且**与 commit policy 无关**
+    ——best_effort 也一样拒绝，因为错的是恢复语义不是提交确认。
+    """
+    from ctx_weft.core.models.config import RuntimeConfig
+    from ctx_weft.core.runtime import CtxWeftRuntime
+
+    class LegacyStore:
+        """只有旧接口的 store——WP2 之前的形态。"""
+        async def append(self, event): ...
+        async def read_by_session(self, session_id): return []
+        async def read_after(self, session_id, after_event_id): return []
+
+    for policy in ("required", "best_effort"):
+        with pytest.raises(ValueError, match="未实现有序提交"):
+            CtxWeftRuntime(
+                event_store=LegacyStore(),
+                config=RuntimeConfig(event_commit_policy=policy),
+            )

@@ -491,16 +491,38 @@ def test_new_exception_codes_follow_existing_naming_style():
 
 
 class _MemStore:
+    """只读 fake：喂一段事件给 `rebuild_view`，不模拟快照。
+
+    有序提交是 `EventStore` 的必需部分（spec: event-log），恢复路径无条件走
+    `committed_head` + `read_range`，所以 fake 也得提供这两个——position 直接用
+    列表下标（1-based），语义上等价于「这些事件按此顺序提交过」。
+    """
+
     def __init__(self, events):
         self._events = events
 
     async def read_by_session(self, session_id, **_kw):
         return list(self._events)
 
+    async def committed_head(self, session_id):
+        return len(self._events)
+
+    async def read_range(self, session_id, *, after_position=0, through_position=None):
+        from ctx_weft.protocols.events import StoredEvent
+        end = len(self._events) if through_position is None else through_position
+        return [
+            StoredEvent(event=e, position=i)
+            for i, e in enumerate(self._events, start=1)
+            if after_position < i <= end
+        ]
+
+    async def append_batch(self, session_id, batch_id, events):  # pragma: no cover - 只读 fake
+        raise NotImplementedError
+
     async def load_latest_snapshot(self, session_id):
         # `rebuild_view` 把 NotImplementedError 当「这个 store 不支持快照」处理，
-        # 落到全量 `read_by_session` 重放（reducers.py:294-297）——这里没有快照
-        # 机制要模拟，直接选这条契约化的退路，而不是让 `_MemStore` 假装有快照。
+        # 落到全量 `read_range(0..head)` 重放——这里没有快照机制要模拟，直接选这条
+        # 契约化的退路，而不是让 `_MemStore` 假装有快照。
         raise NotImplementedError
 
 

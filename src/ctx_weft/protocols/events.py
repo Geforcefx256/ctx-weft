@@ -477,16 +477,24 @@ class PersistenceUnavailableError(Exception):
 class EventStore(Protocol):
     """事件流持久化抽象。host 提供具体实现（Postgres / SQLite / in-memory）。
 
-    ## 三档强制性
+    ## 两档强制性
 
-    1. **必须实现**（`@abstractmethod`）：`append` / `read_by_session`。
+    1. **必须实现**（`@abstractmethod`）：`append` / `read_by_session` /
+       `append_batch` / `read_range` / `committed_head`。
+       **有序提交是底线，不是可选项**——理由见下节。
     2. **可选扩展**（默认 `raise NotImplementedError`，core 捕获后降级为全量 replay）：
        `list_active_session_ids` / `read_after` / `read_session_events_of_types` /
        `save_snapshot` / `load_latest_snapshot`。
-    3. **有序提交扩展**（同样默认 `raise NotImplementedError`）：`append_batch` /
-       `read_range` / `committed_head`。缺席时提交门与 position 快照不可用——详见下节。
 
-    ## 有序提交（spec: event-log；WP3 提交门 / WP4 快照切面的地基）
+    ## 有序提交为何必选（spec: event-log；WP3 提交门 / WP4 快照切面的地基）
+
+    没有提交位置就没有正确的恢复：ID 在事件构造时铸造，而提交可以更晚发生（未提交
+    窗口 `begin_provisional` / `commit_provisional`），「后提交的小 ID」真实可达。
+    按 ID 当快照游标，延迟提交的事件会**永久**落在游标之外——两条恢复路径（全量回放
+    vs 快照+增量）从此给出不同的世界，且不报错、不留痕（可靠性方案 H2）。
+
+    所以这里**不提供 legacy 回落**：一个按 ID 排序的 store 不是「功能少一点」，而是
+    「恢复语义是错的」。宁可在构造期响亮拒绝，也不要让它静默跑出两个世界。
 
     - `append_batch` 是**原子**提交：整批要么全部落库（各自分配连续递增 position）、
       要么全部不存在；批内事件必须同属一个 session。
@@ -498,40 +506,61 @@ class EventStore(Protocol):
     存储实现**不得**用无锁 `MAX(position)+1` 分配——必须经会话 head 行（同事务
     UPDATE）串行化（SQLite `BEGIN IMMEDIATE` 等价路径 / PostgreSQL 行锁）。
 
-    这三个方法**不另立第二个 Protocol**：能力有无由 `supports_ordered_commit(store)`
-    判定（它区分「真实现」与「继承自本协议的 NotImplementedError 桩」），调用方
-    不得改用 `hasattr` ——继承本协议的 store 恒有这些属性。
+    Protocol 的 `@abstractmethod` 拦不住鸭子类型的 store（不继承本协议就没有 ABC
+    检查），所以 Runtime 在构造期用 `supports_ordered_commit(store)` 兜一道，缺一个
+    方法就拒绝启动。
 
     ## 排序口径
 
-    实现了有序提交的 store，`read_by_session` / `read_session_events_of_types`
-    统一按 **position（提交序）** 排序；未实现的 legacy store 按 `id`（ULID 铸造序）。
-    `append(event)` 在前者由单事件 `append_batch` 实现（batch_id 确定性取 event.id），
+    `read_by_session` / `read_session_events_of_types` 按 **position（提交序）** 排序。
+    `append(event)` 由单事件 `append_batch` 实现（batch_id 确定性取 event.id），
     既有调用方语义不变。
     """
 
     @abstractmethod
     async def append(self, event: Event) -> None:
-        """持久化单条事件。"""
+        """持久化单条事件（= 单事件 `append_batch`，batch_id 取 event.id）。"""
         ...
 
     @abstractmethod
     async def read_by_session(self, session_id: str) -> list[Event]:
-        """按 session_id 加载全部事件，按**提交序**升序排序。
+        """按 session_id 加载全部事件，按 `position`（提交序）升序排序。
 
-        实现了有序提交的 store 按 `position` 排（存量 position 为 NULL 的 legacy
-        行排在前、其内部按 id 序）；未实现的 legacy store 按 `id`（ULID 字典序）排。
+        存量 position 为 NULL 的 legacy 行排在前、其内部按 id 序（迁移前后的确定性
+        口径，见 `scripts/migrate_event_positions.py`）。
 
         **排序键不是 `sequence`。** `sequence` 只在同一 `run_id` 内单调递增
         （见 `Event.sequence`）；一个 session 可以跨多个 run，按 sequence 排会把
         不同 run 的事件交错在一起（run A 的 1,2,3 与 run B 的 1,2,3 排成
         A1,B1,A2,B2,A3,B3）。
 
-        **也不再是 `id`。** ID 在事件构造时铸造，而提交可以更晚发生（未提交窗口
-        `begin_provisional` / `commit_provisional`），所以「后提交的小 ID」真实可达；
-        按 ID 排会让两条恢复路径（全量回放 vs 快照+增量）给出不同的世界——这正是
-        可靠性方案 H2 的根因。`position` 由存储层在提交那一刻分配，是唯一可靠的提交序。
+        **也不是 `id`。** 理由见类 docstring「有序提交为何必选」。
         """
+        ...
+
+    # ── 有序提交（必须实现；spec: event-log）──────────────────────────────────
+
+    @abstractmethod
+    async def append_batch(
+        self, session_id: str, batch_id: str, events: "list[Event]",
+    ) -> CommitReceipt:
+        """原子提交一批事件，返回带提交位置的 receipt。"""
+        ...
+
+    @abstractmethod
+    async def read_range(
+        self,
+        session_id: str,
+        *,
+        after_position: int = 0,
+        through_position: int | None = None,
+    ) -> "list[StoredEvent]":
+        """按 position 升序读取 (after_position, through_position] 的已提交事件。"""
+        ...
+
+    @abstractmethod
+    async def committed_head(self, session_id: str) -> int:
+        """该会话最新已确认提交的 position；无提交时为 0。"""
         ...
 
     # ── 可选快照扩展 ──────────────────────────────────────────────────────────
@@ -544,14 +573,13 @@ class EventStore(Protocol):
     async def read_after(self, session_id: str, after_event_id: str) -> list[Event]:
         """**[legacy]** 加载 session 中 id > after_event_id 的增量事件（ULID 字典序）。
 
-        ⚠️ **MUST NOT 用于新版快照增量**（spec: snapshot-recovery）：ID 铸造序 ≠ 提交序，
-        按 ID 当游标会让延迟提交的旧 ID 永久落在游标之外（可靠性方案 H2）。实现了有序
-        提交的 store 走 `read_range(after_position, through_position)`；本方法只在
-        `supports_ordered_commit(store)` 为假的 legacy store 上作为回落路径使用。
+        ⚠️ **core 已无调用点，且 MUST NOT 用于快照增量**（spec: snapshot-recovery）：
+        ID 铸造序 ≠ 提交序，按 ID 当游标会让延迟提交的旧 ID 永久落在游标之外
+        （可靠性方案 H2）。恢复一律走 `read_range(after_position, through_position)`。
+        保留本方法只为宿主自有的「某 id 之后发生了什么」这类只读查询。
 
         `after_event_id` 不存在于本 session 时，字面语义已蕴含：返回 id 大于它的
         **全部**事件，不是空列表——这是纯过滤，不是"从标记处扫描、找不到就返回空"。
-        调用方据此在标记失配时仍能拿到完整增量，而不是静默丢失整段 delta。
         """
         raise NotImplementedError
 
@@ -586,47 +614,23 @@ class EventStore(Protocol):
         """
         raise NotImplementedError
 
-    # ── 有序提交扩展 ──────────────────────────────────────────────────────────
-    # 未实现时抛 NotImplementedError；能力判定走 supports_ordered_commit()。
-    # 缺席的后果：event_commit_policy='required' 构造期失败（不静默退化）、
-    # 快照回落 legacy ID 游标路径并告警（见 SnapshotWriter / rebuild_view）。
 
-    async def append_batch(
-        self, session_id: str, batch_id: str, events: "list[Event]",
-    ) -> CommitReceipt:
-        """原子提交一批事件，返回带提交位置的 receipt。"""
-        raise NotImplementedError
-
-    async def read_range(
-        self,
-        session_id: str,
-        *,
-        after_position: int = 0,
-        through_position: int | None = None,
-    ) -> "list[StoredEvent]":
-        """按 position 升序读取 (after_position, through_position] 的已提交事件。"""
-        raise NotImplementedError
-
-    async def committed_head(self, session_id: str) -> int:
-        """该会话最新已确认提交的 position；无提交时为 0。"""
-        raise NotImplementedError
-
-
-#: 有序提交扩展的三个方法——`supports_ordered_commit` 要求**全部**落地才算具备能力
-#: （部分实现会让提交门与快照切面处于半可用状态，比不支持更难诊断）。
+#: 有序提交的三个必需方法——`supports_ordered_commit` 要求**全部**落地
+#: （部分实现会让提交门与快照切面处于半可用状态，比完全没有更难诊断）。
 _ORDERED_COMMIT_METHODS = ("append_batch", "read_range", "committed_head")
 
 
 def supports_ordered_commit(store: object) -> bool:
-    """store 是否真正实现了有序提交扩展（spec: event-log）。
+    """store 是否真的实现了有序提交（spec: event-log）。
 
-    **不要用 `hasattr` 代替本函数。** 三个方法现在是 `EventStore` 协议自身的可选成员，
-    任何显式继承 `EventStore` 的 store 都恒有这些属性——`hasattr` 会把只继承了
-    `NotImplementedError` 桩的 store 误判为支持，于是 `required` 模式的构造期检查形同
-    虚设，错误推迟到第一次 emit 才炸。
+    有序提交是 `EventStore` 的**必需**部分，所以本函数不是能力协商、而是**契约校验**：
+    Runtime 构造期调用它，缺一个方法就拒绝启动。之所以还需要运行时校验，是因为
+    `@abstractmethod` 只对显式继承 `EventStore` 的实现生效——鸭子类型的 store 不经过
+    ABC 检查，少一个方法要到第一次提交才炸。
 
-    判据是「这个属性是不是协议自带的那个桩」：鸭子类型的 store（不继承协议）自带实现
-    → 真；继承协议但未覆盖 → 假；完全没有该属性 → 假。
+    **不要用 `hasattr` 代替本函数**：继承 `EventStore` 的 store 恒有这些属性名，
+    `hasattr` 会把只继承了抽象桩的 store 误判为已实现。判据是「这个属性是不是协议
+    自带的那个桩」：鸭子类型自带实现 → 真；继承协议但未覆盖 → 假；没有该属性 → 假。
     """
     for name in _ORDERED_COMMIT_METHODS:
         impl = getattr(type(store), name, None)

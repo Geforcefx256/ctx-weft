@@ -14,7 +14,7 @@
 一致切面（spec: snapshot-recovery，change reliability-wp4）：快照边界 = 写那一刻的
 ``committed_head``（C），内容 = ``read_range(0..C)`` 的全量折——触发事件只是「现在写
 一张」的信号，不是边界。单一 apply 语义让「全量回放 vs 快照+增量」两路恢复天然等价
-（E5）。store 不具备有序提交能力时回落旧路径（触发事件 ID 当游标）并告警。
+（E5）。有序提交是 EventStore 的必需部分，故这里没有 legacy 回落分支。
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from ctx_weft.protocols.events import TRANSIENT_EVENT_TYPES, supports_ordered_commit
+from ctx_weft.protocols.events import TRANSIENT_EVENT_TYPES
 
 if TYPE_CHECKING:
     from ctx_weft.protocols.events import Event, EventBus, EventStore
@@ -95,41 +95,12 @@ class SnapshotWriter:
         # （WP3 后 writer 收到的都是已确认事件，C ≥ 触发事件 position，不会漏折它）。
         # 全量折是刻意的：与恢复路径共用同一个 apply 语义，两路等价（E5）不需要额外
         # 证明；增量维护 writer 内存 view 的方案被否决见 design D1。
-        head = None
-        if supports_ordered_commit(self._store):
-            head = await self._store.committed_head(session_id)
-            stored = await self._store.read_range(
-                session_id, after_position=0, through_position=head)
-            view = reduce_events([se.event for se in stored], run_id=session_id)
-            if not view.session_id:
-                return  # 该 session 尚无任何已提交事件，跳过
-            snapshot = RunSnapshot(
-                id=generate_id("snp"),
-                run_id=event.run_id or "",
-                session_id=session_id,
-                last_event_id=event.id,
-                last_event_sequence=event.sequence,
-                state_blob=serialize_view(view),
-                snapshot_reason=reason,
-                snapshot_at=now_utc(),
-                last_commit_position=head,
-                projection_version=self.PROJECTION_VERSION,
-            )
-            await self._store.save_snapshot(snapshot)
-            logger.info(
-                "SnapshotWriter: snapshot %s for session %s (reason=%s, cut=%d events)",
-                snapshot.id, session_id, reason, len(stored),
-            )
-            return
-
-        # ── legacy 回落（store 无有序提交能力）────────────────────────────────
-        from ctx_weft.core.control.reducers import rebuild_view
-        logger.warning(
-            "SnapshotWriter: store lacks committed_head/read_range; falling back to "
-            "legacy id-cursor snapshot (recovery will ignore it and full-replay)")
-        view = await rebuild_view(self._store, session_id)
+        head = await self._store.committed_head(session_id)
+        stored = await self._store.read_range(
+            session_id, after_position=0, through_position=head)
+        view = reduce_events([se.event for se in stored], run_id=session_id)
         if not view.session_id:
-            return
+            return  # 该 session 尚无任何已提交事件，跳过
         snapshot = RunSnapshot(
             id=generate_id("snp"),
             run_id=event.run_id or "",
@@ -139,5 +110,11 @@ class SnapshotWriter:
             state_blob=serialize_view(view),
             snapshot_reason=reason,
             snapshot_at=now_utc(),
+            last_commit_position=head,
+            projection_version=self.PROJECTION_VERSION,
         )
         await self._store.save_snapshot(snapshot)
+        logger.info(
+            "SnapshotWriter: snapshot %s for session %s (reason=%s, cut=%d events)",
+            snapshot.id, session_id, reason, len(stored),
+        )

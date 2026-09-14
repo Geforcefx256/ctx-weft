@@ -18,7 +18,7 @@ from ctx_weft.core.control.types import AgentView, RunStateView, SessionView, Ta
 from ctx_weft.core.hitl.registry import HITL_STAGE_AUTHZ, HITL_STAGE_TOOL, PendingHitl
 from ctx_weft.core.hitl.snapshot import HitlSnapshot
 from ctx_weft.core.models.status import WAITING, TaskStatus
-from ctx_weft.protocols.events import Event, EventType, supports_ordered_commit
+from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.protocols.hitl import (
     HITL_FORM_QUESTION,
     HITL_FORM_WAIT,
@@ -315,51 +315,44 @@ _PROJECTION_VERSION = 1
 async def rebuild_view(event_store: Any, session_id: str) -> RunStateView:
     """按快照+增量或全量回放重建 RunStateView（spec: snapshot-recovery，wp4 改造）。
 
+    恢复**只有一条口径**：position 一致切面。有序提交是 `EventStore` 的必需部分，
+    所以这里不再按 store 能力分路——没有「无 position 时怎么办」这个分支。
+
     路径选择（按序）：
 
-    1. **position 一致切面**（store 具备有序提交能力且快照有效）：
-       快照携带 ``last_commit_position``、``projection_version`` 匹配、且位置不超前于
-       ``committed_head`` → ``read_range((cursor, head])`` 增量 apply。
-    2. **全量回放**：无快照 / 快照缺 position（legacy）/ 版本不匹配 / 引用未来位置
-       （数据异常）→ ``read_range(0..head)``（无能力时 ``read_by_session``）全量折。
+    1. **快照 + 增量**（快照有效）：快照携带 ``last_commit_position``、
+       ``projection_version`` 匹配、且位置不超前于 ``committed_head``
+       → ``read_range((cursor, head])`` 增量 apply。
+    2. **全量回放**：无快照 / 快照缺 position（改造前的存量快照）/ 版本不匹配 /
+       引用未来位置（数据异常）→ ``read_range(0..head)`` 全量折。
        忽略坏快照是性能降级不是数据丢失（日志是真相）。
 
-    ``read_after(id)`` 自本改造起为纯 legacy API——生产无调用点；MUST NOT 用于
-    新版快照增量（ID 铸造序 ≠ 提交序，正是 H2 的根因）。
+    ``read_after(id)`` **不在本函数的任何路径上**：ID 铸造序 ≠ 提交序，按 ID 当游标
+    正是 H2 的根因。
     """
     try:
         snapshot = await event_store.load_latest_snapshot(session_id)
     except NotImplementedError:
         snapshot = None
 
-    if supports_ordered_commit(event_store):
-        head = await event_store.committed_head(session_id)
-        if (
-            snapshot is not None
-            and snapshot.last_commit_position is not None
-            and snapshot.projection_version == _PROJECTION_VERSION
-            and snapshot.last_commit_position <= head
-        ):
-            view = deserialize_view(snapshot.state_blob)
-            delta = await event_store.read_range(
-                session_id,
-                after_position=snapshot.last_commit_position,
-                through_position=head,
-            )
-            return apply_events([se.event for se in delta], view)
-        # 全量：忽略快照（legacy/损坏/超前），按 position 序重放并重造快照由 writer 负责
-        stored = await event_store.read_range(
-            session_id, after_position=0, through_position=head)
-        return reduce_events([se.event for se in stored], run_id=session_id)
-
-    # ── legacy store（无有序提交能力）：维持旧 ID 游标路径 ────────────────────
-    if snapshot:
+    head = await event_store.committed_head(session_id)
+    if (
+        snapshot is not None
+        and snapshot.last_commit_position is not None
+        and snapshot.projection_version == _PROJECTION_VERSION
+        and snapshot.last_commit_position <= head
+    ):
         view = deserialize_view(snapshot.state_blob)
-        delta = await event_store.read_after(session_id, snapshot.last_event_id)
-        return apply_events(delta, view)
-
-    events = await event_store.read_by_session(session_id)
-    return reduce_events(events, run_id=session_id)
+        delta = await event_store.read_range(
+            session_id,
+            after_position=snapshot.last_commit_position,
+            through_position=head,
+        )
+        return apply_events([se.event for se in delta], view)
+    # 全量：忽略快照（存量/损坏/超前），按 position 序重放；重造快照由 writer 负责
+    stored = await event_store.read_range(
+        session_id, after_position=0, through_position=head)
+    return reduce_events([se.event for se in stored], run_id=session_id)
 
 
 def reduce_events(events: list[Event], run_id: str) -> RunStateView:
