@@ -375,7 +375,7 @@ class _LLMTurnOutput:
     tool_calls: list[ToolCall]
     usage: LLMUsage
     # 摄入锚（预铸的 assistant 记录 id，ingest 按 MemoryEvent.id 采纳）与铸造伴随。
-    # tool_calls 内的 id 已是内部标识；minted 保留 raw_id/ordinal 供落库伴随字段。
+    # tool_calls 内的 id 已是内部标识；minted 保留原始 wire id / ordinal 供落库伴随字段。
     anchor: str = ""
     minted: list[MintedCall] = dataclasses.field(default_factory=list)
 
@@ -570,7 +570,7 @@ async def _ingest_assistant_turn(
 
     anchor（spec: conversation-integrity）：预铸的记录 id，经 MemoryEvent.id 交给 provider
     采纳——它同时是内部调用标识与 operation_id 的派生锚，三者由此同源。minted 携带每个
-    调用的 raw wire id 与 ordinal，随 metadata 落库（raw_id 供追溯、op_id 供恢复链复用）；
+    调用的 raw wire id 与 ordinal，随 metadata 落库（raw_tool_call_id 供追溯、op_id 供恢复链复用）；
     两者缺省（旧测试直调 / 无工具回合）时退化为无伴随字段的旧行为。
     """
     from ctx_weft.core.loop.capability_gateway import DISPATCH_TOOLS, SILENT_TOOLS
@@ -580,7 +580,7 @@ async def _ingest_assistant_turn(
         d: dict = {"id": tc.id, "name": tc.name, "input": tc.arguments}
         m = by_ordinal.get(i)
         if m is not None:
-            d["raw_id"] = m.raw_id
+            d["raw_tool_call_id"] = m.raw_id
             if anchor:
                 from ctx_weft.protocols.operations import operation_id_for
                 # 与 _execute_tool_calls 的枚举同口径（全列表 index）→ 派生值逐字节一致。

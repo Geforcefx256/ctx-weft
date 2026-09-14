@@ -28,8 +28,18 @@ class BudgetStrategy(Protocol):
         blocks: list["ContextBlock"],
         token_limit: int,
         request: "ContextRequest",
+        overflow_limit: int | None = None,
     ) -> list["ContextBlock"]:
-        """根据 token_limit 裁剪 blocks；不够时抛 ContextOverflowError。"""
+        """根据 token_limit 裁剪 blocks；不够时抛 ContextOverflowError。
+
+        ``token_limit`` 是**内容预算**——`ContextAssembler` 传入时已扣掉工具面预留
+        （spec: tool-schema-budget）。``overflow_limit`` 是**真窗口**，只用于溢出报错里的
+        ``effective_limit`` 字段：报错数字要对得上宿主配的 context_limit，否则排查时对不上账。
+        None → 退化为 token_limit（直构路径同旧行为）。
+
+        ⚠️ 本参数是 `ContextAssembler.assemble` 的**关键字实参**，自实现本协议的宿主
+        必须接受它，否则 assemble 时 TypeError。
+        """
         ...
 
 

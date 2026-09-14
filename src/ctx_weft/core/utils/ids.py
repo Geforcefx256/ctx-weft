@@ -7,7 +7,7 @@
 复用（`call_1` 这类短值是常态），跨轮次/跨任务召回重建后按裸 id 配对会错配。每个
 assistant 回合摄入时把 wire id 替换为 `tc_{seq36}_{ord36}_{hash12}`——字符集
 `[a-z0-9_]`、长度 ≤64（主流 provider 工具 id 约束的交集内，adapter 原样透传即合法），
-由回合锚 + 调用序号 + 原始 id 确定性派生。raw id 保留在记录 metadata（`raw_id`）。
+由回合锚 + 调用序号 + 原始 id 确定性派生。raw id 保留在记录 metadata（`raw_tool_call_id`）。
 """
 
 from __future__ import annotations

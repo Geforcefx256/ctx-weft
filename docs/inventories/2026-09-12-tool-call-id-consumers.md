@@ -45,5 +45,5 @@
 ## 值域变化（对外可见）
 
 - 事件（CAPABILITY_* / LLM_RESPONSE_FINISHED.tool_calls）与 HITL 请求中的 `tool_call_id`
-  从裸 wire id 变为内部标识；raw id 保留于 assistant 记录 metadata（`tool_calls[].raw_id`），
+  从裸 wire id 变为内部标识；raw id 保留于 assistant 记录 metadata（`tool_calls[].raw_tool_call_id`），
   `op_id`（operation_id）随伴随写入。

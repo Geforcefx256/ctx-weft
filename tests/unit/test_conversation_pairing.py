@@ -123,7 +123,7 @@ async def test_ingest_adopts_anchor_and_records_companions():
     asst = [r for r in rec if r.role == "assistant"][0]
     tc_md = asst.metadata["tool_calls"][0]
     assert tc_md["id"] == minted[0].call.id
-    assert tc_md["raw_id"] == "call_1"
+    assert tc_md["raw_tool_call_id"] == "call_1"
     assert tc_md["op_id"] == operation_id_for("default", "s1", "ag1", anchor, 0)
 
 
@@ -137,7 +137,7 @@ async def test_ingest_without_minting_keeps_legacy_shape():
     assert persisted.tool_calls[0]["id"] == "call_1"
     rec = await mem.load_view(state.scope, MemoryScope.TASK, ctx.provider_ctx)
     tc_md = [r for r in rec if r.role == "assistant"][0].metadata["tool_calls"][0]
-    assert "raw_id" not in tc_md and "op_id" not in tc_md
+    assert "raw_tool_call_id" not in tc_md and "op_id" not in tc_md
 
 
 # ── 重建与合法化：重复 raw id 不复制不错配（内部标识平面） ───────────────────
