@@ -184,7 +184,6 @@ def delegate_task(
         "for the user. Default False = autonomous (the actor must call finish_task "
         "to finish).",
     ] = False,
-    inputs: Annotated[dict, "Optional input data for the sub-task"] = None,
     *,
     ctx: ControlContext = None,
 ) -> ControlResult:
