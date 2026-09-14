@@ -426,12 +426,89 @@ class RunSnapshot:
     projection_version: int = 1
 
 
+# ── 提交位置、批次与存储错误（spec: event-log / event-commit）──────────────────
+
+
+@dataclass(frozen=True)
+class StoredEvent:
+    """事件 + 其在本会话日志中的提交位置。
+
+    `position` 由存储层在提交时分配：同会话内唯一、严格递增，**与事件 ID（铸造序）
+    无关**——延迟提交的旧 ID 会拿到较大的 position，这正是快照恢复改用 position 截断
+    的原因（可靠性方案 H2）。
+    """
+
+    event: Event
+    position: int
+
+
+@dataclass(frozen=True)
+class CommitReceipt:
+    """一次批次提交的确认：batch_id + 按提交顺序排列的 StoredEvent。
+
+    调用方收到 receipt 即意味着该批已获存储确认（required 语义的依据，WP3 提交门）。
+    重试幂等：同 batch_id 同内容重复提交返回原 receipt（position 不变）。
+    """
+
+    batch_id: str
+    records: tuple[StoredEvent, ...]
+
+
+class EventConflictError(Exception):
+    """相同 batch_id 以不同内容重放，或事件 ID 已被另一批次提交。
+
+    幂等重试必须**原样**（逐字段一致，忽略 position）；顶替/改写已提交批次不被允许。
+    调用方不得换一个新 batch_id 猜测性重发——那是双写，不是重试。
+    """
+
+
+class PersistenceUnavailableError(Exception):
+    """事件提交未获存储确认（required 模式下 emit 抛出；spec: event-commit）。
+
+    语义：调用方不得把本错误当作普通可重试失败——会话已进入 ``storage_unavailable``
+    隔离（停止调度新副作用），恢复前须以 batch_id 确认未知提交（幂等重试拿原 receipt）。
+    """
+
+
 # ── EventStore Protocol ───────────────────────────────────────────────────────
 
 
 @runtime_checkable
 class EventStore(Protocol):
-    """事件流持久化抽象。host 提供具体实现（Postgres / SQLite / in-memory）。"""
+    """事件流持久化抽象。host 提供具体实现（Postgres / SQLite / in-memory）。
+
+    ## 三档强制性
+
+    1. **必须实现**（`@abstractmethod`）：`append` / `read_by_session`。
+    2. **可选扩展**（默认 `raise NotImplementedError`，core 捕获后降级为全量 replay）：
+       `list_active_session_ids` / `read_after` / `read_session_events_of_types` /
+       `save_snapshot` / `load_latest_snapshot`。
+    3. **有序提交扩展**（同样默认 `raise NotImplementedError`）：`append_batch` /
+       `read_range` / `committed_head`。缺席时提交门与 position 快照不可用——详见下节。
+
+    ## 有序提交（spec: event-log；WP3 提交门 / WP4 快照切面的地基）
+
+    - `append_batch` 是**原子**提交：整批要么全部落库（各自分配连续递增 position）、
+      要么全部不存在；批内事件必须同属一个 session。
+    - `batch_id` 在第一次提交前生成、重试不换；相同 batch_id + 相同内容（忽略
+      position）→ 原 receipt；不同内容 → `EventConflictError`。
+    - `committed_head` 返回该会话最新已确认提交的 position；无提交时为 0。
+    - `read_range` 按 position 升序只读已提交事件，`through_position` 含端点。
+
+    存储实现**不得**用无锁 `MAX(position)+1` 分配——必须经会话 head 行（同事务
+    UPDATE）串行化（SQLite `BEGIN IMMEDIATE` 等价路径 / PostgreSQL 行锁）。
+
+    这三个方法**不另立第二个 Protocol**：能力有无由 `supports_ordered_commit(store)`
+    判定（它区分「真实现」与「继承自本协议的 NotImplementedError 桩」），调用方
+    不得改用 `hasattr` ——继承本协议的 store 恒有这些属性。
+
+    ## 排序口径
+
+    实现了有序提交的 store，`read_by_session` / `read_session_events_of_types`
+    统一按 **position（提交序）** 排序；未实现的 legacy store 按 `id`（ULID 铸造序）。
+    `append(event)` 在前者由单事件 `append_batch` 实现（batch_id 确定性取 event.id），
+    既有调用方语义不变。
+    """
 
     @abstractmethod
     async def append(self, event: Event) -> None:
@@ -440,14 +517,20 @@ class EventStore(Protocol):
 
     @abstractmethod
     async def read_by_session(self, session_id: str) -> list[Event]:
-        """按 session_id 加载全部事件，按 id（ULID 字典序）升序排序。
+        """按 session_id 加载全部事件，按**提交序**升序排序。
 
-        **排序键是 id，不是 sequence。** `sequence` 只在同一 `run_id` 内单调递增
+        实现了有序提交的 store 按 `position` 排（存量 position 为 NULL 的 legacy
+        行排在前、其内部按 id 序）；未实现的 legacy store 按 `id`（ULID 字典序）排。
+
+        **排序键不是 `sequence`。** `sequence` 只在同一 `run_id` 内单调递增
         （见 `Event.sequence`）；一个 session 可以跨多个 run，按 sequence 排会把
         不同 run 的事件交错在一起（run A 的 1,2,3 与 run B 的 1,2,3 排成
-        A1,B1,A2,B2,A3,B3）。`id` 是 ULID，全局单调，与 `read_after` 的排序口径
-        一致，也是 `SqlEventStore` 的排序键（`ORDER BY id`）。生产里三者（append 顺序 /
-        sequence 顺序 / id 顺序）通常一致，只有乱序 append 或跨 run 会话才会分叉。
+        A1,B1,A2,B2,A3,B3）。
+
+        **也不再是 `id`。** ID 在事件构造时铸造，而提交可以更晚发生（未提交窗口
+        `begin_provisional` / `commit_provisional`），所以「后提交的小 ID」真实可达；
+        按 ID 排会让两条恢复路径（全量回放 vs 快照+增量）给出不同的世界——这正是
+        可靠性方案 H2 的根因。`position` 由存储层在提交那一刻分配，是唯一可靠的提交序。
         """
         ...
 
@@ -459,22 +542,27 @@ class EventStore(Protocol):
         raise NotImplementedError
 
     async def read_after(self, session_id: str, after_event_id: str) -> list[Event]:
-        """加载 session 中 id > after_event_id 的增量事件（ULID 字典序）。
+        """**[legacy]** 加载 session 中 id > after_event_id 的增量事件（ULID 字典序）。
+
+        ⚠️ **MUST NOT 用于新版快照增量**（spec: snapshot-recovery）：ID 铸造序 ≠ 提交序，
+        按 ID 当游标会让延迟提交的旧 ID 永久落在游标之外（可靠性方案 H2）。实现了有序
+        提交的 store 走 `read_range(after_position, through_position)`；本方法只在
+        `supports_ordered_commit(store)` 为假的 legacy store 上作为回落路径使用。
 
         `after_event_id` 不存在于本 session 时，字面语义已蕴含：返回 id 大于它的
         **全部**事件，不是空列表——这是纯过滤，不是"从标记处扫描、找不到就返回空"。
-        调用方（如 `rebuild_view` 用快照的 `last_event_id` 调本方法）据此在标记失配
-        时仍能拿到完整增量，而不是静默丢失整段 delta。
+        调用方据此在标记失配时仍能拿到完整增量，而不是静默丢失整段 delta。
         """
         raise NotImplementedError
 
     async def read_session_events_of_types(
         self, session_id: str, types: "tuple[str, ...]",
     ) -> list[Event]:
-        """只加载 session 中指定类型的事件（按 id / ULID 字典序升序排序）。
+        """只加载 session 中指定类型的事件（按提交序升序排序）。
 
-        排序键与 `read_by_session` 同理是 id 而非 sequence——sequence 只在同一
-        `run_id` 内单调，跨 run 的 session 按它排会交错两个 run 的事件。
+        排序口径与 `read_by_session` 完全一致：有序提交 store 按 `position`、legacy
+        store 按 `id`；两者都不用 `sequence`（它只在同一 `run_id` 内单调，跨 run 的
+        session 按它排会交错两个 run 的事件）。
 
         轻查询——供恢复决策按事件折叠（如 HITL 待解决判定）而**不必全量回放**。
         未实现时抛 NotImplementedError；调用方降级为 read_by_session + 内存过滤。
@@ -497,6 +585,54 @@ class EventStore(Protocol):
         「最后写入即最新」这个更强、不受协议保证的假设。
         """
         raise NotImplementedError
+
+    # ── 有序提交扩展 ──────────────────────────────────────────────────────────
+    # 未实现时抛 NotImplementedError；能力判定走 supports_ordered_commit()。
+    # 缺席的后果：event_commit_policy='required' 构造期失败（不静默退化）、
+    # 快照回落 legacy ID 游标路径并告警（见 SnapshotWriter / rebuild_view）。
+
+    async def append_batch(
+        self, session_id: str, batch_id: str, events: "list[Event]",
+    ) -> CommitReceipt:
+        """原子提交一批事件，返回带提交位置的 receipt。"""
+        raise NotImplementedError
+
+    async def read_range(
+        self,
+        session_id: str,
+        *,
+        after_position: int = 0,
+        through_position: int | None = None,
+    ) -> "list[StoredEvent]":
+        """按 position 升序读取 (after_position, through_position] 的已提交事件。"""
+        raise NotImplementedError
+
+    async def committed_head(self, session_id: str) -> int:
+        """该会话最新已确认提交的 position；无提交时为 0。"""
+        raise NotImplementedError
+
+
+#: 有序提交扩展的三个方法——`supports_ordered_commit` 要求**全部**落地才算具备能力
+#: （部分实现会让提交门与快照切面处于半可用状态，比不支持更难诊断）。
+_ORDERED_COMMIT_METHODS = ("append_batch", "read_range", "committed_head")
+
+
+def supports_ordered_commit(store: object) -> bool:
+    """store 是否真正实现了有序提交扩展（spec: event-log）。
+
+    **不要用 `hasattr` 代替本函数。** 三个方法现在是 `EventStore` 协议自身的可选成员，
+    任何显式继承 `EventStore` 的 store 都恒有这些属性——`hasattr` 会把只继承了
+    `NotImplementedError` 桩的 store 误判为支持，于是 `required` 模式的构造期检查形同
+    虚设，错误推迟到第一次 emit 才炸。
+
+    判据是「这个属性是不是协议自带的那个桩」：鸭子类型的 store（不继承协议）自带实现
+    → 真；继承协议但未覆盖 → 假；完全没有该属性 → 假。
+    """
+    for name in _ORDERED_COMMIT_METHODS:
+        impl = getattr(type(store), name, None)
+        if impl is None or impl is getattr(EventStore, name, None):
+            return False
+    return True
 
 
 # ── Blob 存储（事件流的字节侧）─────────────────────────────────────────────────
@@ -575,93 +711,3 @@ class NullEventBlobStore(EventBlobStore):
         return None
 
 
-# ── 存储不可用（spec: event-commit）────────────────────────────────────────────
-
-
-class PersistenceUnavailableError(Exception):
-    """事件提交未获存储确认（required 模式下 emit 抛出；spec: event-commit）。
-
-    语义：调用方不得把本错误当作普通可重试失败——会话已进入 ``storage_unavailable``
-    隔离（停止调度新副作用），恢复前须以 batch_id 确认未知提交（幂等重试拿原 receipt）。
-    """
-
-
-# ── OrderedEventStore（有序提交扩展，spec: event-log）─────────────────────────
-
-
-@dataclass(frozen=True)
-class StoredEvent:
-    """事件 + 其在本会话日志中的提交位置。
-
-    `position` 由存储层在提交时分配：同会话内唯一、严格递增，**与事件 ID（铸造序）
-    无关**——延迟提交的旧 ID 会拿到较大的 position，这正是快照恢复改用 position 截断
-    的原因（可靠性方案 H2）。
-    """
-
-    event: Event
-    position: int
-
-
-@dataclass(frozen=True)
-class CommitReceipt:
-    """一次批次提交的确认：batch_id + 按提交顺序排列的 StoredEvent。
-
-    调用方收到 receipt 即意味着该批已获存储确认（required 语义的依据，WP3 提交门）。
-    重试幂等：同 batch_id 同内容重复提交返回原 receipt（position 不变）。
-    """
-
-    batch_id: str
-    records: tuple[StoredEvent, ...]
-
-
-class EventConflictError(Exception):
-    """相同 batch_id 以不同内容重放，或事件 ID 已被另一批次提交。
-
-    幂等重试必须**原样**（逐字段一致，忽略 position）；顶替/改写已提交批次不被允许。
-    调用方不得换一个新 batch_id 猜测性重发——那是双写，不是重试。
-    """
-
-
-@runtime_checkable
-class OrderedEventStore(Protocol):
-    """EventStore 的有序提交扩展（spec: event-log；WP3 提交门 / WP4 快照切面的地基）。
-
-    ## position 与批次
-
-    - `append_batch` 是**原子**提交：整批要么全部落库（各自分配连续递增 position）、
-      要么全部不存在；批内事件必须同属一个 session。
-    - `batch_id` 在第一次提交前生成、重试不换；相同 batch_id + 相同内容（忽略
-      position）→ 原 receipt；不同内容 → `EventConflictError`。
-    - `committed_head` 返回该会话最新已确认提交的 position；无提交时为 0。
-    - `read_range` 按 position 升序只读已提交事件，`through_position` 含端点。
-
-    ## 兼容
-
-    `append(event)` 由单事件 `append_batch` 实现（batch_id 确定性取 event.id），
-    既有调用方语义不变。`read_by_session` / `read_session_events_of_types` 在新版
-    Store 统一按 position 排序（legacy 行 position 为 NULL 时排在前、按 id 序）；
-    `read_after(id)` 保留 legacy 口径，新版快照恢复不再使用它。
-
-    存储实现**不得**用无锁 `MAX(position)+1` 分配——必须经会话 head 行（同事务
-    UPDATE）串行化（SQLite `BEGIN IMMEDIATE` 等价路径 / PostgreSQL 行锁）。
-    """  # noqa: D418
-
-    async def append_batch(
-        self, session_id: str, batch_id: str, events: "list[Event]",
-    ) -> CommitReceipt:
-        """原子提交一批事件，返回带提交位置的 receipt。"""
-        raise NotImplementedError
-
-    async def read_range(
-        self,
-        session_id: str,
-        *,
-        after_position: int = 0,
-        through_position: int | None = None,
-    ) -> "list[StoredEvent]":
-        """按 position 升序读取 (after_position, through_position] 的已提交事件。"""
-        raise NotImplementedError
-
-    async def committed_head(self, session_id: str) -> int:
-        """该会话最新已确认提交的 position；无提交时为 0。"""
-        raise NotImplementedError

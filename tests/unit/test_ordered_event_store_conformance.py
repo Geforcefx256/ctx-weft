@@ -1,4 +1,4 @@
-"""OrderedEventStore conformance（spec: event-log；change reliability-wp2）。
+"""EventStore 有序提交扩展的 conformance（spec: event-log；change reliability-wp2）。
 
 参数化内存 / SQLite 跑同一套用例，钉住八条 requirement：位置唯一单调、批次原子、
 batch_id 幂等与冲突、append 兼容、跨会话隔离、双连接争用、按位置读取、（迁移单测另
@@ -16,7 +16,9 @@ from ctx_weft.protocols.events import (
     CommitReceipt,
     Event,
     EventConflictError,
+    EventStore,
     StoredEvent,
+    supports_ordered_commit,
 )
 from ctx_weft.providers.events.store.in_memory.store import InMemoryEventStore
 from ctx_weft.providers.events.store.sql.store import SqlEventStore, open_sqlite_event_store
@@ -211,5 +213,44 @@ def test_protocol_types_shape():
         raise EventConflictError("x")
     except EventConflictError:
         pass
-    from ctx_weft.protocols.events import OrderedEventStore as P
-    assert isinstance(store := InMemoryEventStore(), P)
+    assert supports_ordered_commit(InMemoryEventStore())
+
+
+def test_single_event_protocol_no_parallel_ordered_protocol():
+    """有序提交并进 EventStore，不另立第二个 Protocol（避免两套 store 契约）。"""
+    import ctx_weft.protocols.events as mod
+    assert not hasattr(mod, "OrderedEventStore")
+    for name in ("append_batch", "read_range", "committed_head"):
+        assert hasattr(mod.EventStore, name)
+
+
+def test_supports_ordered_commit_rejects_inherited_stubs():
+    """只继承协议桩的 store 判为不支持——hasattr 会误判，这正是换掉它的理由。
+
+    required 模式的构造期检查依赖这条：误判会把错误推迟到第一次 emit 才炸。
+    """
+    class StubStore(EventStore):
+        async def append(self, event): ...
+        async def read_by_session(self, session_id): return []
+
+    stub = StubStore()
+    assert hasattr(stub, "append_batch")          # 继承自协议，恒为真
+    assert not supports_ordered_commit(stub)      # 但不是真实现
+
+
+def test_supports_ordered_commit_accepts_duck_typed_store():
+    """不继承协议、自带三个方法的鸭子类型 store 判为支持。"""
+    class DuckStore:
+        async def append_batch(self, session_id, batch_id, events): ...
+        async def read_range(self, session_id, **kw): return []
+        async def committed_head(self, session_id): return 0
+
+    assert supports_ordered_commit(DuckStore())
+
+
+def test_supports_ordered_commit_requires_all_three():
+    """部分实现不算支持——半可用的提交门比不支持更难诊断。"""
+    class PartialStore:
+        async def append_batch(self, session_id, batch_id, events): ...
+
+    assert not supports_ordered_commit(PartialStore())

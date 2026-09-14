@@ -3,7 +3,7 @@
 协议在 `ctx_weft.protocols.events`；本模块只是它的一个实现（spec 2026-08-27 三层划界）。
 线程不安全，仅供开发 / 测试 / 单进程 demo；host 上生产要换 Postgres 等持久实现。
 
-OrderedEventStore 扩展（spec: event-log）：一把 asyncio.Lock 保护「head 分配 + 幂等
+有序提交扩展（spec: event-log）：一把 asyncio.Lock 保护「head 分配 + 幂等
 查询 + 批量写入」的短临界区——进程内单事件循环下天然串行；跨会话不互相阻塞的并行度
 由 SQL 实现承担（内存实现只承诺正确性，见 reliability-wp2 design D5）。
 """
@@ -17,7 +17,6 @@ from ctx_weft.protocols.events import (
     Event,
     EventConflictError,
     EventStore,
-    OrderedEventStore,
     RunSnapshot,
     StoredEvent,
 )
@@ -27,7 +26,7 @@ from ctx_weft.providers.events._lifecycle import apply_lifecycle
 # ── InMemoryEventStore ────────────────────────────────────────────────────────
 
 
-class InMemoryEventStore(EventStore, OrderedEventStore):
+class InMemoryEventStore(EventStore):
     """单进程内存版。线程不安全，仅供开发/测试/单进程 demo 使用。
 
     订阅由 `EventPersister` 负责，见 `providers/events/persister.py`。
@@ -42,7 +41,7 @@ class InMemoryEventStore(EventStore, OrderedEventStore):
         self._batches: dict[str, CommitReceipt] = {}      # batch_id → receipt
         self._event_batch: dict[str, str] = {}            # event.id → batch_id（身份守卫）
 
-    # ── 写（OrderedEventStore：原子批次）──────────────────────────────────────
+    # ── 写（有序提交扩展：原子批次）──────────────────────────────────────
 
     async def append_batch(
         self, session_id: str, batch_id: str, events: list[Event],

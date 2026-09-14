@@ -601,11 +601,12 @@ class CtxWeftRuntime:
                     "EventBus.attach_commit_gate：emit/commit_provisional 在 fanout 前 "
                     "先经 gate 确认存储提交）。InProcessEventBus 已支持；自定义总线请实现"
                     "该扩展，或显式配置 event_commit_policy='best_effort' 并接受丢事件风险。")
-            if not hasattr(self.event_store, "append_batch"):
+            from ctx_weft.protocols.events import supports_ordered_commit
+            if not supports_ordered_commit(self.event_store):
                 raise ValueError(
-                    "event_commit_policy='required' 需要 OrderedEventStore 兼容的事件存储"
-                    "（实现 append_batch / read_range / committed_head）；自定义 store 请"
-                    "升级，或显式配置 event_commit_policy='best_effort'。")
+                    "event_commit_policy='required' 需要实现有序提交扩展的事件存储"
+                    "（EventStore.append_batch / read_range / committed_head 三者齐全）；"
+                    "自定义 store 请升级，或显式配置 event_commit_policy='best_effort'。")
             from ctx_weft.core.events.commit_gate import CommitGate
             self._event_bus.attach_commit_gate(CommitGate(
                 self.event_store, on_unavailable=self._mark_storage_unavailable))

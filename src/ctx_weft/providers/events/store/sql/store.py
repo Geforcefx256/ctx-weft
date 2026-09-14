@@ -30,7 +30,6 @@ from ctx_weft.protocols.events import (
     Event,
     EventConflictError,
     EventStore,
-    OrderedEventStore,
     RunSnapshot,
     StoredEvent,
 )
@@ -52,7 +51,7 @@ logger = logging.getLogger(__name__)
 __all__ = ["SqlEventStore", "open_sqlite_event_store"]
 
 
-class SqlEventStore(EventStore, OrderedEventStore):
+class SqlEventStore(EventStore):
     """SQLAlchemy-backed event store（含有序提交扩展，spec: event-log）。"""
 
     def __init__(
@@ -64,7 +63,7 @@ class SqlEventStore(EventStore, OrderedEventStore):
         self._factory = session_factory
         self._keep_snapshots = max(1, keep_snapshots)
 
-    # ── 写（OrderedEventStore：原子批次）──────────────────────────────────────
+    # ── 写（有序提交扩展：原子批次）──────────────────────────────────────
 
     async def append_batch(
         self, session_id: str, batch_id: str, events: list[Event],

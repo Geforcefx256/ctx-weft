@@ -18,7 +18,7 @@ from ctx_weft.core.control.types import AgentView, RunStateView, SessionView, Ta
 from ctx_weft.core.hitl.registry import HITL_STAGE_AUTHZ, HITL_STAGE_TOOL, PendingHitl
 from ctx_weft.core.hitl.snapshot import HitlSnapshot
 from ctx_weft.core.models.status import WAITING, TaskStatus
-from ctx_weft.protocols.events import Event, EventType
+from ctx_weft.protocols.events import Event, EventType, supports_ordered_commit
 from ctx_weft.protocols.hitl import (
     HITL_FORM_QUESTION,
     HITL_FORM_WAIT,
@@ -317,7 +317,7 @@ async def rebuild_view(event_store: Any, session_id: str) -> RunStateView:
 
     路径选择（按序）：
 
-    1. **position 一致切面**（store 具备 OrderedEventStore 能力且快照有效）：
+    1. **position 一致切面**（store 具备有序提交能力且快照有效）：
        快照携带 ``last_commit_position``、``projection_version`` 匹配、且位置不超前于
        ``committed_head`` → ``read_range((cursor, head])`` 增量 apply。
     2. **全量回放**：无快照 / 快照缺 position（legacy）/ 版本不匹配 / 引用未来位置
@@ -332,10 +332,7 @@ async def rebuild_view(event_store: Any, session_id: str) -> RunStateView:
     except NotImplementedError:
         snapshot = None
 
-    has_ordered = (
-        hasattr(event_store, "committed_head") and hasattr(event_store, "read_range"))
-
-    if has_ordered:
+    if supports_ordered_commit(event_store):
         head = await event_store.committed_head(session_id)
         if (
             snapshot is not None
@@ -355,7 +352,7 @@ async def rebuild_view(event_store: Any, session_id: str) -> RunStateView:
             session_id, after_position=0, through_position=head)
         return reduce_events([se.event for se in stored], run_id=session_id)
 
-    # ── legacy store（无 OrderedEventStore 能力）：维持旧 ID 游标路径 ──────────
+    # ── legacy store（无有序提交能力）：维持旧 ID 游标路径 ────────────────────
     if snapshot:
         view = deserialize_view(snapshot.state_blob)
         delta = await event_store.read_after(session_id, snapshot.last_event_id)
