@@ -433,7 +433,6 @@ class CapabilityGateway:
         # provider_ctx；**缺失（裸调）→ 账本全程旁路**——既有单测/宿主直构 gateway 零改动。
         # 已 completed → 短路复用账本结果（O-T08 前半：同逻辑调用重入不再打 provider）。
         ledger = self._operation_store
-        short_circuit: "InvocationResult | None" = None
         ledger_record = None
         if ledger is not None and op_id:
             from ctx_weft.protocols.operations import (
@@ -452,9 +451,6 @@ class CapabilityGateway:
                 return InvocationResult(
                     invocation_id=invocation_id, tool_name=tool_name,
                     content=result_text, is_error=False)
-            # 账本写失败 → PersistenceUnavailableError（复用 WP3 隔离语义；D3：
-            # 账本是 H3 恢复的依据，静默降级会重新制造「伪装成功」）
-            from ctx_weft.protocols.events import PersistenceUnavailableError as _PUE
             try:
                 # 已有记录（重入/恢复）→ 不再 prepare：op_id 即身份，reconcile 注入的
                 # 记录身份字段来自原回合（gateway 的 extra 里未必带），prepare 的身份
@@ -491,15 +487,12 @@ class CapabilityGateway:
                     f"operation ledger unavailable for {op_id!r}: {_led_exc}"
                 ) from _led_exc
 
-        try:
-            streamed = await self._stream_tool(
-                provider, cap.id, effective_args, provider_ctx, state, invocation_id,
-            )
-        except Exception:
-            if ledger is not None and op_id and ledger_record is not None:
-                # 执行崩溃：账本留在 started——副作用可能已发生；结果判定归 WP6 的策略表。
-                pass
-            raise
+        # 执行期异常不在这里碰账本（spec: tool-operations，wp5）：记录**有意**留在
+        # started——副作用可能已发生、结果不可判定，这正是 started 要表达的事实。
+        # 把它改写成别的状态等于替 WP6 的恢复策略表下结论。
+        streamed = await self._stream_tool(
+            provider, cap.id, effective_args, provider_ctx, state, invocation_id,
+        )
 
         # 6b. provider 让出了 needs_human：流已停在此处（其后 yield 的事件从未被消费，见
         # `_stream_events`）。等待权归 gateway——provider 只**声明**需要人。

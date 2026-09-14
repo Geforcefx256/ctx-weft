@@ -119,7 +119,10 @@ class SqlOperationStore:
                     raise ValueError(
                         f"operation_id {record.operation_id!r} already bound to a "
                         f"different logical call")
-                db.rollback()
+                # 幂等命中：本事务未做任何修改，退出 begin() 时提交空事务即可。
+                # 这里**不调 rollback**——原先写的 `db.rollback()` 漏了 await，返回的
+                # 协程从未被等待（RuntimeWarning），回滚实际上从未发生；而补上 await
+                # 又会和 begin() 退出时的 commit 撞车。没有要撤销的写，直接返回。
                 return _to_record(existing)
             db.add(_to_model(record))
         return copy.deepcopy(record)
