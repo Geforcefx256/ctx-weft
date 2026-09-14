@@ -1722,10 +1722,9 @@ def task_payload(task: Task, *, user_prompt_jsonable: "str | list[dict] | None")
             "priority": task.priority,
             "max_retries": task.max_retries,
             "dag_deps": task.dag_deps,
-            # spec: task-handoff——依赖条件与显式输入随创建事件落盘（None 原样落：
-            # 存量读侧按「未声明」解释，不虚构）。
+            # spec: task-handoff——依赖条件随创建事件落盘（None 原样落：存量读侧
+            # 按「未声明」解释，不虚构）。
             "dep_conditions": task.dep_conditions,
-            "inputs": task.inputs,
             "interaction_mode": task.interaction_mode,
             "unattended": task.unattended,
             "origin_tool_call_id": task.origin_tool_call_id or "",

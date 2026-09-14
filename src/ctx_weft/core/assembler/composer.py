@@ -100,7 +100,6 @@ Phase 3 (2026-06-30) 移除 ## Task Background blackboard 段，predecessor 结�
 from __future__ import annotations
 
 import dataclasses
-import json
 import logging
 import re
 from abc import abstractmethod
@@ -122,14 +121,6 @@ from ctx_weft.protocols import LLMMessage
 from ctx_weft.protocols.capability import qualify
 
 logger = logging.getLogger(__name__)
-
-
-def _inputs_section(inputs: dict) -> str:
-    """spec: task-handoff——`## Inputs` 小节：显式输入以 pretty JSON 原样呈现。
-
-    规整阶段的截断/裁剪标记（`_truncated` 等）就写在数据里，原样渲染即对模型可见。
-    """
-    return "## Inputs\n" + json.dumps(inputs, ensure_ascii=False, indent=2)
 
 
 # 渲染层有路径的块 kind：集合外的 kind 在 compose 显式 warning——不留静默盲区。
@@ -589,10 +580,6 @@ class DefaultComposer(Composer):
                 parts.append(f"## Current Task\n{spec_title}\n{spec_desc}")
             elif spec_title:
                 parts.append(f"## Current Task\n{spec_title}")
-            spec_inputs = self._task_spec_inputs(blocks, task)
-            if spec_inputs:
-                # spec: task-handoff——fresh 构建（首次执行/恢复重建）路径的输入区块
-                parts.append(_inputs_section(spec_inputs))
             if spec_prompt:
                 parts.append(
                     f"## Current Message\n{spec_prompt}\n\n"
@@ -729,11 +716,6 @@ class DefaultComposer(Composer):
             prefix = f"## Current Task\n{spec_title}\n{spec_desc}\n\n"
         elif spec_title:
             prefix = f"## Current Task\n{spec_title}\n\n"
-        spec_inputs = self._task_spec_inputs(blocks, task)
-        if spec_inputs:
-            # spec: task-handoff——in-memory 装饰（已有 memory 续跑/恢复/reopen）路径
-            # 的输入区块；与 Current Task 同前缀，钉在首条 user_prompt 回合上。
-            prefix += _inputs_section(spec_inputs) + "\n\n"
         if anchor != latest:
             # 首条原文冠 ## Opening Message（开启此 task 的消息）：与最新一条的
             # ## Current Message 区分，也把原文和随后追加的 directive/capabilities 分隔开。
@@ -1183,15 +1165,4 @@ class DefaultComposer(Composer):
         up = task.user_prompt
         user_prompt = up if isinstance(up, str) else (content_to_text(up) if up else "")
         return title, description, user_prompt
-
-    def _task_spec_inputs(self, blocks, task) -> "dict | None":
-        """当前 task 的显式输入（spec: task-handoff）。
-
-        与 `_task_spec_fields` 同口径：优先 task_spec block 的 metadata，回退直读
-        task。截断/裁剪标记已在规整时写入数据本身，这里原样渲染（对模型可见）。
-        """
-        blk = self._first_kind(blocks, "task_spec") if blocks else None
-        if blk is not None:
-            return blk.metadata.get("inputs")
-        return getattr(task, "inputs", None)
 

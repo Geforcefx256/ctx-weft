@@ -16,7 +16,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Annotated, Any
 
 from ctx_weft.core.capabilities.schema import extract_schema
-from ctx_weft.core.capabilities.task_inputs import InvalidTaskInputs, normalize_task_inputs
 from ctx_weft.core.utils.clock import now_utc
 from ctx_weft.core.utils.headings import SUBTASKS_REVIEW_HEADING
 from ctx_weft.core.utils.ids import generate_id
@@ -185,7 +184,6 @@ def delegate_task(
         "for the user. Default False = autonomous (the actor must call finish_task "
         "to finish).",
     ] = False,
-    inputs: Annotated[dict, "Optional input data for the sub-task"] = None,
     *,
     ctx: ControlContext = None,
 ) -> ControlResult:
@@ -194,12 +192,6 @@ def delegate_task(
 
     if ctx is None or ctx.task_manager is None or ctx.task is None:
         return ControlResult(content=f"Sub-task '{title}' scheduled.")
-
-    # spec: task-handoff——inputs 规整（纯 JSON + 分级收敛），不合格响亮拒绝、不派发。
-    try:
-        normalized_inputs = normalize_task_inputs(inputs)
-    except InvalidTaskInputs as e:
-        return ControlResult(content=f"Cannot delegate sub-task {title!r}: {e}")
 
     child = TaskModel(
         id=generate_id("tsk"),
@@ -211,7 +203,6 @@ def delegate_task(
         title=title,
         description=description,
         user_prompt=task_prompt or description,
-        inputs=normalized_inputs,
         origin_tool_call_id=ctx.tool_call_id or None,
         origin_tool_name=DELEGATE_TASK_NAME,  # 保真：actor 确实调了 delegate_task → finalize 铸框用真名
         interaction_mode=_child_mode(bool(interactive), ctx.task),
@@ -257,8 +248,6 @@ def delegate_plan(
             "inherit_memory (bool, default true), "
             "interactive (bool, default false — true makes the task human-interactive: "
             "a plain-text turn pauses and waits for the user instead of requiring control__finish_task), "
-            "inputs (object, optional JSON data handed to the sub-task verbatim — shown to it "
-            "under a dedicated '## Inputs' section; keep it small), "
             "run_if (str, when this task may start relative to its predecessor: 'success' "
             "(default — only after the predecessor FINISHED) or 'any' (cleanup-style: start "
             "once the predecessor reached any terminal state, including failure))."
@@ -277,9 +266,9 @@ def delegate_plan(
     if ctx is None or ctx.task_manager is None or ctx.task is None:
         return ControlResult(content=_PLAN_DISPATCH_ACK)
 
-    # spec: task-handoff——先整单校验再铸造：inputs 规整与 run_if 合法性任何一项不过，
-    # 整个调用拒绝、零子任务创建（不留下半截 plan）。
-    prepared: list[tuple[dict, dict | None, str]] = []  # (spec, inputs, run_if)
+    # spec: task-handoff——先整单校验再铸造：run_if 合法性不过则整个调用拒绝、
+    # 零子任务创建（不留下半截 plan）。
+    prepared: list[tuple[dict, str]] = []  # (spec, run_if)
     for idx, spec in enumerate(tasks):
         if not isinstance(spec, dict):
             continue
@@ -290,18 +279,12 @@ def delegate_plan(
                 f"Cannot delegate plan: task {idx + 1} ({title!r}) declares invalid "
                 f"run_if {run_if!r}; use 'success' or 'any'."
             ))
-        try:
-            normalized_inputs = normalize_task_inputs(spec.get("inputs"))
-        except InvalidTaskInputs as e:
-            return ControlResult(content=(
-                f"Cannot delegate plan: task {idx + 1} ({title!r}): {e}"
-            ))
-        prepared.append((spec, normalized_inputs, run_if))
+        prepared.append((spec, run_if))
 
     titles: list[str] = []
     child_ids: list[str] = []
     prev_ids: list[str] = []
-    for spec, normalized_inputs, run_if in prepared:
+    for spec, run_if in prepared:
         title = spec.get("title", "subtask")
         child = TaskModel(
             id=generate_id("tsk"),
@@ -313,7 +296,6 @@ def delegate_plan(
             title=title,
             description=spec.get("description", ""),
             user_prompt=spec.get("task_prompt") or spec.get("description", ""),
-            inputs=normalized_inputs,
             origin_tool_call_id=generate_id("tcall"),
             tracking_task_ids=list(prev_ids),
             # spec: task-handoff——本任务对前序的依赖条件（run_if）。物化进

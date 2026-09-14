@@ -1,4 +1,4 @@
-"""spec: task-handoff——集成路径：事件回放恢复、ack-id→reopen、计划断裂、阻塞原因可解释。
+"""spec: task-handoff——集成路径：ack-id→reopen、计划断裂、阻塞原因可解释。
 
 驱动方式：真 TaskManager + 真 InProcessEventBus 发射真事件 →（模拟崩溃）事件列表经
 reduce_events → converters → 新 TaskManager.restore 重建——这正是 rebuild_view 的
@@ -9,9 +9,6 @@ from __future__ import annotations
 
 import pytest
 
-from ctx_weft.core.assembler.assembler import ContextRequest
-from ctx_weft.core.assembler.composer import DefaultComposer
-from ctx_weft.core.assembler.sources.task_spec import TaskSpecSource
 from ctx_weft.core.capabilities.control_tools import (
     ControlContext,
     ControlMetaKey,
@@ -26,7 +23,6 @@ from ctx_weft.core.models.task import Task
 from ctx_weft.core.orchestrator.task.manager import TaskManager
 from ctx_weft.protocols.events import EventType
 from ctx_weft.providers.events import InProcessEventBus
-from types import SimpleNamespace
 
 
 class _CapturingBus:
@@ -84,50 +80,6 @@ async def _delegate_plan_ordered(tm: TaskManager, parent: Task, specs: list[dict
     finally:
         tm.stage_task = orig_stage
     return ack, order
-
-
-# ── 2.4 恢复链：inputs 落盘 → 回放重建 → 执行上下文再投递 ────────────────────
-
-
-@pytest.mark.asyncio
-async def test_inputs_survive_crash_and_reach_reassembled_context():
-    bus = _CapturingBus()
-    tm = _tm(bus)
-    parent = _parent()
-    tm.register_task(parent)
-
-    res = delegate_task(
-        title="analyze", task_prompt="analyze the file",
-        inputs={"file": "report.csv", "threshold": 3},
-        ctx=_ctx(tm, parent),
-    )
-    assert "(task_id:" in res.content
-    child = tm._staged[parent.id][0][0]
-    await tm.push_task(child, parent_task_id=parent.id)
-
-    # 模拟崩溃：只留事件日志，从回放重建
-    view = reduce_events(bus.events, "run_1")
-    recovered_view = view.tasks[child.id]
-    assert recovered_view.inputs == {"file": "report.csv", "threshold": 3}
-    recovered_task = task_from_projection(recovered_view)
-    assert recovered_task.inputs == {"file": "report.csv", "threshold": 3}
-
-    # 恢复后重跑：装配上下文仍含输入区块（走 TaskSpecSource → composer）
-    req = ContextRequest(
-        purpose="act",
-        scope=SimpleNamespace(session_id="s1", task_id=recovered_task.id, agent_id="a1"),
-        task=SimpleNamespace(
-            id=recovered_task.id, title=recovered_task.title, description="",
-            user_prompt=recovered_task.user_prompt, user_prompt_in_memory=False,
-            process_report=None, inputs=recovered_task.inputs,
-        ),
-        agent=SimpleNamespace(id="a1"), session=SimpleNamespace(id="s1"),
-        template=None, bound_capabilities=[], extra={},
-    )
-    blocks = [b async for b in TaskSpecSource().fetch(req, None)]
-    text = "\n".join(m.content for m in DefaultComposer()._build_actor_messages(blocks, req)
-                     if isinstance(m.content, str))
-    assert "## Inputs" in text and "report.csv" in text
 
 
 # ── 3.3 端到端：派发 ack 的 id → observer 以 task_id 发起 reopen ─────────────

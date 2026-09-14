@@ -58,7 +58,6 @@ def task_from_projection(proj: TaskView) -> Task:
         parent_task_id=proj.parent_task_id or None,
         dag_deps=list(proj.dag_deps),
         dep_conditions=dict(proj.dep_conditions) if proj.dep_conditions else None,
-        inputs=dict(proj.inputs) if proj.inputs else None,
         priority=proj.priority,
         max_retries=proj.max_retries,
         settings=deserialize_settings(proj.settings_raw),

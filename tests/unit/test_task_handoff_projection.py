@@ -1,4 +1,4 @@
-"""spec: task-handoff——inputs / dep_conditions / 阻塞取消结局码的投影往返。
+"""spec: task-handoff——dep_conditions / 阻塞取消结局码的投影往返。
 
 覆盖：TASK_CREATED 携带新字段折入 TaskView；TASK_CANCELED 的 error_code 与
 blocked_by_task_id 回填；存量事件（无新键）不炸且语义缺省；converter 回填 Task。
@@ -36,44 +36,38 @@ def _created(extra_task: dict | None = None) -> Event:
     return _ev(EventType.TASK_CREATED, {"task": task})
 
 
-# ── TASK_CREATED：inputs / dep_conditions 折入 ────────────────────────────────
+# ── TASK_CREATED：dep_conditions 折入 ─────────────────────────────────────────
 
 
-def test_created_folds_inputs_and_dep_conditions():
+def test_created_folds_dep_conditions():
     view = reduce_events([
         _created({
-            "inputs": {"file": "a.csv", "mode": "strict"},
             "dag_deps": ["tsk_0"],
             "dep_conditions": {"tsk_0": "success"},
         }),
     ], "run_1")
     t = view.tasks["tsk_1"]
-    assert t.inputs == {"file": "a.csv", "mode": "strict"}
     assert t.dep_conditions == {"tsk_0": "success"}
     # converter 回填 Task
     task = task_from_projection(t)
-    assert task.inputs == {"file": "a.csv", "mode": "strict"}
     assert task.dep_conditions == {"tsk_0": "success"}
 
 
 def test_created_without_new_keys_keeps_legacy_defaults():
-    """存量事件形态：无 inputs / dep_conditions 键 → None（不炸、不虚构）。"""
+    """存量事件形态：无 dep_conditions 键 → None（不炸、不虚构）。"""
     view = reduce_events([_created()], "run_1")
     t = view.tasks["tsk_1"]
-    assert t.inputs is None
     assert t.dep_conditions is None
     task = task_from_projection(t)
-    assert task.inputs is None
     assert task.dep_conditions is None
 
 
 def test_created_with_null_values_keeps_legacy_defaults():
-    """新代码显式落 None（无依赖/无输入的任务）同样回到缺省语义。"""
+    """新代码显式落 None（无依赖的任务）同样回到缺省语义。"""
     view = reduce_events([
-        _created({"inputs": None, "dep_conditions": None}),
+        _created({"dep_conditions": None}),
     ], "run_1")
     t = view.tasks["tsk_1"]
-    assert t.inputs is None
     assert t.dep_conditions is None
 
 
