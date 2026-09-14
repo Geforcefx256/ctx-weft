@@ -96,7 +96,7 @@ async def test_ot06_completed_memory_write_crash_ledger_backfills(tmp_path):
     """O-T06：账本 completed 后 memory 写前崩溃 → 新实例从账本补写，provider 不重执行。
 
     组件级（真退出形态的等价物）：直接构造 completed 账本 + 空 memory → 新 runtime
-    的 reconcile/queryable 语义——这里用更直接的方式验证「账本有结局 → memory 可补」。
+    的 reconcile/裁决链语义——这里用更直接的方式验证「账本有结局 → memory 可补」。
     """
     from ctx_weft.core.control.execution_budget import ExecutionLimits  # noqa: F401
     mem = InMemoryMemoryProvider()

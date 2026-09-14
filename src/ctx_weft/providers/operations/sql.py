@@ -48,7 +48,7 @@ class OperationModel(_Base):
     status: Mapped[str] = mapped_column(String(32))
     revision: Mapped[int] = mapped_column(Integer)
     args_hash: Mapped[str] = mapped_column(String(128), default="")
-    recovery_policy: Mapped[str] = mapped_column(String(32), default="manual")
+    recovery_policy: Mapped[str] = mapped_column(String(32), default="reviewed")
     attempts_json: Mapped[str] = mapped_column(Text, default="[]")
     result_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)

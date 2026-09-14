@@ -77,7 +77,7 @@ class _ExternalEffectTool(ToolCapabilityProvider):
             id="probe:record", name="record", description="Simulated external operation",
             side_effects=True,
             # wp6：显式 manual——钉「未知结果不自动重跑」的默认保守语义
-            recovery_policy="manual",
+            recovery_policy="reviewed",
         )
 
     async def list(self, ctx):

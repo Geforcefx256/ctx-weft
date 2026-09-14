@@ -39,10 +39,10 @@ class _RecordingTool(ToolCapabilityProvider):
         self.invoked: list[dict] = []
 
     async def list(self, ctx) -> list[ToolCapability]:
-        # wp6（spec: tool-operations）：声明 retry_safe —— 崩溃后同 op_id 重跑恰好一次。
+        # wp6（spec: tool-operations）：声明 idempotent —— 崩溃后同 op_id 重跑恰好一次。
         # 默认 manual 的行为由 test_tool_outcome_unknown.py 钉（unknown 停住）。
         return [ToolCapability(id="test:web", name="web", description="fetch a page",
-                               recovery_policy="retry_safe")]
+                               recovery_policy="idempotent")]
 
     async def retrieve(self, ctx) -> list[ToolCapability]:
         return await self.list(ctx)        # 让 CapabilityResolver 绑定 web 进 cache
@@ -100,7 +100,7 @@ async def test_crash_mid_tool_reinvokes_dangling_via_reconcile() -> None:
         timestamp=ts, role="assistant",
         metadata={"tool_calls": [{"id": tcid, "name": "test__web", "input": {"url": "x"}}]}), pctx)
 
-    # wp6：账本注入 STARTED 记录（确定性派生同一 op_id）——retry_safe 分支的输入。
+    # wp6：账本注入 STARTED 记录（确定性派生同一 op_id）——idempotent 分支的输入。
     from ctx_weft.protocols.operations import (
         OperationRecord, OperationStatus, operation_id_for)
     from ctx_weft.providers.operations import InMemoryOperationStore

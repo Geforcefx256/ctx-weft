@@ -63,8 +63,8 @@ class RecoveryPolicy(StrEnum):
       行为逐字相同，分成两个值只会让调用方以为存在不存在的差别。
     - ``REVIEWED``（默认）：core **绝不自行重跑**，把这次不确定交给裁决者。
 
-    裁决者是一条链，不是一个策略值（这正是旧 ``queryable`` / ``manual`` 被合并的原因
-    ——它们都属于「core 判不了」，区别只在谁来判）：
+    「谁来裁决」不是策略值，而是一条链——把它压进枚举会让「core 判不了」这一件事
+    裂成若干个看似并列的值：
 
         Provider 实现 OperationAdjudicator？
           ├─ 是 → 调用它：COMPLETED → 回填不执行；DEFINITELY_NOT_STARTED → 执行；
@@ -72,46 +72,32 @@ class RecoveryPolicy(StrEnum):
           └─ 否 → 落到人：账本 unknown + OperationUncertain + runtime.resolve_operation
 
     裁决能力**靠发现不靠声明**：``OperationAdjudicator`` 是 Provider 级接口，用
-    capability 级字段去声明它本身就是错配，还得靠启动期校验去堵「声明了却没实现」。
-    改成 isinstance 发现之后那个失败模式不存在了，两层校验一并消失；而且 Provider
-    可以逐次决定——判得了的给权威结论，判不了的返回 UNKNOWN 自动落到人。
+    capability 级字段去声明它是错配，还得额外拿启动期校验去堵「声明了却没实现」。
+    isinstance 发现则没有这个失败模式；而且 Provider 可以逐次决定——判得了的给权威
+    结论，判不了的返回 UNKNOWN 自动落到人。
     """
 
     IDEMPOTENT = "idempotent"
     REVIEWED = "reviewed"
 
 
-#: 旧四值 → 新两值（spec: tool-operations）。存量账本行与既有 Provider 声明按此归一。
-_LEGACY_POLICY_ALIASES = {
-    "retry_safe": RecoveryPolicy.IDEMPOTENT,   # 与 idempotent 在 core 里本就同一分支
-    "idempotent": RecoveryPolicy.IDEMPOTENT,
-    "queryable": RecoveryPolicy.REVIEWED,      # 裁决者改由 isinstance 发现
-    "manual": RecoveryPolicy.REVIEWED,         # 「落到人」是裁决链终点，不再是策略值
-}
-
-
 def normalize_recovery_policy(value: object) -> RecoveryPolicy:
     """把声明值归一为 RecoveryPolicy；无法识别则抛 ValueError。
 
-    **不静默兜底**：旧实现是裸 str + `else: manual`，拼错 ``retry-safe`` 会无声降级成
-    「每次崩溃都等人」，启动毫无提示、日志也看不出来。这里响亮失败，由 resolver 在
-    启动期一次性拦下。``None`` / 缺省 → REVIEWED（保守默认）。
+    **不静默兜底**：拼错的取值必须响亮失败，由 resolver 在启动期一次性拦下——静默降级
+    成保守值会让「我标了 idempotent 为什么崩溃后还在等人」变成一个读源码才能查的问题。
+    ``None`` / 缺省 → REVIEWED（Provider 没表态时按需审核处理）。
     """
     if value is None or value == "":
         return RecoveryPolicy.REVIEWED
     if isinstance(value, RecoveryPolicy):
         return value
-    text = str(value)
     try:
-        return RecoveryPolicy(text)          # 正式值
+        return RecoveryPolicy(str(value))
     except ValueError:
-        pass
-    if text in _LEGACY_POLICY_ALIASES:       # 旧四值
-        return _LEGACY_POLICY_ALIASES[text]
-    raise ValueError(
-        f"unknown recovery_policy {value!r}; expected one of "
-        f"{[p.value for p in RecoveryPolicy]} "
-        f"(legacy {sorted(_LEGACY_POLICY_ALIASES)} are accepted and normalized)")
+        raise ValueError(
+            f"unknown recovery_policy {value!r}; expected one of "
+            f"{[p.value for p in RecoveryPolicy]}") from None
 
 
 @dataclass

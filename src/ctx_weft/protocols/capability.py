@@ -77,9 +77,8 @@ class ToolCapability(Capability):
     #   idempotent  重跑安全 → core 同 op_id 直接重跑
     #   reviewed    默认——core 绝不自行重跑，交裁决链（Provider 实现
     #               OperationAdjudicator 则由它裁，否则落到人 resolve_operation）
-    # 旧的 retry_safe/queryable/manual 按 normalize_recovery_policy 归一到这两值。
     # 刻意不从 side_effects 推断：MCP/旧 Provider 的副作用声明可能不完整（方案 §5.4）。
-    recovery_policy: str = RecoveryPolicy.REVIEWED
+    recovery_policy: RecoveryPolicy = RecoveryPolicy.REVIEWED
 
 
 @dataclass

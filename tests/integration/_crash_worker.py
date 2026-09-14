@@ -45,7 +45,7 @@ class _SlowEffectTool(ToolCapabilityProvider):
         return ToolCapability(
             id="slow:effect", name="effect", description="slow external operation",
             input_schema={"type": "object", "properties": {"n": {"type": "integer"}}},
-            side_effects=True, recovery_policy="manual",
+            side_effects=True, recovery_policy="reviewed",
         )
 
     async def list(self, ctx): return [self._cap()]

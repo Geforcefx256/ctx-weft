@@ -1,8 +1,8 @@
 """恢复策略表全分支（spec: tool-operations；wp6-2.2，design D2）。
 
 组件级：真 reconcile + 真 gateway + 真账本（内存），policy 经 capability 声明。
-分派矩阵：manual 不重跑 / retry_safe 同 op_id 恰一次 / 存量无身份 unknown /
-call_1 复用串扰根治。queryable 三态与 cancel 闭环见 test_gateway_operation_ledger
+分派矩阵：reviewed 不重跑 / idempotent 同 op_id 恰一次 / 存量无身份 unknown /
+call_1 复用串扰根治。裁决链三态与 cancel 闭环见下方与 test_gateway_operation_ledger
 与 test_tool_outcome_unknown。
 """
 from __future__ import annotations
@@ -41,7 +41,7 @@ from ctx_weft.core.models.discriminators import TaskErrorCode
 class _EffectTool(ToolCapabilityProvider):
     name = "fx"
 
-    def __init__(self, policy: str = "manual") -> None:
+    def __init__(self, policy: str = "reviewed") -> None:
         self.policy = policy
         self.executions = 0
 
@@ -67,7 +67,7 @@ class _Bus:
     async def emit(self, e): self.events.append(e)
 
 
-async def _mk_fixture(policy="manual", ledger_status: OperationStatus | None = OperationStatus.STARTED,
+async def _mk_fixture(policy="reviewed", ledger_status: OperationStatus | None = OperationStatus.STARTED,
                       tool=None):
     tool = tool if tool is not None else _EffectTool(policy)
     mem = InMemoryMemoryProvider()
@@ -107,10 +107,10 @@ async def _mk_fixture(policy="manual", ledger_status: OperationStatus | None = O
     return tool, ops, bus, state, ctx, op_id
 
 
-async def test_manual_started_goes_unknown_not_rerun():
-    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="manual")
+async def test_reviewed_started_goes_unknown_not_rerun():
+    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="reviewed")
     outcome = await ReconcileStep().execute(state, ctx)
-    assert tool.executions == 0, "manual + started MUST NOT re-execute"
+    assert tool.executions == 0, "reviewed + started MUST NOT re-execute"
     assert state.task.error_code == TaskErrorCode.TOOL_OUTCOME_UNKNOWN
     rec = await ops.get(op_id, ctx.provider_ctx)
     assert rec.status == OperationStatus.UNKNOWN
@@ -119,8 +119,8 @@ async def test_manual_started_goes_unknown_not_rerun():
     assert uncertain[0].payload["revision"] == rec.revision   # 处置接口的乐观锁输入
 
 
-async def test_retry_safe_started_reruns_exactly_once():
-    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="retry_safe")
+async def test_idempotent_started_reruns_exactly_once():
+    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="idempotent")
     outcome = await ReconcileStep().execute(state, ctx)
     assert tool.executions == 1
     assert outcome.next_step == "prepare"
@@ -131,7 +131,7 @@ async def test_retry_safe_started_reruns_exactly_once():
 
 async def test_legacy_no_ledger_record_goes_unknown():
     """存量无身份（WP5 前的数据）：保守 unknown，不以随机 id 执行副作用。"""
-    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="retry_safe",
+    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="idempotent",
                                                           ledger_status=None)
     await ReconcileStep().execute(state, ctx)
     assert tool.executions == 0
@@ -139,8 +139,8 @@ async def test_legacy_no_ledger_record_goes_unknown():
 
 
 async def test_prepared_runs_first_execution():
-    """prepared 且从未 started：首执（此前无副作用）——即使 manual。"""
-    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="manual",
+    """prepared 且从未 started：首执（此前无副作用）——即使 reviewed。"""
+    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="reviewed",
                                                           ledger_status=OperationStatus.PREPARED)
     outcome = await ReconcileStep().execute(state, ctx)
     assert tool.executions == 1
@@ -155,7 +155,7 @@ async def test_call1_reuse_no_cross_talk():
     场景：上一回合 call_1 已有 tool 记录（wire 通道 done）；本回合复用 call_1——
     双通道判据按 op_id（record 不同）→ 仍为 dangling，正确进入策略分派。
     """
-    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="retry_safe")
+    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="idempotent")
     # 上一回合的 tool 记录（wire id 同为 call_1，但属于别的 record）
     from ctx_weft.protocols.memory import MemoryEvent as ME
     prev_rid = await ctx.memory.ingest(ME(
@@ -171,25 +171,22 @@ async def test_call1_reuse_no_cross_talk():
 
 # ── 两值策略与裁决链（spec: tool-operations，wp6 重构）──────────────────────
 #
-# 旧四值（retry_safe/idempotent/queryable/manual）合并为两值：core 要不要做决定。
-# 「谁来裁决」不再是策略值，而是一条链：provider 实现 OperationAdjudicator → 它裁；
-# 否则落到人。裁决能力靠 isinstance 发现，不靠 capability 声明。
+# 策略只有两值，判据是「core 要不要做决定」。「谁来裁决」不是策略值而是一条链：
+# provider 实现 OperationAdjudicator → 它裁；否则落到人。裁决能力靠 isinstance
+# 发现，不靠 capability 声明。
 
 
-def test_legacy_policy_values_normalize():
-    """旧四值全部可归一，语义无损；非法值响亮失败而不是静默降级。"""
+def test_policy_values_validated_not_silently_defaulted():
+    """非法取值响亮失败；缺省按需审核。**不静默降级**是这条的全部意义。"""
     from ctx_weft.protocols.operations import RecoveryPolicy as P, normalize_recovery_policy as N
 
-    assert N("retry_safe") is P.IDEMPOTENT      # 与 idempotent 本就同一分支
     assert N("idempotent") is P.IDEMPOTENT
-    assert N("queryable") is P.REVIEWED         # 裁决者改由发现
-    assert N("manual") is P.REVIEWED            # 「落到人」是链尾不是策略
-    assert N("idempotent") is P.IDEMPOTENT and N("reviewed") is P.REVIEWED
-    assert N(None) is P.REVIEWED and N("") is P.REVIEWED   # 缺省保守
+    assert N("reviewed") is P.REVIEWED
     assert N(P.IDEMPOTENT) is P.IDEMPOTENT
-    for bad in ("retry-safe", "Idempotent", "auto", "queryable2"):
+    assert N(None) is P.REVIEWED and N("") is P.REVIEWED   # Provider 没表态 → 需审核
+    for bad in ("retry_safe", "queryable", "manual", "idempotant", "Idempotent", "auto"):
         with pytest.raises(ValueError, match="unknown recovery_policy"):
-            N(bad)                               # 不静默兜底成 manual
+            N(bad)
 
 
 def test_only_two_policies_exist():

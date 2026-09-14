@@ -91,11 +91,9 @@ class ProviderRegistry:
             self._capability_authorizers[provider.name] = authorizer
         if tool_authorizers:
             self._capability_authorizers.update(tool_authorizers)
-        # spec: tool-operations（wp6）——此处曾有 queryable 声明/实现的对齐校验。
-        # 裁决能力改由 isinstance(provider, OperationAdjudicator) 发现之后，「声明了却
-        # 没实现」这个失败模式不存在了，校验随之删除（且原实现依赖的 `_wp6_caps` 属性
-        # 全仓无人设置，那层弱校验本就从未执行过）。recovery_policy 的**取值**校验在
-        # resolver 的异步面做——那里能 await provider.list(ctx)。
+        # spec: tool-operations（wp6）——裁决能力由 isinstance(provider,
+        # OperationAdjudicator) 发现，注册期无需校验「声明与实现是否对齐」。
+        # recovery_policy 的取值校验在 resolver 的异步面做（那里能 await provider.list）。
         if isinstance(provider, SkillCapabilityProvider):
             self._notify_skill_executor_dirty()
 
