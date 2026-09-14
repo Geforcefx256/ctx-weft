@@ -34,25 +34,28 @@ class CapabilityResolver:
         ctx: ProviderContext,
     ) -> list[Capability]:
         """三阶段解析：required → retrieve → 去 forbidden。"""
-        # spec: tool-operations（wp6）——queryable 对齐的强校验（异步面、cap 已物化）：
-        # registry 的同步弱校验拿不到 list()；这里在首个绑定点响亮失败。
-        from ctx_weft.protocols.capability import ToolCapability
-        from ctx_weft.protocols.operations import QueryResult
-        from ctx_weft.protocols.capability import ToolCapabilityProvider
+        # spec: tool-operations（wp6）——recovery_policy 取值校验（响亮，不静默兜底）：
+        # 旧实现是裸 str + `else: manual`，拼错 'retry-safe' 会无声降级成「每次崩溃都
+        # 等人」。这里在首个绑定点一次性拦下。
+        # 裁决能力**不在此校验**：OperationAdjudicator 靠 isinstance 发现，没有「声明了
+        # 却没实现」这个失败模式可堵。
+        from ctx_weft.protocols.capability import ToolCapability, ToolCapabilityProvider
+        from ctx_weft.protocols.operations import normalize_recovery_policy
         for p in providers:
-            if not isinstance(p, ToolCapabilityProvider) or isinstance(p, QueryResult):
+            if not isinstance(p, ToolCapabilityProvider):
                 continue
             try:
                 caps = await p.list(ctx)
             except Exception:
                 continue
             for cap in caps:
-                if (isinstance(cap, ToolCapability)
-                        and getattr(cap, "recovery_policy", "manual") == "queryable"):
+                if not isinstance(cap, ToolCapability):
+                    continue
+                try:
+                    normalize_recovery_policy(getattr(cap, "recovery_policy", None))
+                except ValueError as exc:
                     raise ValueError(
-                        f"capability {cap.id!r} declares recovery_policy='queryable' "
-                        f"but provider {p.name!r} does not implement QueryResult "
-                        f"(query_result). Implement it or use another policy.")
+                        f"capability {cap.id!r} from provider {p.name!r}: {exc}") from exc
         refs_by_id = {ref.capability_id: ref for ref in template.capability_refs}
         forbidden_ids = {
             ref.capability_id

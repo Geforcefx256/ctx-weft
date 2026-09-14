@@ -32,9 +32,11 @@ __all__ = [
     "OperationStore",
     "operation_id_for",
     "operation_memory_result_id",
-    "QueryOutcome",
-    "QueryResultOutcome",
-    "QueryResult",
+    "RecoveryPolicy",
+    "normalize_recovery_policy",
+    "AdjudicationOutcome",
+    "Adjudication",
+    "OperationAdjudicator",
 ]
 
 
@@ -46,6 +48,70 @@ class OperationStatus(StrEnum):
     COMPLETED = "completed"          # 结局已确认（含 outcome=error 的确认失败）
     WAITING_HUMAN = "waiting_human"  # 停在人工节点（HITL park）
     UNKNOWN = "unknown"              # 无法判定业务结果（WP6 消费：停住等宿主处置）
+
+
+# ── 恢复策略与裁决（spec: tool-operations，wp6）───────────────────────────────
+
+
+class RecoveryPolicy(StrEnum):
+    """崩溃后 started 的操作能不能自动重跑——**只有两类**。
+
+    分类判据是「core 要不要做决定」，不是「副作用长什么样」：
+
+    - ``IDEMPOTENT``：重跑安全，core 直接同 operation_id 重跑。至于安全的**理由**是
+      「重跑本就无害」还是「Provider 以 operation_id 去重」，core 不关心——两者的
+      行为逐字相同，分成两个值只会让调用方以为存在不存在的差别。
+    - ``REVIEWED``（默认）：core **绝不自行重跑**，把这次不确定交给裁决者。
+
+    裁决者是一条链，不是一个策略值（这正是旧 ``queryable`` / ``manual`` 被合并的原因
+    ——它们都属于「core 判不了」，区别只在谁来判）：
+
+        Provider 实现 OperationAdjudicator？
+          ├─ 是 → 调用它：COMPLETED → 回填不执行；DEFINITELY_NOT_STARTED → 执行；
+          │        UNKNOWN → 落到人
+          └─ 否 → 落到人：账本 unknown + OperationUncertain + runtime.resolve_operation
+
+    裁决能力**靠发现不靠声明**：``OperationAdjudicator`` 是 Provider 级接口，用
+    capability 级字段去声明它本身就是错配，还得靠启动期校验去堵「声明了却没实现」。
+    改成 isinstance 发现之后那个失败模式不存在了，两层校验一并消失；而且 Provider
+    可以逐次决定——判得了的给权威结论，判不了的返回 UNKNOWN 自动落到人。
+    """
+
+    IDEMPOTENT = "idempotent"
+    REVIEWED = "reviewed"
+
+
+#: 旧四值 → 新两值（spec: tool-operations）。存量账本行与既有 Provider 声明按此归一。
+_LEGACY_POLICY_ALIASES = {
+    "retry_safe": RecoveryPolicy.IDEMPOTENT,   # 与 idempotent 在 core 里本就同一分支
+    "idempotent": RecoveryPolicy.IDEMPOTENT,
+    "queryable": RecoveryPolicy.REVIEWED,      # 裁决者改由 isinstance 发现
+    "manual": RecoveryPolicy.REVIEWED,         # 「落到人」是裁决链终点，不再是策略值
+}
+
+
+def normalize_recovery_policy(value: object) -> RecoveryPolicy:
+    """把声明值归一为 RecoveryPolicy；无法识别则抛 ValueError。
+
+    **不静默兜底**：旧实现是裸 str + `else: manual`，拼错 ``retry-safe`` 会无声降级成
+    「每次崩溃都等人」，启动毫无提示、日志也看不出来。这里响亮失败，由 resolver 在
+    启动期一次性拦下。``None`` / 缺省 → REVIEWED（保守默认）。
+    """
+    if value is None or value == "":
+        return RecoveryPolicy.REVIEWED
+    if isinstance(value, RecoveryPolicy):
+        return value
+    text = str(value)
+    try:
+        return RecoveryPolicy(text)          # 正式值
+    except ValueError:
+        pass
+    if text in _LEGACY_POLICY_ALIASES:       # 旧四值
+        return _LEGACY_POLICY_ALIASES[text]
+    raise ValueError(
+        f"unknown recovery_policy {value!r}; expected one of "
+        f"{[p.value for p in RecoveryPolicy]} "
+        f"(legacy {sorted(_LEGACY_POLICY_ALIASES)} are accepted and normalized)")
 
 
 @dataclass
@@ -72,7 +138,7 @@ class OperationRecord:
     status: OperationStatus = OperationStatus.PREPARED
     revision: int = 1
     args_hash: str = ""
-    recovery_policy: str = "manual"          # WP5 只落库；WP6 消费
+    recovery_policy: str = RecoveryPolicy.REVIEWED   # WP5 只落库；WP6 消费
     attempts: list[str] = field(default_factory=list)   # invocation_id 列表（每次执行尝试）
     result: Any = None                        # 完整结果 / ContentParts / blob ref
     error: str | None = None
@@ -143,13 +209,13 @@ def operation_memory_result_id(operation_id: str) -> str:
     return f"res_{operation_id[3:]}"
 
 
-# ── QueryResult（spec: tool-operations，wp6）──────────────────────────────────
+# ── 裁决接口（spec: tool-operations，wp6）─────────────────────────────────────
 
 
-class QueryOutcome(StrEnum):
-    """queryable 策略下查询外部系统的三态结论（方案 §5.4）。
+class AdjudicationOutcome(StrEnum):
+    """裁决一次不确定操作的三态结论（方案 §5.4）。
 
-    ``DEFINITELY_NOT_STARTED`` 是**权威否定**——Provider 查得到完整执行记录才算；
+    ``DEFINITELY_NOT_STARTED`` 是**权威否定**——查得到完整执行记录才算；
     「暂时查不到」必须归 UNKNOWN，不得用否定冒充（否则会重跑已发生的副作用）。
     """
 
@@ -159,21 +225,22 @@ class QueryOutcome(StrEnum):
 
 
 @dataclass
-class QueryResultOutcome:
-    """query_result 的返回：outcome + completed 时外部结果（Provider 结果结构）。"""
+class Adjudication:
+    """裁决返回：结论 + COMPLETED 时的外部结果（Provider 结果结构）。"""
 
-    outcome: QueryOutcome
+    outcome: AdjudicationOutcome
     result: Any = None
 
 
 @runtime_checkable
-class QueryResult(Protocol):
-    """声明 `recovery_policy="queryable"` 的 Provider MUST 实现本接口。
+class OperationAdjudicator(Protocol):
+    """Provider 可选实现：替 core 裁决一次结果不确定的操作。
 
-    未实现 → ProviderRegistry 注册期 ValueError（响亮，不静默降级为 manual）。
+    实现即生效——**无需在 capability 上声明**。判不了的操作返回
+    ``AdjudicationOutcome.UNKNOWN``，core 自动落到人工处置。
     """
 
-    async def query_result(
+    async def adjudicate(
         self, operation_id: str, ctx: ProviderContext,
-    ) -> QueryResultOutcome:
+    ) -> Adjudication:
         raise NotImplementedError

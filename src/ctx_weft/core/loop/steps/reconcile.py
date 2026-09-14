@@ -8,14 +8,16 @@ TOOL_RESULT。直接把含 dangling 的消息序列喂给 LLM 会非法报错。
               或 task view 存在 id == operation_memory_result_id(op_id) 的 tool 记录
     ——判据是**逻辑身份**（op_id），与 wire id 无关：call_1 复用不再串扰。
 
-  未完成的 → 按「状态 × recovery_policy」分派（design D2）：
+  未完成的 → 按「状态 × recovery_policy」分派（design D2）。策略只有两类：
     None（存量无身份）        → unknown（保守停住——方案明令不用随机 id 执行副作用）
-    PREPARED                  → gateway.invoke（首执；授权链自然重查）
-    STARTED + retry_safe      → invoke（同 op_id 重试）
-    STARTED + idempotent      → invoke（op_id 即幂等键，Provider 兑现承诺）
-    STARTED + queryable       → provider.query_result：completed→入账本+补 memory 不执行；
-                                definitely_not_started→invoke；unknown→置 unknown
-    STARTED + manual          → 置 unknown
+    PREPARED                  → gateway.invoke（首执；此前无副作用，授权链自然重查）
+    STARTED + idempotent      → invoke（同 op_id 重跑安全）
+    STARTED + reviewed        → 裁决链（core 绝不自行重跑）：
+                                  provider 实现 OperationAdjudicator → 调它
+                                    completed               → 入账本 + 补 memory，不执行
+                                    definitely_not_started  → invoke（权威否定才算）
+                                    unknown                 → 置 unknown
+                                  未实现 → 直接置 unknown（默认形态，不是配置错误）
     WAITING_HUMAN             → 既有 HITL 恢复路径（不 invoke）
     COMPLETED                 → 不应到达（完成判定已滤）；防御性跳过
 
@@ -56,7 +58,8 @@ class ReconcileStep(Step):
 
         from ctx_weft.protocols.operations import (
             OperationStatus, OperationUpdate, operation_id_for,
-            operation_memory_result_id, QueryOutcome,
+            operation_memory_result_id, AdjudicationOutcome, normalize_recovery_policy,
+            RecoveryPolicy,
         )
 
         for tc in dangling:
@@ -75,11 +78,13 @@ class ReconcileStep(Step):
                 logger.info("ReconcileStep: op %s completed — reusing, not re-running", op_id)
                 continue
 
-            # ── 策略分派（D2）：policy 来自 capability 声明（默认 manual）─────────
+            # ── 策略分派（D2）：两类——idempotent 重跑 / reviewed 交裁决链 ─────
+            # 取值在启动期已由 resolver 校验过，这里再归一一次兜住鸭子类型 cap。
             _cache = getattr(gateway, "_cache", None)
             cap = _cache.get_by_qualified_name(
                 state.agent.id, tc["name"], state.task.id) if _cache is not None else None
-            policy = getattr(cap, "recovery_policy", "manual") if cap is not None else "manual"
+            policy = normalize_recovery_policy(
+                getattr(cap, "recovery_policy", None) if cap is not None else None)
             if rec is None:
                 from ctx_weft.core.capabilities.control_tools import PROVIDER_NAME as _CTL
                 from ctx_weft.core.hitl.registry import HITL_STAGE_TOOL
@@ -117,30 +122,29 @@ class ReconcileStep(Step):
                 from ctx_weft.core.capabilities.control_tools import PROVIDER_NAME as _CTL2
                 if tc["name"].startswith(f"{_CTL2}__"):
                     pass  # 控制工具 started：幂等状态迁移（同上 carve-out 理由）
-                elif policy in ("retry_safe", "idempotent"):
-                    pass  # 同 op_id 重试
-                elif policy == "queryable":
-                    q = await self._query(gateway, op_id, tc, state, ctx)
-                    if q is not None and q.outcome == QueryOutcome.COMPLETED:
-                        # 外部已完成：入账本 + 补 memory，不执行
+                elif policy == RecoveryPolicy.IDEMPOTENT:
+                    pass  # 重跑安全 → 同 op_id 重试
+                else:  # RecoveryPolicy.REVIEWED —— core 绝不自行重跑，走裁决链
+                    verdict = await self._adjudicate(gateway, op_id, tc, state, ctx)
+                    if verdict is not None and verdict.outcome == AdjudicationOutcome.COMPLETED:
+                        # 裁决者给出权威「已完成」：入账本 + 补 memory，不执行
                         await ledger.compare_and_set(
                             op_id, rec.revision,
                             OperationUpdate(status=OperationStatus.COMPLETED,
-                                            result=q.result, result_set=True),
+                                            result=verdict.result, result_set=True),
                             ctx.provider_ctx)
-                        await self._backfill_memory(state, ctx, op_id, q.result, tc)
+                        await self._backfill_memory(state, ctx, op_id, verdict.result, tc)
                         continue
-                    if q is not None and q.outcome == QueryOutcome.DEFINITELY_NOT_STARTED:
-                        pass  # 权威否定 → 重跑
+                    if (verdict is not None
+                            and verdict.outcome == AdjudicationOutcome.DEFINITELY_NOT_STARTED):
+                        pass  # 权威否定 → 重跑安全
                     else:
+                        # 无裁决者 / 裁决者判不了 → 链尾：落到人
                         await self._mark_unknown(
                             state, ctx, op_id, tc["name"], ledger, rec,
-                            reason="query-unknown")
+                            reason=("adjudicator-unknown" if verdict is not None
+                                    else "no-adjudicator"))
                         return StepOutcome(next_step=None)
-                else:  # manual
-                    await self._mark_unknown(state, ctx, op_id, tc["name"], ledger, rec,
-                                             reason="manual-policy")
-                    return StepOutcome(next_step=None)
             else:  # UNKNOWN 状态（宿主未处置）——闸门：不绕过决策
                 logger.info("ReconcileStep: op %s already unknown — awaiting host resolution", op_id)
                 return StepOutcome(next_step=None)
@@ -162,21 +166,27 @@ class ReconcileStep(Step):
 
     # ── helpers ────────────────────────────────────────────────────────────────
 
-    async def _query(self, gateway, op_id, tc, state, ctx):
-        """queryable：找 provider 查外部真值。找不到 provider/接口缺失 → None（视 unknown）。"""
-        from ctx_weft.protocols.operations import QueryResult
+    async def _adjudicate(self, gateway, op_id, tc, state, ctx):
+        """裁决链第一环：provider 若实现 OperationAdjudicator 就交它裁。
+
+        返回 None = **没有裁决者**（provider 找不到、未实现接口、或裁决抛错）——
+        调用方据此落到链尾的人工处置。没有裁决者不是错误配置，是默认形态：绝大多数
+        provider 无从查证外部真值，本就该交给人。
+        """
+        from ctx_weft.protocols.operations import OperationAdjudicator
         _cache = getattr(gateway, "_cache", None)
         cap = _cache.get_by_qualified_name(
             state.agent.id, tc["name"], state.task.id) if _cache is not None else None
         _find = getattr(gateway, "_find_provider", None)
         provider = _find(cap.id) if (cap is not None and _find is not None) else None
-        if provider is None or not isinstance(provider, QueryResult):
-            logger.error("ReconcileStep: queryable op %s but provider lacks QueryResult", op_id)
+        if provider is None or not isinstance(provider, OperationAdjudicator):
+            logger.info(
+                "ReconcileStep: op %s has no adjudicator — escalating to host", op_id)
             return None
         try:
-            return await provider.query_result(op_id, ctx.provider_ctx)
+            return await provider.adjudicate(op_id, ctx.provider_ctx)
         except Exception:
-            logger.exception("ReconcileStep: query_result failed for %s", op_id)
+            logger.exception("ReconcileStep: adjudicate failed for %s — escalating", op_id)
             return None
 
     async def _mark_unknown(self, state, ctx, op_id, tool_name, ledger, rec, *, reason):
@@ -248,7 +258,7 @@ class ReconcileStep(Step):
             address=state.scope, content=str(result), timestamp=now_utc(),
             role="tool",
             metadata={"tool_call_id": tc.get("id"), "operation_id": op_id,
-                      "recovered_via": "queryable"},
+                      "recovered_via": "adjudicator"},
         ), ctx.provider_ctx)
 
 

@@ -41,22 +41,33 @@
 
 ### Requirement: 恢复策略表
 
-`ToolCapability` SHALL 声明显式 `recovery_policy`（`retry_safe | idempotent | queryable | manual`），默认 `manual`（不从 side_effects 推断安全）。恢复时按状态×策略分派：`completed` 复用结果不重执行；`prepared` 且从未进入 `started` 可首次执行（仍先重新检查授权）；`started + retry_safe` 以同 operation_id 重试；`started + idempotent` 以相同 operation_id 作幂等键重试；`started + queryable` 先查询，仅 `definitely_not_started` 为权威结论时重跑；`started + manual` 与一切结果不定情形一律置 `unknown` 不自动执行；`waiting_human` 经既有 HumanResumable 协议恢复，不从头重新 invoke。声明 `queryable` 的 Provider MUST 实现 `QueryResult`，未实现则启动校验失败。Reconcile 的完成匹配 SHALL 以账本 operation_id 为判据，MUST NOT 再以 tool_call_id 集合判定（防 call_1 复用串扰）。无账本身份的存量 dangling SHALL 默认置 `unknown`，不得以随机生成的 id 自动执行副作用工具。控制工具单独核验：delegate 以 operation_id 找回已创建子任务（确认丢失重入不生成第二棵子树）、finish/metadata 同身份幂等、ask_user 复用已有请求；MUST NOT 对控制工具整体标记 retry_safe 后省略验证。
+`ToolCapability` SHALL 声明 `recovery_policy`，取值**恰为两类**（`idempotent | reviewed`），默认 `reviewed`（不从 side_effects 推断安全）。分类判据是「core 要不要做决定」：`idempotent` = 重跑安全，core 同 operation_id 直接重跑；`reviewed` = core MUST NOT 自行重跑，交裁决链。
 
-#### Scenario: manual 副作用不重跑
+旧四值 `retry_safe | idempotent | queryable | manual` SHALL 按固定映射归一（`retry_safe`/`idempotent`→`idempotent`；`queryable`/`manual`→`reviewed`）；无法识别的取值 SHALL 在启动校验响亮失败，MUST NOT 静默降级为保守值。
 
-- **WHEN** started 后崩溃且策略为 manual
-- **THEN** 操作置 unknown 等宿主处置，恢复不得自动重执行
+裁决能力 SHALL 由 `isinstance(provider, OperationAdjudicator)` **发现**，MUST NOT 要求在 capability 上声明——该接口是 Provider 级的，用 capability 级字段声明会制造「声明了却没实现」这一类本不必存在的失败模式。
 
-#### Scenario: retry_safe 重跑恰好一次补全
+恢复时按状态×策略分派：`completed` 复用结果不重执行；`prepared` 且从未进入 `started` 可首次执行（仍先重新检查授权）；`started + idempotent` 以同 operation_id 重试；`started + reviewed` 走裁决链——Provider 实现 `OperationAdjudicator` 则调用之，`completed` 直接复用外部结果不再执行、`definitely_not_started`（仅权威否定）方可重跑、`unknown` 置 `unknown`；未实现裁决接口则直接置 `unknown`（默认形态，不是配置错误）。一切结果不定情形一律置 `unknown` 不自动执行；`waiting_human` 经既有 HumanResumable 协议恢复，不从头重新 invoke。Reconcile 的完成匹配 SHALL 以账本 operation_id 为判据，MUST NOT 再以 tool_call_id 集合判定（防 call_1 复用串扰）。无账本身份的存量 dangling SHALL 默认置 `unknown`，不得以随机生成的 id 自动执行副作用工具。控制工具单独核验：delegate 以 operation_id 找回已创建子任务（确认丢失重入不生成第二棵子树）、finish/metadata 同身份幂等、ask_user 复用已有请求；MUST NOT 对控制工具整体标记 retry_safe 后省略验证。
 
-- **WHEN** started 后崩溃且策略为 retry_safe，恢复重入
+#### Scenario: reviewed 且无裁决者时不重跑
+
+- **WHEN** started 后崩溃且策略为 reviewed，Provider 未实现 OperationAdjudicator
+- **THEN** 操作置 unknown 等宿主处置，恢复不得自动重执行；这是默认形态，不报配置错误
+
+#### Scenario: idempotent 重跑恰好一次补全
+
+- **WHEN** started 后崩溃且策略为 idempotent，恢复重入
 - **THEN** 以同 operation_id 重试一次；外部副作用由 Provider 承诺幂等；账本与 memory 各落一次
 
-#### Scenario: queryable 的权威否定
+#### Scenario: 裁决者的权威否定
 
-- **WHEN** started 后崩溃且策略为 queryable，查询返回 definitely_not_started
-- **THEN** 以同 operation_id 重新执行；查询返回 completed 则直接复用外部结果不再执行
+- **WHEN** started 后崩溃且策略为 reviewed，Provider 的裁决返回 definitely_not_started
+- **THEN** 以同 operation_id 重新执行；裁决返回 completed 则直接复用外部结果不再执行；返回 unknown 则置 unknown 落到人
+
+#### Scenario: 旧四值归一且非法值响亮
+
+- **WHEN** Provider 声明 `retry_safe` / `queryable` / `manual`，或声明一个拼错的值
+- **THEN** 前者按映射归一、行为与改造前一致；后者在启动校验失败并指明合法取值
 
 #### Scenario: 存量无身份 dangling 保守停住
 

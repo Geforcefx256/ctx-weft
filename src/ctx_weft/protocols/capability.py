@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 from ctx_weft.protocols.context import ProviderContext
+from ctx_weft.protocols.operations import RecoveryPolicy
 
 if TYPE_CHECKING:
     from ctx_weft.protocols.context import ContentPart
@@ -71,13 +72,14 @@ class ToolCapability(Capability):
     input_schema: dict[str, Any] = field(default_factory=dict)
     side_effects: bool = False
     spillable: bool = True  # 输出超长时是否允许 gateway 落盘；可重新派生的只读工具置 False
-    # spec: tool-operations（wp6）——恢复策略（崩溃后该工具的 started 操作能不能自动重跑）：
-    #   retry_safe  重试无有害副作用（同 op_id 直接重跑）
-    #   idempotent  Provider 以 op_id 为幂等键保证不重复
-    #   queryable   Provider 实现 QueryResult，可权威查询外部真值
-    #   manual      默认——副作用结果未知时保守停住（unknown），等宿主 resolve_operation
+    # spec: tool-operations（wp6）——恢复策略（崩溃后该工具的 started 操作能不能自动
+    # 重跑）。**只有两类**，判据是「core 要不要做决定」：
+    #   idempotent  重跑安全 → core 同 op_id 直接重跑
+    #   reviewed    默认——core 绝不自行重跑，交裁决链（Provider 实现
+    #               OperationAdjudicator 则由它裁，否则落到人 resolve_operation）
+    # 旧的 retry_safe/queryable/manual 按 normalize_recovery_policy 归一到这两值。
     # 刻意不从 side_effects 推断：MCP/旧 Provider 的副作用声明可能不完整（方案 §5.4）。
-    recovery_policy: str = "manual"
+    recovery_policy: str = RecoveryPolicy.REVIEWED
 
 
 @dataclass

@@ -67,8 +67,9 @@ class _Bus:
     async def emit(self, e): self.events.append(e)
 
 
-async def _mk_fixture(policy="manual", ledger_status: OperationStatus | None = OperationStatus.STARTED):
-    tool = _EffectTool(policy)
+async def _mk_fixture(policy="manual", ledger_status: OperationStatus | None = OperationStatus.STARTED,
+                      tool=None):
+    tool = tool if tool is not None else _EffectTool(policy)
     mem = InMemoryMemoryProvider()
     ops = InMemoryOperationStore()
     bus = _Bus()
@@ -166,3 +167,80 @@ async def test_call1_reuse_no_cross_talk():
     assert len(dangling) == 1, "op-id judged: reused call_1 must still dangle for the new call"
     await ReconcileStep().execute(state, ctx)
     assert tool.executions == 1
+
+
+# ── 两值策略与裁决链（spec: tool-operations，wp6 重构）──────────────────────
+#
+# 旧四值（retry_safe/idempotent/queryable/manual）合并为两值：core 要不要做决定。
+# 「谁来裁决」不再是策略值，而是一条链：provider 实现 OperationAdjudicator → 它裁；
+# 否则落到人。裁决能力靠 isinstance 发现，不靠 capability 声明。
+
+
+def test_legacy_policy_values_normalize():
+    """旧四值全部可归一，语义无损；非法值响亮失败而不是静默降级。"""
+    from ctx_weft.protocols.operations import RecoveryPolicy as P, normalize_recovery_policy as N
+
+    assert N("retry_safe") is P.IDEMPOTENT      # 与 idempotent 本就同一分支
+    assert N("idempotent") is P.IDEMPOTENT
+    assert N("queryable") is P.REVIEWED         # 裁决者改由发现
+    assert N("manual") is P.REVIEWED            # 「落到人」是链尾不是策略
+    assert N("idempotent") is P.IDEMPOTENT and N("reviewed") is P.REVIEWED
+    assert N(None) is P.REVIEWED and N("") is P.REVIEWED   # 缺省保守
+    assert N(P.IDEMPOTENT) is P.IDEMPOTENT
+    for bad in ("retry-safe", "Idempotent", "auto", "queryable2"):
+        with pytest.raises(ValueError, match="unknown recovery_policy"):
+            N(bad)                               # 不静默兜底成 manual
+
+
+def test_only_two_policies_exist():
+    """策略面就是两个值——core 一视同仁的分类不该分成多个值。"""
+    from ctx_weft.protocols.operations import RecoveryPolicy as P
+
+    assert [p.value for p in P] == ["idempotent", "reviewed"]
+
+
+class _AdjudicatingTool(_EffectTool):
+    """实现裁决接口的 provider——**不需要在 capability 上声明任何东西**。"""
+
+    def __init__(self, verdict, policy: str = "reviewed") -> None:
+        super().__init__(policy)
+        self.verdict = verdict
+        self.adjudications = 0
+
+    async def adjudicate(self, operation_id, ctx):
+        self.adjudications += 1
+        return self.verdict
+
+
+async def test_adjudicator_completed_backfills_without_executing():
+    """裁决者给权威「已完成」→ 回填账本，provider 不被执行。"""
+    from ctx_weft.protocols.operations import Adjudication, AdjudicationOutcome
+
+    adj = _AdjudicatingTool(Adjudication(AdjudicationOutcome.COMPLETED, result="外部已完成"))
+    _, ops, bus, state, ctx, op_id = await _mk_fixture(tool=adj)
+
+    await ReconcileStep().execute(state, ctx)
+    assert adj.adjudications == 1, "reviewed 必须先问裁决者"
+    assert adj.executions == 0, "权威已完成 → 绝不执行"
+    assert (await ops.get(op_id, ctx.provider_ctx)).status == OperationStatus.COMPLETED
+
+
+async def test_adjudicator_unknown_escalates_to_host():
+    """裁决者判不了 → 落到链尾的人工处置，不是重跑。"""
+    from ctx_weft.protocols.operations import Adjudication, AdjudicationOutcome
+
+    adj = _AdjudicatingTool(Adjudication(AdjudicationOutcome.UNKNOWN))
+    _, ops, bus, state, ctx, op_id = await _mk_fixture(tool=adj)
+
+    await ReconcileStep().execute(state, ctx)
+    assert adj.adjudications == 1
+    assert adj.executions == 0, "判不了就不许跑"
+    assert (await ops.get(op_id, ctx.provider_ctx)).status == OperationStatus.UNKNOWN
+
+
+async def test_reviewed_without_adjudicator_escalates_not_errors():
+    """没有裁决者是**默认形态**而非配置错误：直接落到人，不报错、不重跑。"""
+    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="reviewed")
+    await ReconcileStep().execute(state, ctx)
+    assert tool.executions == 0
+    assert (await ops.get(op_id, ctx.provider_ctx)).status == OperationStatus.UNKNOWN

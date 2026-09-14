@@ -4392,14 +4392,16 @@ class _SessionTaskRunner:
     # ── helpers（原闭包内嵌函数）───────────────────────────────────────────────
 
     async def _reconcile_or(self, t: "Task", agent: "Agent", base: str) -> str:
-        # spec: tool-operations（wp6）闸门：unknown 中断的 task 未经 resolve_operation
-        # 不得续跑（recover_agent 不得绕过宿主决策重跑工具）。
+        """base initial_step；若该 task 最近 assistant turn 有 dangling tool_call → reconcile。
+
+        闸门（spec: tool-operations，wp6）：unknown 中断的 task 未经 resolve_operation
+        不得续跑——recover_agent 不得绕过宿主决策重跑工具。
+        """
         from ctx_weft.core.models.discriminators import TaskErrorCode as _TEC
         if getattr(t, "error_code", None) == _TEC.TOOL_OUTCOME_UNKNOWN:
             raise RuntimeError(
                 f"task {t.id} is interrupted with TOOL_OUTCOME_UNKNOWN — resolve the "
                 f"uncertain operation via runtime.resolve_operation() before resuming")
-        """base initial_step；若该 task 最近 assistant turn 有 dangling tool_call → reconcile。"""
         from ctx_weft.protocols.context import ProviderContext as _PCtx
         from ctx_weft.protocols.memory import MemoryAddress as _Scope
         sess_id = self._session.id
