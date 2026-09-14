@@ -78,7 +78,7 @@ Loop Engine          reason → act → observe → finalize
 EventBus             事件总线，所有状态变更的唯一出口
 ```
 
-> **证据供给（2026-09 起，spec: context-evidence）**：知识检索（KnowledgeProvider）与语义召回（recall_semantic）命中的内容渲染进 act prompt 的尾部动态区（`## Retrieved Evidence`，含 score 与来源），不打穿 prompt cache 前缀（当前任务锚回合逐字节稳定）。预算裁剪在来源等级上叠加相关性轴：per-source top-K（`evidence_top_k`，默认 3，0 关闭）**且** score 达 `evidence_score_floor` 的证据提级到与当前任务内容同档——紧张预算下先丢低分证据、再丢陈旧胶囊、后丢达标证据；同档内低分先丢、无 score 的当前任务历史殿后。裁剪丢弃留结构化日志（证据类单列 warning）；装配层遇到无渲染路径的块 kind（如 blackboard）显式 warning，不留静默盲区。
+> **证据投递（尚未实现）**：知识检索（KnowledgeProvider）与语义召回（recall_semantic）命中的内容目前**被装配、进预算、然后在渲染层丢弃**——`reference` / `summary` 两类块没有渲染路径。这是已知缺口，投递与相关性裁剪留待后续单独实现。在那之前装配层对它们发 warning（`no rendering path for block kind(s)`），不留静默盲区。
 >
 > **工具面预算口径（2026-09 起，spec: context-budget）**：装配预算先扣工具面预留（名称 + 描述 + 入参 schema，按能力快照现算，`AssembledPrompt.metadata.tools_reserved_tokens` 可读）——工具声明不参与裁剪，预算压力由预留承担；溢出报错仍报真窗口。act 循环内增量估算追踪工具面指纹（覆盖 name+description+schema 的规范化定义哈希——同名工具 schema 更新可感知）：运行期 pin 大 schema 后估算立即增长（`max_tokens` 随之收紧）；工具面不变时增量行为与旧口径一致。发送前超限**不硬拒**（明示决策）：收紧 max_tokens + WARNING 留痕 + 既有比例机制触发下轮压缩。估算与实际 usage 的偏差留工具面分项记录（指纹/估算/实测同现于回喂日志）。
 >

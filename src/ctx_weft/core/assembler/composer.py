@@ -122,11 +122,15 @@ from ctx_weft.protocols.capability import qualify
 
 logger = logging.getLogger(__name__)
 
-# 渲染层有路径的块 kind（spec: context-evidence）：集合外的 kind 在 compose 显式
-# warning（今日即 blackboard——Phase 3 裁定不渲染，但要被看见，不留静默盲区）。
+# 渲染层有路径的块 kind：集合外的 kind 在 compose 显式 warning——不留静默盲区。
+# 今日集合外的有 blackboard（Phase 3 裁定不渲染）与 reference / summary
+# （检索参考与语义召回的**投递路径尚未实现**，见下）。
+#
+# ⚠️ reference / summary 目前被装配、进预算、然后丢弃。这是**已知缺口**，证据投递
+# 留待后续单独实现；在那之前这条 warning 是它唯一的可见性——曾经它们是静默消失的。
 _RENDERABLE_KINDS = frozenset({
     "identity", "background", "task_spec", "history",
-    "capabilities", "directive", "guidance", "reference", "summary",
+    "capabilities", "directive", "guidance",
 })
 
 if TYPE_CHECKING:
@@ -458,7 +462,7 @@ class DefaultComposer(Composer):
     ) -> AssembledPrompt:
         from ctx_weft.core.assembler.assembler import AssembledPrompt
 
-        # 未识别 kind 显式留痕（spec: context-evidence）：无渲染路径的块不再静默消失。
+        # 未识别 kind 显式留痕：无渲染路径的块不静默消失。
         unsupported = sorted({b.kind for b in blocks} - _RENDERABLE_KINDS)
         if unsupported:
             sources = sorted({b.source for b in blocks if b.kind in unsupported})
@@ -649,14 +653,9 @@ class DefaultComposer(Composer):
             else:
                 merged = self._append_to_last_user(merged, capabilities_text)
                 cap_idx = len(merged) - 1
-        # 末条 user 收尾（act）：证据（检索/召回）→ guidance（任务锚定/plan 全景/已完成
-        # 清单/静态指针）——动态内容居尾不打穿 prompt cache 前缀。证据逐轮随查询变化，
-        # 落尾部动态区（guidance 之前，guidance 恒收口）。仅 act 渲染证据（facet purpose
-        # 的 trailing cue 自带角色定义，证据非其输入）；空节零渲染。
+        # 末条 user 收尾（act）：guidance（任务锚定/plan 全景/已完成清单/静态指针）
+        # ——动态内容居尾不打穿 prompt cache 前缀。
         if getattr(request, "purpose", None) == "act":
-            evidence_text = self._build_evidence_section(blocks)
-            if evidence_text:
-                merged = self._append_to_last_user(merged, evidence_text)
             guidance = self._first_kind(blocks, "guidance")
             if guidance is not None:
                 merged = self._append_to_last_user(merged, content_to_text(guidance.content))
@@ -907,32 +906,6 @@ class DefaultComposer(Composer):
             "You can use the capabilities listed below to complete the current task.\n\n"
             + resources_section
         )
-
-    def _build_evidence_section(self, blocks: list[ContextBlock]) -> str:
-        """证据段（spec: context-evidence）：检索参考 + 语义召回，含 score 与来源标识。
-
-        两个 source 的块各自成小节；命中内容是回答当前问题的证据，渲染于尾部动态区
-        （调用点在 guidance 之前）。空节零渲染（无命中零开销）。
-        """
-        refs = [b for b in blocks if b.kind == "reference"]
-        sums = [b for b in blocks if b.kind == "summary"]
-        if not refs and not sums:
-            return ""
-
-        def _items(blks: list[ContextBlock]) -> list[str]:
-            lines = []
-            for b in blks:
-                score = b.metadata.get("score")
-                score_s = f"{score:.3f}" if isinstance(score, (int, float)) else "-"
-                lines.append(f"- ({score_s}) {b.source}: {content_to_text(b.content)}")
-            return lines
-
-        sections: list[str] = []
-        if refs:
-            sections.append("### References\n" + "\n".join(_items(refs)))
-        if sums:
-            sections.append("### Recalled Memories\n" + "\n".join(_items(sums)))
-        return "## Retrieved Evidence\n" + "\n\n".join(sections)
 
     def _build_directive_section(self, blocks: list[ContextBlock]) -> str:
         """当前 task 的 skill 指令段。空时返回 ""。

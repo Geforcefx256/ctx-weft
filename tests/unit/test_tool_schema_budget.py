@@ -3,7 +3,6 @@
 覆盖：费率单一真源（与旧两处公式口径一致）、装配预留（大 schema 入账 / compact 空
 面 / cache 缺失回退 / 溢出报错用真窗口）、指纹感知同名工具定义增长、循环增量追踪
 （pin 大 schema 后估算立即增长 / 工具面不变行为不变）、发送前超限不硬拒 + WARNING、
-与 context-evidence 的组合口径（预留先扣减、证据地板在剩余内生效）。
 """
 
 from __future__ import annotations
@@ -301,64 +300,3 @@ async def test_estimate_feedback_log_carries_tools_fields(caplog):
         and "tools_est=" in r.getMessage()
         and "actual_prompt=" in r.getMessage()
         for r in caplog.records), caplog.text
-
-
-# ── 与 context-evidence 的组合口径 ──────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_combined_schema_reservation_then_evidence_floor():
-    """schema 预留先扣减；证据提级在其剩余内生效（两 change 组合语义）。
-
-    构造：真窗口仅容 task_spec 地板 + 小证据；大 schema 预留把内容预算压到
-    「无预留时本可存活的高分证据」之下——证据被裁、地板存活，且 metadata 可归因。
-    """
-    from ctx_weft.core.assembler.assembler import ContextBlock
-
-    class _OneBlockSource:
-        name = "stub"
-
-        def __init__(self, blk) -> None:
-            self._blk = blk
-
-        async def fetch(self, request, deps):
-            yield self._blk
-
-    ev = ContextBlock(
-        id="ev1", source="knowledge:kb", kind="reference", target="messages",
-        content="answer evidence", priority=slot_priority("reference"),
-        token_estimate=50, metadata={"score": 0.9, "timestamp": "2026-01-01T00:00:00"})
-    spec = ContextBlock(
-        id="spec", source="task_spec", kind="task_spec", target="messages",
-        content="", priority=0, token_estimate=10,
-        metadata={"title": "T", "description": "", "user_prompt": "hi"})
-
-    def build(cache):
-        return ContextAssembler(
-            sources=[_OneBlockSource(spec), _OneBlockSource(ev)],
-            budget=PriorityBudgetStrategy(evidence_top_k=3),
-            composer=DefaultComposer(),
-            deps=AssemblerDeps(
-                memory=SimpleNamespace(), knowledge_providers=[],
-                provider_ctx=ProviderContext(session_id="s1", tenant_id="default",
-                                             task_id="tsk_1", agent_id="ag1"),
-                capability_cache=cache, agent_id="ag1"),
-        )
-
-    # 无 cache（零预留）：预算 200 容得下 spec(10)+ev(50) → 证据存活。
-    prompt_plain = await build(None).assemble(_req(session_limit=200))
-    body = "\n".join(m.content for m in prompt_plain.messages if isinstance(m.content, str))
-    assert "answer evidence" in body
-
-    # 带 cache：预留按实测动态取窗口——内容预算 = (reserved + 30)，容地板(10) 不容
-    # 地板+证据(60)：证据被裁、地板存活、不溢出、可归因（schema 预留先扣减、证据
-    # 地板在其剩余内生效——两 change 组合语义）。
-    probe = await build(_cache_with(_cap_tool())).assemble(_req(session_limit=10_000_000))
-    reserved = probe.metadata["tools_reserved_tokens"]
-    assert reserved > 200
-    prompt_reserved = await build(_cache_with(_cap_tool())).assemble(
-        _req(session_limit=reserved + 30))
-    body2 = "\n".join(
-        m.content for m in prompt_reserved.messages if isinstance(m.content, str))
-    assert "answer evidence" not in body2                       # 剩余预算容不下证据
-    assert prompt_reserved.metadata["tools_reserved_tokens"] == reserved

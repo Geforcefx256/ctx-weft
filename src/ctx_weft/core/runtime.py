@@ -3754,10 +3754,7 @@ class CtxWeftRuntime:
                 KnowledgeRetrievalSource(),
                 GuidanceSource(),
             ],
-            budget=PriorityBudgetStrategy(
-                evidence_top_k=self._config.evidence_top_k,
-                evidence_score_floor=self._config.evidence_score_floor,
-            ),
+            budget=PriorityBudgetStrategy(),
             composer=DefaultComposer(),
             deps=deps,
         )
