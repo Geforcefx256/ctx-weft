@@ -234,10 +234,12 @@ def _ingest_task_material(mem, scope, pctx, *, converged_tool_line: str | None =
     return _ing()
 
 
+# 与 `converge_tool_output` 实际产出同形：取回说明整句由 sink 给，gateway 原样嵌入。
 _CONVERGED_LINE = (
-    "[Tool output truncated: 9000 chars exceeded 4000-char limit; full text available "
-    f"via {READ_TOOL_QUALIFIED_NAME}(invocation_id='inv_evidence_1', tail=N or offset=N, "
-    "limit=N)]\n--- preview (first 100 chars) ---\nAAAA...\n--- tail (last 120 chars) "
+    "[Tool output truncated: 9000 chars exceeded 4000-char limit. Full text is "
+    f"retrievable — read it with {READ_TOOL_QUALIFIED_NAME}("
+    "invocation_id='inv_evidence_1', tail=N) for the last N chars, or "
+    "(invocation_id='inv_evidence_1', offset=0, limit=N) to page from the start.]\n--- preview (first 100 chars) ---\nAAAA...\n--- tail (last 120 chars) "
     "---\n..." + "B" * 100)
 
 

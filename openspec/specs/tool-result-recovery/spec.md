@@ -10,7 +10,7 @@
 
 工具输出超过收敛阈值时，执行链 SHALL 在丢弃任何内容之前把全文交给 `SpillSink`（core 对「超长输出去哪」的**唯一**契约），并把它返回的引用嵌入收敛版。SHALL NOT 为此另立第二个存储协议——「能不能被模型回读」是 sink **实现的能力**，不是 core 契约的分支。
 
-引用的措辞 SHALL 由 sink 决定（只有存进去的一方知道怎么取回来）：落盘实现给路径，可回读实现给工具调用形态。无 sink 或 spill 抛错时收敛版 SHALL 显式标注「不可取回」，MUST NOT 留下一个取不回来的引用。
+`spill()` 的返回值 SHALL 是一句**面向模型的、自足的取回说明**——点名**用哪个工具、传什么参数**，而非一个裸引用；gateway SHALL 原样嵌入，MUST NOT 自己套框架词。只有存进去的那一方消得掉歧义：core 看到一个路径与一个调用形态，无从分辨前者要用 `fs__read_file` 读、后者可照抄；统一套一句「full text at X」对两种 sink 都不准确，模型猜错就是白跑一轮工具。无 sink 或 spill 抛错时收敛版 SHALL 显式标注「NOT recoverable」，MUST NOT 留下一个取不回来的引用。
 
 宿主可注册一个**可回读的** sink（内置 `ResultsCapabilityProvider`：全文入 LRU，并自带 `read_tool_output` 工具）。该 provider 同时是 `SpillSink` 与 `ToolCapabilityProvider`，注册一次两个角色齐备——存与取住在同一个对象里，不存在「注册了回读工具却没注册对应存储」的错配。未注册任何 sink 时超长输出硬截断。
 

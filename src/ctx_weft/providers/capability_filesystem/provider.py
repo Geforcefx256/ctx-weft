@@ -642,14 +642,20 @@ class FilesystemToolsProvider(ToolCapabilityProvider, SpillSink,
         return self._workspaces.get(ctx.session_id)
 
     async def spill(self, content: str, ctx: ProviderContext, *, name_hint: str = "") -> str:
-        """SpillSink：把超长内容落盘到该 session 的 workspace，返回落盘路径；未登记则 raise。"""
+        """SpillSink：把超长内容落盘到该 session 的 workspace，返回**取回说明**；未登记则 raise。
+
+        说明里点名 `fs__read_file`——落盘的文件就在 workspace 里，本 provider 自己的读取
+        工具能翻页读回来。只给一条路径的话，模型得自己猜该用哪个工具、传什么参数。
+        """
         ws = self.workspace_for(ctx)
         if ws is None:
             raise RuntimeError(f"no workspace registered for session {ctx.session_id!r}")
         safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in (name_hint or "out"))
         file_path = Path(ws) / "tool_outputs" / f"{safe}_{generate_id('spill')}.txt"
         await asyncio.to_thread(self._write_text, file_path, content)
-        return str(file_path)
+        return (f"Full text saved to {file_path} — read it with "
+                f"{FS_PROVIDER_NAME}__read_file(path='{file_path}', offset=1, limit=500) "
+                f"and page with the offset it suggests.")
 
     @staticmethod
     def _write_text(file_path: Path, content: str) -> None:

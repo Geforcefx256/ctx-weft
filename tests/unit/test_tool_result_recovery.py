@@ -246,7 +246,7 @@ async def test_spill_failure_marks_unrecoverable():
     provider = _Big("w" * 3_000)
     gw, mem, state, ctx, _ = _harness(provider, store=_FailingStore())
     res = await gw.invoke("mcp__b__dump", {}, state, ctx)
-    assert "not recoverable" in res.content
+    assert "NOT recoverable" in res.content
     assert "w" * 100 in res.content          # 头部预览仍在（不静默、不空转）
 
 
@@ -282,5 +282,5 @@ async def test_pure_converge_without_sink_still_bounded():
     out = await converge_tool_output(
         "q" * 2_500 + "END_MARK", "inv_x", None, None,
         threshold=1000, preview_chars=50, tail_chars=60)
-    assert "not recoverable" in out
+    assert "NOT recoverable" in out
     assert "END_MARK" in out

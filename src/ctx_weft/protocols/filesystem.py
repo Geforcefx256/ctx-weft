@@ -3,8 +3,8 @@
 把"文件系统操作"这一类 capability 从其他可选工具中分出来，只约定 core 真正依赖的两件事：
 
   1. 固定的工具名（FS_PROVIDER_NAME 前缀 + FsTool 常量），调用方与实现共用同一份。
-  2. SpillSink：CapabilityGateway 截断超长工具输出时，把全文落盘并返回路径——core 因此
-     不直接碰文件系统，也不需要知道「落到哪」。
+  2. SpillSink：CapabilityGateway 截断超长工具输出时，把全文交出去并拿回一句**取回说明**
+     ——core 因此不直接碰文件系统，也不需要知道「落到哪」「怎么取回来」。
 
 注意：per-session workspace 的指定 / 登记 / 路径锚定**不在协议内**。那是 SpillSink 实现
 （ctx_weft.providers.capability_filesystem.FilesystemToolsProvider）与 host 接线的细节：
@@ -31,17 +31,31 @@ class FsTool:
 
 
 class SpillSink(ABC):
-    """core 的「落盘 sink」契约：把超长内容落盘到某持久位置，返回落盘路径。
+    """core 对「超长内容存到哪」的**唯一**契约：收下全文，返回一句**取回说明**。
 
-    CapabilityGateway 在工具输出超阈值时调用 spill()，把全文落盘、result 改为
-    「截断提示 + 路径 + 预览」。core 不直接碰文件系统、也不知道 workspace——只知道
-    「有个 sink 能把内容落盘并返回路径」。该 session 没有可落盘位置时 spill() 应 raise，
-    调用方（gateway）据此回退到硬截断。
+    CapabilityGateway 在工具输出超阈值时调用 spill()，把 result 改为
+    「截断提示 + 取回说明 + 头尾预览」。core 不直接碰文件系统、也不知道 workspace。
 
-    实现见 ctx_weft.providers.capability_filesystem.FilesystemToolsProvider。
+    返回值 SHALL 是一句**面向模型的、自足的**取回说明——写清楚**用哪个工具、传什么参数**
+    才能读到全文，而不是一个裸引用。理由是歧义只有 sink 自己消得掉：core 拿到一个
+    `/ws/tool_outputs/x.txt` 和一个 `results__read_tool_output(...)`，无从分辨前者要用
+    `fs__read_file` 读、后者是个可照抄的调用形态；它若统一套一句「full text at {ref}」，
+    对两种 sink 都不准确。写说明的成本只在**存进去的那一方**这里是零。
+
+    句子形态（首字母大写、以句号收尾，gateway 原样嵌入，不再加任何框架词）：
+
+        Full text saved to /ws/tool_outputs/out_abc.txt — read it with
+        fs__read_file(path='/ws/tool_outputs/out_abc.txt', offset=1, limit=500).
+
+    该 session 没有可落盘位置时 spill() 应 raise，调用方（gateway）据此回退到硬截断，
+    并显式标注「不可取回」——**不留一个取不回来的引用**。
+
+    实现见 capability_filesystem.FilesystemToolsProvider（落盘）与
+    capability_results.ResultsCapabilityProvider（入内存 LRU + 自带回读工具）。
     """
 
     @abstractmethod
     async def spill(self, content: str, ctx: ProviderContext, *, name_hint: str = "") -> str:
+        """收下 ``content``，返回一句面向模型的取回说明；存不下则 raise。"""
         ...
 

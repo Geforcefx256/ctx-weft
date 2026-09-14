@@ -202,8 +202,8 @@ async def converge_tool_output(
 ) -> str:
     """收敛工具长输出（spec: tool-result-recovery）——唯一的收敛实现，四个入口共用。
 
-    全文交给 `SpillSink`（宿主注册，可以是落盘的也可以是可回读的内存实现），拿回一个
-    引用；上下文承载 = 引用 + 全长 + 头部预览 + **尾部预览**（错误与结论高发区）。
+    全文交给 `SpillSink`（宿主注册，可以是落盘的也可以是可回读的内存实现），拿回一句
+    **取回说明**；上下文承载 = 说明 + 全长 + 头部预览 + **尾部预览**（错误与结论高发区）。
 
     无 sink 或 spill 抛错 → 显式标注「全文不可取回」，工具结果本身照常回灌——**不假装
     有个取不回来的引用**，那只会让模型白试一次。未超阈值原样返回。
@@ -215,21 +215,27 @@ async def converge_tool_output(
     head = full_text[:preview_chars]
     tail = full_text[len(full_text) - tail_chars:] if tail_chars > 0 else ""
 
-    ref = None
+    recovery = None
     if spill_sink is not None:
         try:
-            ref = await spill_sink.spill(full_text, provider_ctx, name_hint=invocation_id)
+            recovery = await spill_sink.spill(
+                full_text, provider_ctx, name_hint=invocation_id,
+            )
         except Exception:
             logger.exception("CapabilityGateway: spill failed for %s", invocation_id)
 
-    header = (
+    # 取回说明**整句**由 sink 给（SpillSink 契约），gateway 原样嵌入、不加框架词。
+    # 只有存进去的那一方知道该用哪个工具、传什么参数取回来：落盘的点名
+    # `fs__read_file` 并给出路径，可回读的给出可照抄的 `results__read_tool_output(...)`。
+    # core 若统一套一句「full text at {ref}」，对两种 sink 都不准确——一个路径究竟是
+    # 「宿主侧的文件」还是「我能读的东西」，模型只能猜，猜错就是白跑一轮工具。
+    parts = [
         f"[Tool output truncated: {original_length} chars exceeded "
-        f"{threshold}-char limit"
-    )
-    # 引用的措辞由 sink 决定——只有存进去的那一方知道怎么取回来（落盘的给路径，
-    # 可回读的给工具调用形态）。core 不替它编。
-    parts = [f"{header}; full text at {ref}]" if ref else
-             f"{header}; full text not recoverable (no spill sink or spill failed)]"]
+        f"{threshold}-char limit. "
+        + (recovery or "Full text is NOT recoverable (no spill sink configured, or "
+                       "the spill failed) — what follows is all that remains.")
+        + "]"
+    ]
 
     body = [f"--- preview (first {len(head)} chars) ---", head]
     if tail:

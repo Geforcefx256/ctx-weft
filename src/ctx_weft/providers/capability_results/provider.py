@@ -60,9 +60,8 @@ async def read_tool_output(
 ) -> str:
     """Read back the full text of a truncated tool output by its invocation id.
 
-    A truncated tool result includes a line like
-    "[Tool output truncated: N chars ...; full text available via "
-    "results__read_tool_output(invocation_id='...')]".
+    A truncated tool result says "Full text is retrievable — read it with
+    results__read_tool_output(invocation_id='...')" and carries the id to use.
     Use `tail=N` to read the last N chars, or `offset` + `limit` to page from the
     start (0-based). Without window args this returns the first page. The
     invocation_id is per execution attempt — a re-executed tool call has a new id
@@ -95,12 +94,14 @@ class ResultsCapabilityProvider(ToolCapabilityProvider, SpillSink):
         """收下全文，返回**给模型看的取回说明**（gateway 原样嵌进截断提示）。
 
         ``name_hint`` 是本次执行的 invocation_id——它同时是回读键，所以说明里直接写成
-        可照抄的调用形态。存不下就抛（SpillSink 契约），gateway 据此回退硬截断。
+        可照抄的调用形态：**点名工具 + 填好 id**，模型不必从别处推。存不下就抛
+        （SpillSink 契约），gateway 据此回退硬截断。
         """
         key = name_hint or "unknown"
         await self._store.put(key, content, ctx=ctx)
-        return (f"{READ_TOOL_QUALIFIED_NAME}("
-                f"invocation_id='{key}', tail=N or offset=N, limit=N)")
+        return (f"Full text is retrievable — read it with "
+                f"{READ_TOOL_QUALIFIED_NAME}(invocation_id='{key}', tail=N) for the last N "
+                f"chars, or (invocation_id='{key}', offset=0, limit=N) to page from the start.")
 
     async def info(self, ctx: ProviderContext) -> CapabilityProviderInfo:
         return CapabilityProviderInfo(
