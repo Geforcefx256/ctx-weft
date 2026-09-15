@@ -3580,12 +3580,10 @@ class CtxWeftRuntime:
     async def _read_session_events_of_types(
         self, session_id: str, types: "tuple[EventType, ...]",
     ) -> "list[Event]":
-        """轻查询取该 session 的指定类型事件；EventStore 未实现轻查询时退化为全量读 + 内存过滤。"""
-        try:
-            return await self.event_store.read_session_events_of_types(session_id, types)
-        except NotImplementedError:
-            return [e for e in await self.event_store.read_by_session(session_id)
-                    if e.type in types]
+        """轻查询取该 session 的指定类型事件（降级逻辑与 capability 折叠共用一份）。"""
+        from ctx_weft.core.control.reducers import load_events_of_types
+
+        return await load_events_of_types(self.event_store, session_id, types)
 
     async def _hydrate_snapshot_messages(self, snapshot, session_id: str) -> None:
         """把 `decisions_for` 里的 **event 侧** 内容还原成 memory 侧可用的形态。
@@ -3799,7 +3797,7 @@ class CtxWeftRuntime:
             skill_provider_index=skill_index,
             cancel_token=cancel_token,
             task_manager=task_manager,
-            read_events_of_types=self._read_session_events_of_types,
+            event_store=self.event_store,
             hitl=self.hitl,
             waiter=HitlWaiter(self.hitl_registry, timeout_sec=self._hitl_timeout_sec),
             pause_token=pause_token,

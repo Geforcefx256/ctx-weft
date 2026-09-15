@@ -103,12 +103,10 @@ def _harness(tool, *, authorizer=None, sink=False):
         agent=SimpleNamespace(id="a1", template_id="tpl"), scope=scope,
         resolved_model=SimpleNamespace(model="m", account=""), sequence_counter=0)
 
-    async def _read(session_id, types):
-        return await store.read_session_events_of_types(session_id, types)
 
     ctx = LoopContext(assembler=None, llm=None, memory=mem, event_bus=bus,
                       provider_ctx=pctx, task_manager=_TM(bus),
-                      read_events_of_types=_read)
+                      event_store=store)
     cache = CapabilityCache()
     cache.put("a1", [tool._cap()])
     providers = [tool]

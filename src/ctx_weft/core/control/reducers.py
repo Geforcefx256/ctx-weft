@@ -1017,6 +1017,22 @@ def fold_hitl_snapshot(events: list[Event]) -> HitlSnapshot:
 # 折出来就用，不存。比 HITL 折叠还省一层：未决 HITL 的年龄没有上界所以不能截尾，
 # 而 dangling tool_call 必定在最后一个 assistant 回合之后，读最近一段即可。
 
+async def load_events_of_types(
+    store, session_id: str, types: "tuple[EventType, ...]",
+) -> list[Event]:
+    """按类型取该会话的事件——**本文件这些折叠的统一数据入口**。
+
+    `read_session_events_of_types` 是 `EventStore` 的可选扩展；未实现时退化为全量读 +
+    内存过滤。这段降级本来在 runtime 里是个只有一个调用方的私有方法，capability 折叠
+    落地后成了第二个需要它的人——与其各写各的，不如和折叠住在一起：需要它的理由完全
+    一样（「恢复决策按事件折叠，不必全量回放」）。
+    """
+    try:
+        return await store.read_session_events_of_types(session_id, types)
+    except NotImplementedError:
+        return [e for e in await store.read_by_session(session_id) if e.type in types]
+
+
 #: 折叠所需的事件类型。供事件库按类型过滤读取，无需全量回放。
 CAP_FOLD_EVENT_TYPES: tuple[EventType, ...] = (
     EventType.CAPABILITY_INVOKED,

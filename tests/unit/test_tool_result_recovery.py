@@ -126,14 +126,12 @@ def _harness(provider, *, store=None, threshold=1000, sink=True):
         scope=scope,
         resolved_model=SimpleNamespace(model="mock", account=""),
     )
-    async def _read(session_id, types):
-        return await event_store.read_session_events_of_types(session_id, types)
 
     ctx = LoopContext(
         assembler=None, llm=None, memory=mem, event_bus=bus,
         provider_ctx=ProviderContext(
             session_id="s1", tenant_id="default", task_id="tsk_1", agent_id="agt_1"),
-        read_events_of_types=_read,
+        event_store=event_store,
     )
     return gw, mem, state, ctx, scope
 

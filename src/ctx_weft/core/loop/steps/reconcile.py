@@ -64,17 +64,17 @@ class ReconcileStep(Step):
         # 找不到 dangling 工具（spec/07 §6 端到端缺陷修复）。
         await resolve_and_bind(state, ctx)
 
-        from ctx_weft.core.control.reducers import CAP_FOLD_EVENT_TYPES, fold_operations
+        from ctx_weft.core.control.reducers import (
+            CAP_FOLD_EVENT_TYPES, fold_operations, load_events_of_types)
         from ctx_weft.core.loop.capability_gateway import tool_result_record_id
 
         # 恢复判据来自**事件流**：capability 事件在 gateway 里于 provider 之前经提交门
         # 落库，所以「有没有 INVOKED」就是「provider 有没有被调用过」。折出来就用，不存。
-        # 拿不到查询函数（宿主直构 / 测试替身）→ 空事实 → 一律按「无从判断」保守处理。
+        # 没接事件库（宿主直构 / 测试替身）→ 空事实 → 一律按「无从判断」保守处理。
         facts: dict = {}
-        read_events = getattr(ctx, "read_events_of_types", None)
-        if read_events is not None:
-            facts = fold_operations(await read_events(
-                state.scope.session_id, CAP_FOLD_EVENT_TYPES))
+        if ctx.event_store is not None:
+            facts = fold_operations(await load_events_of_types(
+                ctx.event_store, state.scope.session_id, CAP_FOLD_EVENT_TYPES))
 
         for tc in dangling:
             if ctx.cancel_token is not None and ctx.cancel_token.is_cancelled:
@@ -145,13 +145,13 @@ class ReconcileStep(Step):
         3. **冷 HITL 重入**：该 tool_call 的人工决定已在案，说明崩在等人处、
            provider 从未启动。
 
-        都不成立 = 拿不到事件查询，或裸 wire id（存量数据，跨回合会互相覆盖所以不能
-        当判据）——无从判断，保守作结。
+        都不成立 = 没接事件库，或裸 wire id（存量数据，跨回合会互相覆盖所以不能当判据）
+        ——无从判断，保守作结。
         """
         from ctx_weft.core.capabilities.control_tools import PROVIDER_NAME as _CTL
         from ctx_weft.core.hitl.registry import HITL_STAGE_AUTHZ, HITL_STAGE_TOOL
 
-        if op_id and getattr(ctx, "read_events_of_types", None) is not None:
+        if op_id and ctx.event_store is not None:
             return True
         if tc["name"].startswith(f"{_CTL}__"):
             return True

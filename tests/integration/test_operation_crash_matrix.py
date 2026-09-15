@@ -150,8 +150,6 @@ async def test_ot06_finished_but_memory_write_crashed_backfills(tmp_path):
             id=f"evt_seed_{i}", type=etype, session_id="s1", run_id="r0", sequence=i,
             timestamp=datetime.now(UTC), payload=payload))
 
-    async def _read(session_id, types):
-        return await event_store.read_session_events_of_types(session_id, types)
 
     state = LoopState(
         run_id="r1", session=SimpleNamespace(id="s1", tenant_id="default"),
@@ -159,7 +157,7 @@ async def test_ot06_finished_but_memory_write_crashed_backfills(tmp_path):
         agent=SimpleNamespace(id="a1", template_id="t"), scope=scope,
         resolved_model=SimpleNamespace(model="m", account=""), sequence_counter=0)
     ctx = LoopContext(assembler=None, llm=None, memory=mem, event_bus=bus,
-                      provider_ctx=pctx, read_events_of_types=_read)
+                      provider_ctx=pctx, event_store=event_store)
     cache = CapabilityCache()
     cache.put("a1", [tool._cap()])
     ctx.capability_gateway = CapabilityGateway(
@@ -215,14 +213,12 @@ async def test_ot14_delegate_completed_reentry_no_duplicate_children():
         resolved_model=SimpleNamespace(model="m", account=""),
         sequence_counter=0,
     )
-    async def _read(session_id, types):
-        return await event_store.read_session_events_of_types(session_id, types)
 
     ctx = LoopContext(
         assembler=None, llm=None, memory=mem, event_bus=bus,
         provider_ctx=ProviderContext(session_id="s1", tenant_id="default",
                                      task_id="t1", agent_id="a1"),
-        read_events_of_types=_read,
+        event_store=event_store,
     )
     cache = CapabilityCache()
     from ctx_weft.protocols.capability import ToolCapability as TC

@@ -122,12 +122,10 @@ async def _mk_fixture(policy="reviewed", *, invoked=True, finished=False, tool=N
         sequence_counter=0,
     )
 
-    async def _read(session_id, types):
-        return await event_store.read_session_events_of_types(session_id, types)
 
     ctx = LoopContext(assembler=None, llm=None, memory=mem, event_bus=bus,
                       provider_ctx=pctx, task_manager=_TM(bus),
-                      read_events_of_types=_read)
+                      event_store=event_store)
     cache = CapabilityCache()
     cache.put("a1", [tool._cap()])
     gw = CapabilityGateway(capability_cache=cache, capability_providers=[tool],
@@ -197,7 +195,7 @@ async def test_no_event_query_at_all_concludes_without_rerun():
     """折不出事实（宿主直构 / 测试替身没接查询）——无从判断，不重跑。"""
     tool, store, bus, state, ctx, op_id = await _mk_fixture(
         policy="idempotent", invoked=False)
-    ctx.read_events_of_types = None
+    ctx.event_store = None
     outcome = await ReconcileStep().execute(state, ctx)
 
     assert tool.executions == 0, "无从判断的副作用工具不得自动重跑"

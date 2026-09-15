@@ -449,10 +449,12 @@ class CapabilityGateway:
         # 发生一次，折了也是空——实测五个场景里四个读到「没有」。重入只有两条来路：
         # ReconcileStep 与 HITL 冷续跑，两者都知道自己是重入，由调用侧告知即可。
         facts = None
-        if reentry and ledger_key and ctx.read_events_of_types is not None:
-            from ctx_weft.core.control.reducers import CAP_FOLD_EVENT_TYPES, fold_operations
-            facts = fold_operations(await ctx.read_events_of_types(
-                ctx.provider_ctx.session_id, CAP_FOLD_EVENT_TYPES)).get(ledger_key)
+        if reentry and ledger_key and ctx.event_store is not None:
+            from ctx_weft.core.control.reducers import (
+                CAP_FOLD_EVENT_TYPES, fold_operations, load_events_of_types)
+            facts = fold_operations(await load_events_of_types(
+                ctx.event_store, ctx.provider_ctx.session_id,
+                CAP_FOLD_EVENT_TYPES)).get(ledger_key)
 
         # 2a. 同逻辑调用重入且已有结局 → 复用结果，**这里就 return**。
         #

@@ -60,15 +60,15 @@ async def test_reconcile_invokes_only_dangling_tool_calls() -> None:
         extra={},                          # 无 template → resolve_and_bind 解析为空,不动 cache
     )
     ctx = SimpleNamespace(memory=mem, provider_ctx=pctx, capability_gateway=gateway,
-                          cancel_token=None, event_bus=_NullBus(),
+                          cancel_token=None, event_bus=_NullBus(), event_store=None,
                           capability_providers=[], capability_cache=None)
 
-    # wp6（spec: tool-operations）：无账本身份的 dangling **不自动重执行**——tc2 不被
-    # invoke。但也不停机：作结「无从查证」写成工具结果，循环继续到 prepare，由 agent
-    # 在任务上下文里决定怎么办（结果不确定是一种工具结果，不是一种控制流）。
+    # spec: tool-operations——`event_store=None` = 折不出事实 = 无从判断，dangling
+    # **不自动重执行**（tc2 不被 invoke）。但也不停机：作结「无从查证」写成工具结果，
+    # 循环继续到 prepare，由 agent 在任务上下文里决定怎么办。
     state.sequence_counter = 0
     outcome = await ReconcileStep().execute(state, ctx)
-    assert invoked == [], "无账本身份的副作用工具不得自动重跑"
+    assert invoked == [], "无从判断的副作用工具不得自动重跑"
     assert outcome.next_step == "prepare", "不停机——把结果交给 agent 继续"
 
 
