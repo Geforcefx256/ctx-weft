@@ -5,7 +5,7 @@
 > ---
 >
 > ⚠️ **本文是 2026-09-11 的原始方案，不是当前实现的描述。** 实施过程中下列设计被**推翻重做**，
-> 以 `openspec/specs/` 下的 capability spec 与 `ARCHITECTURE.md` 为准：
+> 以 `ARCHITECTURE.md` 与代码中的 docstring 为准：
 >
 > | 方案原文 | 实际落地 |
 > |---|---|
