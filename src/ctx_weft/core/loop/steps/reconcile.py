@@ -5,7 +5,7 @@ TOOL_RESULT。直接把含 dangling 的消息序列喂给 LLM 会非法报错。
 
   完成判定（双通道，spec §5.4 / design D1）：
     done(op_id) = 账本 get(op_id).status == COMPLETED
-              或 task view 存在 id == operation_memory_result_id(op_id) 的 tool 记录
+              或 task view 存在 id == tool_result_record_id(op_id) 的 tool 记录
     ——判据是**逻辑身份**（op_id），与 wire id 无关：call_1 复用不再串扰。
 
   未完成的 → 按「账本状态 × recovery_policy」分派（design D2）。策略**只有两类**，
@@ -18,14 +18,16 @@ TOOL_RESULT。直接把含 dangling 的消息序列喂给 LLM 会非法报错。
     WAITING_HUMAN              → 既有 HITL 恢复路径（不 invoke）
     STARTED + 控制工具         → invoke（同上 carve-out）
     STARTED + idempotent       → invoke（同 op_id 重跑安全）
-    STARTED + reviewed         → 问裁决者，它只回答**该不该重跑**：
-                                   rerun=True   → invoke（权威判定没跑成）
-                                   rerun=False  → 作结：把它给的 result 写成工具结果
-                                 provider 未实现裁决接口 → core 代为作结「无从查证」
+    STARTED + reviewed         → 交给 gateway 问**重跑授权**（宿主注册的
+                                 RerunAuthorizer），它只回答该不该再跑一遍：
+                                   allowed=True  → invoke（权威判定没跑成）
+                                   allowed=False → 作结：把它的 message 写成工具结果
+                                   needs_human   → 既有 HITL park
+                                 未注册 → core 代为作结「无从查证」
     COMPLETED                  → 不应到达（完成判定已滤）
 
   **作结 = 账本 CAS completed + 把 result 经收敛写成 TOOL_RESULT，然后照常续跑。**
-  「不重跑」的两种由来——裁决者查到了真结果 / 谁也查不到——对 core 是**同一条路**，
+  「不重跑」的两种由来——授权方查到了真结果 / 谁也查不到——对 core 是**同一条路**，
   区别全在 result 文本里。结果不确定是一种工具结果，不是一种控制流：不停机、不改
   task 状态、不发专属事件、不设专属错误码或处置 API，agent 下一轮读到它自行决定。
 → next_step="prepare"：assembler 重建出完整 turn，LLM 续跑。
@@ -62,12 +64,10 @@ class ReconcileStep(Step):
         # 找不到 dangling 工具（spec/07 §6 端到端缺陷修复）。
         await resolve_and_bind(state, ctx)
 
-        from ctx_weft.protocols.operations import (
-            OperationStatus, OperationUpdate,
-            operation_memory_result_id, Adjudication, normalize_recovery_policy,
-            RecoveryPolicy,
-        )
+        from ctx_weft.protocols.capability import OperationStatus, tool_result_record_id
 
+        # 鸭子类型的 gateway（测试替身 / 宿主直构）没有这个属性 → 账本旁路。
+        ledger = getattr(gateway, "operation_store", None)
         for tc in dangling:
             if ctx.cancel_token is not None and ctx.cancel_token.is_cancelled:
                 ctx.cancel_token.raise_if_cancelled()
@@ -76,88 +76,40 @@ class ReconcileStep(Step):
             op_id = tc.get("id", "") if is_internal_call_id(tc.get("id", "")) else ""
 
             # ── 双通道完成判定（D1）：账本 / 确定性 memory id ─────────────────────
-            ledger = getattr(gateway, "_operation_store", None)
             rec = await ledger.get(op_id, ctx.provider_ctx) if ledger is not None else None
             if (rec is not None and rec.status == OperationStatus.COMPLETED) or (
-                    operation_memory_result_id(op_id) in tool_record_ids):
+                    tool_result_record_id(op_id) in tool_record_ids):
                 if (
                     rec is not None and rec.status == OperationStatus.COMPLETED
-                    and operation_memory_result_id(op_id) not in tool_record_ids
+                    and tool_result_record_id(op_id) not in tool_record_ids
                 ):
                     # spec: tool-result-recovery——「账本完成而 memory 缺失」（completed 与
                     # TOOL_RESULT 写入之间崩溃）：以账本全文经收敛补写（原执行 id 引用），
                     # 兑现 tool-operations 的补写要求；此前此处直接 continue，dangling 兜底
                     # 会把这次调用的结果整个剥掉。
                     await self._backfill_memory(
-                        state, ctx, op_id, rec.result, tc,
+                        state, ctx, op_id, tc, rec.result,
                         gateway=gateway, rec=rec, via="ledger-completed")
                 logger.info("ReconcileStep: op %s completed — reusing, not re-running", op_id)
                 continue
 
-            # ── 策略分派（D2）：两类——idempotent 重跑 / reviewed 交裁决链 ─────
-            # 取值在启动期已由 resolver 校验过，这里再归一一次兜住鸭子类型 cap。
-            _cache = getattr(gateway, "_cache", None)
-            cap = _cache.get_by_qualified_name(
-                state.agent.id, tc["name"], state.task.id) if _cache is not None else None
-            policy = normalize_recovery_policy(
-                getattr(cap, "recovery_policy", None) if cap is not None else None)
-            if rec is None:
-                from ctx_weft.core.capabilities.control_tools import PROVIDER_NAME as _CTL
-                from ctx_weft.core.hitl.registry import HITL_STAGE_TOOL
-                hitl = getattr(ctx, "hitl", None)
-                from ctx_weft.core.hitl.registry import HITL_STAGE_AUTHZ
-                _sid = getattr(state.session, "id", "")
-                _tcid = tc.get("id", "")
-                decision_on_record = hitl is not None and (
-                    hitl.registry.decision_for(_sid, _tcid, HITL_STAGE_TOOL) is not None
-                    or hitl.registry.decision_for(_sid, _tcid, HITL_STAGE_AUTHZ) is not None
-                )
-                if tc["name"].startswith(f"{_CTL}__"):
-                    # 控制工具（方案 §5.4「单独核验」）：core 自有的幂等状态迁移——
-                    # finish/metadata 同身份幂等、ask_user 复用既有请求（HITL 决定缓存
-                    # 门控）、delegate 经 gateway completed 短路防双建。无账本记录按
-                    # 首执处理（PREPARED 语义），不进 unknown。
-                    pass
-                elif decision_on_record:
-                    # 冷 HITL 重入：该 tool_call 的人工决定已在案（crash 发生在等待处、
-                    # provider 从未启动）= 「prepared 且从未进入 started」——首执安全。
-                    pass
-                else:
-                    # 存量无身份（WP5 之前的数据）或账本未接线的外部副作用工具：
-                    # 不重跑，作结说明无从查证——不用随机 id 去碰副作用工具。
-                    await self._conclude_unverified(
-                        state, ctx, op_id, tc, ledger, rec,
-                        f"[Operation outcome unverified] 工具 {tc['name']} 的这次调用在"
-                        f"崩溃前没有留下账本记录，无法确定副作用是否已发生。不要重试这次调用。",
-                        gateway=gateway)
-                    continue
-            if rec is None:
-                pass  # 控制工具 / 冷 HITL 首执 carve-out（上方已分流其它去作结）
-            elif rec.status == OperationStatus.WAITING_HUMAN:
-                logger.info("ReconcileStep: op %s waiting_human — HITL path resumes", op_id)
+            # ── 未完成的三条出路 ────────────────────────────────────────────
+            # started 的重跑判断**不在这里**：gateway 自己从账本读得到 started 记录，
+            # 策略与重跑授权的解析也都在它手上（`_authorize_rerun`）。reconcile 只要
+            # 把它交出去，由 gateway 决定这次 invoke 到底打不打 provider。
+            if rec is not None and rec.status == OperationStatus.WAITING_HUMAN:
+                logger.info("ReconcileStep: %s waiting_human — HITL path resumes", op_id)
                 continue  # 既有 HITL 恢复路径处理
-            elif rec.status == OperationStatus.PREPARED:
-                pass  # 首次执行（此前无副作用）
-            elif rec.status == OperationStatus.STARTED:
-                from ctx_weft.core.capabilities.control_tools import PROVIDER_NAME as _CTL2
-                if tc["name"].startswith(f"{_CTL2}__"):
-                    pass  # 控制工具 started：幂等状态迁移（同上 carve-out 理由）
-                elif policy == RecoveryPolicy.IDEMPOTENT:
-                    pass  # 重跑安全 → 同 op_id 重试
-                else:  # RecoveryPolicy.REVIEWED —— core 绝不自行决定
-                    verdict = await self._adjudicate(gateway, op_id, tc, state, ctx)
-                    if not verdict.rerun:
-                        # 作结：裁决者查到了真结果、或只能说明查不到——对 core 同一件事。
-                        await self._conclude_unverified(
-                            state, ctx, op_id, tc, ledger, rec, verdict.result,
-                            gateway=gateway)
-                        continue
-                    # 权威判定没跑成 → 同 op_id 重跑安全
+
+            if rec is None and not self._safe_first_execution(tc, op_id, ledger, state, ctx):
+                # 真·无身份：账本未接线，或存量数据（账本建立之前写入）。不重跑，
+                # 作结说明无从查证——不用随机 id 去碰副作用工具。
+                await self._conclude_no_record(state, ctx, op_id, tc, gateway)
+                continue
 
             logger.info(
-                "ReconcileStep: executing op %s (tool %s, ledger=%s, policy=%s)",
-                op_id, tc["name"],
-                rec.status if rec is not None else "no-record", policy)
+                "ReconcileStep: handing %s (tool %s, ledger=%s) to gateway",
+                op_id, tc["name"], rec.status if rec is not None else "no-record")
             await gateway.invoke(
                 tool_name=tc["name"],
                 arguments=tc.get("input", {}) or {},
@@ -170,70 +122,63 @@ class ReconcileStep(Step):
 
     # ── helpers ────────────────────────────────────────────────────────────────
 
-    async def _adjudicate(self, gateway, op_id, tc, state, ctx):
-        """裁决链第一环：provider 若实现 OperationAdjudicator 就交它裁。
+    def _safe_first_execution(self, tc, op_id, ledger, state, ctx) -> bool:
+        """无账本记录时，这次调用是不是「确定还没跑过」——是则首执安全。
 
-        **恒返回 Adjudication**：provider 找不到、未实现接口、或裁决抛错时，core 代为
-        作结「无从查证」——同样不重跑。没有裁决者不是错误配置而是默认形态：绝大多数
-        provider 无从查证外部真值。
+        三种成立情形：
 
-        这里是 core 唯一还替人组织措辞的地方，但没有别的选择；它说的也是实话——
-        「没人能查证」，而不是「查了查不到」。
+        1. **持久账本查不到记录**：gateway 的 prepare 在授权与参数校验**之后**，所以
+           「有内部标识 + 账本跨进程活着 + 无记录」只能是崩在 prepare 之前——provider
+           确定没被调用过，副作用确定没发生。这比 PREPARED 还早一格。
+
+           判据必须是 `durable`，不能只是「账本非 None」：内存账本重启后一片空白，
+           「没跑过」和「跑过但账本随进程没了」长得一模一样（O-T05 的真子进程强退就
+           踩在这里——副作用会被执行两次）。
+        2. **控制工具**：core 自有的幂等状态迁移——finish/metadata 同身份幂等、
+           ask_user 复用既有请求（HITL 决定缓存门控）、delegate 经 gateway 的
+           completed 短路防双建（方案 §5.4「单独核验」）。
+        3. **冷 HITL 重入**：该 tool_call 的人工决定已在案，说明崩在等人处、
+           provider 从未启动。
+
+        都不成立 = 账本未接线，或存量数据（账本建立之前写入）——无从判断，保守作结。
         """
-        from ctx_weft.protocols.operations import Adjudication, OperationAdjudicator
-        _cache = getattr(gateway, "_cache", None)
-        cap = _cache.get_by_qualified_name(
-            state.agent.id, tc["name"], state.task.id) if _cache is not None else None
-        _find = getattr(gateway, "_find_provider", None)
-        provider = _find(cap.id) if (cap is not None and _find is not None) else None
-        unverified = Adjudication.conclude(
-            f"[Operation outcome unverified] 工具 {tc['name']} 在执行中被中断，"
-            f"provider 未提供结果查证能力，无法确定副作用是否已发生。"
-            f"operation_id: {op_id}。不要重试这次调用。")
-        if provider is None or not isinstance(provider, OperationAdjudicator):
-            logger.info("ReconcileStep: op %s has no adjudicator — concluding unverified", op_id)
-            return unverified
-        try:
-            return await provider.adjudicate(op_id, ctx.provider_ctx)
-        except Exception:
-            logger.exception(
-                "ReconcileStep: adjudicate failed for %s — concluding unverified", op_id)
-            return unverified
+        from ctx_weft.core.capabilities.control_tools import PROVIDER_NAME as _CTL
+        from ctx_weft.core.hitl.registry import HITL_STAGE_AUTHZ, HITL_STAGE_TOOL
 
-    async def _conclude_unverified(self, state, ctx, op_id, tc, ledger, rec, result, *,
-                                   gateway=None):
-        """作结一次不重跑的操作：账本 completed + 把 ``result`` 写成这次调用的工具结果。
+        if op_id and getattr(ledger, "durable", False):
+            return True
+        if tc["name"].startswith(f"{_CTL}__"):
+            return True
+        hitl = getattr(ctx, "hitl", None)
+        if hitl is None:
+            return False
+        sid, tcid = getattr(state.session, "id", ""), tc.get("id", "")
+        return (hitl.registry.decision_for(sid, tcid, HITL_STAGE_TOOL) is not None
+                or hitl.registry.decision_for(sid, tcid, HITL_STAGE_AUTHZ) is not None)
 
-        与「裁决者查到了真结果」走的是**同一条路**——对 core 而言两者没有区别，差的
-        只是 result 的内容。不发专属事件、不改 task 状态、不停机：**结果不确定是一种
-        工具结果，不是一种控制流**。agent 下一轮读到它，在任务上下文里决定怎么办。
+    async def _conclude_no_record(self, state, ctx, op_id, tc, gateway):
+        """作结一条无从查证的 dangling：把说明写成这次调用的工具结果，不重跑。
+
+        与 gateway 的 `_conclude_without_rerun` 是同一件事的两个入口——那边处理「账本
+        里有 started 记录」，这边处理「压根没有记录」，后者没有可 CAS 的行。两边都不
+        发专属事件、不改 task 状态、不停机：**结果不确定是一种工具结果，不是一种
+        控制流**。agent 下一轮读到它，在任务上下文里决定怎么办。
         """
-        from ctx_weft.protocols.operations import OperationStatus, OperationUpdate
+        await self._backfill_memory(
+            state, ctx, op_id, tc,
+            f"[Operation outcome unverified] 工具 {tc['name']} 的这次调用在崩溃前没有"
+            f"留下账本记录，无法确定副作用是否已发生。不要重试这次调用。",
+            gateway=gateway, via="no-ledger-record")
+        logger.info("ReconcileStep: %s concluded without re-running (no ledger record)", op_id)
 
-        if ledger is not None and rec is not None:
-            try:
-                await ledger.compare_and_set(
-                    rec.operation_id, rec.revision,
-                    OperationUpdate(status=OperationStatus.COMPLETED,
-                                    result=result, result_set=True),
-                    ctx.provider_ctx)
-            except Exception:
-                # 账本写不进去不该拦住「把结果告诉 agent」——后者才是这一步的产出。
-                logger.exception("ReconcileStep: ledger conclude failed for %s", op_id)
-        await self._backfill_memory(state, ctx, op_id, result, tc,
-                                    gateway=gateway, rec=rec, via="adjudicator")
-        logger.info("ReconcileStep: op %s concluded without re-running", op_id)
-
-    async def _backfill_memory(self, state, ctx, op_id, result, tc, *,
-                               gateway=None, rec=None, via="adjudicator"):
+    async def _backfill_memory(self, state, ctx, op_id, tc, result, *,
+                               gateway=None, rec=None, via="ledger-completed"):
         """补写 TOOL_RESULT（spec: tool-result-recovery——补写统一过收敛，禁全文直灌）。
 
         幂等由 memory 的 id 契约保证（同 id ingest = no-op）。收敛引用沿用账本原执行
         invocation_id（attempts 尾项）；store 逐出后以账本全文重新入库（restore 语义）。
         """
-        from ctx_weft.protocols import MemoryEvent, MemoryKind, MemoryScope
-        from ctx_weft.protocols.operations import operation_memory_result_id
-        from ctx_weft.core.utils.clock import now_utc
+        from ctx_weft.core.loop.capability_gateway import ingest_tool_result
         content = str(result)
         attempts = getattr(rec, "attempts", None)
         ref_inv = attempts[-1] if attempts else tc.get("id", "")
@@ -243,14 +188,10 @@ class ReconcileStep(Step):
                     content, ctx, ref_inv, tc.get("name", ""), spillable=True)
             except Exception:
                 logger.exception("ReconcileStep: converge on backfill failed for %s", op_id)
-        await ctx.memory.ingest(MemoryEvent(
-            id=operation_memory_result_id(op_id),
-            kind=MemoryKind.CONVERSATION_TURN, scope=MemoryScope.TASK,
-            address=state.scope, content=content, timestamp=now_utc(),
-            role="tool",
-            metadata={"tool_call_id": tc.get("id"), "operation_id": op_id,
-                      "recovered_via": via},
-        ), ctx.provider_ctx)
+        await ingest_tool_result(
+            ctx.memory, ctx.provider_ctx, state.scope,
+            tool_call_id=tc.get("id", ""), content=content,
+            invocation_id=ref_inv, tool_name=tc.get("name", ""), via=via)
 
 
 async def _dangling_tool_calls(memory, scope, provider_ctx) -> tuple[list[dict], set[str]]:
@@ -279,20 +220,41 @@ async def _dangling_tool_calls(memory, scope, provider_ctx) -> tuple[list[dict],
     tool_calls = last_asst.metadata.get("tool_calls") or []
     if not tool_calls:
         return [], set()
-    # tool 记录集合（双通道之一：确定性 id 存在 = 已完成）。刻意**不看 wire id**：
-    # call_1 复用是常态，wire 配对会把新调用误判为完成（串扰——正是 H3 判据切换要
-    # 根治的形态）。旧数据的 tool 记录（无确定性 id）经 wire 配对曾判 done 的场景，
-    # 由账本通道（COMPLETED）或 unknown 分支兜底。
+    # 完成判据分两个平面，取决于这个调用有没有内部标识。
+    #
+    # **内部标识（新数据）**：确定性记录 id 在视图里 = 已完成。刻意**不看 wire id**：
+    # call_1 复用是常态，wire 配对会把新调用误判为完成（串扰——正是 H3 判据切换要根治
+    # 的形态）。
+    #
+    # **裸 wire id（存量数据）**：不存在确定性派生（同一个 call_1 可属于任意多个回合），
+    # 只能退回 wire 配对，且**限定在锚定回合之后写入的 tool 记录**里找。不这样限定的话
+    # 同 id 的旧回合结果会把本回合的调用误判成已完成；不做这个判定的话（此前如此）裸 id
+    # 的 dangling 每轮 reconcile 都会被重新作结，对话里每轮多一份结果。跨回合歧义仍在
+    # ——那是存量数据的既定形态（spec: conversation-integrity 明列为不在保证范围内），
+    # 命中时留痕，不静默。
     tool_records = [r for r in view
                     if r.kind is MemoryKind.CONVERSATION_TURN and r.role == "tool"]
     tool_record_ids = {r.id for r in tool_records}
+    anchor_at = next((i for i, r in enumerate(view) if r.id == last_asst.id), -1)
+    legacy_paired = {
+        r.metadata.get("tool_call_id")
+        for r in view[anchor_at + 1:]
+        if r.kind is MemoryKind.CONVERSATION_TURN and r.role == "tool"
+    } - {None, ""}
 
-    from ctx_weft.protocols.operations import operation_memory_result_id
+    from ctx_weft.protocols.capability import tool_result_record_id
     dangling: list[dict] = []
     for i, tc in enumerate(tool_calls):
         call_id = tc.get("id", "")
-        # memory 通道的完成判据：确定性 TOOL_RESULT 记录 id 已在视图里 = 已完成。
-        if is_internal_call_id(call_id) and operation_memory_result_id(call_id) in tool_record_ids:
+        rid = tool_result_record_id(call_id)
+        if rid is not None:
+            if rid in tool_record_ids:
+                continue
+        elif call_id in legacy_paired:
+            logger.info(
+                "dangling check: bare wire id %r paired by metadata (no deterministic "
+                "record id available; cross-turn reuse of this id would be ambiguous)",
+                call_id)
             continue
         dangling.append(dict(tc, _record_id=last_asst.id, _ordinal=i))
     return dangling, tool_record_ids

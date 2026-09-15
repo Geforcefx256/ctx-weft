@@ -88,11 +88,11 @@ async def test_reconcile_no_dangling_routes_to_prepare() -> None:
                                  timestamp=base + timedelta(seconds=1), role="assistant",
                                  metadata={"tool_calls": [{"id": TC_A, "name": "web", "input": {}}]}), pctx)
     # 完成判据 = 确定性 memory id（wire 记录不再判 done——防 call_1 串扰）
-    from ctx_weft.protocols.operations import operation_memory_result_id
+    from ctx_weft.protocols.capability import tool_result_record_id
     op_id = TC_A
     await mem.ingest(MemoryEvent(type=MemoryEventType.TOOL_RESULT, address=sc, content="out",
                                  timestamp=base + timedelta(seconds=2), role="tool",
-                                 id=operation_memory_result_id(op_id),
+                                 id=tool_result_record_id(op_id),
                                  metadata={"tool_call_id": "tcA"}), pctx)
     invoked = []
     async def fake_invoke(**kw): invoked.append(kw); return None
@@ -138,10 +138,10 @@ async def test_resolve_reconcile_detection_helper() -> None:
     assert bool(await _dangling()) is True
     # 确定性 id 判 done：按 (record_id, ordinal=0) 派生的 memory id 写 tool 记录
     from ctx_weft.protocols.memory import MemoryEvent
-    from ctx_weft.protocols.operations import operation_memory_result_id
+    from ctx_weft.protocols.capability import tool_result_record_id
     op_id = TC_B
     await mem.ingest(MemoryEvent(
         type=MemoryEventType.TOOL_RESULT, address=sc, content="done",
         timestamp=base + timedelta(seconds=3), role="tool",
-        id=operation_memory_result_id(op_id)), pctx)
+        id=tool_result_record_id(op_id)), pctx)
     assert bool(await _dangling()) is False

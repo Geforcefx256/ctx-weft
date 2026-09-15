@@ -37,10 +37,10 @@ from ctx_weft.core.utils.ids import mint_call_id
 TC1 = mint_call_id(anchor="rec1", ordinal=0, raw_id="tc1", turn_seq=0)
 TC_DEL = mint_call_id(anchor="rec1", ordinal=1, raw_id="tc_del", turn_seq=0)
 
-from ctx_weft.protocols.operations import (
+from ctx_weft.protocols.capability import (
     OperationRecord,
     OperationStatus,
-    operation_memory_result_id,
+    tool_result_record_id,
 )
 from ctx_weft.providers.events.store.sql.store import open_sqlite_event_store
 from ctx_weft.providers.operations import InMemoryOperationStore
@@ -120,12 +120,12 @@ async def test_ot06_completed_memory_write_crash_ledger_backfills(tmp_path):
     op_id = TC1
     ops = InMemoryOperationStore()
     await ops.prepare(OperationRecord(
-        operation_id=op_id, tenant_id="default", session_id="s1", agent_id="a1",
+        tool_call_id=op_id, tenant_id="default", session_id="s1", agent_id="a1",
         assistant_record_id=rid, tool_ordinal=0, tool_name="fx__act",
         task_id="t1",
         status=OperationStatus.COMPLETED, revision=3,
         result="completed-result-from-ledger",
-        memory_result_id=operation_memory_result_id(op_id),
+        memory_result_id=tool_result_record_id(op_id),
         attempts=["inv1"],
     ), pctx)
 
@@ -133,17 +133,17 @@ async def test_ot06_completed_memory_write_crash_ledger_backfills(tmp_path):
     # 幂等补写（裁决作结与恢复补写走同一条路径；
     # completed 态由 reconcile 的双通道完成判定直接跳过重执行——这里钉补写原语本身）
     from ctx_weft.protocols.memory import MemoryEvent
-    rid_tool = operation_memory_result_id(op_id)
+    rid_tool = tool_result_record_id(op_id)
     await mem.ingest(MemoryEvent(
         id=rid_tool,
         kind=MemoryKind.CONVERSATION_TURN, scope=MemoryScope.TASK, address=scope,
         content="completed-result-from-ledger", timestamp=datetime.now(UTC),
-        role="tool", metadata={"operation_id": op_id,
+        role="tool", metadata={"tool_call_id": op_id,
                                  "recovered_via": "ledger-backfill"}), pctx)
 
     # memory 补写了确定性 id 的 TOOL_RESULT
     found = [r for r in await mem.load_view(scope, MemoryScope.TASK, pctx)
-             if r.id == operation_memory_result_id(op_id)]
+             if r.id == tool_result_record_id(op_id)]
     assert found and found[0].content == "completed-result-from-ledger", (
         "O-T06: ledger completed → memory backfill via deterministic id")
 

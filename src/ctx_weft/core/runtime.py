@@ -615,6 +615,17 @@ class CtxWeftRuntime:
                     "EventBus.attach_commit_gate：emit/commit_provisional 在 fanout 前 "
                     "先经 gate 确认存储提交）。InProcessEventBus 已支持；自定义总线请实现"
                     "该扩展，或显式配置 event_commit_policy='best_effort' 并接受丢事件风险。")
+            # spec: tool-operations §5.6——「不能因为 EventStore 是 SQL 就认为账本也持久」。
+            # required 模式承诺的是可靠恢复，而 dangling 外部操作的恢复依据在**账本**：
+            # 账本不跨进程时，崩溃后「查不到记录」无从区分「没跑过」与「跑过但记录没了」，
+            # core 只能一律保守作结。这条差异必须在启动时说出来，不能让宿主以为配了
+            # SQL 事件库就万事大吉。
+            if not getattr(self.providers.get_operation_store(), "durable", False):
+                logger.warning(
+                    "event_commit_policy='required' 但操作账本不跨进程（未注册持久 "
+                    "OperationStore，正在用内存默认实现）：崩溃恢复时 started 的工具调用"
+                    "一律保守作结、不重跑，也无法判定「其实还没开始跑」。要跨进程恢复请"
+                    "注册 SqlOperationStore（providers.operations.open_sqlite_operation_store）。")
             from ctx_weft.core.events.commit_gate import CommitGate
             self._event_bus.attach_commit_gate(CommitGate(
                 self.event_store, on_unavailable=self._mark_storage_unavailable))
@@ -3768,6 +3779,7 @@ class CtxWeftRuntime:
             memory=memory,
             event_bus=self._event_bus,
             provider_authorizers=self.providers.get_capability_authorizers(),
+            rerun_authorizers=self.providers.get_capability_rerun_authorizers(),
             spill_threshold=self._config.spill_threshold,
             spill_preview_chars=self._config.spill_preview_chars,
             spill_tail_chars=self._config.spill_tail_chars,

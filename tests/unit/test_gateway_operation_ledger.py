@@ -22,7 +22,7 @@ from ctx_weft.protocols.capability import (
     ToolCapabilityProvider,
 )
 from ctx_weft.core.utils.ids import mint_call_id
-from ctx_weft.protocols.operations import OperationStatus
+from ctx_weft.protocols.capability import OperationStatus
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from ctx_weft.providers.operations import InMemoryOperationStore
 
@@ -146,7 +146,7 @@ async def test_ledger_failure_raises_persistence_unavailable():
 async def test_identity_is_per_call_not_shared_state():
     """身份是 invoke 的入参，不是共享可变字段——不可能泄漏给下一个无关调用。
 
-    旧设计经 `provider_ctx.operation_id` 转移所有权，忘了清就会让后台 observe 的
+    旧设计经 `provider_ctx.tool_call_id` 转移所有权，忘了清就会让后台 observe 的
     collect_process_report 命中别的操作的 completed 短路（实测回归）。改成入参后
     这个失败模式在结构上不存在。
     """
@@ -158,4 +158,4 @@ async def test_identity_is_per_call_not_shared_state():
     # 紧接着一次不带身份的调用：旁路、正常执行、不命中上一次的 completed
     res = await gateway.invoke("probe__go", {}, state, ctx)
     assert res.is_error is False and tool.calls == 2
-    assert not hasattr(ctx.provider_ctx, "operation_id")
+    assert not hasattr(ctx.provider_ctx, "tool_call_id")

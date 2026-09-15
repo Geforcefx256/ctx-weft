@@ -104,7 +104,7 @@ async def test_crash_mid_tool_reinvokes_dangling_via_reconcile() -> None:
         metadata={"tool_calls": [{"id": tcid, "name": "test__web", "input": {"url": "x"}}]}), pctx)
 
     # 账本注入 STARTED 记录（键 = tool_call 的内部标识）——idempotent 分支的输入。
-    from ctx_weft.protocols.operations import OperationRecord, OperationStatus
+    from ctx_weft.protocols.capability import OperationRecord, OperationStatus
     from ctx_weft.providers.operations import InMemoryOperationStore
     ops = runtime.providers.get_operation_store()
     assert isinstance(ops, InMemoryOperationStore)
@@ -114,7 +114,7 @@ async def test_crash_mid_tool_reinvokes_dangling_via_reconcile() -> None:
     op_id = tcid
     from ctx_weft.protocols.context import ProviderContext as _PC
     await ops.prepare(OperationRecord(
-        operation_id=op_id, tenant_id="default", session_id=sid, agent_id=aid,
+        tool_call_id=op_id, tenant_id="default", session_id=sid, agent_id=aid,
         assistant_record_id=last_asst.id, tool_ordinal=0, tool_name="test__web",
         status=OperationStatus.STARTED, revision=2, attempts=["inv_first"]),
         _PC(session_id=sid, tenant_id="default", task_id=tid, agent_id=aid))

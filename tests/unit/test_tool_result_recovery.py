@@ -23,6 +23,7 @@ from ctx_weft.protocols.capability import (
     CapabilityProviderInfo,
     ToolCapability,
     ToolCapabilityProvider,
+    tool_result_record_id,
 )
 from ctx_weft.providers.capability_results import (
     READ_TOOL_QUALIFIED_NAME,
@@ -265,15 +266,28 @@ async def test_reconcile_backfill_converges_ledger_result():
     res = await gw.invoke("mcp__b__dump", {}, state, ctx, tool_call_id=OP_B)  # 原执行
 
     rec = await ledger.get(OP_B, ctx.provider_ctx)
+
+    # 「账本 completed 而 TOOL_RESULT 从未写成」那个崩溃窗口——**换一个空 memory**，而不是
+    # 把已写的那条抹掉：记录 id 现在是确定性的，抹掉走 `fold` 会给它立墓碑，同 id 再也
+    # 回不来；而真窗口里那条记录压根不存在。账本与结果存储沿用同一份（它们没丢）。
+    gw2, mem2, state2, ctx2, scope2 = _harness(provider, store=store, ledger=ledger)
+
     step = ReconcileStep()
     tc = {"id": OP_B, "name": "mcp__b__dump", "input": {}}
     await step._backfill_memory(
-        state, ctx, OP_B, rec.result, tc, gateway=gw, rec=rec, via="ledger-completed")
+        state2, ctx2, OP_B, tc, rec.result, gateway=gw2, rec=rec, via="ledger-completed")
 
-    recs = await mem.load_view(scope, MemoryScope.TASK, ctx.provider_ctx)
+    recs = await mem2.load_view(scope2, MemoryScope.TASK, ctx2.provider_ctx)
     bf = [r for r in recs if r.metadata.get("recovered_via") == "ledger-completed"][0]
+    assert bf.id == tool_result_record_id(OP_B)              # 确定性 id：再补一次即幂等
     assert READ_TOOL_QUALIFIED_NAME in bf.content            # 收敛版，非全文直灌
     assert res.invocation_id in bf.content                   # 引用 = 账本原执行 id
+
+    # 幂等：同一条补写重复执行不产生第二份。
+    await step._backfill_memory(
+        state2, ctx2, OP_B, tc, rec.result, gateway=gw2, rec=rec, via="ledger-completed")
+    recs2 = await mem2.load_view(scope2, MemoryScope.TASK, ctx2.provider_ctx)
+    assert len([r for r in recs2 if r.role == "tool"]) == 1
 
 
 @pytest.mark.asyncio

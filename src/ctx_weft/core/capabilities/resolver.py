@@ -40,7 +40,7 @@ class CapabilityResolver:
         # 裁决能力**不在此校验**：OperationAdjudicator 靠 isinstance 发现，没有「声明了
         # 却没实现」这个失败模式可堵。
         from ctx_weft.protocols.capability import ToolCapability, ToolCapabilityProvider
-        from ctx_weft.protocols.operations import normalize_recovery_policy
+        from ctx_weft.protocols.capability import normalize_recovery_policy
         for p in providers:
             if not isinstance(p, ToolCapabilityProvider):
                 continue

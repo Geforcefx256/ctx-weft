@@ -23,6 +23,7 @@ from ctx_weft.core.utils.task_ref import task_ref
 from ctx_weft.core.models.task import NormalTaskSettings
 from ctx_weft.protocols.capability import (
     CapabilityEvent,
+    RecoveryPolicy,
     CapabilityProviderInfo,
     Purpose,
     SessionScopedCapabilityProvider,
@@ -155,6 +156,15 @@ def control_tool(*, purposes: list[Purpose], input_schema: dict[str, Any] | None
             description=first_line,
             input_schema=input_schema or extract_schema(fn),  # extract_schema 默认排除 "ctx"
             side_effects=False,
+            # spec: tool-operations「控制工具单独核验」——控制工具的副作用**全在 core
+            # 自己手里**，逐个核过都是同身份幂等的状态迁移，所以崩溃后按 idempotent
+            # 直接重跑，不必问重跑授权（问也没人答得了：外部系统里根本没有对应物）：
+            #   finish_task / report_task_outcome  同身份幂等的 task 状态迁移
+            #   ask_user                           复用既有 HITL 请求（决定缓存门控）
+            #   delegate_task / delegate_plan      经 gateway 的 completed 短路防双建
+            # 这是**声明**而不是 gateway 里的一条按名字前缀的特判：判据本来就是「这个
+            # 工具重跑安不安全」，那正是本字段的含义；写成特判则两处都要记得同步。
+            recovery_policy=RecoveryPolicy.IDEMPOTENT,
         )
         _CONTROL_TOOLS[fn.__name__] = (cap, fn)
         return fn

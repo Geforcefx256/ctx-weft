@@ -11,7 +11,7 @@ import copy
 from datetime import UTC, datetime
 
 from ctx_weft.protocols.context import ProviderContext
-from ctx_weft.protocols.operations import (
+from ctx_weft.protocols.capability import (
     OperationRecord,
     OperationStatus,
     OperationUpdate,
@@ -28,17 +28,21 @@ def _now() -> datetime:
 class InMemoryOperationStore:
     """dict 版操作账本。prepare 幂等（同 id 同内容 no-op）；CAS 乐观锁串行推进。"""
 
+    #: **不跨进程**。重启后一片空白，于是「查不到记录」既可能是「没跑过」也可能是
+    #: 「跑过但账本随进程没了」——恢复路径据此保守作结，不把前者当成后者。
+    durable = False
+
     def __init__(self) -> None:
         self._records: dict[str, OperationRecord] = {}
         self._lock = asyncio.Lock()
 
-    async def get(self, operation_id: str, ctx: ProviderContext) -> OperationRecord | None:
-        rec = self._records.get(operation_id)
+    async def get(self, tool_call_id: str, ctx: ProviderContext) -> OperationRecord | None:
+        rec = self._records.get(tool_call_id)
         return copy.deepcopy(rec) if rec is not None else None
 
     async def prepare(self, record: OperationRecord, ctx: ProviderContext) -> OperationRecord:
         async with self._lock:
-            existing = self._records.get(record.operation_id)
+            existing = self._records.get(record.tool_call_id)
             if existing is not None:
                 # 幂等：同 id 同内容（身份字段一致）no-op；异内容拒绝（身份被复用）
                 same = all(
@@ -48,28 +52,28 @@ class InMemoryOperationStore:
                 )
                 if not same:
                     raise ValueError(
-                        f"operation_id {record.operation_id!r} already bound to a "
+                        f"tool_call_id {record.tool_call_id!r} already bound to a "
                         f"different logical call")
                 return copy.deepcopy(existing)
             rec = copy.deepcopy(record)
             rec.created_at = rec.updated_at = _now()
-            self._records[rec.operation_id] = rec
+            self._records[rec.tool_call_id] = rec
             return copy.deepcopy(rec)
 
     async def compare_and_set(
         self,
-        operation_id: str,
+        tool_call_id: str,
         expected_revision: int,
         update: OperationUpdate,
         ctx: ProviderContext,
     ) -> OperationRecord:
         async with self._lock:
-            rec = self._records.get(operation_id)
+            rec = self._records.get(tool_call_id)
             if rec is None:
-                raise KeyError(f"operation {operation_id!r} not prepared")
+                raise KeyError(f"operation {tool_call_id!r} not prepared")
             if rec.revision != expected_revision:
                 raise RevisionConflict(
-                    f"operation {operation_id!r} revision {rec.revision} != expected "
+                    f"operation {tool_call_id!r} revision {rec.revision} != expected "
                     f"{expected_revision}")
             if update.status is not None:
                 _validate_transition(rec.status, update.status)

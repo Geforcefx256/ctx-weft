@@ -26,9 +26,11 @@ from ctx_weft.protocols import ToolCall
 __all__ = ["generate_id", "is_internal_call_id", "mint_call_id",
            "mint_turn_call_ids", "MintedCall"]
 
-# 内部调用标识的形态契约（adapter 验收 / 单测共用同一判据）。
-INTERNAL_CALL_ID_RE = re.compile(r"^tc_[0-9a-z]+_[0-9a-z]+_[0-9a-f]{12}$")
-INTERNAL_CALL_ID_MAX_LEN = 64
+# 形态契约住在 protocols（它是对适配层的约束，不是 core 的实现细节）；这里转出，
+# 使 `from ...utils.ids import is_internal_call_id` 的既有调用方零改动。
+from ctx_weft.protocols.capability import (  # noqa: E402
+    INTERNAL_CALL_ID_MAX_LEN, INTERNAL_CALL_ID_RE, is_internal_call_id,
+)
 
 # tc_ + seq36 + _ + ord36 + _ + 12 hex：两位 base36 段封顶长度，防极端入参撑爆 64。
 _MAX_SEQ36_LEN = 13
@@ -56,14 +58,6 @@ def _base36(n: int) -> str:
     return "".join(reversed(out))
 
 
-def is_internal_call_id(value: object) -> bool:
-    """是否为摄入点铸造的内部 tool_call 标识（``tc_...``）。
-
-    账本以它为键——裸 wire id（无铸造的测试替身 / 宿主直构 gateway）判假，账本旁路。
-    """
-    return isinstance(value, str) and bool(INTERNAL_CALL_ID_RE.match(value))
-
-
 def mint_call_id(*, anchor: str, ordinal: int, raw_id: str, turn_seq: int) -> str:
     """铸单个内部调用标识：`tc_{seq36}_{ord36}_{sha256(anchor|ordinal|raw)[:12]}`。
 
@@ -86,7 +80,7 @@ class MintedCall:
     """一次铸造的完整产物：替换后的 ToolCall + 审计伴随字段。
 
     raw_id 是 LLM 的原始 wire id（落 metadata 供追溯）；ordinal 是该调用在回合内的
-    序号（与 operation_id 的派生输入同口径，见 act._execute_tool_calls）。
+    序号（与 tool_call_id 的派生输入同口径，见 act._execute_tool_calls）。
     """
 
     call: ToolCall

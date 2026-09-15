@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 from ctx_weft.protocols import (
     Authorizer,
+    RerunAuthorizer,
     CapabilityProvider,
     KnowledgeProvider,
     LLMClientResolver,
@@ -47,6 +48,12 @@ class ProviderRegistry:
         self._knowledge: list[tuple[int, KnowledgeProvider]] = []  # (priority, provider)
         self._capabilities: list[CapabilityProvider] = []
         self._capability_authorizers: dict[str, Authorizer] = {}  # provider_name or capability_id → Authorizer
+        #: 重跑授权（spec: tool-operations）——**独立通道**，与事前授权分开注册。
+        #: 两个问题不同、时刻不同：authorize 每次调用都问，authorize_rerun 只在崩溃恢复
+        #: 时问。合用一个对象会逼出包装器，而包装器碰 `HumanGatedAuthorizer` 这个
+        #: runtime_checkable 会误判（方法存在即被认成实现了）。同一个类想两边都管，
+        #: 继承两个 ABC、注册两次即可。**未注册 = 不重跑**，无 isinstance 探测。
+        self._capability_rerun_authorizers: dict[str, "RerunAuthorizer"] = {}
         self._llm_provider: LLMClientResolver | None = None
         self._blob_store: "MemoryBlobStore | None" = None
         self._null_blob_store: "MemoryBlobStore | None" = None
@@ -85,14 +92,21 @@ class ProviderRegistry:
         *,
         authorizer: Authorizer | None = None,
         tool_authorizers: dict[str, Authorizer] | None = None,
+        rerun_authorizer: "RerunAuthorizer | None" = None,
+        tool_rerun_authorizers: "dict[str, RerunAuthorizer] | None" = None,
     ) -> None:
         self._capabilities.append(provider)
         if authorizer is not None:
             self._capability_authorizers[provider.name] = authorizer
         if tool_authorizers:
             self._capability_authorizers.update(tool_authorizers)
-        # spec: tool-operations（wp6）——裁决能力由 isinstance(provider,
-        # OperationAdjudicator) 发现，注册期无需校验「声明与实现是否对齐」。
+        # spec: tool-operations——重跑授权走自己的两个位，与事前授权同构（provider 级 +
+        # 逐工具级）。刻意**不**在这里探测 isinstance(authorizer, RerunAuthorizer) 把它
+        # 顺手挂过来：那就又成了「同一个角色两条发现路径」。
+        if rerun_authorizer is not None:
+            self._capability_rerun_authorizers[provider.name] = rerun_authorizer
+        if tool_rerun_authorizers:
+            self._capability_rerun_authorizers.update(tool_rerun_authorizers)
         # recovery_policy 的取值校验在 resolver 的异步面做（那里能 await provider.list）。
         if isinstance(provider, SkillCapabilityProvider):
             self._notify_skill_executor_dirty()
@@ -102,8 +116,9 @@ class ProviderRegistry:
         removed = [p for p in self._capabilities if p.name == provider_name]
         self._capabilities = [p for p in self._capabilities if p.name != provider_name]
         prefix = provider_name + ":"
-        for key in [k for k in self._capability_authorizers if k == provider_name or k.startswith(prefix)]:
-            del self._capability_authorizers[key]
+        for reg in (self._capability_authorizers, self._capability_rerun_authorizers):
+            for key in [k for k in reg if k == provider_name or k.startswith(prefix)]:
+                del reg[key]
         if any(isinstance(p, SkillCapabilityProvider) for p in removed):
             self._notify_skill_executor_dirty()
         return len(self._capabilities) < before
@@ -118,6 +133,18 @@ class ProviderRegistry:
     def get_capability_authorizers(self) -> dict[str, Authorizer]:
         """provider_name → Authorizer 映射，供 CapabilityGateway 使用。"""
         return dict(self._capability_authorizers)
+
+    def set_capability_rerun_authorizer(self, key: str, authorizer: "RerunAuthorizer") -> None:
+        """注册或覆盖单个重跑授权，key 可以是 provider_name 或完整 capability_id。
+
+        逐工具粒度的用处在于给**自己不控制的 provider** 挂——`mcp-github:create_issue`
+        知道怎么查证，同 provider 的其它工具不必受影响。
+        """
+        self._capability_rerun_authorizers[key] = authorizer
+
+    def get_capability_rerun_authorizers(self) -> "dict[str, RerunAuthorizer]":
+        """provider_name / capability_id → RerunAuthorizer，供 CapabilityGateway 使用。"""
+        return dict(self._capability_rerun_authorizers)
 
     def _notify_skill_executor_dirty(self) -> None:
         """SkillCapabilityProvider 增减时通知持有 skill 索引的 provider 重建。

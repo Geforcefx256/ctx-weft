@@ -9,17 +9,34 @@
   ToolCapabilityProvider  — 实现 invoke() / cancel()
   SkillCapabilityProvider — 实现 Level2 load_definition() + Level3 list_files/load_resource/exec_script
   AgentCapabilityProvider — list() 发现 + get_template() 加载，发现与加载同源
+
+两个 authorizer（各自独立注册，见 `ProviderRegistry.register_capability`）：
+  Authorizer       — 「这次该不该跑」（事前，每次调用）
+  RerunAuthorizer  — 「已经跑过一次、结果不明，还该不该再跑」（崩溃恢复时，可选）
+
+## 调用账本为什么住在这里
+
+`OperationStore` 一族曾是独立的 `protocols/operations.py`。它不是一个域，是**本域的
+持久化半边**：`RecoveryPolicy` 是 `ToolCapability` 的字段、账本键就是 tool_call 标识、
+账本只有 gateway 一个写者和 reconcile 一个读者。切成两个模块的代价是包内唯一一条模块级
+反向依赖（capability → operations），而接上 `RerunAuthorizer` 之后（它收 `Capability`、
+返回 `AuthorizationDecision`）会直接成环。
+
+包里的先例也在反方向：`events.py` 一个文件装下事件数据类型 + `EventBus` + `EventStore`
++ `EventBlobStore`——**「存储后端协议」在本仓从来不是拆模块的理由，域才是**。
 """
 
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from datetime import datetime
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 from ctx_weft.protocols.context import ProviderContext
-from ctx_weft.protocols.operations import RecoveryPolicy
 
 if TYPE_CHECKING:
     from ctx_weft.protocols.context import ContentPart
@@ -45,6 +62,62 @@ def qualify(capability_id: str) -> str:
     by. Routing still uses the raw ``cap.id``.
     """
     return capability_id.replace(":", "__")
+
+
+# ── 恢复策略（spec: tool-operations）──────────────────────────────────────────
+#
+# 放在 Capability 之前是因为 ToolCapability 有一个此类型的字段。
+
+
+class RecoveryPolicy(StrEnum):
+    """崩溃后 started 的操作能不能自动重跑——**只有两类**。
+
+    分类判据是「core 要不要做决定」，不是「副作用长什么样」：
+
+    - ``IDEMPOTENT``：重跑安全，core 直接同 tool_call_id 重跑。至于安全的**理由**是
+      「重跑本就无害」还是「Provider 以该 id 去重」，core 不关心——两者的行为逐字
+      相同，分成两个值只会让调用方以为存在不存在的差别。
+    - ``REVIEWED``（默认）：core **绝不自行重跑**，把这次不确定交给重跑授权。
+
+    「谁来决定」不是策略值，而是一条链：
+
+        宿主给这个工具注册了 RerunAuthorizer？
+          ├─ 是 → 问它，按 AuthorizationDecision 三选一：
+          │        allowed=True            以同 tool_call_id 重跑
+          │        allowed=False           message 成为这次调用的工具结果，作结
+          │        needs_human is not None 走既有 HITL park（账本落 waiting_human）
+          └─ 否 → core 代为作结「无从查证」（同样不重跑）
+
+    两个分支都以**作结**收尾——账本 CAS completed + 把 result 写成 TOOL_RESULT，然后
+    照常续跑。没有第三条出路：「不确定」是一种工具结果，不是一种控制流（见
+    ``RerunAuthorizer``）。
+
+    重跑授权**由宿主注册，不由 provider 实现**：知道怎么查证外部真值的那个对象，未必
+    是提供工具的那个对象（MCP 工具尤其如此）。走注册通道，宿主才能给自己不控制的
+    provider 挂上，粒度也和事前授权一样是三级（capability_id > provider 前缀 > 无）。
+    """
+
+    IDEMPOTENT = "idempotent"
+    REVIEWED = "reviewed"
+
+
+def normalize_recovery_policy(value: object) -> RecoveryPolicy:
+    """把声明值归一为 RecoveryPolicy；无法识别则抛 ValueError。
+
+    **不静默兜底**：拼错的取值必须响亮失败，由 resolver 在启动期一次性拦下——静默降级
+    成保守值会让「我标了 idempotent 为什么崩溃后还在等人」变成一个读源码才能查的问题。
+    ``None`` / 缺省 → REVIEWED（Provider 没表态时按需审核处理）。
+    """
+    if value is None or value == "":
+        return RecoveryPolicy.REVIEWED
+    if isinstance(value, RecoveryPolicy):
+        return value
+    try:
+        return RecoveryPolicy(str(value))
+    except ValueError:
+        raise ValueError(
+            f"unknown recovery_policy {value!r}; expected one of "
+            f"{[p.value for p in RecoveryPolicy]}") from None
 
 
 # ── Capability 基类 + 三个子类 ─────────────────────────────────────────────────
@@ -74,12 +147,13 @@ class ToolCapability(Capability):
     spillable: bool = True  # 输出超长时是否允许 gateway 落盘；可重新派生的只读工具置 False
     # spec: tool-operations（wp6）——恢复策略（崩溃后该工具的 started 操作能不能自动
     # 重跑）。**只有两类**，判据是「core 要不要做决定」：
-    #   idempotent  重跑安全 → core 同 op_id 直接重跑
-    #   reviewed    默认——core 绝不自行重跑，交裁决链：Provider 实现
-    #               OperationAdjudicator 则由它答「该不该重跑」，未实现则 core 代为
-    #               作结「无从查证」。两条都不停机——不确定是工具结果不是控制流。
+    #   idempotent  重跑安全 → core 同 tool_call_id 直接重跑
+    #   reviewed    默认——core 绝不自行重跑，交重跑授权（宿主注册的 RerunAuthorizer；
+    #               没注册则 core 代为作结「无从查证」）。两条都不停机——不确定是
+    #               工具结果，不是控制流。
     # 刻意不从 side_effects 推断：MCP/旧 Provider 的副作用声明可能不完整（方案 §5.4）。
-    # **这里是恢复策略的唯一读取点**（reconcile 读活声明）；账本行上的同名列不参与判定。
+    # **这里是恢复策略的唯一存放点**：gateway 恢复时读的就是这份活声明。刻意不在账本行
+    # 上冗余一份——工具下线或改判之后，账本里那份写死的旧值会让恢复按过期策略走。
     recovery_policy: RecoveryPolicy = RecoveryPolicy.REVIEWED
 
 
@@ -278,6 +352,162 @@ class AgentCapabilityProvider(CapabilityProvider, ABC):
         return []
 
 
+# ── 调用账本（spec: tool-operations）──────────────────────────────────────────
+#
+# 账本把「副作用是否已发生、结果是什么」变成可判定事实，供恢复路径消费。它与工具触达
+# 的业务系统**不组成分布式事务**（方案明令不据此声称 exactly-once）。
+#
+# ## 一个身份，不是两个
+#
+# 账本键就是这次调用在摄入点铸造的**内部 tool_call 标识**（``tc_...``，见
+# ``core/utils/ids.mint_call_id``）：跨轮次/跨任务/跨会话唯一，随 assistant 回合一同
+# 落库，恢复时**读出来**而不是重算。
+#
+# 曾经这里另有一个 ``tool_call_id``，由 ``(tenant, session, agent, record_id, ordinal)``
+# 派生——那是在铸造落地之前，裸 wire id 不可信（模型复用 ``call_1`` 是常态）的产物。
+# 铸造之后消息里的 id 本身已经唯一且稳定，第二条身份失去存在理由，两者合并为一；连
+# ``tool_call_id`` 这个**名字**也一并退场，免得同一个值有两个称呼。
+#
+# ``invocation_id`` 是另一回事，保留：它是单次**执行尝试**的身份（provider 据此登记
+# 在途句柄供 cancel）。一次逻辑调用可以有多次尝试。
+
+
+class OperationStatus(StrEnum):
+    """账本状态机。合法转移见 `OperationRecord` docstring。"""
+
+    PREPARED = "prepared"            # 身份已持久、尚未执行（prepared→started 之前无外部副作用）
+    STARTED = "started"              # provider 调用进行中（副作用可能已发生）
+    # 这次逻辑调用已有最终结果——**含「结果无法确定」这一种结果**。曾经另有一个
+    # UNKNOWN 状态承载后者，但它的两个消费方（停机闸门、宿主处置 API）都已删除；
+    # 结论本身住在 result 文本里，状态再分一档没有消费者。
+    COMPLETED = "completed"
+    WAITING_HUMAN = "waiting_human"  # 停在人工节点（HITL park）
+
+
+@dataclass
+class OperationRecord:
+    """一条逻辑调用的账本行。
+
+    合法转移：prepared→started→completed；waiting_human 见状态机表。
+    ``revision`` 乐观锁：每次 CAS +1，compare_and_set 期望值不匹配即拒绝。
+
+    **恢复判据只读四个字段**：``status`` / ``result`` / ``attempts`` / ``effective_args``。
+    其余是审计与诊断用的随行记录，恢复路径不读（各字段注释逐条注明），别把它们当成会
+    影响行为的开关。
+    """
+
+    tool_call_id: str
+    tenant_id: str
+    session_id: str
+    agent_id: str
+    assistant_record_id: str
+    tool_ordinal: int
+    tool_name: str
+    task_id: str = ""             # 随行：供宿主按 task 检索账本；core 不读
+    status: OperationStatus = OperationStatus.PREPARED   # 恢复判据
+    revision: int = 1
+    args_hash: str = ""           # 随行：授权后参数指纹（gateway 的 invocation_key）；core 不读
+    #: 恢复判据：**授权与 HITL 改写之后、真正交给 provider 的那份参数**。
+    #:
+    #: `RerunAuthorizer` 要靠它去外部查证（「查一下 order_id=X 那单成没成」）——恢复时
+    #: 手上的 dangling tool_call 只有模型给的原始参数，HITL 改过的值不在里面，`args_hash`
+    #: 又只是指纹。这也是 spec §5.1「冷恢复需要原执行参数时从受保护的 operation 存储
+    #: 读取，不从公开审计事件的 `***` 逆向恢复」唯一的兑现处。
+    #:
+    #: ⚠️ **未脱敏**：含 Authorization 头一类凭据明文。账本是受保护的执行数据——
+    #: MUST NOT 原样进事件流、SSE 或普通日志（那些通道用 audit_arguments 的脱敏副本）。
+    effective_args: dict[str, Any] | None = None
+    attempts: list[str] = field(default_factory=list)   # 恢复判据：invocation_id 列表（每次执行尝试）
+    result: Any = None                        # 恢复判据：完整结果 / ContentParts / blob ref
+    error: str | None = None
+    #: 随行：**core 不读**——所有读取点都现算 `tool_result_record_id(tool_call_id)`
+    #: （确定性派生，无需回表）。存这一列只为 SQL 侧可直接按 memory id 反查。
+    memory_result_id: str = ""
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+@dataclass
+class OperationUpdate:
+    """CAS 携带的增量：status/result/error/attempt 追加。None 字段不更新。"""
+
+    status: OperationStatus | None = None
+    result: Any = None
+    result_set: bool = False                  # 显式区分「未更新」与「更新为 None」
+    error: str | None = None
+    append_attempt: str | None = None
+
+
+@runtime_checkable
+class OperationStore(Protocol):
+    """操作账本抽象。host 提供持久实现（SQL）；runtime 缺省注册内存版。
+
+    写失败按存储不可用处理（复用 event-commit 的隔离链路）——账本是恢复的依据，
+    静默降级会重新制造「伪装成功」。
+    """
+
+    #: 这个账本扛不扛得住进程退出。**恢复语义直接依赖它**：只有持久账本才能让
+    #: 「查不到记录」等价于「prepare 还没跑过，所以副作用确定没发生」；内存账本重启后
+    #: 一片空白，两种情形长得一模一样，那时唯一安全的答案是不重跑。
+    #:
+    #: 默认 False = 保守。自实现的 store 没声明就按不持久对待，宁可多作结一次。
+    durable: bool = False
+
+    async def get(self, tool_call_id: str, ctx: ProviderContext) -> OperationRecord | None:
+        raise NotImplementedError
+
+    async def prepare(self, record: OperationRecord, ctx: ProviderContext) -> OperationRecord:
+        """登记 PREPARED 行。幂等：同 id 同内容 no-op 返回既有行。"""
+        raise NotImplementedError
+
+    async def compare_and_set(
+        self,
+        tool_call_id: str,
+        expected_revision: int,
+        update: OperationUpdate,
+        ctx: ProviderContext,
+    ) -> OperationRecord:
+        """乐观锁推进状态机；revision 不匹配抛 RevisionConflict。"""
+        raise NotImplementedError
+
+
+class RevisionConflict(Exception):
+    """CAS 期望 revision 不匹配——后到者被拒，状态机不倒退不跳跃。"""
+
+
+#: 内部 tool_call 标识的**形态契约**（`core/utils/ids.mint_call_id` 按此铸造）。
+#: 住在 protocols 而非 core，因为它是对**适配层**的约束：字符集与长度落在主流 provider
+#: 对工具 id 要求的交集内，适配层原样透传即合法，不得编码/截断/改写。
+INTERNAL_CALL_ID_RE = re.compile(r"^tc_[0-9a-z]+_[0-9a-z]+_[0-9a-f]{12}$")
+INTERNAL_CALL_ID_MAX_LEN = 64
+
+
+def is_internal_call_id(value: object) -> bool:
+    """是否为摄入点铸造的内部 tool_call 标识（``tc_...``）。
+
+    这是全仓唯一的判据：账本键、TOOL_RESULT 记录 id 派生、dangling 完成判定都问它。
+    裸 wire id（无铸造的测试替身 / 宿主直构 gateway / 存量数据）判假。
+    """
+    return isinstance(value, str) and bool(INTERNAL_CALL_ID_RE.match(value))
+
+
+def tool_result_record_id(tool_call_id: str) -> str | None:
+    """TOOL_RESULT 的 memory 记录 id —— **只对内部标识有定义**，裸 wire id 返回 None。
+
+    内部标识形如 ``tc_{seq36}_{ord36}_{hash12}``，前缀等长，切掉 3 字符换 ``res_``。
+    确定性派生的用处有二：completed 后 memory 写失败时恢复按同一 id 幂等补写；
+    dangling 判定据它认出「这次调用已有结果」。
+
+    **返回 None 而不是硬切前缀**：本函数曾无条件 ``f"res_{tool_call_id[3:]}"``，于是
+    ``""`` → ``"res_"``、``"call_1"`` → ``"res_l_1"``——两条裸 wire id 的 dangling
+    作结会撞同一个 ``"res_"``，后一条被 memory 的 ingest 幂等契约当 no-op 吞掉：结果从
+    对话里消失，而那个 tool_call 从此永久悬挂。裸 id 本来就**不存在**确定性派生（同一个
+    ``call_1`` 可以属于任意多个回合），那就说出来，让调用方显式面对，而不是造一个
+    会撞车的值。
+    """
+    return f"res_{tool_call_id[3:]}" if is_internal_call_id(tool_call_id) else None
+
+
 # ── 授权契约 ───────────────────────────────────────────────────────────────────
 
 
@@ -296,6 +526,10 @@ class AuthorizationDecision:
     #: 所以旧实现必须让 authorizer 自己先去登记请求（那正是耦合的源头）。
     #: 非 None 时 `allowed` 必须为 False；gateway 先判 allowed，安全不变式不依赖本字段。
     needs_human: "HitlAsk | None" = None
+    #: 本决定被转成工具结果时算不算错误。事前授权的 deny 是错误（默认 True）；重跑
+    #: 授权的 deny 常常不是——「已完成：流水号 TX-9981」是好消息，标成 error 会让模型
+    #: 以为出了问题。`RerunAuthorizer` 作结时按内容自己定。
+    result_is_error: bool = True
 
 
 class Authorizer(ABC):
@@ -322,6 +556,101 @@ class Authorizer(ABC):
         *,
         tool_call_id: str = "",
     ) -> AuthorizationDecision: ...
+
+
+class RerunAuthorizer(ABC):
+    """授权一次**崩溃恢复中的重跑**。可选——没注册就是不重跑。
+
+    ## 为什么是独立的一个 authorizer，而不是 `Authorizer` 上的一个可选接口
+
+    两个问题不同，发生的时刻也不同：
+
+        authorize        ——「这次该不该跑」（事前，每次调用）
+        authorize_rerun  ——「已经跑过一次、结果不明，还该不该再跑」（恢复时，罕见）
+
+    **绝不能复用 `authorize` 回答后者**：默认 `AllowAllAuthorizer` 会答 allowed=True，
+    于是 core 闷头重跑副作用——可靠性方案 H3 存在的意义就是堵这个。
+
+    也没有做成挂在 `Authorizer` 对象上的 `runtime_checkable` 可选接口（`HumanGatedAuthorizer`
+    那种形态）。理由有二。其一，`on_decision` 是**同一次授权在人答复后的延续**，本来就
+    是同一个 authorizer 的活；重跑授权不是。其二更实际：需要重跑授权的工具（有副作用、
+    非幂等）恰恰也是需要人工事前审批的工具，宿主十有八九要「authorize 走
+    HumanConfirmationAuthorizer、authorize_rerun 走自己的查证逻辑」——挂同一个对象就逼出
+    一个包装器，而包装器不能无条件定义 ``on_decision``：`HumanGatedAuthorizer` 是
+    `runtime_checkable`，方法存在即被认成实现了，会把一个不问人的 base 伪装成问人的。
+    独立注册通道让这个坑根本不出现。一个类想两边都管，同时继承两个 ABC、注册两次即可。
+
+    ## 注册与粒度
+
+    由**宿主**注册，不由 provider 实现——知道怎么查证外部真值的对象未必是提供工具的
+    对象（MCP 工具尤其如此）::
+
+        registry.register_capability(provider, rerun_authorizer=ChargeRerunAuthorizer())
+        registry.set_capability_rerun_authorizer("mcp-github:create_issue", ...)
+
+    解析与事前授权同为三级：精确 capability_id > provider 前缀 > 无（= 不重跑）。
+
+    ## Provider 侧要配合的唯一一条
+
+    想让这个问题**有可能**答得出来，provider 必须在执行时就把调用身份交给外部系统当
+    幂等键——事后才查得回来。见 `ToolCapabilityProvider.invoke` 的
+    ``ctx.extra["tool_call_id"]``。
+
+    ## 返回值语义
+
+    ``allowed=True``             以同 tool_call_id 重跑（provider 被再次调用）
+    ``allowed=False``            ``message`` 成为这次调用的工具结果，账本作结、循环续跑；
+                                 查到了真结果还是压根查不到，对 core 是同一条路——区别
+                                 全在文本里，由知情的这一方自己写，core 不替它组织措辞。
+                                 别忘了按内容设 ``result_is_error``。
+    ``needs_human is not None``  走既有 HITL park（账本落 waiting_human），决定缓存按
+                                 ``(session, tool_call_id, HITL_STAGE_RERUN)`` 索引，冷恢复
+                                 自动复用。core **不会**因为「不确定」而自己停机等人——
+                                 停不停是这里主动选的。
+    """
+
+    @abstractmethod
+    async def authorize_rerun(
+        self,
+        capability: Capability,
+        record: OperationRecord,
+        ctx: ProviderContext,
+        arguments: dict[str, Any] | None = None,
+        *,
+        tool_call_id: str = "",
+    ) -> AuthorizationDecision:
+        """``record.effective_args`` 是**上一次真实执行**的参数（授权+HITL 之后），查证
+        外部真值用它；``arguments`` 是本次恢复手上模型给的原始参数，两者可能不同。"""
+        ...
+
+    async def on_human_decision(
+        self,
+        capability: Capability,
+        record: OperationRecord,
+        ctx: ProviderContext,
+        arguments: dict[str, Any] | None,
+        tool_call_id: str,
+        decision: "HitlDecision",
+    ) -> AuthorizationDecision:
+        """`authorize_rerun` 返回 ``needs_human`` 后，人给了决定，把它翻成授权结果。
+
+        与 `Authorizer` / `HumanGatedAuthorizer` 的分法不同，这里是**基类自带默认实现**
+        而不是另一个可选接口。因为这个问题只有一种自然答法：批准 = 重跑，拒绝 = 用人
+        写的那句话作结。一般授权没有这种自然映射（「人同意了」到底放行什么参数是领域
+        问题），所以那边必须由实现方回答；这边不必，于是不该逼每个实现方抄一遍。
+
+        未知 outcome 落 else 分支 = **不重跑**——重跑是危险决定，未知值必须落到保守侧。
+        需要别的语义（比如批准即视为已完成、直接回填外部结果）就覆盖本方法。
+        """
+        from ctx_weft.protocols.hitl import HITL_OUTCOME_ACCEPTED
+
+        if decision.outcome == HITL_OUTCOME_ACCEPTED:
+            return AuthorizationDecision(allowed=True, message=decision.message)
+        return AuthorizationDecision(
+            allowed=False, result_is_error=False,
+            message=decision.message or
+            f"[Operation outcome unresolved] 工具 {capability.name} 的这次调用被中断，"
+            f"人工审核后决定不重试。")
 
 
 @runtime_checkable

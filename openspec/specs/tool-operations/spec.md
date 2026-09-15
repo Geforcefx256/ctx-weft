@@ -45,15 +45,19 @@
 
 无法识别的取值 SHALL 在启动校验响亮失败，MUST NOT 静默降级为保守值。
 
-裁决能力 SHALL 由 `isinstance(provider, OperationAdjudicator)` **发现**，MUST NOT 要求在 capability 上声明——该接口是 Provider 级的，用 capability 级字段声明会制造「声明了却没实现」这一类本不必存在的失败模式。
+重跑授权 SHALL 由**宿主注册**，MUST NOT 要求由 provider 对象自身实现——知道怎么查证外部真值的对象未必是提供工具的对象（MCP 工具尤其如此），绑在 provider 上则宿主无法为自己不控制的 provider 补上查证能力。控制工具 SHALL 声明 `idempotent`（core 自有的同身份幂等状态迁移），MUST NOT 在 gateway 里写成按名字前缀的特判。
 
-恢复时按状态×策略分派：`completed` 复用结果不重执行；`prepared` 且从未进入 `started` 可首次执行（仍先重新检查授权）；`started + idempotent` 以同 operation_id 重试；`started + reviewed` 问裁决者，它 SHALL 只回答**该不该重跑**（`Adjudication.rerun`）：`rerun=True` 以同 operation_id 重跑；`rerun=False` 把裁决者给出的 `result` 写成这次调用的工具结果并作结。Provider 未实现裁决接口时 core SHALL 代为作结「无从查证」，同样不重跑。
+恢复时按状态×策略分派：`completed` 复用结果不重执行；`prepared` 且从未进入 `started` 可首次执行；`started + idempotent` 以同 tool_call_id 重试；`started + reviewed` 问**重跑授权**（`RerunAuthorizer.authorize_rerun`），它 SHALL 返回 `AuthorizationDecision`：`allowed=True` 以同 tool_call_id 重跑；`allowed=False` 把 `message` 写成这次调用的工具结果并作结（`result_is_error` 由授权方按内容决定——查到外部真结果时 MUST NOT 标成错误）；`needs_human` 走既有 HITL park（账本落 `waiting_human`，决定缓存第三维 SHALL 是独立的 rerun stage，MUST NOT 与事前授权共用键）。未注册重跑授权时 core SHALL 代为作结「无从查证」，同样不重跑。
+
+重跑授权 SHALL 与事前授权 `Authorizer` **分开注册、分开解析**（provider 级 + 逐工具级，无 default = 不重跑），MUST NOT 复用 `authorize` 回答重跑问题——默认放行型 authorizer 会对它答「允许」，等于自动重跑副作用。二者 SHALL 在同一次恢复 invoke 中依次执行：先重跑授权、放行后再走事前授权（「当初准跑」不等于「现在还准跑」），MUST NOT 互相顶替。
+
+`prepared` 之前（**持久**账本查不到记录）SHALL 视为确定未启动而首次执行。该判定 MUST 以账本自陈的跨进程持久性（`OperationStore.durable`）为条件：非持久账本重启后为空，「没跑过」与「跑过但记录随进程消失」不可区分，此时 SHALL 保守作结。Runtime 在 `event_commit_policy="required"` 而账本不持久时 SHALL 启动告警，如实报告该能力缺失。
 
 「结果无法确定」SHALL 表现为一种**工具结果**，MUST NOT 成为一种控制流：MUST NOT 因此停机、MUST NOT 要求宿主介入才能续跑、MUST NOT 为它设立专属错误码/事件类型/处置 API。裁决者判不了时用 `result` 的**文本**说明查到了什么、查不到什么——那是内容不是状态，core 不替它组织措辞，也不据此分支。重复调用的防护归 Provider 自理：core 的承诺止于「不自行重跑」，agent 下一轮主动再调是一次新的逻辑调用。一切结果不定情形一律不自动执行；`waiting_human` 经既有 HumanResumable 协议恢复，不从头重新 invoke。Reconcile 的完成匹配 SHALL 以账本 operation_id 为判据，MUST NOT 再以 tool_call_id 集合判定（防 call_1 复用串扰）。无账本身份的存量 dangling SHALL 同样作结「无账本记录，无从查证」，MUST NOT 以随机生成的 id 自动执行副作用工具。控制工具单独核验：delegate 以 operation_id 找回已创建子任务（确认丢失重入不生成第二棵子树）、finish/metadata 同身份幂等、ask_user 复用已有请求；MUST NOT 对控制工具整体标记 `idempotent` 后省略验证。
 
-#### Scenario: reviewed 且无裁决者时不重跑
+#### Scenario: reviewed 且无重跑授权时不重跑
 
-- **WHEN** started 后崩溃且策略为 reviewed，Provider 未实现 OperationAdjudicator
+- **WHEN** started 后崩溃且策略为 reviewed，宿主未注册 RerunAuthorizer
 - **THEN** core 代为作结「无从查证」：账本 CAS completed、该说明文本成为这次调用的工具结果，恢复不重执行、会话照常续跑；这是默认形态，不报配置错误
 
 #### Scenario: idempotent 重跑恰好一次补全
@@ -61,15 +65,30 @@
 - **WHEN** started 后崩溃且策略为 idempotent，恢复重入
 - **THEN** 以同 operation_id 重试一次；外部副作用由 Provider 承诺幂等；账本与 memory 各落一次
 
-#### Scenario: 裁决者的权威否定
+#### Scenario: 重跑授权的权威放行
 
-- **WHEN** started 后崩溃且策略为 reviewed，Provider 的裁决返回 `Adjudication.rerun_safe()`（权威判定「这次没跑成」）
-- **THEN** 以同 operation_id 重新执行
+- **WHEN** started 后崩溃且策略为 reviewed，重跑授权返回 `allowed=True`（权威判定「这次没跑成」）
+- **THEN** 以同 tool_call_id 重新执行；其后仍走一次事前授权
 
-#### Scenario: 裁决者判不了也只是一种结果
+#### Scenario: 判不了也只是一种结果
 
-- **WHEN** 裁决者查不到外部真值，返回 `Adjudication.conclude(<说明文本>)`
+- **WHEN** 重跑授权查不到外部真值，返回 `allowed=False` + 说明文本
 - **THEN** 不重跑，该文本成为这次调用的工具结果；task 状态不变、无专属事件、无需宿主介入，agent 下一轮据此自行决定
+
+#### Scenario: 交给人
+
+- **WHEN** 重跑授权返回 `needs_human`
+- **THEN** 走既有 HITL park、账本落 waiting_human；人批准则以同 tool_call_id 重跑，拒绝则用人写的话作结；决定按 rerun stage 缓存，冷恢复复用不再问第二遍
+
+#### Scenario: 重跑授权看得到真实执行参数
+
+- **WHEN** 首次执行的参数经 HITL 改写过，崩溃后重跑授权被问到
+- **THEN** 它从账本记录读到的是**授权与改写之后**交给 provider 的那份参数，而非对话里模型给的原始参数
+
+#### Scenario: 非持久账本不得据「无记录」判为未启动
+
+- **WHEN** 宿主未注册持久 OperationStore，进程真实退出后恢复，账本为空
+- **THEN** 恢复保守作结、不重跑（外部副作用恰好一次）；启动时已就该能力缺失告警
 
 #### Scenario: 非法取值响亮失败
 

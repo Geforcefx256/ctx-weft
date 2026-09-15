@@ -466,7 +466,7 @@ async def _run_llm_turn(
     # 类短值）是常态，跨轮次/跨任务重建后按裸 id 配对会错配。本函数是唯一供值点——
     # 事件 payload、memory 记录、current_messages、gateway/HITL 全部消费同一次铸造的
     # 值。锚 = 预铸的 assistant 记录 id（ingest 经 MemoryEvent.id 采纳，见
-    # _ingest_assistant_turn），跨平面一致且与 operation_id 派生同源。observe 的
+    # _ingest_assistant_turn），跨平面一致且与 tool_call_id 派生同源。observe 的
     # run_observe_react 对自己的回合同口径（live 平面，不入 memory）。
     anchor = generate_id("asst")
     minted: list[MintedCall] = []
@@ -548,7 +548,7 @@ async def _account_tokens(state: LoopState, ctx: LoopContext, usage: LLMUsage) -
 class PersistedAssistantTurn:
     """`_ingest_assistant_turn` 的结构化返回（spec: tool-operations，wp5）。
 
-    ``record_id`` 是 LLM_RESPONSE 回合的 memory 记录 id——operation_id 的派生输入之一
+    ``record_id`` 是 LLM_RESPONSE 回合的 memory 记录 id——tool_call_id 的派生输入之一
     （确定性派生 → 同一逻辑调用跨重启同 id）。``tool_calls`` 直通旧形态（message
     重建消费点零语义变化）。
     """
@@ -569,7 +569,7 @@ async def _ingest_assistant_turn(
     无损重建（spec 2026-06-28 §2.3）。
 
     anchor（spec: conversation-integrity）：预铸的记录 id，经 MemoryEvent.id 交给 provider
-    采纳——它同时是内部调用标识与 operation_id 的派生锚，三者由此同源。minted 携带每个
+    采纳——它同时是内部调用标识与 tool_call_id 的派生锚，三者由此同源。minted 携带每个
     调用的 raw wire id 与 ordinal，随 metadata 落库（raw_tool_call_id 供追溯）；
     两者缺省（旧测试直调 / 无工具回合）时退化为无伴随字段的旧行为。
     """
@@ -779,24 +779,16 @@ async def _ingest_synthetic_tool_result(
     state: LoopState, ctx: LoopContext, tc: ToolCall, content: str, *,
     interrupted: bool = False, cancelled: bool = False,
 ) -> None:
-    """为被打断/未执行的工具补一条 TOOL_RESULT，使 tool_call↔result 一一对应（无 dangling）。"""
-    await ctx.memory.ingest(
-        MemoryEvent(
-            kind=MemoryKind.CONVERSATION_TURN, scope=MemoryScope.TASK,
-            address=state.scope,
-            content=content,
-            timestamp=now_utc(),
-            role="tool",
-            metadata={
-                "tool_name": tc.name,
-                "tool_call_id": tc.id,
-                "is_error": True,
-                "interrupted": interrupted,
-                "cancelled": cancelled,
-            },
-        ),
-        ctx.provider_ctx,
-    )
+    """为被打断/未执行的工具补一条 TOOL_RESULT，使 tool_call↔result 一一对应（无 dangling）。
+
+    走 `ingest_tool_result`：记录 id 必须是确定性的那一个，否则这条补位在 dangling 判定
+    眼里不存在——「补它就是为了不悬挂」这个目的会落空，恢复时该调用被重新执行一遍。
+    """
+    from ctx_weft.core.loop.capability_gateway import ingest_tool_result
+    await ingest_tool_result(
+        ctx.memory, ctx.provider_ctx, state.scope,
+        tool_call_id=tc.id, content=content, is_error=True, tool_name=tc.name,
+        extra_metadata={"interrupted": interrupted, "cancelled": cancelled})
 
 
 async def _await_tool_or_stop(invoke_task: "asyncio.Future", ctx: LoopContext) -> bool:

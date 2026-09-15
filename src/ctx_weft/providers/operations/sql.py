@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from ctx_weft.protocols.context import ProviderContext
-from ctx_weft.protocols.operations import (
+from ctx_weft.protocols.capability import (
     OperationRecord,
     OperationStatus,
     OperationUpdate,
@@ -38,7 +38,7 @@ class _Base(DeclarativeBase):
 class OperationModel(_Base):
     __tablename__ = "operations"
 
-    operation_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tool_call_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(64), index=True)
     session_id: Mapped[str] = mapped_column(String(64), index=True)
     agent_id: Mapped[str] = mapped_column(String(64))
@@ -48,7 +48,10 @@ class OperationModel(_Base):
     status: Mapped[str] = mapped_column(String(32))
     revision: Mapped[int] = mapped_column(Integer)
     args_hash: Mapped[str] = mapped_column(String(128), default="")
-    recovery_policy: Mapped[str] = mapped_column(String(32), default="reviewed")
+    #: spec: tool-operations——授权与 HITL 改写之后的真实入参（**未脱敏**，受保护）。
+    #: 崩溃恢复时 RerunAuthorizer 靠它去外部查证。刻意**不**存 recovery_policy：
+    #: 策略读 capability 的活声明，账本里冗余一份只会在工具改判后按过期策略走。
+    effective_args_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempts_json: Mapped[str] = mapped_column(Text, default="[]")
     result_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -59,11 +62,13 @@ class OperationModel(_Base):
 
 def _to_model(rec: OperationRecord) -> OperationModel:
     return OperationModel(
-        operation_id=rec.operation_id, tenant_id=rec.tenant_id,
+        tool_call_id=rec.tool_call_id, tenant_id=rec.tenant_id,
         session_id=rec.session_id, agent_id=rec.agent_id,
         assistant_record_id=rec.assistant_record_id, tool_ordinal=rec.tool_ordinal,
         tool_name=rec.tool_name, status=rec.status.value, revision=rec.revision,
-        args_hash=rec.args_hash, recovery_policy=rec.recovery_policy,
+        args_hash=rec.args_hash,
+        effective_args_json=json.dumps(rec.effective_args, ensure_ascii=False, default=str)
+        if rec.effective_args is not None else None,
         attempts_json=json.dumps(rec.attempts),
         result_json=json.dumps(rec.result, ensure_ascii=False, default=str)
         if rec.result is not None else None,
@@ -73,12 +78,13 @@ def _to_model(rec: OperationRecord) -> OperationModel:
 
 def _to_record(row: OperationModel) -> OperationRecord:
     return OperationRecord(
-        operation_id=row.operation_id, tenant_id=row.tenant_id,
+        tool_call_id=row.tool_call_id, tenant_id=row.tenant_id,
         session_id=row.session_id, agent_id=row.agent_id,
         assistant_record_id=row.assistant_record_id, tool_ordinal=row.tool_ordinal,
         tool_name=row.tool_name, status=OperationStatus(row.status),
         revision=row.revision, args_hash=row.args_hash,
-        recovery_policy=row.recovery_policy,
+        effective_args=json.loads(row.effective_args_json)
+        if row.effective_args_json else None,
         attempts=json.loads(row.attempts_json or "[]"),
         result=json.loads(row.result_json) if row.result_json else None,
         error=row.error, memory_result_id=row.memory_result_id,
@@ -98,17 +104,20 @@ _LEGAL = {
 class SqlOperationStore:
     """SQLAlchemy-backed 操作账本（CAS 由 WHERE revision=? 行数判定，天然乐观锁）。"""
 
+    #: 跨进程持久——恢复路径据此把「查不到记录」判成「确定没跑过」。
+    durable = True
+
     def __init__(self, session_factory: "async_sessionmaker[AsyncSession]") -> None:
         self._factory = session_factory
 
-    async def get(self, operation_id: str, ctx: ProviderContext) -> OperationRecord | None:
+    async def get(self, tool_call_id: str, ctx: ProviderContext) -> OperationRecord | None:
         async with self._factory() as db:
-            row = await db.get(OperationModel, operation_id)
+            row = await db.get(OperationModel, tool_call_id)
             return _to_record(row) if row is not None else None
 
     async def prepare(self, record: OperationRecord, ctx: ProviderContext) -> OperationRecord:
         async with self._factory() as db, db.begin():
-            existing = await db.get(OperationModel, record.operation_id)
+            existing = await db.get(OperationModel, record.tool_call_id)
             if existing is not None:
                 same = all(
                     getattr(existing, f) == getattr(record, f)
@@ -117,7 +126,7 @@ class SqlOperationStore:
                 )
                 if not same:
                     raise ValueError(
-                        f"operation_id {record.operation_id!r} already bound to a "
+                        f"tool_call_id {record.tool_call_id!r} already bound to a "
                         f"different logical call")
                 # 幂等命中：本事务未做任何修改，退出 begin() 时提交空事务即可。
                 # 这里**不调 rollback**——原先写的 `db.rollback()` 漏了 await，返回的
@@ -129,19 +138,19 @@ class SqlOperationStore:
 
     async def compare_and_set(
         self,
-        operation_id: str,
+        tool_call_id: str,
         expected_revision: int,
         update: OperationUpdate,
         ctx: ProviderContext,
     ) -> OperationRecord:
         from sqlalchemy import update as sa_update
         async with self._factory() as db, db.begin():
-            row = await db.get(OperationModel, operation_id)
+            row = await db.get(OperationModel, tool_call_id)
             if row is None:
-                raise KeyError(f"operation {operation_id!r} not prepared")
+                raise KeyError(f"operation {tool_call_id!r} not prepared")
             if row.revision != expected_revision:
                 raise RevisionConflict(
-                    f"operation {operation_id!r} revision {row.revision} != expected "
+                    f"operation {tool_call_id!r} revision {row.revision} != expected "
                     f"{expected_revision}")
             if update.status is not None:
                 if update.status.value not in _LEGAL.get(row.status, set()):
@@ -161,13 +170,21 @@ class SqlOperationStore:
                 attempts = json.loads(row.attempts_json or "[]")
                 attempts.append(update.append_attempt)
                 patch["attempts_json"] = json.dumps(attempts)
-            await db.execute(
+            res = await db.execute(
                 sa_update(OperationModel).where(
-                    OperationModel.operation_id == operation_id,
+                    OperationModel.tool_call_id == tool_call_id,
                     OperationModel.revision == expected_revision,
                 ).values(**patch)
             )
-        got = await self.get(operation_id, ctx)
+            if res.rowcount == 0:
+                # 上面的 `row.revision != expected_revision` 只挡住了「读的时候就不对」。
+                # 另一个连接在这两步之间推进了状态时，WHERE 匹配 0 行——什么都没写，却
+                # 会把对方写完的记录当成自己 CAS 成功的返回值。必须在这里也拒绝，否则
+                # 本实现与 in_memory 版语义不一致（那边是单锁 + 显式比对，严格）。
+                raise RevisionConflict(
+                    f"operation {tool_call_id!r} changed concurrently; expected revision "
+                    f"{expected_revision}")
+        got = await self.get(tool_call_id, ctx)
         assert got is not None
         return got
 
