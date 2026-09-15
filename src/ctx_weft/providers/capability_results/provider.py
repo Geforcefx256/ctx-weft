@@ -50,7 +50,7 @@ _UNAVAILABLE = (
 )
 
 
-@tool(purposes=["act"], side_effects=False, spillable=False)
+@tool(purposes=["act"], side_effects=False, spillable=False, recovery_policy="idempotent")
 async def read_tool_output(
     invocation_id: str,
     offset: int | None = None,

@@ -18,12 +18,12 @@ from ctx_weft.core.capabilities.cache import CapabilityCache
 from ctx_weft.core.loop.capability_gateway import CapabilityGateway, converge_tool_output
 from ctx_weft.core.loop.driver import LoopContext, LoopState
 from ctx_weft.protocols import MemoryAddress, MemoryScope, ProviderContext
+from ctx_weft.core.loop.capability_gateway import tool_result_record_id
 from ctx_weft.protocols.capability import (
     CapabilityEvent,
     CapabilityProviderInfo,
     ToolCapability,
     ToolCapabilityProvider,
-    tool_result_record_id,
 )
 from ctx_weft.providers.capability_results import (
     READ_TOOL_QUALIFIED_NAME,
@@ -32,7 +32,6 @@ from ctx_weft.providers.capability_results import (
 from ctx_weft.providers.capability_results import ResultsCapabilityProvider
 from ctx_weft.providers.events import InProcessEventBus
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
-from ctx_weft.providers.operations import InMemoryOperationStore
 from ctx_weft.providers.results import InMemoryToolResultStore
 
 # ── 结果存储 ──────────────────────────────────────────────────────────────────
@@ -93,12 +92,22 @@ class _Big(ToolCapabilityProvider):
     async def cancel(self, invocation_id, ctx) -> None: return None
 
 
-def _harness(provider, *, store=None, ledger=None, threshold=1000, sink=True):
+#: 同一个结果存储共享同一个事件库——`_harness` 被调两次模拟「同一会话的第二次
+#: 进入」（重放 / 补写），两次必须看见同一条事件流。
+_SHARED_EVENT_STORE: dict = {}
+
+
+def _harness(provider, *, store=None, threshold=1000, sink=True):
     """`sink=True` 注册一个可回读的 SpillSink（ResultsCapabilityProvider）。
 
     core 只认 SpillSink——「能不能回读」由宿主注册哪种实现决定，不是 core 的协议分支。
     """
     bus = InProcessEventBus()
+    # 事件库 + 提交门：重入判据来自 capability 事件流，所以夹具要跟生产同构。
+    from ctx_weft.core.events.commit_gate import CommitGate
+    from ctx_weft.providers.events.store.in_memory.store import InMemoryEventStore
+    event_store = _SHARED_EVENT_STORE.setdefault(id(store), InMemoryEventStore())
+    bus.attach_commit_gate(CommitGate(event_store))
     mem = InMemoryMemoryProvider()
     cache = CapabilityCache()
     cache.put("agt_1", [provider._cap()])
@@ -109,7 +118,6 @@ def _harness(provider, *, store=None, ledger=None, threshold=1000, sink=True):
         capability_cache=cache, capability_providers=providers,
         memory=mem, event_bus=bus, spill_threshold=threshold,
         spill_preview_chars=100, spill_tail_chars=120,
-        operation_store=ledger,
     )
     scope = MemoryAddress(session_id="s1", task_id="tsk_1", agent_id="agt_1")
     state = LoopState(
@@ -118,40 +126,39 @@ def _harness(provider, *, store=None, ledger=None, threshold=1000, sink=True):
         scope=scope,
         resolved_model=SimpleNamespace(model="mock", account=""),
     )
+    async def _read(session_id, types):
+        return await event_store.read_session_events_of_types(session_id, types)
+
     ctx = LoopContext(
         assembler=None, llm=None, memory=mem, event_bus=bus,
         provider_ctx=ProviderContext(
             session_id="s1", tenant_id="default", task_id="tsk_1", agent_id="agt_1"),
+        read_events_of_types=_read,
     )
     return gw, mem, state, ctx, scope
 
 
 @pytest.mark.asyncio
-async def test_converge_ledger_full_context_converged_with_tail():
+async def test_converged_context_and_full_text_in_the_sink():
+    """收敛分层：上下文拿收敛版，全文归 sink——**核心不留第二份副本**。"""
     tail_marker = "TAIL_MARKER_9876543210"
     big = "x" * 5_000 + tail_marker
     store = InMemoryToolResultStore()
-    ledger = InMemoryOperationStore()
     provider = _Big(big)
-    gw, mem, state, ctx, scope = _harness(provider, store=store, ledger=ledger)
+    gw, mem, state, ctx, scope = _harness(provider, store=store)
 
     res = await gw.invoke("mcp__b__dump", {}, state, ctx, tool_call_id=OP_A)
 
     # 上下文 = 收敛版：引用 + 全长 + 头预览 + 尾预览（尾部止血）。
-    assert tail_marker in res.content                       # 尾部证据直接可见
+    assert tail_marker in res.content
     assert str(len(big)) in res.content
     assert READ_TOOL_QUALIFIED_NAME in res.content
     assert "x" * 5_000 not in res.content                   # 全文未直灌
     # memory TOOL_RESULT 同为收敛版。
     recs = await mem.load_view(scope, MemoryScope.TASK, ctx.provider_ctx)
-    tool_rec = [r for r in recs if r.role == "tool"][0]
-    assert tool_rec.content == res.content
-    # 账本 completed = 收敛前全文（修 tool-operations 偏离）。
-    op_rec = await ledger.get(OP_A, ctx.provider_ctx)
-    assert op_rec.result == big
-    assert len(op_rec.result) == len(big)
-    # store 持全文，可窗口回读。
-    assert await store.get(op_rec.attempts[-1]) == big
+    assert [r for r in recs if r.role == "tool"][0].content == res.content
+    # 全文只在 sink 里，键 = 这次执行的 invocation_id。
+    assert await store.get(res.invocation_id) == big
 
 
 @pytest.mark.asyncio
@@ -201,36 +208,39 @@ OP_A = mint_call_id(anchor="recA", ordinal=0, raw_id="call_1", turn_seq=1)
 OP_B = mint_call_id(anchor="recB", ordinal=0, raw_id="call_1", turn_seq=9)
 
 
-# ── 重放：统一收敛 + 持久账本重放入库 ────────────────────────────────────────
+# ── 重放：结果来自事件流 ──────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_completed_shortcircuit_replay_converges_and_reputs():
-    big = "z" * 4_000
+async def test_completed_reentry_replays_the_recorded_result():
+    """同逻辑调用重入 → 复用**事件里记着的那份**，不再打 provider、不再收敛一遍。"""
     store = InMemoryToolResultStore()
-    ledger = InMemoryOperationStore()
-    provider = _Big(big)
-    gw, mem, state, ctx, _ = _harness(provider, store=store, ledger=ledger)
+    provider = _Big("z" * 4_000)
+    gw, mem, state, ctx, _ = _harness(provider, store=store)
 
     first = await gw.invoke("mcp__b__dump", {}, state, ctx, tool_call_id=OP_A)
-    first_inv = first.invocation_id
     assert READ_TOOL_QUALIFIED_NAME in first.content
+    replay = await gw.invoke("mcp__b__dump", {}, state, ctx,
+                             tool_call_id=OP_A, reentry=True)
+    assert replay.content == first.content, "照抄事件里那份，逐字节一致"
 
-    # 清空内存 store（模拟逐出/重启）→ 重放须以账本全文重新入库且形态收敛。
-    store2 = InMemoryToolResultStore()
-    gw2, *_ = _harness(_Big("unused"), store=store2, ledger=ledger)
-    # gateway 默认 store 是独立实例——把重放 gateway 指向被清空的 store2：
-    gw2._spill_sink = ResultsCapabilityProvider(store2)
-    # 同一逻辑调用重入 = 同一个内部标识（旧设计靠 provider_ctx 另传身份才做得到）。
-    replay = await gw2.invoke("mcp__b__dump", {}, state, ctx, tool_call_id=OP_A)
 
-    assert READ_TOOL_QUALIFIED_NAME in replay.content      # 收敛版，非全文直灌
-    assert replay.content.count("z" * 100) < 10
-    # 引用身份 = 账本原执行 invocation_id（非重放新铸值）。
-    assert first_inv in replay.content
-    # store2 已由账本全文重新入库 → 可回读（spec R4 场景「清空存储后重放仍可回读」）。
-    assert await store2.get(first_inv) == big
-    assert await store2.get(replay.invocation_id) is None  # 重放新 id 不入库
+@pytest.mark.asyncio
+async def test_full_text_survives_only_as_long_as_the_sink_does():
+    """sink 被清空 → 全文取不回来了。这是**有意的**。
+
+    账本时代核心另存一份收敛前全文，逐出后拿它重新入库。撤销之后，「全文能存活多久」
+    完全由宿主注册的 sink 决定——不持久就是不持久，核心不再存副本假装兜得住，而收敛版
+    里本来就有「NOT recoverable」的如实说法。
+    """
+    store = InMemoryToolResultStore()
+    provider = _Big("z" * 4_000)
+    gw, mem, state, ctx, _ = _harness(provider, store=store)
+    res = await gw.invoke("mcp__b__dump", {}, state, ctx, tool_call_id=OP_A)
+
+    assert await store.get(res.invocation_id) == "z" * 4_000
+    assert await InMemoryToolResultStore().get(res.invocation_id) is None   # 逐出/重启
+
 
 
 # ── store 写失败显式标记 ─────────────────────────────────────────────────────
@@ -251,43 +261,37 @@ async def test_spill_failure_marks_unrecoverable():
     assert "w" * 100 in res.content          # 头部预览仍在（不静默、不空转）
 
 
-# ── reconcile 补写入口（账本完成而 memory 缺失 → 收敛补写） ────────────────────
+# ── reconcile 补写入口（FINISHED 已发而 memory 缺失 → 照抄事件里那份） ──────────
 
 
 @pytest.mark.asyncio
-async def test_reconcile_backfill_converges_ledger_result():
+async def test_reconcile_backfills_from_the_event_without_reconverging():
+    """「已完成而 memory 缺失」的补写：用事件里那份，**不再收敛一遍**。
+
+    那份就是当初进对话的收敛版；再过一次收敛出口会把收敛说明自己当正文又切一刀。
+    """
     from ctx_weft.core.loop.steps.reconcile import ReconcileStep
 
     big = "r" * 4_000
     store = InMemoryToolResultStore()
-    ledger = InMemoryOperationStore()
     provider = _Big(big)
-    gw, mem, state, ctx, scope = _harness(provider, store=store, ledger=ledger)
-    res = await gw.invoke("mcp__b__dump", {}, state, ctx, tool_call_id=OP_B)  # 原执行
+    gw, mem, state, ctx, scope = _harness(provider, store=store)
+    res = await gw.invoke("mcp__b__dump", {}, state, ctx, tool_call_id=OP_B)
 
-    rec = await ledger.get(OP_B, ctx.provider_ctx)
-
-    # 「账本 completed 而 TOOL_RESULT 从未写成」那个崩溃窗口——**换一个空 memory**，而不是
-    # 把已写的那条抹掉：记录 id 现在是确定性的，抹掉走 `fold` 会给它立墓碑，同 id 再也
-    # 回不来；而真窗口里那条记录压根不存在。账本与结果存储沿用同一份（它们没丢）。
-    gw2, mem2, state2, ctx2, scope2 = _harness(provider, store=store, ledger=ledger)
-
-    step = ReconcileStep()
+    # 「FINISHED 已发而 TOOL_RESULT 从未写成」那个崩溃窗口——换一个空 memory，而不是
+    # 把已写的那条抹掉：记录 id 是确定性的，抹掉走 fold 会给它立墓碑，同 id 再也回不来。
+    gw2, mem2, state2, ctx2, scope2 = _harness(provider, store=store)
     tc = {"id": OP_B, "name": "mcp__b__dump", "input": {}}
-    await step._backfill_memory(
-        state2, ctx2, OP_B, tc, rec.result, gateway=gw2, rec=rec, via="ledger-completed")
+    for _ in range(2):          # 补两次，验幂等
+        await ReconcileStep()._backfill_memory(
+            state2, ctx2, OP_B, tc, res.content, gateway=gw2,
+            attempts=(res.invocation_id,), converge=False, via="event-finished")
 
     recs = await mem2.load_view(scope2, MemoryScope.TASK, ctx2.provider_ctx)
-    bf = [r for r in recs if r.metadata.get("recovered_via") == "ledger-completed"][0]
-    assert bf.id == tool_result_record_id(OP_B)              # 确定性 id：再补一次即幂等
-    assert READ_TOOL_QUALIFIED_NAME in bf.content            # 收敛版，非全文直灌
-    assert res.invocation_id in bf.content                   # 引用 = 账本原执行 id
-
-    # 幂等：同一条补写重复执行不产生第二份。
-    await step._backfill_memory(
-        state2, ctx2, OP_B, tc, rec.result, gateway=gw2, rec=rec, via="ledger-completed")
-    recs2 = await mem2.load_view(scope2, MemoryScope.TASK, ctx2.provider_ctx)
-    assert len([r for r in recs2 if r.role == "tool"]) == 1
+    tool_recs = [r for r in recs if r.role == "tool"]
+    assert len(tool_recs) == 1, "同一确定性 id，补两次只落一条"
+    assert tool_recs[0].id == tool_result_record_id(OP_B)
+    assert tool_recs[0].content == res.content, "照抄，不重新收敛"
 
 
 @pytest.mark.asyncio

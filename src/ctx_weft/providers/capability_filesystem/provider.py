@@ -275,7 +275,7 @@ async def shell(
             runner.cancel()
 
 
-@tool(purposes=["act", "compact"], side_effects=False, spillable=False)
+@tool(purposes=["act", "compact"], side_effects=False, spillable=False, recovery_policy="idempotent")
 async def read_file(
     path: Annotated[str, "File path; relative paths are resolved against the workspace"],
     offset: Annotated[int | None, "1-based start line (line mode; default 1)"] = None,

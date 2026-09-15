@@ -12,7 +12,8 @@ import pathlib
 
 import pytest
 
-from ctx_weft.protocols.capability import is_internal_call_id, tool_result_record_id
+from ctx_weft.core.loop.capability_gateway import tool_result_record_id
+from ctx_weft.protocols.capability import is_internal_call_id
 
 
 def test_derivation_is_partial_not_a_colliding_guess():
@@ -127,7 +128,7 @@ async def test_bare_wire_ids_get_distinct_records_and_are_not_reconcluded():
     cache = CapabilityCache(); cache.put("a1", [tool._cap()])
     ctx.capability_gateway = CapabilityGateway(
         capability_cache=cache, capability_providers=[tool], memory=mem,
-        event_bus=InProcessEventBus(), operation_store=None)
+        event_bus=InProcessEventBus())
 
     await mem.ingest(MemoryEvent(
         kind=MemoryKind.CONVERSATION_TURN, scope=MemoryScope.TASK, address=scope,

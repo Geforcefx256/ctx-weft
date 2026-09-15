@@ -8,7 +8,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 from abc import abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from ctx_weft.core.assembler import AssembledPrompt, ContextAssembler
@@ -147,6 +147,12 @@ class LoopContext:
     config: Any = None
     # TaskManager 引用（Phase 5+）；PrepareStep compact dispatch 用；None 时退化为 inline compact
     task_manager: TaskManager|None = None
+    #: 按类型取本会话事件（spec: tool-operations）。恢复判据要折 capability 事件流，
+    #: 而 loop **只需要问一个问题、从不写事件库**——所以注入一个查询函数，不塞整个
+    #: EventStore。runtime 注入的是它自己那份 `_read_session_events_of_types`，已含
+    #: 「store 不支持轻查询 → 退化为全量读 + 内存过滤」的降级。
+    #: None（宿主直构 / 测试替身）→ 折不出事实，调用方按「无从判断」保守处理。
+    read_events_of_types: "Callable[[str, tuple[str, ...]], Awaitable[list[Any]]] | None" = None
     # HITL：管账的 service 与管栈的 waiter 分开持有——旧实现把两者塞进一个对象，
     # 于是编排层被迫认识协程栈（spec §3）。
     hitl: "HitlService | None" = None

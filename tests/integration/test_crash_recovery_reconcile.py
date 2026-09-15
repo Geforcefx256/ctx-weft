@@ -103,21 +103,16 @@ async def test_crash_mid_tool_reinvokes_dangling_via_reconcile() -> None:
         timestamp=ts, role="assistant",
         metadata={"tool_calls": [{"id": tcid, "name": "test__web", "input": {"url": "x"}}]}), pctx)
 
-    # 账本注入 STARTED 记录（键 = tool_call 的内部标识）——idempotent 分支的输入。
-    from ctx_weft.protocols.capability import OperationRecord, OperationStatus
-    from ctx_weft.providers.operations import InMemoryOperationStore
-    ops = runtime.providers.get_operation_store()
-    assert isinstance(ops, InMemoryOperationStore)
-    view = await mem.load_view(scope, _MEM_TASK_SCOPE, pctx)
-    last_asst = next(r for r in reversed(view)
-                     if r.kind is _MK.CONVERSATION_TURN and r.role == "assistant")
-    op_id = tcid
-    from ctx_weft.protocols.context import ProviderContext as _PC
-    await ops.prepare(OperationRecord(
-        tool_call_id=op_id, tenant_id="default", session_id=sid, agent_id=aid,
-        assistant_record_id=last_asst.id, tool_ordinal=0, tool_name="test__web",
-        status=OperationStatus.STARTED, revision=2, attempts=["inv_first"]),
-        _PC(session_id=sid, tenant_id="default", task_id=tid, agent_id=aid))
+    # 注入「崩溃前调用过」的事实：一条 CapabilityInvoked、没有 Finished
+    # ——这正是账本时代 `status=started` 的等价物，idempotent 分支的输入。
+    from ctx_weft.core.utils.clock import now_utc as _now
+    from ctx_weft.protocols.events import Event as _Ev, EventType as _ET
+
+    await runtime.event_store.append(_Ev(
+        id="evt_seed_invoked", type=_ET.CAPABILITY_INVOKED, session_id=sid,
+        run_id="r_seed", sequence=1, timestamp=_now(),
+        payload={"tool_call_id": tcid, "invocation_id": "inv_first",
+                 "capability_name": "test__web", "capability_id": "test:web"}))
 
     with mock.patch(
         "ctx_weft.core.loop.steps.background_observe.launch_background_observe",

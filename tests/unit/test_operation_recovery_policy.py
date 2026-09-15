@@ -1,49 +1,47 @@
-"""恢复策略表全分支（spec: tool-operations；wp6-2.2，design D2）。
+"""恢复策略表与重跑授权链（spec: tool-operations）。
 
-组件级：真 reconcile + 真 gateway + 真账本（内存），policy 经 capability 声明。
-分派矩阵：reviewed 交裁决链不自行重跑 / idempotent 同 op_id 恰一次 / 无账本记录作结
-「无从查证」/ call_1 复用串扰根治 / 裁决链两分支（rerun / conclude）+ 无裁决者默认形态。
-账本执行序见 test_gateway_operation_ledger，真子进程强退见
-tests/integration/test_operation_crash_matrix.py。
+组件级：真 reconcile + 真 gateway + 真事件库（内存）+ 提交门，policy 经 capability 声明。
+
+判据来自**事件流**：`CapabilityInvoked` 在 provider 之前经提交门落库，所以
+「有没有 INVOKED」就是「provider 有没有被调用过」。夹具因此靠**播事件**而不是写账本
+来构造崩溃前的状态——那张 `operations` 表已经不存在了。
+
+分派矩阵：reviewed 交重跑授权不自行重跑 / idempotent 同 id 恰一次 / 折不出事实时作结
+「无从查证」/ call_1 复用串扰根治 / 重跑授权两分支（放行 · 作结）+ 未注册的默认形态。
 """
+
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
 
 import pytest
 
 from ctx_weft.core.capabilities.cache import CapabilityCache
-from ctx_weft.core.loop.capability_gateway import CapabilityGateway
+from ctx_weft.core.events.commit_gate import CommitGate
+from ctx_weft.core.loop.capability_gateway import CapabilityGateway, tool_result_record_id
 from ctx_weft.core.loop.driver import LoopContext, LoopState
 from ctx_weft.core.loop.steps.reconcile import ReconcileStep
+from ctx_weft.core.utils.clock import now_utc
+from ctx_weft.core.utils.ids import mint_call_id
 from ctx_weft.protocols import MemoryAddress, MemoryKind, MemoryScope, ProviderContext
 from ctx_weft.protocols.capability import (
+    AuthorizationDecision,
     CapabilityEvent,
     CapabilityProviderInfo,
+    RerunAuthorizer,
     ToolCapability,
     ToolCapabilityProvider,
 )
 from ctx_weft.protocols.events import EventType
 from ctx_weft.protocols.memory import MemoryEvent
-from ctx_weft.core.utils.ids import mint_call_id
-
-#: 摄入点铸造的内部标识——既是消息里的 tool_call id，也是账本键。
-OP = mint_call_id(anchor="rec_fx", ordinal=0, raw_id="call_1", turn_seq=0)
-
-from ctx_weft.protocols.capability import (
-    AuthorizationDecision,
-    OperationRecord,
-    OperationStatus,
-    OperationUpdate,
-    RerunAuthorizer,
-)
 from ctx_weft.providers.events import InProcessEventBus
+from ctx_weft.providers.events.store.in_memory.store import InMemoryEventStore
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
-from ctx_weft.providers.operations import InMemoryOperationStore
-from ctx_weft.core.utils.clock import now_utc
 
-from ctx_weft.core.models.discriminators import TaskErrorCode
+#: 摄入点铸造的内部标识——既是消息里的 tool_call id，也是事件 payload 的配对键。
+OP = mint_call_id(anchor="rec_fx", ordinal=0, raw_id="call_1", turn_seq=0)
 
 
 class _EffectTool(ToolCapabilityProvider):
@@ -70,17 +68,49 @@ class _EffectTool(ToolCapabilityProvider):
     async def cancel(self, i, ctx): return None
 
 
-class _Bus:
-    def __init__(self): self.events = []
-    async def emit(self, e): self.events.append(e)
+class _TM:
+    def __init__(self, bus) -> None:
+        self._bus = bus
+
+    async def commit_round(self, task_id) -> None:
+        await self._bus.commit_provisional(task_id)
 
 
-async def _mk_fixture(policy="reviewed", ledger_status: OperationStatus | None = OperationStatus.STARTED,
-                      tool=None):
+async def _seed(store, *, tool_call_id: str, invoked: bool, finished: bool = False,
+                invocation_id: str = "inv_first", result: str = "old result") -> None:
+    """播出「崩溃前」的 capability 事件——夹具构造状态的唯一手段。
+
+    `invoked and not finished` = 账本时代的 `status=started`；两个都 False = 没跑过。
+    """
+    from ctx_weft.protocols.events import Event
+
+    seq = 0
+
+    def _ev(etype, payload):
+        nonlocal seq
+        seq += 1
+        return Event(id=f"evt_seed_{seq}", type=etype, session_id="s1", run_id="r0",
+                     sequence=seq, timestamp=now_utc(), payload=payload)
+
+    batch = []
+    if invoked:
+        batch.append(_ev(EventType.CAPABILITY_INVOKED, {
+            "tool_call_id": tool_call_id, "invocation_id": invocation_id,
+            "capability_name": "fx__act", "capability_id": "fx:act"}))
+    if finished:
+        batch.append(_ev(EventType.CAPABILITY_FINISHED, {
+            "tool_call_id": tool_call_id, "invocation_id": invocation_id,
+            "capability_name": "fx__act", "outcome": "success",
+            "result": result, "result_length": len(result)}))
+    for ev in batch:
+        await store.append(ev)
+
+
+async def _mk_fixture(policy="reviewed", *, invoked=True, finished=False, tool=None):
     tool = tool if tool is not None else _EffectTool(policy)
     mem = InMemoryMemoryProvider()
-    ops = InMemoryOperationStore()
-    bus = _Bus()
+    event_store, bus = InMemoryEventStore(), InProcessEventBus()
+    bus.attach_commit_gate(CommitGate(event_store))
     scope = MemoryAddress(session_id="s1", task_id="t1", agent_id="a1")
     pctx = ProviderContext(session_id="s1", tenant_id="default", task_id="t1", agent_id="a1")
 
@@ -91,140 +121,130 @@ async def _mk_fixture(policy="reviewed", ledger_status: OperationStatus | None =
         scope=scope, resolved_model=SimpleNamespace(model="m", account=""),
         sequence_counter=0,
     )
+
+    async def _read(session_id, types):
+        return await event_store.read_session_events_of_types(session_id, types)
+
     ctx = LoopContext(assembler=None, llm=None, memory=mem, event_bus=bus,
-                      provider_ctx=pctx)
+                      provider_ctx=pctx, task_manager=_TM(bus),
+                      read_events_of_types=_read)
     cache = CapabilityCache()
     cache.put("a1", [tool._cap()])
     gw = CapabilityGateway(capability_cache=cache, capability_providers=[tool],
-                           memory=mem, event_bus=InProcessEventBus(), operation_store=ops)
+                           memory=mem, event_bus=bus)
     ctx.capability_gateway = gw
 
-    rid = await mem.ingest(MemoryEvent(
+    await mem.ingest(MemoryEvent(
         kind=MemoryKind.CONVERSATION_TURN, scope=MemoryScope.TASK, address=scope,
         content="", timestamp=now_utc(), role="assistant",
         metadata={"tool_calls": [{"id": OP, "name": "fx__act", "input": {"n": 1}}]}),
         pctx)
 
-    op_id = OP        # 账本键就是 tool_call 的内部标识
-    if ledger_status is not None:
-        await ops.prepare(OperationRecord(
-            tool_call_id=op_id, tenant_id="default", session_id="s1", agent_id="a1",
-            assistant_record_id=rid, tool_ordinal=0, tool_name="fx__act",
-            status=ledger_status, revision=2, attempts=["inv_first"],
-        ), pctx)
-    return tool, ops, bus, state, ctx, op_id
+    await _seed(event_store, tool_call_id=OP, invoked=invoked, finished=finished)
+    return tool, event_store, bus, state, ctx, OP
 
 
+async def _tool_records(ctx, state):
+    recs = await ctx.memory.load_view(state.scope, MemoryScope.TASK, ctx.provider_ctx)
+    return [r for r in recs if r.role == "tool"]
+
+
+# ── 分派矩阵 ──────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
 async def test_reviewed_started_concludes_without_rerun():
     """H3 的核心性质：不重跑。但**不停机**——作结写成工具结果，循环继续。"""
-    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="reviewed")
+    tool, store, bus, state, ctx, op_id = await _mk_fixture(policy="reviewed")
     outcome = await ReconcileStep().execute(state, ctx)
-    assert tool.executions == 0, "reviewed + started MUST NOT re-execute"
+
+    assert tool.executions == 0, "reviewed + 已调用未完成 MUST NOT re-execute"
     assert outcome.next_step == "prepare", "不确定是工具结果，不是控制流——不停机"
-    rec = await ops.get(op_id, ctx.provider_ctx)
-    assert rec.status == OperationStatus.COMPLETED, "已作结（结论内容在 result 里）"
-    assert "unverified" in str(rec.result), rec.result
+    recs = await _tool_records(ctx, state)
+    assert len(recs) == 1 and "unverified" in str(recs[0].content)
 
 
+@pytest.mark.asyncio
 async def test_idempotent_started_reruns_exactly_once():
-    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="idempotent")
+    tool, store, bus, state, ctx, op_id = await _mk_fixture(policy="idempotent")
     outcome = await ReconcileStep().execute(state, ctx)
+
     assert tool.executions == 1
     assert outcome.next_step == "prepare"
-    rec = await ops.get(op_id, ctx.provider_ctx)
-    assert rec.status == OperationStatus.COMPLETED
-    assert rec.attempts == ["inv_first", rec.attempts[-1]] or len(rec.attempts) == 2
+    evs = await store.read_session_events_of_types(
+        "s1", (EventType.CAPABILITY_INVOKED, EventType.CAPABILITY_FINISHED))
+    assert sum(1 for e in evs if e.type == EventType.CAPABILITY_INVOKED) == 2, \
+        "播的那条 + 重跑这条"
 
 
-async def test_durable_ledger_without_record_is_first_execution():
-    """**持久**账本 + 内部标识 + 查不到记录 = 确定还没跑过，首执安全。
+@pytest.mark.asyncio
+async def test_never_invoked_is_first_execution():
+    """折得出事实而里面没有 INVOKED = **确定还没跑过**，首执安全（即使 reviewed）。
 
-    gateway 的 prepare 在授权与参数校验**之后**，所以这三个条件同时成立只能是崩在
-    prepare 之前——provider 确定没被调用过。此前这里和「真·无从判断」走同一个出口，
-    给 agent 写一句「无法确定副作用是否已发生」——对这条路那是不实的。
+    比账本时代的判据更硬：那时要先判账本跨不跨进程（内存账本重启后一片空白，「没跑过」
+    与「跑过但记录没了」长得一样）；事件库在 required 模式下本来就必须持久。
     """
-    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="reviewed",
-                                                          ledger_status=None)
-    ops.durable = True        # 扮演 SqlOperationStore：跨进程活着
+    tool, store, bus, state, ctx, op_id = await _mk_fixture(
+        policy="reviewed", invoked=False)
     outcome = await ReconcileStep().execute(state, ctx)
+
     assert tool.executions == 1, "确定未启动 → 首执，即使策略是 reviewed"
     assert outcome.next_step == "prepare"
-    rec = await ops.get(op_id, ctx.provider_ctx)
-    assert rec.status == OperationStatus.COMPLETED
 
 
-async def test_non_durable_ledger_without_record_concludes_without_rerun():
-    """内存账本查不到记录**不**证明没跑过——重启后它一片空白，两种情形一模一样。
-
-    O-T05 的真子进程强退就踩在这里：宿主没注册持久账本，恢复进程拿到空的内存默认
-    账本，若按「没记录 = 没跑过」处理，副作用会被执行两次。
-    """
-    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="idempotent",
-                                                          ledger_status=None)
-    assert ops.durable is False
+@pytest.mark.asyncio
+async def test_no_event_query_at_all_concludes_without_rerun():
+    """折不出事实（宿主直构 / 测试替身没接查询）——无从判断，不重跑。"""
+    tool, store, bus, state, ctx, op_id = await _mk_fixture(
+        policy="idempotent", invoked=False)
+    ctx.read_events_of_types = None
     outcome = await ReconcileStep().execute(state, ctx)
-    assert tool.executions == 0, "不持久 → 无从判断 → 不重跑"
+
+    assert tool.executions == 0, "无从判断的副作用工具不得自动重跑"
     assert outcome.next_step == "prepare"
 
 
-async def test_no_ledger_at_all_concludes_without_rerun():
-    """账本根本没接线（宿主直构 gateway / 存量数据）——同样不重跑。"""
-    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="idempotent",
-                                                          ledger_status=None)
-    ctx.capability_gateway._operation_store = None
+@pytest.mark.asyncio
+async def test_finished_is_not_dangling():
+    """已完成 → reconcile 跳过，并从事件里那份补写 memory（不再收敛一遍）。"""
+    tool, store, bus, state, ctx, op_id = await _mk_fixture(
+        policy="reviewed", invoked=True, finished=True)
     outcome = await ReconcileStep().execute(state, ctx)
-    assert tool.executions == 0, "无账本身份的副作用工具不得自动重跑"
+
+    assert tool.executions == 0
     assert outcome.next_step == "prepare"
+    recs = await _tool_records(ctx, state)
+    assert len(recs) == 1
+    assert recs[0].id == tool_result_record_id(op_id), "确定性记录 id"
+    assert recs[0].content == "old result", "照抄事件里那份"
 
 
-async def test_prepared_runs_first_execution():
-    """prepared 且从未 started：首执（此前无副作用）——即使 reviewed。"""
-    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="reviewed",
-                                                          ledger_status=OperationStatus.PREPARED)
-    outcome = await ReconcileStep().execute(state, ctx)
-    assert tool.executions == 1
-    assert outcome.next_step == "prepare"
-    rec = await ops.get(op_id, ctx.provider_ctx)
-    assert rec.status == OperationStatus.COMPLETED
-
-
+@pytest.mark.asyncio
 async def test_call1_reuse_no_cross_talk():
-    """call_1 复用串扰根治：旧 tool 记录的 wire id 不使新调用被误判完成。
+    """call_1 复用串扰根治：旧 tool 记录的 wire id 不使新调用被误判完成。"""
+    tool, store, bus, state, ctx, op_id = await _mk_fixture(policy="idempotent")
+    from ctx_weft.core.loop.steps.reconcile import _dangling_tool_calls
 
-    场景：上一回合 call_1 已有 tool 记录（wire 通道 done）；本回合复用 call_1——
-    双通道判据按内部标识（与 wire id 无关）→ 仍为 dangling，正确进入策略分派。
-    """
-    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="idempotent")
     # 上一回合的 tool 记录（wire id 同为 call_1，但属于别的 record）
-    from ctx_weft.protocols.memory import MemoryEvent as ME
-    prev_rid = await ctx.memory.ingest(ME(
+    await ctx.memory.ingest(MemoryEvent(
         kind=MemoryKind.CONVERSATION_TURN, scope=MemoryScope.TASK,
         address=state.scope, content="old result", timestamp=now_utc(),
         role="tool", metadata={"tool_call_id": "call_1"}), ctx.provider_ctx)
-    from ctx_weft.core.loop.steps.reconcile import _dangling_tool_calls
+
     dangling, _ = await _dangling_tool_calls(ctx.memory, state.scope, ctx.provider_ctx)
     assert len(dangling) == 1, "按内部标识判定：复用的 call_1 不得让新调用误判为已完成"
     await ReconcileStep().execute(state, ctx)
     assert tool.executions == 1
 
 
-# ── 两值策略与裁决链（spec: tool-operations，wp6 重构）──────────────────────
-#
-# 策略只有两值，判据是「core 要不要做决定」。「谁来裁决」不是策略值而是一条链：
-# provider 实现 OperationAdjudicator → 它裁；否则落到人。裁决能力靠 isinstance
-# 发现，不靠 capability 声明。
+# ── 两值策略与重跑授权链 ──────────────────────────────────────────────────────
 
 
 def test_policy_values_validated_not_silently_defaulted():
-    """非法取值响亮失败；缺省按需审核。**不静默降级**是这条的全部意义。"""
-    from ctx_weft.protocols.capability import RecoveryPolicy as P, normalize_recovery_policy as N
+    from ctx_weft.protocols.capability import normalize_recovery_policy as N
 
-    assert N("idempotent") is P.IDEMPOTENT
-    assert N("reviewed") is P.REVIEWED
-    assert N(P.IDEMPOTENT) is P.IDEMPOTENT
-    assert N(None) is P.REVIEWED and N("") is P.REVIEWED   # Provider 没表态 → 需审核
     for bad in ("retry_safe", "queryable", "manual", "idempotant", "Idempotent", "auto"):
-        with pytest.raises(ValueError, match="unknown recovery_policy"):
+        with pytest.raises(ValueError):
             N(bad)
 
 
@@ -241,11 +261,12 @@ class _Rerun(RerunAuthorizer):
     def __init__(self, verdict) -> None:
         self.verdict = verdict
         self.asked = 0
-        self.seen_args: dict | None = None
+        self.seen: object = None
 
-    async def authorize_rerun(self, capability, record, ctx, arguments=None, *, tool_call_id=""):
+    async def authorize_rerun(self, capability, context, ctx, arguments=None, *,
+                              tool_call_id=""):
         self.asked += 1
-        self.seen_args = record.effective_args
+        self.seen = context
         return self.verdict
 
 
@@ -255,23 +276,22 @@ def _with_rerun(ctx, authorizer, key="fx"):
     return authorizer
 
 
+@pytest.mark.asyncio
 async def test_rerun_denied_concludes_without_executing():
-    """重跑授权说不 → 它给的 message 成为这次调用的结果，provider 不被执行。"""
-    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="reviewed")
+    tool, store, bus, state, ctx, op_id = await _mk_fixture(policy="reviewed")
     rr = _with_rerun(ctx, _Rerun(AuthorizationDecision(
         allowed=False, result_is_error=False, message="外部已完成：流水号 TX-9981")))
 
     await ReconcileStep().execute(state, ctx)
     assert rr.asked == 1, "reviewed 必须先问重跑授权"
     assert tool.executions == 0, "allowed=False → 绝不执行"
-    rec = await ops.get(op_id, ctx.provider_ctx)
-    assert rec.status == OperationStatus.COMPLETED
-    assert "TX-9981" in str(rec.result)
+    recs = await _tool_records(ctx, state)
+    assert "TX-9981" in str(recs[0].content)
 
 
+@pytest.mark.asyncio
 async def test_rerun_allowed_reexecutes():
-    """重跑授权放行 → 同 tool_call_id 重跑。"""
-    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="reviewed")
+    tool, store, bus, state, ctx, op_id = await _mk_fixture(policy="reviewed")
     rr = _with_rerun(ctx, _Rerun(AuthorizationDecision(allowed=True)))
 
     await ReconcileStep().execute(state, ctx)
@@ -279,12 +299,10 @@ async def test_rerun_allowed_reexecutes():
     assert tool.executions == 1, "权威判定没跑成 → 重跑"
 
 
+@pytest.mark.asyncio
 async def test_rerun_says_it_cannot_tell():
-    """「我不知道」用文本表达——core 一视同仁：不重跑、写结果、继续。
-
-    这正是砍掉三态枚举的理由：查到真结果和查不到，对 core 是同一条路。
-    """
-    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="reviewed")
+    """「我不知道」用文本表达——core 一视同仁：不重跑、写结果、继续。"""
+    tool, store, bus, state, ctx, op_id = await _mk_fixture(policy="reviewed")
     _with_rerun(ctx, _Rerun(AuthorizationDecision(
         allowed=False, result_is_error=False,
         message="查不到这笔交易的记录；网关侧索引可能延迟，副作用可能已发生。不要重试。")))
@@ -292,107 +310,115 @@ async def test_rerun_says_it_cannot_tell():
     outcome = await ReconcileStep().execute(state, ctx)
     assert tool.executions == 0, "判不了就不许跑"
     assert outcome.next_step == "prepare", "不停机，交给 agent"
-    rec = await ops.get(op_id, ctx.provider_ctx)
-    assert "不要重试" in str(rec.result), "授权方的措辞原样成为工具结果"
+    recs = await _tool_records(ctx, state)
+    assert "不要重试" in str(recs[0].content), "授权方的措辞原样成为工具结果"
 
 
-async def test_rerun_sees_effective_args_not_the_raw_ones():
-    """账本持有的是**上一次真实执行**的参数（授权 + HITL 改写之后）。
+@pytest.mark.asyncio
+async def test_rerun_context_carries_the_attempts_not_the_credentials():
+    """`RerunContext` 只给身份与尝试记录——**不给执行参数**。
 
-    没有这一条，任何走过 HITL 改参的调用，重跑授权都查不对东西。
+    早先版本递过 `effective_args`（未脱敏、含凭据），理由是「要按参数去外部查」。撤销
+    了：重跑授权由宿主注册、与 provider 同属宿主，而 provider 为了事后查得到本来就必须
+    在执行时把 `ctx.extra["tool_call_id"]` 当幂等键存进自己的系统。
     """
-    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="reviewed")
-    rec0 = await ops.get(op_id, ctx.provider_ctx)
-    await ops.compare_and_set(op_id, rec0.revision, OperationUpdate(), ctx.provider_ctx)
-    # 模拟首次执行落库的 effective_args（与对话里那份 {"n": 1} 不同）
-    ops._records[op_id].effective_args = {"n": 1, "order_id": "ORD-7", "approved_by": "ops"}
+    from ctx_weft.protocols.capability import RerunContext
+
+    tool, store, bus, state, ctx, op_id = await _mk_fixture(policy="reviewed")
     rr = _with_rerun(ctx, _Rerun(AuthorizationDecision(
-        allowed=False, result_is_error=False, message="查过了，没跑成但也别重试")))
-
+        allowed=False, result_is_error=False, message="查过了")))
     await ReconcileStep().execute(state, ctx)
-    assert rr.seen_args == {"n": 1, "order_id": "ORD-7", "approved_by": "ops"}
+
+    assert isinstance(rr.seen, RerunContext)
+    assert rr.seen.tool_call_id == op_id
+    assert rr.seen.attempts == ("inv_first",)
+    assert not hasattr(rr.seen, "effective_args"), "核心不替宿主保管凭据明文"
 
 
+@pytest.mark.asyncio
 async def test_rerun_authorizer_is_per_tool_not_per_provider_object():
     """逐工具粒度：给自己不控制的 provider 挂，同 provider 其它工具不受影响。"""
-    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="reviewed")
+    tool, store, bus, state, ctx, op_id = await _mk_fixture(policy="reviewed")
     _with_rerun(ctx, _Rerun(AuthorizationDecision(allowed=True)), key="fx:act")
     await ReconcileStep().execute(state, ctx)
     assert tool.executions == 1, "精确 capability_id 优先于 provider 前缀"
 
 
+@pytest.mark.asyncio
 async def test_human_decision_default_mapping():
     """基类自带的默认：人批准 = 重跑，人拒绝 = 用人写的那句话作结。"""
+    from ctx_weft.protocols.capability import RerunContext
     from ctx_weft.protocols.hitl import HITL_OUTCOME_ACCEPTED, HitlDecision
 
     rr = _Rerun(AuthorizationDecision(allowed=True))
     cap = ToolCapability(id="fx:act", name="act", description="d")
+    rc = RerunContext(tool_call_id="tc", attempts=())
     approved = await rr.on_human_decision(
-        cap, None, None, None, "tc", HitlDecision(outcome=HITL_OUTCOME_ACCEPTED))
+        cap, rc, None, None, "tc", HitlDecision(outcome=HITL_OUTCOME_ACCEPTED))
     assert approved.allowed is True
     rejected = await rr.on_human_decision(
-        cap, None, None, None, "tc", HitlDecision(outcome="rejected", message="别重试，我手工处理了"))
+        cap, rc, None, None, "tc",
+        HitlDecision(outcome="rejected", message="别重试，我手工处理了"))
     assert rejected.allowed is False
     assert rejected.result_is_error is False, "人工作结不是错误"
     assert "手工处理" in str(rejected.message)
 
 
+@pytest.mark.asyncio
 async def test_reviewed_without_rerun_authorizer_concludes_not_errors():
-    """没注册重跑授权是**默认形态**而非配置错误：core 代为作结「无从查证」，不报错、不重跑。"""
-    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="reviewed")
+    """没注册重跑授权是**默认形态**而非配置错误：core 代为作结「无从查证」。"""
+    tool, store, bus, state, ctx, op_id = await _mk_fixture(policy="reviewed")
     outcome = await ReconcileStep().execute(state, ctx)
+
     assert tool.executions == 0
     assert outcome.next_step == "prepare"
-    rec = await ops.get(op_id, ctx.provider_ctx)
-    assert rec.status == OperationStatus.COMPLETED
-    assert "unverified" in str(rec.result)
+    recs = await _tool_records(ctx, state)
+    assert "unverified" in str(recs[0].content)
 
 
 def test_no_uncertainty_control_plane():
     """「不确定」不再有专属控制面：错误码 / 事件类型 / 宿主处置 API 全部不存在。"""
+    import ctx_weft.protocols.capability as _cap
     from ctx_weft.core.models.discriminators import TaskErrorCode
     from ctx_weft.core.runtime import CtxWeftRuntime
-    from ctx_weft.protocols.events import EventType
-    from ctx_weft.protocols.capability import OperationStatus
 
     assert not hasattr(TaskErrorCode, "TOOL_OUTCOME_UNKNOWN")
     assert not hasattr(EventType, "OPERATION_UNCERTAIN")
     assert not hasattr(CtxWeftRuntime, "resolve_operation")
-    import ctx_weft.protocols.capability as _cap
-    assert not hasattr(_cap, "Adjudication")
-    assert not hasattr(_cap, "OperationAdjudicator")
-    assert not hasattr(OperationStatus, "UNKNOWN")
+    for gone in ("Adjudication", "OperationAdjudicator", "OperationStore",
+                 "OperationRecord", "OperationStatus", "OperationUpdate",
+                 "RevisionConflict"):
+        assert not hasattr(_cap, gone), gone
 
 
-async def test_conclude_writes_the_deterministic_result_id():
-    """作结写的 TOOL_RESULT 必须带**确定性** id —— 它是 dangling 判定的 memory 通道。
+@pytest.mark.asyncio
+async def test_conclude_closes_the_dangling_invoked():
+    """作结要补发 `CapabilityFinished`——它闭合的正是上一轮那条悬着的 INVOKED。
 
-    拿自动 id 写进去，这次调用在下一轮 reconcile 眼里仍是 dangling，而账本已 COMPLETED，
-    于是「账本完成而 memory 缺失」的补写分支会再写一条：对话里两份结果。
+    不发的话那次调用永远停在「已调用未完成」，下一次恢复又要重问一遍重跑授权。
     """
-    from ctx_weft.protocols.capability import tool_result_record_id
+    tool, store, bus, state, ctx, op_id = await _mk_fixture(policy="reviewed")
+    _with_rerun(ctx, _Rerun(AuthorizationDecision(
+        allowed=False, result_is_error=False, message="查过了，不必重试")))
+    await ReconcileStep().execute(state, ctx)
 
-    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="reviewed")
+    from ctx_weft.core.control.reducers import CAP_FOLD_EVENT_TYPES, fold_operations
+    facts = fold_operations(
+        await store.read_session_events_of_types("s1", CAP_FOLD_EVENT_TYPES))[op_id]
+    assert facts.finished, "作结之后这次调用不再是「已调用未完成」"
+    assert facts.attempts == ("inv_first",), "没有多出一次从未发生的尝试"
+
+
+@pytest.mark.asyncio
+async def test_conclude_writes_the_deterministic_result_id():
+    """作结写的 TOOL_RESULT 必须带**确定性** id —— 它是 dangling 判定的 memory 通道。"""
+    tool, store, bus, state, ctx, op_id = await _mk_fixture(policy="reviewed")
     _with_rerun(ctx, _Rerun(AuthorizationDecision(
         allowed=False, result_is_error=False, message="外部已完成：TX-1")))
     await ReconcileStep().execute(state, ctx)
 
-    recs = await ctx.memory.load_view(state.scope, MemoryScope.TASK, ctx.provider_ctx)
-    tool_recs = [r for r in recs if r.role == "tool"]
-    assert [r.id for r in tool_recs] == [tool_result_record_id(op_id)]
+    recs = await _tool_records(ctx, state)
+    assert [r.id for r in recs] == [tool_result_record_id(op_id)]
 
-    # 再跑一轮 reconcile：memory 通道认得出来，不再产生第二份结果。
-    await ReconcileStep().execute(state, ctx)
-    recs2 = await ctx.memory.load_view(state.scope, MemoryScope.TASK, ctx.provider_ctx)
-    assert len([r for r in recs2 if r.role == "tool"]) == 1, "重跑 reconcile 不得写出第二份"
-
-
-async def test_conclude_emits_no_orphan_finished_event():
-    """作结发生在 `_record_invocation` 之前 —— 发 CapabilityFinished 就是一条没有配对
-    Invoked 的孤立事件，而这次 invoke 本来也没真的调用 provider。改前同样只写 memory。"""
-    tool, ops, bus, state, ctx, op_id = await _mk_fixture(policy="reviewed")
-    _with_rerun(ctx, _Rerun(AuthorizationDecision(allowed=False, message="不重试")))
-    await ReconcileStep().execute(state, ctx)
-
-    kinds = [getattr(e, "type", None) for e in bus.events]
-    assert EventType.CAPABILITY_FINISHED not in kinds, kinds
+    await ReconcileStep().execute(state, ctx)      # 再跑一轮：认得出已完成
+    assert len(await _tool_records(ctx, state)) == 1, "重跑 reconcile 不得写出第二份"

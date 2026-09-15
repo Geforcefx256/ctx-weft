@@ -32,7 +32,6 @@ from ctx_weft.protocols.events import EventType
 from ctx_weft.providers.events import InProcessEventBus
 from ctx_weft.providers.events.store.in_memory.store import InMemoryEventStore
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
-from ctx_weft.providers.operations import InMemoryOperationStore
 
 CAP_TYPES = (EventType.CAPABILITY_INVOKED, EventType.CAPABILITY_FINISHED)
 TC = mint_call_id(anchor="asst_ei", ordinal=0, raw_id="call_1", turn_seq=1)
@@ -83,7 +82,7 @@ def _harness():
     store = InMemoryEventStore()
     bus = InProcessEventBus()
     bus.attach_commit_gate(CommitGate(store))        # required 语义
-    mem, ledger, tool = InMemoryMemoryProvider(), InMemoryOperationStore(), _Tool()
+    mem, tool = InMemoryMemoryProvider(), _Tool()
     scope = MemoryAddress(session_id="s1", task_id="t1", agent_id="a1")
     pctx = ProviderContext(session_id="s1", tenant_id="default", task_id="t1", agent_id="a1")
     state = LoopState(
@@ -92,13 +91,17 @@ def _harness():
         agent=SimpleNamespace(id="a1", template_id="tpl"), scope=scope,
         resolved_model=SimpleNamespace(model="m", account=""), sequence_counter=0)
     authz = _CountingAllow()
+    async def _read(session_id, types):
+        return await store.read_session_events_of_types(session_id, types)
+
     ctx = LoopContext(assembler=None, llm=None, memory=mem, event_bus=bus,
-                      provider_ctx=pctx, task_manager=_TM(bus))
+                      provider_ctx=pctx, task_manager=_TM(bus),
+                      read_events_of_types=_read)
     cache = CapabilityCache()
     cache.put("a1", [tool._cap()])
     gw = CapabilityGateway(
         capability_cache=cache, capability_providers=[tool], memory=mem, event_bus=bus,
-        operation_store=ledger, provider_authorizers={"fx": authz})
+ provider_authorizers={"fx": authz})
     ctx.capability_gateway = gw
     return gw, store, tool, authz, state, ctx
 
@@ -113,7 +116,9 @@ async def test_completed_reentry_leaves_no_orphan_invoked():
     """
     gw, store, tool, authz, state, ctx = _harness()
     await gw.invoke("fx__act", {}, state, ctx, tool_call_id=TC)
-    await gw.invoke("fx__act", {}, state, ctx, tool_call_id=TC)      # 重入
+    # 重入由调用侧告知（reconcile / HITL 冷续跑都知道自己是重入）——热路径一次调用
+    # 只发生一次，不该为重入白折一遍事件流。
+    await gw.invoke("fx__act", {}, state, ctx, tool_call_id=TC, reentry=True)
 
     evs = await store.read_session_events_of_types("s1", CAP_TYPES)
     kinds = [e.type for e in evs]

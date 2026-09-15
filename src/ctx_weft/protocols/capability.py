@@ -14,16 +14,19 @@
   Authorizer       — 「这次该不该跑」（事前，每次调用）
   RerunAuthorizer  — 「已经跑过一次、结果不明，还该不该再跑」（崩溃恢复时，可选）
 
-## 调用账本为什么住在这里
+## 账本为什么不在这里（也不在别处）
 
-`OperationStore` 一族曾是独立的 `protocols/operations.py`。它不是一个域，是**本域的
-持久化半边**：`RecoveryPolicy` 是 `ToolCapability` 的字段、账本键就是 tool_call 标识、
-账本只有 gateway 一个写者和 reconcile 一个读者。切成两个模块的代价是包内唯一一条模块级
-反向依赖（capability → operations），而接上 `RerunAuthorizer` 之后（它收 `Capability`、
-返回 `AuthorizationDecision`）会直接成环。
+一次工具调用的执行记录**就是它在事件流里留下的痕迹**：`CapabilityInvoked` 在 provider
+之前、经提交门确认才返回，`CapabilityFinished` 带的正是进对话的那份结果。核心不为此
+另设存储，protocols 也不为此暴露存储协议——折法住在 `core/control/reducers.py`，与
+`fold_hitl_snapshot` / `fold_pending_task_recap` 并列。
 
-包里的先例也在反方向：`events.py` 一个文件装下事件数据类型 + `EventBus` + `EventStore`
-+ `EventBlobStore`——**「存储后端协议」在本仓从来不是拆模块的理由，域才是**。
+曾经这里有一整套 `OperationStore` / `OperationRecord` / CAS revision（更早还是独立的
+`protocols/operations.py`）。它的核心承诺「调 provider 之前先把『我要动手了』持久确认
+下来」与提交门重复；其余几档各有归宿——`prepared` = 没有 INVOKED，`started` = 有
+INVOKED 无 FINISHED，`waiting_human` = HITL 自己的账，`revision` 的唯一消费方（宿主并发
+处置 API）早已删除。宿主面只剩两样：provider 声明 `RecoveryPolicy`，宿主实现
+`RerunAuthorizer`。
 """
 
 from __future__ import annotations
@@ -352,132 +355,44 @@ class AgentCapabilityProvider(CapabilityProvider, ABC):
         return []
 
 
-# ── 调用账本（spec: tool-operations）──────────────────────────────────────────
+# ── 调用事实（spec: tool-operations）──────────────────────────────────────────
 #
-# 账本把「副作用是否已发生、结果是什么」变成可判定事实，供恢复路径消费。它与工具触达
-# 的业务系统**不组成分布式事务**（方案明令不据此声称 exactly-once）。
+# 一次工具调用的执行记录**就是它在事件流里留下的痕迹**——`CapabilityInvoked` 在
+# provider 之前、经提交门确认才返回；`CapabilityFinished` 带的正是进对话的那份结果。
+# 折法住在 `core/control/reducers.py`（与 `fold_hitl_snapshot` 并列），核心不为此另设
+# 存储，protocols 也不为此暴露存储协议。
 #
-# ## 一个身份，不是两个
-#
-# 账本键就是这次调用在摄入点铸造的**内部 tool_call 标识**（``tc_...``，见
-# ``core/utils/ids.mint_call_id``）：跨轮次/跨任务/跨会话唯一，随 assistant 回合一同
-# 落库，恢复时**读出来**而不是重算。
-#
-# 曾经这里另有一个 ``tool_call_id``，由 ``(tenant, session, agent, record_id, ordinal)``
-# 派生——那是在铸造落地之前，裸 wire id 不可信（模型复用 ``call_1`` 是常态）的产物。
-# 铸造之后消息里的 id 本身已经唯一且稳定，第二条身份失去存在理由，两者合并为一；连
-# ``tool_call_id`` 这个**名字**也一并退场，免得同一个值有两个称呼。
-#
-# ``invocation_id`` 是另一回事，保留：它是单次**执行尝试**的身份（provider 据此登记
-# 在途句柄供 cancel）。一次逻辑调用可以有多次尝试。
+# 这里只留**宿主要碰的那一件**：重跑授权收到的只读事实。
 
 
-class OperationStatus(StrEnum):
-    """账本状态机。合法转移见 `OperationRecord` docstring。"""
+@dataclass(frozen=True)
+class RerunContext:
+    """崩溃恢复中交给 `RerunAuthorizer` 的只读执行事实。
 
-    PREPARED = "prepared"            # 身份已持久、尚未执行（prepared→started 之前无外部副作用）
-    STARTED = "started"              # provider 调用进行中（副作用可能已发生）
-    # 这次逻辑调用已有最终结果——**含「结果无法确定」这一种结果**。曾经另有一个
-    # UNKNOWN 状态承载后者，但它的两个消费方（停机闸门、宿主处置 API）都已删除；
-    # 结论本身住在 result 文本里，状态再分一档没有消费者。
-    COMPLETED = "completed"
-    WAITING_HUMAN = "waiting_human"  # 停在人工节点（HITL park）
+    刻意只给查证外部真值用得上的三样。更早的设计把整行账本递过来，连 `revision` /
+    存储时间戳一起——那是内核内务，宿主既不该读也不该据以分支。
 
-
-@dataclass
-class OperationRecord:
-    """一条逻辑调用的账本行。
-
-    合法转移：prepared→started→completed；waiting_human 见状态机表。
-    ``revision`` 乐观锁：每次 CAS +1，compare_and_set 期望值不匹配即拒绝。
-
-    **恢复判据只读四个字段**：``status`` / ``result`` / ``attempts`` / ``effective_args``。
-    其余是审计与诊断用的随行记录，恢复路径不读（各字段注释逐条注明），别把它们当成会
-    影响行为的开关。
+    **没有参数**。曾经这里有一个 `effective_args`（授权与 HITL 改写之后交给 provider
+    的真实入参，未脱敏），理由是「重跑授权要按参数去外部查」。撤掉了：重跑授权由宿主
+    注册、与 provider 同属宿主，而 provider 为了事后查得到，本来就必须在执行时把
+    `ctx.extra["tool_call_id"]`（= 这里的 `tool_call_id`）当幂等键存进自己的系统。
+    核心替宿主保管一份它自己已经有的凭据明文，是白担风险。
     """
 
+    #: 这次逻辑调用的身份——**同时是 provider 该用的幂等键**。
     tool_call_id: str
-    tenant_id: str
-    session_id: str
-    agent_id: str
-    assistant_record_id: str
-    tool_ordinal: int
-    tool_name: str
-    task_id: str = ""             # 随行：供宿主按 task 检索账本；core 不读
-    status: OperationStatus = OperationStatus.PREPARED   # 恢复判据
-    revision: int = 1
-    args_hash: str = ""           # 随行：授权后参数指纹（gateway 的 invocation_key）；core 不读
-    #: 恢复判据：**授权与 HITL 改写之后、真正交给 provider 的那份参数**。
-    #:
-    #: `RerunAuthorizer` 要靠它去外部查证（「查一下 order_id=X 那单成没成」）——恢复时
-    #: 手上的 dangling tool_call 只有模型给的原始参数，HITL 改过的值不在里面，`args_hash`
-    #: 又只是指纹。这也是 spec §5.1「冷恢复需要原执行参数时从受保护的 operation 存储
-    #: 读取，不从公开审计事件的 `***` 逆向恢复」唯一的兑现处。
-    #:
-    #: ⚠️ **未脱敏**：含 Authorization 头一类凭据明文。账本是受保护的执行数据——
-    #: MUST NOT 原样进事件流、SSE 或普通日志（那些通道用 audit_arguments 的脱敏副本）。
-    effective_args: dict[str, Any] | None = None
-    attempts: list[str] = field(default_factory=list)   # 恢复判据：invocation_id 列表（每次执行尝试）
-    result: Any = None                        # 恢复判据：完整结果 / ContentParts / blob ref
-    error: str | None = None
-    #: 随行：**core 不读**——所有读取点都现算 `tool_result_record_id(tool_call_id)`
-    #: （确定性派生，无需回表）。存这一列只为 SQL 侧可直接按 memory id 反查。
-    memory_result_id: str = ""
-    created_at: datetime | None = None
-    updated_at: datetime | None = None
+    #: 已发生的执行尝试（invocation_id），按时间序。`len()` 即动过几次手。
+    attempts: tuple[str, ...] = ()
+    #: 最后一次尝试的时刻，供「查最近 N 分钟有没有这笔」。
+    last_attempt_at: datetime | None = None
 
 
-@dataclass
-class OperationUpdate:
-    """CAS 携带的增量：status/result/error/attempt 追加。None 字段不更新。"""
+# ── 内部 tool_call 标识的形态契约 ──────────────────────────────────────────────
+#
+# 住在 protocols 而非 core，因为它是对**适配层**的约束：字符集与长度落在主流 provider
+# 对工具 id 要求的交集内，适配层原样透传即合法，不得编码/截断/改写。
+# 铸造实现见 `core/utils/ids.mint_call_id`。
 
-    status: OperationStatus | None = None
-    result: Any = None
-    result_set: bool = False                  # 显式区分「未更新」与「更新为 None」
-    error: str | None = None
-    append_attempt: str | None = None
-
-
-@runtime_checkable
-class OperationStore(Protocol):
-    """操作账本抽象。host 提供持久实现（SQL）；runtime 缺省注册内存版。
-
-    写失败按存储不可用处理（复用 event-commit 的隔离链路）——账本是恢复的依据，
-    静默降级会重新制造「伪装成功」。
-    """
-
-    #: 这个账本扛不扛得住进程退出。**恢复语义直接依赖它**：只有持久账本才能让
-    #: 「查不到记录」等价于「prepare 还没跑过，所以副作用确定没发生」；内存账本重启后
-    #: 一片空白，两种情形长得一模一样，那时唯一安全的答案是不重跑。
-    #:
-    #: 默认 False = 保守。自实现的 store 没声明就按不持久对待，宁可多作结一次。
-    durable: bool = False
-
-    async def get(self, tool_call_id: str, ctx: ProviderContext) -> OperationRecord | None:
-        raise NotImplementedError
-
-    async def prepare(self, record: OperationRecord, ctx: ProviderContext) -> OperationRecord:
-        """登记 PREPARED 行。幂等：同 id 同内容 no-op 返回既有行。"""
-        raise NotImplementedError
-
-    async def compare_and_set(
-        self,
-        tool_call_id: str,
-        expected_revision: int,
-        update: OperationUpdate,
-        ctx: ProviderContext,
-    ) -> OperationRecord:
-        """乐观锁推进状态机；revision 不匹配抛 RevisionConflict。"""
-        raise NotImplementedError
-
-
-class RevisionConflict(Exception):
-    """CAS 期望 revision 不匹配——后到者被拒，状态机不倒退不跳跃。"""
-
-
-#: 内部 tool_call 标识的**形态契约**（`core/utils/ids.mint_call_id` 按此铸造）。
-#: 住在 protocols 而非 core，因为它是对**适配层**的约束：字符集与长度落在主流 provider
-#: 对工具 id 要求的交集内，适配层原样透传即合法，不得编码/截断/改写。
 INTERNAL_CALL_ID_RE = re.compile(r"^tc_[0-9a-z]+_[0-9a-z]+_[0-9a-f]{12}$")
 INTERNAL_CALL_ID_MAX_LEN = 64
 
@@ -485,27 +400,10 @@ INTERNAL_CALL_ID_MAX_LEN = 64
 def is_internal_call_id(value: object) -> bool:
     """是否为摄入点铸造的内部 tool_call 标识（``tc_...``）。
 
-    这是全仓唯一的判据：账本键、TOOL_RESULT 记录 id 派生、dangling 完成判定都问它。
-    裸 wire id（无铸造的测试替身 / 宿主直构 gateway / 存量数据）判假。
+    全仓唯一的判据：恢复判据的折叠键、TOOL_RESULT 记录 id 的派生、dangling 完成判定
+    都问它。裸 wire id（无铸造的测试替身 / 宿主直构 gateway / 存量数据）判假。
     """
     return isinstance(value, str) and bool(INTERNAL_CALL_ID_RE.match(value))
-
-
-def tool_result_record_id(tool_call_id: str) -> str | None:
-    """TOOL_RESULT 的 memory 记录 id —— **只对内部标识有定义**，裸 wire id 返回 None。
-
-    内部标识形如 ``tc_{seq36}_{ord36}_{hash12}``，前缀等长，切掉 3 字符换 ``res_``。
-    确定性派生的用处有二：completed 后 memory 写失败时恢复按同一 id 幂等补写；
-    dangling 判定据它认出「这次调用已有结果」。
-
-    **返回 None 而不是硬切前缀**：本函数曾无条件 ``f"res_{tool_call_id[3:]}"``，于是
-    ``""`` → ``"res_"``、``"call_1"`` → ``"res_l_1"``——两条裸 wire id 的 dangling
-    作结会撞同一个 ``"res_"``，后一条被 memory 的 ingest 幂等契约当 no-op 吞掉：结果从
-    对话里消失，而那个 tool_call 从此永久悬挂。裸 id 本来就**不存在**确定性派生（同一个
-    ``call_1`` 可以属于任意多个回合），那就说出来，让调用方显式面对，而不是造一个
-    会撞车的值。
-    """
-    return f"res_{tool_call_id[3:]}" if is_internal_call_id(tool_call_id) else None
 
 
 # ── 授权契约 ───────────────────────────────────────────────────────────────────
@@ -613,20 +511,21 @@ class RerunAuthorizer(ABC):
     async def authorize_rerun(
         self,
         capability: Capability,
-        record: OperationRecord,
+        context: RerunContext,
         ctx: ProviderContext,
         arguments: dict[str, Any] | None = None,
         *,
         tool_call_id: str = "",
     ) -> AuthorizationDecision:
-        """``record.effective_args`` 是**上一次真实执行**的参数（授权+HITL 之后），查证
-        外部真值用它；``arguments`` 是本次恢复手上模型给的原始参数，两者可能不同。"""
+        """``context`` 是这次调用已经发生过的事实；``arguments`` 是本次恢复手上模型给的
+        原始参数。要按真实执行参数查证，用 ``context.tool_call_id`` 去 provider 自己
+        执行时留下的幂等键记录里找——核心不保管那份（见 `RerunContext`）。"""
         ...
 
     async def on_human_decision(
         self,
         capability: Capability,
-        record: OperationRecord,
+        context: RerunContext,
         ctx: ProviderContext,
         arguments: dict[str, Any] | None,
         tool_call_id: str,

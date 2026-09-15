@@ -41,9 +41,9 @@ from ctx_weft.core.capabilities.cache import CapabilityCache
 from ctx_weft.core.utils.clock import now_utc
 from ctx_weft.core.utils.ids import generate_id, is_internal_call_id
 from ctx_weft.protocols.capability import (
-    AuthorizationDecision, Authorizer, CapabilityProvider, OperationStatus,
+    AuthorizationDecision, Authorizer, CapabilityProvider,
     RecoveryPolicy, RerunAuthorizer, ToolCapabilityProvider,
-    normalize_recovery_policy, qualify, tool_result_record_id,
+    RerunContext, normalize_recovery_policy, qualify,
 )
 from ctx_weft.protocols.context import ContentPart, TextPart
 from ctx_weft.protocols.llm import RAW_ARGS_KEY
@@ -245,6 +245,22 @@ async def converge_tool_output(
     return "\n".join(parts) + "\n" + "\n".join(body)
 
 
+def tool_result_record_id(tool_call_id: str) -> str | None:
+    """TOOL_RESULT 的 memory 记录 id —— **只对内部标识有定义**，裸 wire id 返回 None。
+
+    内部标识形如 ``tc_{seq36}_{ord36}_{hash12}``，前缀等长，切掉 3 字符换 ``res_``。
+    确定性派生的用处有二：`CapabilityFinished` 已发而 TOOL_RESULT 写入失败时，恢复按
+    同一 id 幂等补写；dangling 判定据它认出「这次调用已有结果」。
+
+    **返回 None 而不是硬切前缀**：本函数曾无条件 ``f"res_{tool_call_id[3:]}"``，于是
+    ``""`` → ``"res_"``、``"call_1"`` → ``"res_l_1"``——两条裸 wire id 的 dangling 作结
+    会撞同一个 ``"res_"``，后一条被 memory 的 ingest 幂等契约当 no-op 吞掉：结果从对话
+    里消失，而那个 tool_call 从此永久悬挂。裸 id 本来就**不存在**确定性派生（同一个
+    ``call_1`` 可以属于任意多个回合），那就说出来，让调用方显式面对。
+    """
+    return f"res_{tool_call_id[3:]}" if is_internal_call_id(tool_call_id) else None
+
+
 # ── TASK 层 TOOL_RESULT 的唯一写入点（spec: tool-operations）────────────────────
 
 
@@ -343,7 +359,6 @@ class CapabilityGateway:
         spill_preview_chars: int = 1000,
         spill_tail_chars: int = 1000,
         memory_blob_store: "MemoryBlobStore | None" = None,
-        operation_store=None,
     ) -> None:
         self._cache = capability_cache
         self._providers = capability_providers
@@ -357,9 +372,6 @@ class CapabilityGateway:
         # 没接 blob store」同一口径，也让不关心多模态的构造点（含全部既有测试）行为
         # 逐字节不变。
         self._memory_blob_store = memory_blob_store
-        # spec: tool-operations（wp5）——操作账本（None = 调用方未接线，tool_call_id
-        # 存在也旁路；runtime 构造期从 registry 解析注入）。
-        self._operation_store = operation_store
         self._event_bus = event_bus
         self._provider_authorizers: dict[str, Authorizer] = provider_authorizers or {}
         if default_authorizer is None:
@@ -390,6 +402,7 @@ class CapabilityGateway:
         state: "LoopState",
         ctx: LoopContext,
         tool_call_id: str = "",
+        reentry: bool = False,
     ) -> InvocationResult:
         """执行一次工具调用，返回结构化结果。
 
@@ -432,42 +445,39 @@ class CapabilityGateway:
         # 顺序上重跑在前：注定不重跑的调用不该白跑一遍事前授权链（那可能还会 park 问人）。
         # 放行之后事前授权照常跑——「当初准跑」不等于「现在还准跑」，两者不互相顶替。
         #
-        # 账本在这里读一次，下面的执行序段复用同一份（`existing`），不再 get 第二次。
-        ledger = self._operation_store
-        existing = None
-        if ledger is not None and ledger_key:
-            existing = await ledger.get(ledger_key, ctx.provider_ctx)
+        # 判据来自**事件流**，且**只在重入时读**（`reentry=True`）。热路径一次调用只会
+        # 发生一次，折了也是空——实测五个场景里四个读到「没有」。重入只有两条来路：
+        # ReconcileStep 与 HITL 冷续跑，两者都知道自己是重入，由调用侧告知即可。
+        facts = None
+        if reentry and ledger_key and ctx.read_events_of_types is not None:
+            from ctx_weft.core.control.reducers import CAP_FOLD_EVENT_TYPES, fold_operations
+            facts = fold_operations(await ctx.read_events_of_types(
+                ctx.provider_ctx.session_id, CAP_FOLD_EVENT_TYPES)).get(ledger_key)
 
-        # 2a. 同逻辑调用重入：账本已有完整结局 → 复用结果，**这里就 return**。
+        # 2a. 同逻辑调用重入且已有结局 → 复用结果，**这里就 return**。
         #
-        # 短路点必须在 `_record_invocation` 之前。放在它之后（改造前如此）会先发一条
+        # 短路点必须在 `_record_invocation` 之前。放在它之后会先发一条
         # `CapabilityInvoked`，再从短路 return——不走 `_record_result`、不发
         # `CapabilityFinished`，于是事件流里留下一条**孤立的 INVOKED，而 provider 根本
-        # 没被调用**。事件流是宿主可见的审计面，按 Invoked/Finished 配对做 UI 的宿主会
-        # 看到一次永远悬着的调用；恢复判据若改读事件流，折出的 attempts 还会多一个从未
-        # 发生的尝试。
+        # 没被调用**（`test_capability_event_integrity.py` 钉住）。
         #
-        # 连带：重放**不再走事前授权**（改造前走完 authorize 才短路）。这是对的——重放
-        # 什么都不执行，而 authorize 问的是「能不能跑」；顺带省掉一次可能 park 问人的
-        # 授权。`test_completed_reentry_short_circuits_no_reinvoke` 钉住这一条。
-        if existing is not None and existing.status == OperationStatus.COMPLETED:
-            # spec: tool-result-recovery——重放统一收敛（D4/D6）：结果进入对话前过
-            # converge（禁全文直灌）；引用身份 = 账本原执行 invocation_id（attempts
-            # 尾项），store 逐出后以账本全文重新入库。
-            result_text = existing.result if isinstance(existing.result, str) else (
-                "[Replayed completed operation result]")
-            ref_inv = (existing.attempts[-1]
-                       if getattr(existing, "attempts", None) else invocation_id)
-            result_text = await self._converge_result(
-                result_text, ctx, ref_inv, tool_name, cap.spillable)
+        # 连带：重放**不走事前授权**——重放什么都不执行，而 authorize 问的是「能不能
+        # 跑」；顺带省掉一次可能 park 问人的授权。
+        #
+        # 事件里那份 result **就是当初进对话的收敛版**，直接用，不再收敛一遍（再来一次
+        # 会把收敛说明自己当正文又切一刀）。唯一的例外是 `spillable=False`：那类输出
+        # 不收敛，超过事件 payload 的上限就会被截断——而它们全是只读、可重新派生的
+        # （`fs__read_file` / `results__read_tool_output` / skill 的 `list_files`，清一色
+        # `side_effects=False`），正确动作是**重跑而非重放**，所以这里放它落下去。
+        if facts is not None and facts.finished and facts.result is not None                 and not facts.truncated:
             logger.info(
-                "CapabilityGateway: operation %s completed in ledger — replaying "
-                "result, provider not re-invoked", ledger_key)
+                "CapabilityGateway: %s already finished — replaying recorded result, "
+                "provider not re-invoked", ledger_key)
             return InvocationResult(
                 invocation_id=invocation_id, tool_name=tool_name,
-                content=result_text, is_error=False)
+                content=facts.result, is_error=(facts.outcome == "error"))
 
-        if existing is not None and existing.status == OperationStatus.STARTED:
+        if facts is not None and facts.invoked and not facts.finished:
             if normalize_recovery_policy(
                     getattr(cap, "recovery_policy", None)) is RecoveryPolicy.IDEMPOTENT:
                 logger.info(
@@ -475,12 +485,13 @@ class CapabilityGateway:
                     tool_name, ledger_key)
             else:
                 verdict = await self._authorize_rerun(
-                    cap, existing, state, ctx, arguments, tool_call_id, inv_key)
+                    cap, facts, state, ctx, arguments, tool_call_id, inv_key)
                 if not verdict.allowed:
                     return await self._conclude_without_rerun(
-                        state, ctx, cap, existing, verdict,
+                        state, ctx, cap, facts, verdict,
                         tool_name, invocation_id, ledger_key,
-                        tool_call_id=tool_call_id)
+                        tool_call_id=tool_call_id,
+                        is_dispatch=is_dispatch, is_silent=is_silent)
 
         # 3. Authorization：按 cap.id 前缀取 per-provider authorizer，无则用 default
         authorizer = self._get_authorizer(cap.id)
@@ -627,60 +638,9 @@ class CapabilityGateway:
             extra={**ctx.provider_ctx.extra, "tool_call_id": tool_call_id},
         )
 
-        # ── 操作账本（spec: tool-operations，wp5；方案 §5.3 执行序）──────────────
-        # 步骤 ②③：prepare → CAS started。tool_call_id 由调用侧（act/reconcile）铸好放进
-        # provider_ctx；**缺失（裸调）→ 账本全程旁路**——既有单测/宿主直构 gateway 零改动。
-        # completed 的短路在上面第 2a 步（必须早于 `_record_invocation`，理由见那里）。
-        ledger_record = None
-        if ledger is not None and ledger_key:
-            from ctx_weft.protocols.capability import (
-                OperationRecord as _OpRec, OperationStatus as _OpSt,
-                OperationUpdate as _Upd2, tool_result_record_id,
-            )
-            # `existing` 在上面第 2 步已读；重跑授权放行后到这里，状态未变。
-            try:
-                # 已有记录（重入/恢复）→ 不再 prepare：ledger_key 即身份，reconcile 注入的
-                # 记录身份字段来自原回合（gateway 的 extra 里未必带），prepare 的身份
-                # 比对会误拒。直接沿用 existing；只有无记录时才铸新行。
-                ledger_record = existing if existing is not None else await ledger.prepare(_OpRec(
-                    tool_call_id=ledger_key,
-                    tenant_id=state.session.tenant_id,
-                    session_id=state.session.id,
-                    agent_id=state.agent.id,
-                    assistant_record_id=str(ctx.provider_ctx.extra.get("assistant_record_id", "")),
-                    tool_ordinal=int(ctx.provider_ctx.extra.get("tool_ordinal", 0)),
-                    tool_name=tool_name,
-                    task_id=state.task.id if state.task is not None else "",
-                    args_hash=inv_key,
-                    # spec: tool-operations——授权与 HITL 改写之后的真实入参落库：崩溃
-                    # 恢复时 `RerunAuthorizer` 要靠它去外部查证，而那时手上的 dangling
-                    # tool_call 只有模型给的原始参数。**未脱敏**，账本是受保护数据。
-                    effective_args=dict(effective_args),
-                    memory_result_id=tool_result_record_id(ledger_key),
-                ), ctx.provider_ctx)
-                if existing is not None and existing.status == _OpSt.STARTED:
-                    # 重入（HITL 等待超时后同逻辑调用再执行）：状态已 started——不重复
-                    # 转移（started→started 非法），只追加 attempt。
-                    ledger_record = await ledger.compare_and_set(
-                        ledger_key, existing.revision,
-                        _Upd2(append_attempt=invocation_id), ctx.provider_ctx)
-                else:
-                    # waiting_human → started（人答了续跑）/ prepared → started（首启）
-                    ledger_record = await ledger.compare_and_set(
-                        ledger_key, ledger_record.revision,
-                        _Upd2(status=_OpSt.STARTED, append_attempt=invocation_id),
-                        ctx.provider_ctx)
-            except Exception as _led_exc:
-                # 账本写失败 → PersistenceUnavailableError（复用 WP3 隔离语义；D3：
-                # 账本是 H3 恢复的依据，静默降级会重新制造「伪装成功」）
-                from ctx_weft.protocols.events import PersistenceUnavailableError as _PUE
-                raise _PUE(
-                    f"operation ledger unavailable for {ledger_key!r}: {_led_exc}"
-                ) from _led_exc
-
-        # 执行期异常不在这里碰账本（spec: tool-operations，wp5）：记录**有意**留在
-        # started——副作用可能已发生、结果不可判定，这正是 started 要表达的事实。
-        # 把它改写成别的状态等于替 WP6 的恢复策略表下结论。
+        # 执行期异常不在这里补任何「结束」事件：`CapabilityInvoked` 已发而
+        # `CapabilityFinished` 未发，**正是**「副作用可能已发生、结果不可判定」这个
+        # 事实本身。补一条就等于替恢复策略下结论。
         streamed = await self._stream_tool(
             provider, cap.id, effective_args, provider_ctx, state, invocation_id,
         )
@@ -715,19 +675,9 @@ class CapabilityGateway:
                 from ctx_weft.core.loop.park import HitlPark as _HP
                 if not isinstance(_park_exc, _HP):
                     raise
-                # spec: tool-operations——park 上抛前把账本标到 waiting_human
-                # （started→waiting_human 合法）：冷/热恢复据此识别「同身份续跑」。
-                if ledger is not None and ledger_key and ledger_record is not None:
-                    from ctx_weft.protocols.capability import (
-                        OperationStatus as _Wh, OperationUpdate as _Wu)
-                    try:
-                        await ledger.compare_and_set(
-                            ledger_key, ledger_record.revision,
-                            _Wu(status=_Wh.WAITING_HUMAN), ctx.provider_ctx)
-                    except Exception:
-                        logger.exception(
-                            "ledger waiting_human mark failed for %s (park proceeds)",
-                            ledger_key)
+                # 停在人那儿这件事由 **HITL 自己的账**表达（registry 的未决请求 +
+                # HitlOpened 事件），恢复时 `ReconcileStep._waiting_human` 据此判定。
+                # 不再另记一份。
                 raise
             else:
                 # 拿到了真人的决定：原有两条路，逐字节未改。
@@ -791,19 +741,6 @@ class CapabilityGateway:
             # 过归一层：宿主 provider 可能给 dict 形态的 part（JSON 往返），
             # 与 MemoryEvent / LLMMessage 的 __post_init__ 共用同一份归一。
             content = normalize_content_parts([TextPart(text=text), *note_parts, *parts])
-
-        # ── 步骤⑤：账本 completed（持久确认）——先于 TOOL_RESULT 写与事件（spec §5.3：
-        # completed 后 memory 写失败 → 恢复按 tool_result_record_id(ledger_key) 幂等补写，
-        # 不再执行工具）。完整结果入账本（非审计截断文本；parts/blob ref 原样）——
-        # spec: tool-result-recovery 起 result 恒为**收敛前全文**（此前 spill 截断先于
-        # 账本写入，实际入账的是截断文本，偏离既有条款）。
-        if ledger is not None and ledger_key and ledger_record is not None:
-            from ctx_weft.protocols.capability import OperationStatus as _St, OperationUpdate as _Upd2
-            ledger_record = await ledger.compare_and_set(
-                ledger_key, ledger_record.revision,
-                _Upd2(status=_St.COMPLETED, result=full_text, result_set=True,
-                     error=str(metadata.get("error", "")) or None if is_error else None),
-                ctx.provider_ctx)
 
         # 7. 记录 result（事件 + TOOL_RESULT 入 memory）——审计通道（脱敏副本）
         await self._record_result(state, ctx, tool_name, invocation_id, audit_args, content, is_error, is_dispatch, is_silent, tool_call_id)
@@ -1028,12 +965,6 @@ class CapabilityGateway:
                 tool_call_id=tool_call_id, content=content, is_error=is_error,
                 invocation_id=invocation_id, tool_name=tool_name)
 
-    @property
-    def operation_store(self):
-        """调用账本（None = 未接线）。reconcile 的完成判定要读它——给个只读入口，
-        免得它继续伸手够 `_operation_store`。"""
-        return self._operation_store
-
     def _find_provider(self, capability_id: str) -> ToolCapabilityProvider | None:
         prefix = capability_id.rsplit(":", 1)[0]
         return self._provider_index.get(prefix)
@@ -1053,7 +984,7 @@ class CapabilityGateway:
         return self._rerun_authorizers.get(prefix)
 
     async def _authorize_rerun(
-        self, cap, record, state: "LoopState", ctx: "LoopContext",
+        self, cap, facts, state: "LoopState", ctx: "LoopContext",
         arguments: dict | None, tool_call_id: str, inv_key: str,
     ) -> "AuthorizationDecision":
         """问「还该不该再跑」。**恒返回一个 decision**，不抛。
@@ -1069,6 +1000,12 @@ class CapabilityGateway:
             message=(f"[Operation outcome unverified] 工具 {cap.name} 在执行中被中断，"
                      f"没有注册重跑授权，无法确定副作用是否已发生。不要重试这次调用。"))
         from ctx_weft.core.loop.park import HitlPark
+        # 内部折叠出来的事实**不直接递给宿主**：`OperationFacts` 带着 result / outcome /
+        # truncated 这些内核内务，宿主既不该读也不该据以分支。转成对外的只读视图。
+        record = RerunContext(
+            tool_call_id=tool_call_id,
+            attempts=tuple(getattr(facts, "attempts", ()) or ()),
+            last_attempt_at=getattr(facts, "last_attempt_at", None))
         rerun = self._get_rerun_authorizer(cap.id)
         if rerun is None:
             logger.info(
@@ -1104,7 +1041,6 @@ class CapabilityGateway:
         except HitlPark:
             # 冷路径：park 是控制流信号，必须穿出去。穿出前把账本标到 waiting_human
             # （started→waiting_human 合法），冷恢复据此识别「同身份停在人那儿」。
-            await self._mark_waiting_human(record, ctx)
             raise
         except Exception:
             logger.exception(
@@ -1112,60 +1048,34 @@ class CapabilityGateway:
                 cap.id)
             return unverified
 
-    async def _mark_waiting_human(self, record, ctx: "LoopContext") -> None:
-        """账本 started → waiting_human。标记失败只记日志——park 照常进行。"""
-        ledger = self._operation_store
-        if ledger is None or record is None:
-            return
-        from ctx_weft.protocols.capability import (
-            OperationStatus as _St, OperationUpdate as _Upd)
-        try:
-            await ledger.compare_and_set(
-                record.tool_call_id, record.revision,
-                _Upd(status=_St.WAITING_HUMAN), ctx.provider_ctx)
-        except Exception:
-            logger.exception(
-                "ledger waiting_human mark failed for %s (park proceeds)", record.tool_call_id)
-
     async def _conclude_without_rerun(
-        self, state: "LoopState", ctx: "LoopContext", cap, record,
+        self, state: "LoopState", ctx: "LoopContext", cap, facts,
         verdict: "AuthorizationDecision", tool_name: str, invocation_id: str,
-        ledger_key: str, *, tool_call_id: str,
+        ledger_key: str, *, tool_call_id: str, is_dispatch: bool, is_silent: bool,
     ) -> InvocationResult:
-        """作结一次不重跑的调用：账本 CAS completed + 把 verdict 的话写成工具结果。
+        """作结一次不重跑的调用：把 verdict 的话写成这次调用的工具结果。
 
         「查到了真结果」与「谁也查不到」走的是**同一条路**——对 core 而言两者没有区别，
-        差的只是 message 的内容。不发专属事件、不改 task 状态、不停机：**结果不确定是
-        一种工具结果，不是一种控制流**。agent 下一轮读到它，在任务上下文里决定怎么办。
+        差的只是 message 的内容。不改 task 状态、不停机：**结果不确定是一种工具结果，
+        不是一种控制流**。agent 下一轮读到它，在任务上下文里决定怎么办。
+
+        走 `_record_result`（发 `CapabilityFinished` + 写 TOOL_RESULT）。这里发 FINISHED
+        **不是**孤立事件——恰恰相反：作结只发生在 `facts.invoked and not facts.finished`
+        时，也就是上一轮那条 `CapabilityInvoked` 还悬着，这一发正好把它闭合。不发的话
+        那次调用会永远停在「已调用未完成」，下一次恢复又要重问一遍重跑授权。
+
+        事件用的是**原执行的** invocation_id（`facts.attempts` 尾项）而非这次重入新生成
+        的，配对才对得上。
         """
-        from ctx_weft.protocols.capability import tool_result_record_id
         text, parts = split_for_tool_result(verdict.message)
-        # spec: tool-result-recovery——凡进对话的结果统一过收敛，禁全文直灌。引用身份
-        # 沿用账本记录的原执行 invocation_id（attempts 尾项），不是这次重入新生成的。
-        ref_inv = record.attempts[-1] if getattr(record, "attempts", None) else invocation_id
+        ref_inv = facts.attempts[-1] if getattr(facts, "attempts", None) else invocation_id
+        # spec: tool-result-recovery——凡进对话的结果统一过收敛，禁全文直灌。
         text = await self._converge_result(text, ctx, ref_inv, tool_name, cap.spillable)
-        ledger = self._operation_store
-        if ledger is not None and ledger_key:
-            from ctx_weft.protocols.capability import (
-                OperationStatus as _St, OperationUpdate as _Upd)
-            try:
-                await ledger.compare_and_set(
-                    ledger_key, record.revision,
-                    _Upd(status=_St.COMPLETED, result=text, result_set=True),
-                    ctx.provider_ctx)
-            except Exception:
-                # 账本写不进去不该拦住「把结果告诉 agent」——后者才是这一步的产出。
-                logger.exception("CapabilityGateway: ledger conclude failed for %s", ledger_key)
         content: "str | list[ContentPart]" = (
             normalize_content_parts([TextPart(text=text), *parts]) if parts else text)
-        # 走 `ingest_tool_result`（记录 id 的决定收在那一处），但**不走 `_record_result`**：
-        # 作结发生在 `_record_invocation` 之前，发 CapabilityFinished 就是一条没有配对
-        # Invoked 的孤立事件，而这次 invoke 本来也没真的调用 provider。
-        await ingest_tool_result(
-            self._memory, ctx.provider_ctx, _tool_scope(state),
-            tool_call_id=tool_call_id, content=content,
-            is_error=verdict.result_is_error, invocation_id=ref_inv,
-            tool_name=tool_name, via="rerun-denied")
+        await self._record_result(
+            state, ctx, tool_name, ref_inv, {}, content,
+            verdict.result_is_error, is_dispatch, is_silent, tool_call_id)
         logger.info("CapabilityGateway: %s concluded without re-running", ledger_key)
         return InvocationResult(
             invocation_id=invocation_id, tool_name=tool_name,

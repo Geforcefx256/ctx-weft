@@ -7,6 +7,7 @@ RunStateView.sessions / .tasks 包含完整的 Session/Task 投影。
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
@@ -992,3 +993,91 @@ def fold_hitl_snapshot(events: list[Event]) -> HitlSnapshot:
                 snap.decisions_for[key] = (decision, req.resume_state)
 
     return snap
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# capability 调用折叠（spec: tool-operations）
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# 一次工具调用在事件流里留下的痕迹，就是它的执行记录——不需要第二个存储。
+#
+# 曾经有一张 `operations` 表（`OperationStore` / `OperationRecord` / CAS revision）
+# 记同样的事。它的核心承诺是「在调 provider 之前把『我要动手了』持久确认下来」，
+# 而 `CapabilityInvoked` 经提交门 emit 时**本来就**是先拿到存储确认才返回的——
+# 那两次 CAS 是重复劳动。其余几档也各有归宿：
+#
+#   prepared      → 没有 INVOKED 就是没跑过（授权拒绝时事件流一条都没有）
+#   started       → 有 INVOKED、无 FINISHED
+#   completed     → 有 FINISHED，payload 带的正是进对话的那份收敛版
+#   waiting_human → HITL 有自己的事件集与 `fold_hitl_snapshot`
+#   revision CAS  → 唯一消费者（宿主并发处置 API）已删，无并发写者
+#
+# 与 `reduce_events` 的分工：那个折的是常驻状态（每步都读、进快照）；这个只在恢复
+# 与重入时问一次，所以和 `fold_hitl_snapshot` / `fold_pending_task_recap` 同类——
+# 折出来就用，不存。比 HITL 折叠还省一层：未决 HITL 的年龄没有上界所以不能截尾，
+# 而 dangling tool_call 必定在最后一个 assistant 回合之后，读最近一段即可。
+
+#: 折叠所需的事件类型。供事件库按类型过滤读取，无需全量回放。
+CAP_FOLD_EVENT_TYPES: tuple[EventType, ...] = (
+    EventType.CAPABILITY_INVOKED,
+    EventType.CAPABILITY_FINISHED,
+)
+
+
+@dataclass(frozen=True)
+class OperationFacts:
+    """一次逻辑调用在事件流里留下的痕迹。**折出来的，不存。**"""
+
+    #: 有 `CapabilityInvoked` = provider 被调用过，副作用可能已发生。
+    #: 反过来更有用：**没有就是确定没跑过**——gateway 的 `_record_invocation` 在
+    #: provider 之前、在授权与参数校验之后，所以拒绝与校验失败都不会留下这条。
+    invoked: bool = False
+    finished: bool = False
+    #: 各次执行尝试的 invocation_id，按事件顺序。
+    attempts: tuple[str, ...] = ()
+    #: `CapabilityFinished` 里那份结果——**就是进对话的收敛版**，重放直接用，
+    #: 不必也不该再生成一遍。
+    result: str | None = None
+    outcome: str | None = None
+    #: 结果原始长度。`> len(result)` 说明事件 payload 的 8000 上限把它截断了——
+    #: 只可能发生在 `spillable=False`（不收敛）的工具上，而那类全是只读可重新派生的。
+    result_length: int | None = None
+    last_attempt_at: "datetime | None" = None
+
+    @property
+    def truncated(self) -> bool:
+        """事件里这份结果是不是被截断的（重放前要据此决定重跑还是复用）。"""
+        return (self.result_length or 0) > len(self.result or "")
+
+
+def fold_operations(events: list[Event]) -> dict[str, OperationFacts]:
+    """按 tool_call_id 折 `CapabilityInvoked` / `CapabilityFinished`。
+
+    键是摄入点铸造的内部 tool_call 标识（`tc_...`）——裸 wire id 的调用同样会进来，
+    调用方自行按 `is_internal_call_id` 取舍（跨回合复用的裸 id 会互相覆盖，那是存量
+    数据的既定歧义，见 capability `conversation-integrity`）。
+    """
+    out: dict[str, OperationFacts] = {}
+    for ev in events:
+        payload = ev.payload or {}
+        tool_call_id = payload.get("tool_call_id") or ""
+        if not tool_call_id:
+            continue
+        facts = out.get(tool_call_id, OperationFacts())
+        if ev.type == EventType.CAPABILITY_INVOKED:
+            facts = replace(
+                facts,
+                invoked=True,
+                attempts=(*facts.attempts, payload.get("invocation_id", "")),
+                last_attempt_at=ev.timestamp,
+            )
+        elif ev.type == EventType.CAPABILITY_FINISHED:
+            facts = replace(
+                facts,
+                finished=True,
+                result=payload.get("result"),
+                outcome=payload.get("outcome"),
+                result_length=payload.get("result_length"),
+            )
+        out[tool_call_id] = facts
+    return out

@@ -59,10 +59,6 @@ class ProviderRegistry:
         self._null_blob_store: "MemoryBlobStore | None" = None
         self._event_blob_store: "EventBlobStore | None" = None
         self._null_event_blob_store: "EventBlobStore | None" = None
-        # spec: tool-operations（wp5）——操作账本：显式注册 > 内存默认（惰性单例）
-        self._operation_store = None
-        self._operation_store_registered = False
-        self._in_memory_operation_store = None
 
     # ── Memory ────────────────────────────────────────────────────────────────
 
@@ -198,29 +194,6 @@ class ProviderRegistry:
             from ctx_weft.protocols import NullMemoryBlobStore
             self._null_blob_store = NullMemoryBlobStore()
         return self._null_blob_store
-
-    # ── OperationStore（spec: tool-operations，wp5）───────────────────────────
-
-    def register_operation_store(self, store: "object") -> None:
-        """注册工具操作账本。未注册时 get_operation_store() 返回内存默认实现
-        （进程内可用；跨进程恢复需宿主显式注入 SQL/持久实现——runtime 起动时据
-        registered 标志如实报告能力差异）。"""
-        self._operation_store = store
-        self._operation_store_registered = True
-
-    def get_operation_store(self):
-        """取操作账本。两级：显式注册 > InMemoryOperationStore（惰性单例）。"""
-        if self._operation_store is not None:
-            return self._operation_store
-        if self._in_memory_operation_store is None:
-            from ctx_weft.providers.operations import InMemoryOperationStore
-            self._in_memory_operation_store = InMemoryOperationStore()
-        return self._in_memory_operation_store
-
-    @property
-    def operation_store_registered(self) -> bool:
-        """宿主是否显式注册了持久账本（False = 内存默认，跨进程恢复能力缺失）。"""
-        return self._operation_store_registered
 
     # ── EventBlobStore ───────────────────────────────────────────────────────
 

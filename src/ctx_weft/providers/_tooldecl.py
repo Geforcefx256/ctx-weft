@@ -10,7 +10,7 @@ import inspect
 from collections.abc import Callable
 
 from ctx_weft.core.capabilities.schema import extract_schema
-from ctx_weft.protocols.capability import Purpose, ToolCapability
+from ctx_weft.protocols.capability import normalize_recovery_policy, Purpose, ToolCapability
 
 
 def make_tool_registry(provider_name: str):
@@ -32,6 +32,7 @@ def make_tool_registry(provider_name: str):
         side_effects: bool = False,
         spillable: bool = True,
         description: str | None = None,
+        recovery_policy: str = "reviewed",
     ):
         """声明并注册工具：提取 schema，存函数体为实现。
 
@@ -47,6 +48,10 @@ def make_tool_registry(provider_name: str):
                 description=description or doc,
                 input_schema=extract_schema(fn),  # ctx 已在 _SCHEMA_SKIP_DEFAULT 中
                 side_effects=side_effects,
+                # 崩溃后该工具的在途调用能不能自动重跑。默认 reviewed（保守）；
+                # 只读、可重新派生的工具（read_file / read_tool_output）声明 idempotent
+                # ——重跑它们既安全又是唯一合理的恢复动作。
+                recovery_policy=normalize_recovery_policy(recovery_policy),
                 spillable=spillable,
             )
             tools[fn.__name__] = cap
