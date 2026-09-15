@@ -75,9 +75,11 @@ class ToolCapability(Capability):
     # spec: tool-operations（wp6）——恢复策略（崩溃后该工具的 started 操作能不能自动
     # 重跑）。**只有两类**，判据是「core 要不要做决定」：
     #   idempotent  重跑安全 → core 同 op_id 直接重跑
-    #   reviewed    默认——core 绝不自行重跑，交裁决链（Provider 实现
-    #               OperationAdjudicator 则由它裁，否则落到人 resolve_operation）
+    #   reviewed    默认——core 绝不自行重跑，交裁决链：Provider 实现
+    #               OperationAdjudicator 则由它答「该不该重跑」，未实现则 core 代为
+    #               作结「无从查证」。两条都不停机——不确定是工具结果不是控制流。
     # 刻意不从 side_effects 推断：MCP/旧 Provider 的副作用声明可能不完整（方案 §5.4）。
+    # **这里是恢复策略的唯一读取点**（reconcile 读活声明）；账本行上的同名列不参与判定。
     recovery_policy: RecoveryPolicy = RecoveryPolicy.REVIEWED
 
 

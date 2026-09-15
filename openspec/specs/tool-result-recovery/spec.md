@@ -44,7 +44,7 @@
 
 ### Requirement: 账本与重放的收敛分层
 
-操作账本 completed 记录 SHALL 持收敛前全文（或对结果存储的持久引用），MUST NOT 持收敛版。凡结果进入对话上下文的重放/补写入口——completed 短路重放、恢复时「账本已完成而 memory 缺失」的补写、queryable 查询重放、宿主处置 `supply_result`——MUST 统一重走收敛，禁止全文直灌。重放产生的收敛版 MUST 引用可解析的执行身份：沿用账本记录的原执行 invocation_id（而非重放路径新生成的执行身份）；结果存储未命中该键时 SHALL 先以账本全文重新入库再收敛，重放入库失败时按存储失败显式标记。
+操作账本 completed 记录 SHALL 持收敛前全文（或对结果存储的持久引用），MUST NOT 持收敛版。凡结果进入对话上下文的重放/补写入口——completed 短路重放、恢复时「账本已完成而 memory 缺失」的补写、裁决作结（`Adjudication.conclude` 给出的 result，含 core 代为作结的「无从查证」文本）——MUST 统一重走收敛，禁止全文直灌。重放产生的收敛版 MUST 引用可解析的执行身份：沿用账本记录的原执行 invocation_id（而非重放路径新生成的执行身份）；结果存储未命中该键时 SHALL 先以账本全文重新入库再收敛，重放入库失败时按存储失败显式标记。
 
 #### Scenario: 账本存全文
 
@@ -61,9 +61,9 @@
 - **WHEN** 内存结果存储被清空（逐出/重启），同逻辑调用经持久账本 completed 短路重放
 - **THEN** 重放以账本全文重新入库（键 = 账本记录的原执行 invocation_id），收敛版中的回取引用可实际取回内容
 
-#### Scenario: 宿主补结果同样收敛
+#### Scenario: 裁决作结的结果同样收敛
 
-- **WHEN** 结果未知（unknown）的操作由宿主经 `supply_result` 补入完整结果
+- **WHEN** `reviewed` 操作经裁决作结（裁决者查到的外部结果，或 core 代为作结的「无从查证」说明）补入对话
 - **THEN** 该结果进入对话时为收敛版，非全文直灌
 
 ### Requirement: 存储失败显式标记

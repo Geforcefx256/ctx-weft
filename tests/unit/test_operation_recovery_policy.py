@@ -1,9 +1,10 @@
 """恢复策略表全分支（spec: tool-operations；wp6-2.2，design D2）。
 
 组件级：真 reconcile + 真 gateway + 真账本（内存），policy 经 capability 声明。
-分派矩阵：reviewed 不重跑 / idempotent 同 op_id 恰一次 / 存量无身份 unknown /
-call_1 复用串扰根治。裁决链三态与 cancel 闭环见下方与 test_gateway_operation_ledger
-与 test_tool_outcome_unknown。
+分派矩阵：reviewed 交裁决链不自行重跑 / idempotent 同 op_id 恰一次 / 无账本记录作结
+「无从查证」/ call_1 复用串扰根治 / 裁决链两分支（rerun / conclude）+ 无裁决者默认形态。
+账本执行序见 test_gateway_operation_ledger，真子进程强退见
+tests/integration/test_operation_crash_matrix.py。
 """
 from __future__ import annotations
 

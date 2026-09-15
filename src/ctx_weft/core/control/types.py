@@ -67,7 +67,6 @@ class TaskView:
     dag_deps: list[str] = field(default_factory=list)
     priority: int = 5
     max_retries: int = 3
-    # spec: execution-limits（wp8）——budget 已消费量投影
     tenant_id: str = "default"
     outputs: Any = None
     error: str | None = None

@@ -1,17 +1,17 @@
-"""WP0 基线夹具（H3）：工具副作用完成后结果写入失败，恢复盲目重跑。
+"""H3 契约锚：工具副作用已发生、结果写入失败 → 恢复**不重跑**（spec: tool-operations）。
 
-钉住 2026-09-11 可靠性方案 H3 的**缺陷现状**（探针 verify_agent_architecture.py
-`recovery_duplicate` 的 pytest 移植；上游 docs/plans/2026-09-11-agent-core-
-reliability-plan.md §1.2/§5）：ReconcileStep 对无配对 TOOL_RESULT 的 dangling
-tool_call 一律经 gateway 重新执行（reconcile.py）——外部副作用已发生、只是结果没写进
-memory 的场合，恢复会把非幂等副作用再执行一遍。全仓无 operation_id/幂等账本。
+本文件原是 WP0 的**缺陷基线**夹具（钉住 2026-09-11 可靠性方案 H3 的旧行为：
+ReconcileStep 对无配对 TOOL_RESULT 的 dangling tool_call 一律经 gateway 重新执行，
+外部副作用被执行两次），在 WP5/WP6 落地后**有意翻转**为现契约。
 
 外部副作用用**独立子进程 + SQLite 计数器**承载（design D5）：副作用证据落在外部
 文件里，不随测试进程内存消失——「Runtime 崩溃后副作用仍在」由新开连接可读来模拟。
-真正的进程退出矩阵归 WP6（方案 O-T05/O-T06），本夹具只要「故障点之后计数器可读」。
+真子进程强退的形态见 `test_operation_crash_matrix.py`（O-T05/O-T06）。
 
-⚠️ 本文件断言的是**旧契约**（缺陷行为），供 WP6（恢复策略 + 操作账本）实施时
-**有意翻转**：翻转后 manual 策略下外部副作用计数保持 1、操作进入 unknown 等宿主处置。
+⚠️ 本例走的是**无账本记录**那条分支：`tool_call_id` 是裸 wire id（`effect_test`，非
+摄入点铸造的 `tc_...`），`is_internal_call_id` 判假 → 账本全程旁路 → reconcile 读不到
+记录 → 作结「无账本记录，无从查证」。它钉的是「一律不盲重跑」这条底线，**不**覆盖
+`started + reviewed` 的裁决链——那条由 `tests/unit/test_operation_recovery_policy.py` 钉。
 """
 from __future__ import annotations
 
@@ -76,7 +76,7 @@ class _ExternalEffectTool(ToolCapabilityProvider):
         return ToolCapability(
             id="probe:record", name="record", description="Simulated external operation",
             side_effects=True,
-            # wp6：显式 manual——钉「未知结果不自动重跑」的默认保守语义
+            # 显式写出默认值：reviewed = core 绝不自行重跑（本例实际走无记录分支）
             recovery_policy="reviewed",
         )
 
@@ -130,8 +130,8 @@ def _fixture(db_path):
     return memory, state, ctx, tool
 
 
-async def test_result_write_failure_then_reconcile_reruns_side_effect(tmp_path):
-    """wp6 契约锚：副作用完成后结果写失败 → manual 策略保守停住 → 外部计数 = 1。"""
+async def test_result_write_failure_then_reconcile_does_not_rerun(tmp_path):
+    """契约锚：副作用完成后结果写失败 → 恢复作结不重跑 → 外部计数 = 1。"""
     db = tmp_path / "effects.sqlite"
     memory, state, ctx, tool = _fixture(db)
 
@@ -169,9 +169,9 @@ async def test_result_write_failure_then_reconcile_reruns_side_effect(tmp_path):
     with patch("ctx_weft.core.loop.steps.reconcile.resolve_and_bind", new=AsyncMock()):
         await ReconcileStep().execute(state, ctx)
 
-    # wp6 翻转后契约（spec: tool-operations）：默认 reviewed → 副作用保持 1 次，
-    # 不盲重跑。作结写成工具结果后循环继续，不停机（见 test_operation_recovery_policy）
+    # 翻转后契约（spec: tool-operations）：无账本记录 → 作结「无从查证」，副作用保持
+    # 1 次。作结写成工具结果后循环继续，不停机（见 test_operation_recovery_policy）
     external_effects = _read_effects(db)
     assert external_effects == 1, (
-        f"reviewed policy must NOT re-run the completed side effect (got {external_effects})")
+        f"recovery must NOT re-run the completed side effect (got {external_effects})")
     assert len(set(tool.invocations)) == 1

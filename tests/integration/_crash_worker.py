@@ -33,7 +33,7 @@ TOOL_SLEEP_SEC = 3.0
 
 
 class _SlowEffectTool(ToolCapabilityProvider):
-    """副作用（计数文件 + marker）→ 睡 3s → 返回。manual 策略。"""
+    """副作用（计数文件 + marker）→ 睡 3s → 返回。默认 reviewed 策略。"""
 
     name = "slow"
 
@@ -164,7 +164,7 @@ async def ot05_recover(workdir: Path) -> dict:
         try:
             await rt.recover_agent(ids["agent_id"])
         except Exception:
-            pass  # manual unknown → 闸门拒绝续跑（O-T05 预期）
+            pass  # 恢复期异常不影响判据：O-T05 只看外部副作用计数是否仍为 1
         await asyncio.sleep(1.0)
     return {"recovered": True}
 

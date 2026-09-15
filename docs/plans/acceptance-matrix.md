@@ -29,30 +29,28 @@
 | O-T01 | 认证头原值 | `test_gateway_argument_channels.py::test_provider_receives_original_authorization_header` |
 | O-T02 | 人类修改参数 | `test_gateway_argument_channels.py::test_provider_receives_hitl_modified_header_unredacted` |
 | O-T03 | prepared 前崩溃 | `test_operation_recovery_policy.py::test_prepared_runs_first_execution`（prepared→started 转移）|
-| O-T04 | started 后 manual | `test_operation_recovery_policy.py::test_manual_started_goes_unknown_not_rerun` |
-| O-T05 | 外部成功 completed 前崩溃 manual | `test_operation_crash_matrix.py::test_ot05_manual_started_real_exit_side_effect_once`（**真子进程退出**）|
+| O-T04 | started 后 reviewed（默认） | `test_operation_recovery_policy.py::test_reviewed_started_concludes_without_rerun` + `::test_reviewed_without_adjudicator_concludes_not_errors` |
+| O-T05 | 外部成功 completed 前崩溃 reviewed | `test_operation_crash_matrix.py::test_ot05_reviewed_started_real_exit_side_effect_once`（**真子进程退出**）|
 | O-T06 | completed 后 memory 写前崩溃 | `test_operation_crash_matrix.py::test_ot06_completed_memory_write_crash_ledger_backfills` |
 | O-T07 | memory 后 Finished 前崩溃 | memory 幂等 + 通知补发——`test_gateway_operation_ledger.py::test_full_execution_order_records_completed`（顺序含 Finished）；完整崩溃间隙由 O-T05 的真退出覆盖 |
 | O-T08 | 多次重入同 operation_id | `test_gateway_operation_ledger.py::test_completed_reentry_short_circuits_no_reinvoke` |
-| O-T09 | 两条 assistant 同 call_1 同参 | `test_operation_identity.py::test_two_identical_legal_calls_dont_merge` |
+| O-T09 | 两条 assistant 同 call_1 同参 | `test_conversation_pairing.py::test_mint_deterministic_and_differentiating`（铸造面：同 raw 不同回合 → 不同 id）+ `test_operation_recovery_policy.py::test_call1_reuse_no_cross_talk`（账本面：不误判完成）|
 | O-T10 | HITL 热/冷竞态 | `test_hitl_e2e_v2.py::test_cold_approval_reconciles_and_invokes_the_tool_exactly_once` |
-| O-T11 | unknown 后 recover_agent | `test_resolve_operation.py::test_gate_blocks_recover_on_unknown` |
-| O-T12 | 两宿主并发 resolve | `test_resolve_operation.py::test_revision_mutex_two_concurrent_resolutions` |
+| ~~O-T11~~ | ~~unknown 后 recover_agent~~ | **条目作废**——「结果不确定」不再是控制流，没有停机闸门可测。现契约（无专属错误码/事件/处置 API）由 `test_operation_recovery_policy.py::test_no_uncertainty_control_plane` 反向钉住 |
+| ~~O-T12~~ | ~~两宿主并发 resolve~~ | **条目作废**——`resolve_operation` 已删除。账本自身的 revision 乐观锁由 `test_operation_store_conformance.py::test_cas_serializes_and_rejects_stale` 覆盖 |
 | O-T13 | 结果超 8000 字符或含图片 | `test_operation_store_conformance.py::test_full_roundtrip_with_parts_and_blob_ref`（blob ref 往返）|
 | O-T14 | delegate 确认丢失 | `test_operation_crash_matrix.py::test_ot14_delegate_completed_reentry_no_duplicate_children` |
-| O-T15 | 授权撤销后重试 | `test_operation_recovery_policy.py::test_legacy_no_ledger_record_goes_unknown`（保守面）；完整授权重查由 gateway 既有授权链覆盖 |
-| O-T16 | 远端取消失败 | **未单独立项**——wp7 的 uncooperative provider 标记（`test_execution_limits.py::test_provider_timeout_marks_uncooperative`）覆盖「未终止可见 + 同会话拒绝」的语义面 |
+| O-T15 | 授权撤销后重试 | `test_operation_recovery_policy.py::test_legacy_no_ledger_record_concludes_without_rerun`（保守面）；完整授权重查由 gateway 既有授权链覆盖 |
+| O-T16 | 远端取消失败 | **未落地**——原锚在 wp7 的 uncooperative provider 标记上，wp7 的 `ExecutionLimits` 已整体移除（计时与打断判定为宿主策略，不属 SDK 职责），该语义面当前无 core 侧实现可测 |
 
-## L-T：限制与扩展（6 条）
+## L-T：限制与扩展（6 条）——**整表作废**
 
-| 条目 | 测试锚 |
-|---|---|
-| L-T01 opt-in deadline | `test_execution_limits.py::test_actor_turn_limit_interrupts` |
-| L-T02 长 HITL 不计量 | `test_execution_budget.py::test_parked_correct_arithmetic`（park 不计）|
-| L-T03 retry 不重置 | `test_execution_budget.py::test_retry_accumulates_across_runs` |
-| L-T04 重启恢复 | `test_budget_persisted.py::test_restore_continues_remaining_budget` + `test_budget_persisted.py::test_budget_snapshot_written_to_task_projection` |
-| L-T05 不合作 Provider | `test_execution_limits.py::test_provider_timeout_marks_uncooperative` |
-| L-T06 旧字段警告不激活 | `test_execution_limits.py::test_deprecation_warnings_deduplicated` |
+WP7 的 `ExecutionLimits`（step/task/provider 超时、actor 轮数、预算持久化）连同 WP8 的
+budget persisted 接线已整体移除：计时与打断是宿主策略，不是 SDK 职责。L-T01–L-T06 六条
+全部失去被测对象，对应的 `test_execution_limits.py` / `test_execution_budget.py` /
+`test_budget_persisted.py` 均已不在仓内。**不要按本表去找这些文件。**
+
+现存的有效限制（act 轮数上限、LLM 自愈预算、内置 shell 超时）是既有机制，不在本矩阵范围内。
 
 ## X-T：扩展（2 条）——归 WP9
 

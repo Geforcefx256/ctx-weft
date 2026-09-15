@@ -1,6 +1,22 @@
 # ctx-weft 架构可靠性与扩展边界实施方案
 
 > **实施流程：** 使用 `superpowers:executing-plans` 按工作包执行；先建立失败用例，再改变实现。本文是待验证方案，不表示修复已经完成。
+>
+> ---
+>
+> ⚠️ **本文是 2026-09-11 的原始方案，不是当前实现的描述。** 实施过程中下列设计被**推翻重做**，
+> 以 `openspec/specs/` 下的 capability spec 与 `ARCHITECTURE.md` 为准：
+>
+> | 方案原文 | 实际落地 |
+> |---|---|
+> | §5.2 `operation_id` 由 `(tenant, session, agent, assistant_record_id, tool_ordinal)` 派生 | **合并掉了**——`operation_id` 就是摄入点铸造的内部 tool_call 标识 `tc_...`，随消息落库，恢复时读出而非重算 |
+> | §5.4 四值策略 `retry_safe / idempotent / queryable / manual` + 七行状态×策略表 | **收成两值** `idempotent / reviewed`；裁决能力由 `isinstance(provider, OperationAdjudicator)` 发现，不是策略值 |
+> | §5.4 裁决三态 `completed / definitely_not_started / unknown` | **换成 `Adjudication.rerun: bool` + `result`**——只问「该不该重跑」，不问「发生了什么」 |
+> | §5.5 结果未知的宿主处置（`TOOL_OUTCOME_UNKNOWN` / `OperationUncertain` / `runtime.resolve_operation` / 恢复闸门 / `OperationStatus.UNKNOWN`） | **全部删除**——「结果不确定」是一种工具结果，不是一种控制流 |
+> | §6 `ExecutionLimits` opt-in 执行限制（H5） | **整体撤销**——计时与打断是宿主策略，不是 SDK 职责。`Task.timeout_ms` / `RuntimeConfig.default_task_timeout_ms` 已删且未替代 |
+> | §4.3 `OrderedEventStore` 独立协议 | **并入 `EventStore` 本体**为必需方法，不另立平行协议；`read_after` 删除 |
+>
+> H1–H4 的问题定位与验收口径仍然有效（探针 `verification/verify_agent_architecture.py --expect fixed` 四项 True）。
 
 **Goal：** 让事件提交、快照恢复和工具重入有可测试的可靠性契约，并逐步降低宿主扩展 Agent 内核时必须修改 core 的范围。
 
@@ -445,7 +461,7 @@ MemoryProvider 暂时保留聚合接口以降低迁移成本。不要把工作�
 ### WP0：固化证据与验收夹具
 
 - 已提供：`docs/plans/verification/verify_agent_architecture.py`。
-- 新建：`tests/integration/test_runtime_storage_failure.py`、`tests/integration/test_snapshot_commit_interleaving.py`、`tests/integration/test_tool_outcome_unknown.py`。
+- 新建：`tests/integration/test_runtime_storage_failure.py`、`tests/integration/test_snapshot_commit_interleaving.py`、`tests/integration/test_tool_outcome_not_rerun.py`。
 - 先把四个探针移植为完整 Runtime 测试；使用 asyncio.Event/barrier 控制时序，不用随机 sleep 碰运气。
 - H3 增加子进程夹具：外部模拟服务使用独立 SQLite 计数器，确保 Runtime 进程退出后副作用证据仍存在。测试目录用 tmp_path，不连接真实服务。
 - 保存原分支与候选分支的 pytest 输出、故障位置、Git SHA、Python/数据库版本。
@@ -501,7 +517,7 @@ MemoryProvider 暂时保留聚合接口以降低迁移成本。不要把工作�
 - 新建：`tests/unit/test_operation_recovery_policy.py`、`tests/integration/test_operation_crash_matrix.py`。
 - 验证所有恢复策略表分支；未知副作用不得因 generic retry、recover_agent 或 HITL 冷回复而被重复执行。
 - control/delegate 使用操作身份去重；测试创建子任务成功后确认丢失。
-- 命令：`.venv/Scripts/python.exe -m pytest tests/unit/test_operation_recovery_policy.py tests/integration/test_operation_crash_matrix.py tests/integration/test_tool_outcome_unknown.py tests/unit/test_hitl_reconcile.py tests/integration/test_crash_recovery_reconcile.py -q`。
+- 命令：`.venv/Scripts/python.exe -m pytest tests/unit/test_operation_recovery_policy.py tests/integration/test_operation_crash_matrix.py tests/integration/test_tool_outcome_not_rerun.py tests/unit/test_hitl_reconcile.py tests/integration/test_crash_recovery_reconcile.py -q`。
 - 更新旧“所有 dangling 都重跑”的测试，仅在明确 retry_safe 的夹具中继续要求重跑。
 
 ### WP7：执行限制与无效配置迁移

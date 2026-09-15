@@ -1,7 +1,7 @@
 """子进程强退矩阵（spec: tool-operations；wp8-2，方案 O-T05/O-T06/O-T14）。
 
 真子进程退出 + 新 Runtime 实例（无桩 h3 的 pytest 形态）。三条：
-- O-T05：manual started → 真退出 → 新实例 → 副作用 1 次 + INTERRUPTED + unknown
+- O-T05：reviewed started → 真退出 → 新实例 → 副作用 1 次（不重跑，作结后续跑）
 - O-T06：completed 后 memory 写前崩溃 → 新实例从账本补写 TOOL_RESULT，不重执行
 - O-T14：delegate 的 op completed 后确认丢失 → 重入找回原 child（不双建）
 """
@@ -65,8 +65,8 @@ def _count_effects(workdir: Path) -> int:
     return sum(1 for line in f.read_text(encoding="utf-8").splitlines() if line.startswith("EFFECT"))
 
 
-async def test_ot05_manual_started_real_exit_side_effect_once(tmp_path):
-    """O-T05：manual started → worker 子进程硬杀 → 新实例 recover → 副作用 1 次。"""
+async def test_ot05_reviewed_started_real_exit_side_effect_once(tmp_path):
+    """O-T05：reviewed started → worker 子进程硬杀 → 新实例 recover → 副作用 1 次。"""
     workdir = tmp_path / "ot05"
     workdir.mkdir()
     marker = workdir / "effect_done.marker"
@@ -93,7 +93,7 @@ async def test_ot05_manual_started_real_exit_side_effect_once(tmp_path):
     )
     final_count = _count_effects(workdir)
     assert final_count == 1, (
-        f"O-T05: manual policy must NOT re-run side effect after real crash "
+        f"O-T05: reviewed policy must NOT re-run side effect after real crash "
         f"(got {final_count})")
 
 

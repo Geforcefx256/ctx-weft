@@ -16,7 +16,6 @@ class RuntimeConfig:
     # 存储提交再对外通知，存储失败显式抛 PersistenceUnavailableError 并隔离会话；
     # best_effort = 旧观察者路径（吞存储错误），启动告警、不可靠恢复。
     event_commit_policy: str = "required"
-    # opt-in 执行限制（spec: execution-limits，wp7）：None = 不注入 = 零行为变化。
     task_max_concurrent: int = 4
     task_max_retries: int = 3
     default_token_budget: int = 200_000
@@ -25,7 +24,6 @@ class RuntimeConfig:
     spill_preview_chars: int = 1000
     # spec: tool-result-recovery——收敛版尾部预览字符数（错误/结论高发区立即止血）。
     spill_tail_chars: int = 1000
-    # spec: context-evidence——证据动态提级：per-source top-K（硬上界，0 关闭）∧ score 下限。
     # LLM 瞬时故障自愈预算（stream_llm_resilient 读取；默认=历史安全值）
     llm_self_heal_max_attempts: int = 8
     llm_self_heal_max_duration_sec: float = 300.0

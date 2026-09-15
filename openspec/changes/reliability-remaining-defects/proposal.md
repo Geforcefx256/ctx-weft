@@ -1,6 +1,13 @@
 # Proposal: reliability-remaining-defects
 
 > 上游方案：`docs/plans/2026-09-11-agent-core-reliability-plan.md`（WP3–WP9）。
+> ⚠️ **本文是 2026-09-11 立项时的跟踪面，其后多处被推翻，不可当作当前契约读。**
+> 当前契约以 `openspec/specs/` 下的 capability spec 为准；被推翻的清单见
+> `docs/plans/2026-09-11-agent-core-reliability-plan.md` 顶部的状态表。要点三条：
+> WP5 的 `operation_id` 五元组派生已合并进摄入点铸造的 tool_call 标识；
+> WP6 的四值策略收成两值、`TOOL_OUTCOME_UNKNOWN` / `resolve_operation` 一整套处置面已删除；
+> WP7 的 `ExecutionLimits`（本文记分板标为「H5 ✅」）已整体撤销，H5 现状是**未解决且不打算解决**。
+
 > **角色：总纲/跟踪面（2026-09-11 裁定）**——实施按 WP 拆子 change（一会话一个，如 reliability-wp0-wp1 / reliability-wp2 的节奏），本 change 不直接 apply；每 WP 子 change 归档时回到本表勾对应任务组，tasks 组号即子 change 的映射单位。
 > 子 change 映射：WP2→reliability-wp2（已建）；WP3→reliability-wp3；WP4→reliability-wp4（WP3+WP4 合并宣布 H1/H2 解决）；WP5/6→H3 单元；WP7→reliability-wp7；WP8→验收；WP9→可选。
 > 已修复不在本 change：H4（reliability-wp0-wp1，真链路验证）；WP2 有序日志地基已单独立 change（reliability-wp2，待实施）——本 change 的 WP3/WP4 依赖其先行完成。

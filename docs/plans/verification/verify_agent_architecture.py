@@ -202,8 +202,9 @@ async def recovery_duplicate():
     recovery_error = None
     # The cache is already bound. Bypass only discovery, not reconciliation,
     # gateway execution, persistence, or the simulated external side effect.
-    # wp6（reliability-wp6）：RecordingTool 默认 manual → 恢复保守停住（unknown），
-    # 副作用不再重跑；操作账本记 unknown、task 带 TOOL_OUTCOME_UNKNOWN。
+    # spec: tool-operations——tool_call_id 是裸 wire id（非摄入点铸造的 tc_...），
+    # 账本旁路 → reconcile 读不到记录 → 作结「无账本记录，无从查证」：副作用不重跑，
+    # 结果写成 TOOL_RESULT 后循环照常续跑（不停机、无专属错误码/事件）。
     state.task = SimpleNamespace(id="task1", status="ACTIVE")
     state.sequence_counter = 0
     with patch("ctx_weft.core.loop.steps.reconcile.resolve_and_bind", new=AsyncMock()):

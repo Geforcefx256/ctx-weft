@@ -40,7 +40,7 @@ class _RecordingTool(ToolCapabilityProvider):
 
     async def list(self, ctx) -> list[ToolCapability]:
         # wp6（spec: tool-operations）：声明 idempotent —— 崩溃后同 op_id 重跑恰好一次。
-        # 默认 manual 的行为由 test_tool_outcome_unknown.py 钉（unknown 停住）。
+        # 默认 reviewed 的行为由 test_tool_outcome_not_rerun.py 钉（作结、不重跑）。
         return [ToolCapability(id="test:web", name="web", description="fetch a page",
                                recovery_policy="idempotent")]
 

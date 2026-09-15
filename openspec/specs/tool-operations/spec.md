@@ -27,7 +27,7 @@
 
 ### Requirement: 操作账本状态机
 
-`OperationStore` SHALL 提供 `get / prepare / compare_and_set`，按状态机 `prepared → started → completed` 记录操作（另含 `waiting_human` / `unknown`）；OperationRecord MUST 含身份五元组、授权后参数指纹、恢复策略字段、attempt IDs、完整规范化结果或可持久读取的结果引用（非审计截断文本）、error、memory result ID 引用。执行顺序 SHALL 为：持久身份 → 授权校验 → prepared → CAS started（持久确认）→ 调 Provider → 保存 outcome completed（持久确认）→ 幂等写入 TOOL_RESULT memory → 发 CapabilityFinished。账本 completed 而 memory 写入失败时，恢复 SHALL 从账本重建 memory、不再次执行工具。memory result id SHALL 由 operation_id 确定性生成。OperationStore 写失败 SHALL 按存储不可用处理（会话隔离），不得静默降级。宿主未注册持久 OperationStore 时 runtime SHALL 默认提供内存实现并在声明跨进程恢复能力时如实报告缺失。
+`OperationStore` SHALL 提供 `get / prepare / compare_and_set`，按状态机 `prepared → started → completed` 记录操作（另含 `waiting_human`）；MUST NOT 为「结果无法确定」另立状态——那是 `completed` 的一种 `result` 内容；OperationRecord MUST 含身份五元组、授权后参数指纹、恢复策略字段、attempt IDs、完整规范化结果或可持久读取的结果引用（非审计截断文本）、error、memory result ID 引用。执行顺序 SHALL 为：持久身份 → 授权校验 → prepared → CAS started（持久确认）→ 调 Provider → 保存 outcome completed（持久确认）→ 幂等写入 TOOL_RESULT memory → 发 CapabilityFinished。账本 completed 而 memory 写入失败时，恢复 SHALL 从账本重建 memory、不再次执行工具。memory result id SHALL 由 operation_id 确定性生成。OperationStore 写失败 SHALL 按存储不可用处理（会话隔离），不得静默降级。宿主未注册持久 OperationStore 时 runtime SHALL 默认提供内存实现并在声明跨进程恢复能力时如实报告缺失。
 
 #### Scenario: completed 后 memory 写前崩溃
 
@@ -49,12 +49,12 @@
 
 恢复时按状态×策略分派：`completed` 复用结果不重执行；`prepared` 且从未进入 `started` 可首次执行（仍先重新检查授权）；`started + idempotent` 以同 operation_id 重试；`started + reviewed` 问裁决者，它 SHALL 只回答**该不该重跑**（`Adjudication.rerun`）：`rerun=True` 以同 operation_id 重跑；`rerun=False` 把裁决者给出的 `result` 写成这次调用的工具结果并作结。Provider 未实现裁决接口时 core SHALL 代为作结「无从查证」，同样不重跑。
 
-「结果无法确定」SHALL 表现为一种**工具结果**，MUST NOT 成为一种控制流：MUST NOT 因此停机、MUST NOT 要求宿主介入才能续跑、MUST NOT 为它设立专属错误码/事件类型/处置 API。裁决者判不了时用 `result` 的**文本**说明查到了什么、查不到什么——那是内容不是状态，core 不替它组织措辞，也不据此分支。重复调用的防护归 Provider 自理：core 的承诺止于「不自行重跑」，agent 下一轮主动再调是一次新的逻辑调用。一切结果不定情形一律不自动执行；`waiting_human` 经既有 HumanResumable 协议恢复，不从头重新 invoke。Reconcile 的完成匹配 SHALL 以账本 operation_id 为判据，MUST NOT 再以 tool_call_id 集合判定（防 call_1 复用串扰）。无账本身份的存量 dangling SHALL 默认置 `unknown`，不得以随机生成的 id 自动执行副作用工具。控制工具单独核验：delegate 以 operation_id 找回已创建子任务（确认丢失重入不生成第二棵子树）、finish/metadata 同身份幂等、ask_user 复用已有请求；MUST NOT 对控制工具整体标记 `idempotent` 后省略验证。
+「结果无法确定」SHALL 表现为一种**工具结果**，MUST NOT 成为一种控制流：MUST NOT 因此停机、MUST NOT 要求宿主介入才能续跑、MUST NOT 为它设立专属错误码/事件类型/处置 API。裁决者判不了时用 `result` 的**文本**说明查到了什么、查不到什么——那是内容不是状态，core 不替它组织措辞，也不据此分支。重复调用的防护归 Provider 自理：core 的承诺止于「不自行重跑」，agent 下一轮主动再调是一次新的逻辑调用。一切结果不定情形一律不自动执行；`waiting_human` 经既有 HumanResumable 协议恢复，不从头重新 invoke。Reconcile 的完成匹配 SHALL 以账本 operation_id 为判据，MUST NOT 再以 tool_call_id 集合判定（防 call_1 复用串扰）。无账本身份的存量 dangling SHALL 同样作结「无账本记录，无从查证」，MUST NOT 以随机生成的 id 自动执行副作用工具。控制工具单独核验：delegate 以 operation_id 找回已创建子任务（确认丢失重入不生成第二棵子树）、finish/metadata 同身份幂等、ask_user 复用已有请求；MUST NOT 对控制工具整体标记 `idempotent` 后省略验证。
 
 #### Scenario: reviewed 且无裁决者时不重跑
 
 - **WHEN** started 后崩溃且策略为 reviewed，Provider 未实现 OperationAdjudicator
-- **THEN** 操作置 unknown 等宿主处置，恢复不得自动重执行；这是默认形态，不报配置错误
+- **THEN** core 代为作结「无从查证」：账本 CAS completed、该说明文本成为这次调用的工具结果，恢复不重执行、会话照常续跑；这是默认形态，不报配置错误
 
 #### Scenario: idempotent 重跑恰好一次补全
 
@@ -63,34 +63,20 @@
 
 #### Scenario: 裁决者的权威否定
 
-- **WHEN** started 后崩溃且策略为 reviewed，Provider 的裁决返回 definitely_not_started
-- **THEN** 以同 operation_id 重新执行；裁决返回 completed 则直接复用外部结果不再执行；返回 unknown 则置 unknown 落到人
+- **WHEN** started 后崩溃且策略为 reviewed，Provider 的裁决返回 `Adjudication.rerun_safe()`（权威判定「这次没跑成」）
+- **THEN** 以同 operation_id 重新执行
+
+#### Scenario: 裁决者判不了也只是一种结果
+
+- **WHEN** 裁决者查不到外部真值，返回 `Adjudication.conclude(<说明文本>)`
+- **THEN** 不重跑，该文本成为这次调用的工具结果；task 状态不变、无专属事件、无需宿主介入，agent 下一轮据此自行决定
 
 #### Scenario: 非法取值响亮失败
 
 - **WHEN** Provider 声明一个不在取值域内的 `recovery_policy`
 - **THEN** 启动校验失败并指明合法取值；MUST NOT 静默降级为 `reviewed` 后照常启动
 
-#### Scenario: 存量无身份 dangling 保守停住
+#### Scenario: 存量无身份 dangling 保守作结
 
-- **WHEN** 恢复遇到 WP5 之前持久化的 dangling（无账本记录可查）
-- **THEN** 默认置 unknown 并要求宿主处置，不自动执行
-
-### Requirement: 结果未知的宿主处置
-
-未知操作 SHALL 将 task 置 INTERRUPTED + `TOOL_OUTCOME_UNKNOWN` 错误码并发布 `OperationUncertain` 事件（payload 至少含 operation_id、工具名、revision、可用处置动作、脱敏摘要）；宿主经 `resolve_operation(operation_id, decision, expected_revision)` 处置：`supply_result`（宿主已核实外部结果，按 Provider 结果结构归一化后入账本并按确定性 id 补写 memory）/ `retry_confirmed`（宿主显式承担重复执行风险，持久记录决定后以原 operation_id 重排）/ `cancel_task`（停止该任务；不声称撤销已发生的外部动作）。revision 不匹配 SHALL 拒绝（双宿主并发处置恰好一个成功）；unknown 状态下普通 `recover_agent` MUST NOT 绕过决策重跑工具（闸门）。
-
-#### Scenario: 两个宿主并发处置
-
-- **WHEN** 两个请求以不同 decision 并发 resolve 同一 operation
-- **THEN** 恰好一个成功，另一个因 revision 不匹配被拒绝
-
-#### Scenario: supply_result 补写 memory 不重执行
-
-- **WHEN** 宿主以 supply_result 提供核实过的外部结果
-- **THEN** 账本 CAS completed、按 operation_id 确定性派生的 memory id 幂等补写 TOOL_RESULT；provider 不被调用
-
-#### Scenario: unknown 闸门挡住普通恢复
-
-- **WHEN** task 处于 unknown 中断且宿主未 resolve，调用 recover_agent
-- **THEN** 恢复不重跑该工具，保持等待宿主处置
+- **WHEN** 恢复遇到账本建立之前持久化的 dangling（无账本记录可查）
+- **THEN** 作结「无账本记录，无从查证」，不自动执行；不生成随机 id 去碰副作用工具

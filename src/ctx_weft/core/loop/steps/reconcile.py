@@ -8,23 +8,26 @@ TOOL_RESULT。直接把含 dangling 的消息序列喂给 LLM 会非法报错。
               或 task view 存在 id == operation_memory_result_id(op_id) 的 tool 记录
     ——判据是**逻辑身份**（op_id），与 wire id 无关：call_1 复用不再串扰。
 
-  未完成的 → 按「状态 × recovery_policy」分派（design D2）。策略只有两类：
-    None（存量无身份）        → 作结「无从查证」（不用随机 id 去碰副作用工具）
-    PREPARED                  → gateway.invoke（首执；此前无副作用，授权链自然重查）
-    STARTED + idempotent      → invoke（同 op_id 重跑安全）
-    STARTED + reviewed        → 问裁决者，它只回答**该不该重跑**：
-                                  rerun=True   → invoke（权威判定没跑成）
-                                  rerun=False  → 作结：把它给的 result 写成工具结果
-                                provider 未实现裁决接口 → core 代为作结「无从查证」
-    WAITING_HUMAN             → 既有 HITL 恢复路径（不 invoke）
-    COMPLETED                 → 不应到达（完成判定已滤）；防御性跳过
+  未完成的 → 按「账本状态 × recovery_policy」分派（design D2）。策略**只有两类**，
+  且取自 capability 的活声明（不是账本行上那一列，见 `OperationRecord.recovery_policy`）：
 
-  「不重跑」的两种由来——查到了真结果 / 查不到——对 core 是**同一条路**，区别全在
-  result 文本里。结果不确定是一种工具结果，不是一种控制流：不停机、不发专属事件、
-  不需要宿主介入，agent 下一轮读到它自行决定。
+    无账本记录 + 控制工具      → invoke（core 自有的幂等状态迁移，见下方 carve-out）
+    无账本记录 + HITL 决定在案 → invoke（崩溃在等人处，provider 从未启动 = 首执安全）
+    无账本记录 + 其它          → 作结「无账本记录，无从查证」（不用随机 id 碰副作用工具）
+    PREPARED                   → invoke（首执；此前无副作用，授权链自然重查）
+    WAITING_HUMAN              → 既有 HITL 恢复路径（不 invoke）
+    STARTED + 控制工具         → invoke（同上 carve-out）
+    STARTED + idempotent       → invoke（同 op_id 重跑安全）
+    STARTED + reviewed         → 问裁决者，它只回答**该不该重跑**：
+                                   rerun=True   → invoke（权威判定没跑成）
+                                   rerun=False  → 作结：把它给的 result 写成工具结果
+                                 provider 未实现裁决接口 → core 代为作结「无从查证」
+    COMPLETED                  → 不应到达（完成判定已滤）
 
-  置 unknown = 账本 CAS unknown + task INTERRUPTED(TOOL_OUTCOME_UNKNOWN)
-  + OperationUncertain 事件（revision 供 resolve_operation）+ 短路停止后续 dangling。
+  **作结 = 账本 CAS completed + 把 result 经收敛写成 TOOL_RESULT，然后照常续跑。**
+  「不重跑」的两种由来——裁决者查到了真结果 / 谁也查不到——对 core 是**同一条路**，
+  区别全在 result 文本里。结果不确定是一种工具结果，不是一种控制流：不停机、不改
+  task 状态、不发专属事件、不设专属错误码或处置 API，agent 下一轮读到它自行决定。
 → next_step="prepare"：assembler 重建出完整 turn，LLM 续跑。
 """
 
@@ -253,7 +256,8 @@ class ReconcileStep(Step):
 async def _dangling_tool_calls(memory, scope, provider_ctx) -> tuple[list[dict], set[str]]:
     """最近一个 assistant turn 里未完成的 tool_call（按逻辑身份判定）。
 
-    返回 (dangling, tool_record_ids)：前者带 _record_id/_ordinal/_recovery_policy，
+    返回 (dangling, tool_record_ids)：前者每项是原 tool_call dict 加 `_record_id` /
+    `_ordinal` 两个伴随键（策略不在这里取——见 execute 里读 capability 活声明那一处）；
     后者是 task view 里全部 tool 记录的 id 集合（memory 通道完成判据的输入）。
     """
     from ctx_weft.protocols import MemoryAddress, MemoryKind, MemoryScope

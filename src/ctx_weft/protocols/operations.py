@@ -70,14 +70,19 @@ class RecoveryPolicy(StrEnum):
     裂成若干个看似并列的值：
 
         Provider 实现 OperationAdjudicator？
-          ├─ 是 → 调用它：COMPLETED → 回填不执行；DEFINITELY_NOT_STARTED → 执行；
-          │        UNKNOWN → 落到人
-          └─ 否 → 落到人：账本 unknown + OperationUncertain + runtime.resolve_operation
+          ├─ 是 → 调用它，按 Adjudication.rerun 二选一：
+          │        rerun=True  → 同 operation_id 重跑
+          │        rerun=False → 它给的 result 成为这次调用的工具结果，作结
+          └─ 否 → core 代为作结「无从查证」（同样不重跑）
+
+    两个分支都以**作结**收尾——账本 CAS completed + 把 result 写成 TOOL_RESULT，然后
+    照常续跑。没有第三条出路：「不确定」是一种工具结果，不是一种控制流（见
+    ``Adjudication`` 的 docstring）。
 
     裁决能力**靠发现不靠声明**：``OperationAdjudicator`` 是 Provider 级接口，用
     capability 级字段去声明它是错配，还得额外拿启动期校验去堵「声明了却没实现」。
     isinstance 发现则没有这个失败模式；而且 Provider 可以逐次决定——判得了的给权威
-    结论，判不了的返回 UNKNOWN 自动落到人。
+    结论，判不了的用 ``Adjudication.conclude(<说明文本>)`` 把话说清楚交给 agent。
     """
 
     IDEMPOTENT = "idempotent"
@@ -110,8 +115,11 @@ class OperationRecord:
     合法转移：prepared→started→completed；waiting_human 见状态机表。
     ``revision`` 乐观锁：每次 CAS +1，compare_and_set 期望值不匹配即拒绝。
     ``result``：完整规范化结果（str | ContentParts 列表 | blob ref 字符串）——非审计
-    事件的截断文本（两条通道目的不同，不合并）。``args_hash``：授权后参数指纹
-    （复用 gateway 的 invocation_key 实现）。
+    事件的截断文本（两条通道目的不同，不合并）。
+
+    **恢复判据只读三个字段**：``status`` / ``result`` / ``attempts``。其余是审计与
+    诊断用的随行记录，core 的恢复路径不读（各字段注释逐条注明），别把它们当成会
+    影响行为的开关。
     """
 
     operation_id: str
@@ -121,17 +129,21 @@ class OperationRecord:
     assistant_record_id: str
     tool_ordinal: int
     tool_name: str
-    # 派生 task 维度（wp6 resolve_operation 补写 memory 用；空=未携带，宿主可经
-    # OperationUncertain payload 自行定位 task）
-    task_id: str = ""
-    status: OperationStatus = OperationStatus.PREPARED
+    task_id: str = ""             # 随行：派生 task 维度，供宿主按 task 检索账本；core 不读
+    status: OperationStatus = OperationStatus.PREPARED   # 恢复判据
     revision: int = 1
-    args_hash: str = ""
-    recovery_policy: str = RecoveryPolicy.REVIEWED   # WP5 只落库；WP6 消费
-    attempts: list[str] = field(default_factory=list)   # invocation_id 列表（每次执行尝试）
-    result: Any = None                        # 完整结果 / ContentParts / blob ref
+    args_hash: str = ""           # 随行：授权后参数指纹（gateway 的 invocation_key）；core 不读
+    #: 随行：**core 不读**——恢复时的策略取自 capability 的活声明
+    #: （`reconcile` 的 `normalize_recovery_policy(cap.recovery_policy)`），不是这一行。
+    #: 读活声明才对：工具下线 / 改判后，账本里那份写死的旧值会让恢复按过期策略走。
+    #: gateway 建行时也不填它，所以这一列恒为默认值，**不要据此推断任何工具的策略**。
+    recovery_policy: str = RecoveryPolicy.REVIEWED
+    attempts: list[str] = field(default_factory=list)   # 恢复判据：invocation_id 列表（每次执行尝试）
+    result: Any = None                        # 恢复判据：完整结果 / ContentParts / blob ref
     error: str | None = None
-    memory_result_id: str = ""                # TOOL_RESULT 记录 id（确定性派生）
+    #: 随行：**core 不读**——所有读取点都现算 `operation_memory_result_id(operation_id)`
+    #: （确定性派生，无需回表）。存这一列只为 SQL 侧可直接按 memory id 反查。
+    memory_result_id: str = ""
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
