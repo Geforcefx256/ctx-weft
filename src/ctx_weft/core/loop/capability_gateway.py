@@ -437,6 +437,36 @@ class CapabilityGateway:
         existing = None
         if ledger is not None and ledger_key:
             existing = await ledger.get(ledger_key, ctx.provider_ctx)
+
+        # 2a. 同逻辑调用重入：账本已有完整结局 → 复用结果，**这里就 return**。
+        #
+        # 短路点必须在 `_record_invocation` 之前。放在它之后（改造前如此）会先发一条
+        # `CapabilityInvoked`，再从短路 return——不走 `_record_result`、不发
+        # `CapabilityFinished`，于是事件流里留下一条**孤立的 INVOKED，而 provider 根本
+        # 没被调用**。事件流是宿主可见的审计面，按 Invoked/Finished 配对做 UI 的宿主会
+        # 看到一次永远悬着的调用；恢复判据若改读事件流，折出的 attempts 还会多一个从未
+        # 发生的尝试。
+        #
+        # 连带：重放**不再走事前授权**（改造前走完 authorize 才短路）。这是对的——重放
+        # 什么都不执行，而 authorize 问的是「能不能跑」；顺带省掉一次可能 park 问人的
+        # 授权。`test_completed_reentry_short_circuits_no_reinvoke` 钉住这一条。
+        if existing is not None and existing.status == OperationStatus.COMPLETED:
+            # spec: tool-result-recovery——重放统一收敛（D4/D6）：结果进入对话前过
+            # converge（禁全文直灌）；引用身份 = 账本原执行 invocation_id（attempts
+            # 尾项），store 逐出后以账本全文重新入库。
+            result_text = existing.result if isinstance(existing.result, str) else (
+                "[Replayed completed operation result]")
+            ref_inv = (existing.attempts[-1]
+                       if getattr(existing, "attempts", None) else invocation_id)
+            result_text = await self._converge_result(
+                result_text, ctx, ref_inv, tool_name, cap.spillable)
+            logger.info(
+                "CapabilityGateway: operation %s completed in ledger — replaying "
+                "result, provider not re-invoked", ledger_key)
+            return InvocationResult(
+                invocation_id=invocation_id, tool_name=tool_name,
+                content=result_text, is_error=False)
+
         if existing is not None and existing.status == OperationStatus.STARTED:
             if normalize_recovery_policy(
                     getattr(cap, "recovery_policy", None)) is RecoveryPolicy.IDEMPOTENT:
@@ -567,7 +597,26 @@ class CapabilityGateway:
                 f"[Error: no provider found for '{cap.id}']", is_dispatch, is_silent, tool_call_id,
             )
 
-        # 5. 记录 invocation（事件 + TOOL_INVOCATION / delegate conversation turn 入 memory）——审计通道
+        # 5. 关窗：这一轮已经不可撤销了（spec: event-commit / tool-operations）。
+        #
+        # 未提交窗口的前提是「这一轮还什么不可逆的事都没发生，所以可以当没发生过」。
+        # 关窗点此前只认一件事——act 收到第一个 chunk（用户看见输出了）。但**调用一个
+        # 工具**是同一类不可逆动作，而 `begin_round` 的三个调用点里有两个是消息注入 /
+        # HITL 冷续跑，ReconcileStep 正跑在那条路上、且在任何 chunk 之前：于是它的
+        # invoke 落在开着的窗口里。实测后果是 `discard_round` 之后事件流**否认一次已经
+        # 发生了副作用的调用存在过**——日志在撒谎。
+        #
+        # 不按 `side_effects` 或 `recovery_policy` 挑：前者的声明可能不完整（MCP / 旧
+        # provider，方案自己说的），后者的 `idempotent` 说的是「重跑安全」而非「撤销
+        # 安全」——一个幂等写工具重跑无害，但撤销之后事件流否认它写过外部系统，同样是
+        # 撒谎。判据越简单越不会漂：**调了工具就关窗**。
+        #
+        # 代价是「窗口里跑过工具的那一轮不再可撤销」，那正是正确的语义。幂等（act 的
+        # 每个 chunk 都调同一个函数），无 task_manager 时是 no-op。
+        from ctx_weft.core.loop.steps.act import _commit_round
+        await _commit_round(state, ctx)
+
+        # 6. 记录 invocation（事件 + TOOL_INVOCATION / delegate conversation turn 入 memory）——审计通道
         await self._record_invocation(state, ctx, tool_name, cap, invocation_id, audit_args, is_dispatch, is_silent, tool_call_id)
 
         # 6. 执行（流式）——执行通道：effective_args（未脱敏）。透传 invocation_id（provider 据此
@@ -581,7 +630,7 @@ class CapabilityGateway:
         # ── 操作账本（spec: tool-operations，wp5；方案 §5.3 执行序）──────────────
         # 步骤 ②③：prepare → CAS started。tool_call_id 由调用侧（act/reconcile）铸好放进
         # provider_ctx；**缺失（裸调）→ 账本全程旁路**——既有单测/宿主直构 gateway 零改动。
-        # 已 completed → 短路复用账本结果（O-T08 前半：同逻辑调用重入不再打 provider）。
+        # completed 的短路在上面第 2a 步（必须早于 `_record_invocation`，理由见那里）。
         ledger_record = None
         if ledger is not None and ledger_key:
             from ctx_weft.protocols.capability import (
@@ -589,24 +638,6 @@ class CapabilityGateway:
                 OperationUpdate as _Upd2, tool_result_record_id,
             )
             # `existing` 在上面第 2 步已读；重跑授权放行后到这里，状态未变。
-            if existing is not None and existing.status == _OpSt.COMPLETED:
-                # O-T08 前半：同逻辑调用重入——账本已有完整结局，不再打 provider、
-                # 不重复写 memory（首次执行已写 TOOL_RESULT）。
-                # spec: tool-result-recovery——重放统一收敛（D4/D6）：结果进入对话前过
-                # converge（禁全文直灌）；引用身份 = 账本原执行 invocation_id（attempts
-                # 尾项），store 逐出后以账本全文重新入库。
-                result_text = existing.result if isinstance(existing.result, str) else (
-                    "[Replayed completed operation result]")
-                ref_inv = (existing.attempts[-1]
-                           if getattr(existing, "attempts", None) else invocation_id)
-                result_text = await self._converge_result(
-                    result_text, ctx, ref_inv, tool_name, cap.spillable)
-                logger.info(
-                    "CapabilityGateway: operation %s completed in ledger — replaying "
-                    "result, provider not re-invoked", ledger_key)
-                return InvocationResult(
-                    invocation_id=invocation_id, tool_name=tool_name,
-                    content=result_text, is_error=False)
             try:
                 # 已有记录（重入/恢复）→ 不再 prepare：ledger_key 即身份，reconcile 注入的
                 # 记录身份字段来自原回合（gateway 的 extra 里未必带），prepare 的身份
