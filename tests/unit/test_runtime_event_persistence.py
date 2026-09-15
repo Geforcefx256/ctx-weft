@@ -121,6 +121,9 @@ async def test_no_double_write_via_attach_persistence_single_entry_point(
 # ── snapshot_every_n 的两种取值 ────────────────────────────────────────────────
 
 
+from ctx_weft.core.models.config import RuntimeConfig
+
+
 async def test_snapshot_every_n_zero_means_no_snapshot_writer(tmp_path) -> None:
     async with _sql_store(tmp_path) as store:
         runtime = CtxWeftRuntime(providers=_make_registry(), event_store=store)
@@ -147,8 +150,15 @@ async def test_snapshot_every_n_positive_attaches_and_writes_snapshot(tmp_path) 
 
 
 async def test_detach_stops_persistence(tmp_path) -> None:
+    """best_effort：persister 订阅可 detach（spec: event-commit 的兼容路径）。
+
+    required（默认）没有 persister 订阅可 detach——提交在 CommitGate 里；
+    那一路的等价物见下方 test_required_mode_persists_via_gate_not_persister。
+    """
     async with _sql_store(tmp_path) as store:
-        runtime = CtxWeftRuntime(providers=_make_registry(), event_store=store)
+        runtime = CtxWeftRuntime(
+            providers=_make_registry(), event_store=store,
+            config=RuntimeConfig(event_commit_policy="best_effort"))
 
         await runtime.event_bus.emit(_ev(1, "SessionCreated"))
         assert len(await store.read_by_session("s1")) == 1
@@ -158,3 +168,18 @@ async def test_detach_stops_persistence(tmp_path) -> None:
         await runtime.event_bus.emit(_ev(2, "RunStarted"))
         # detach 之后新事件不应该再落库——store 里仍然只有 detach 之前那一条。
         assert len(await store.read_by_session("s1")) == 1
+
+
+async def test_required_mode_persists_via_gate_not_persister(tmp_path) -> None:
+    """required（默认，spec: event-commit）：无 persister 订阅，提交走 CommitGate——
+    detach 句柄是空壳，事件照常落库（先确认提交、再通知）。"""
+    async with _sql_store(tmp_path) as store:
+        runtime = CtxWeftRuntime(providers=_make_registry(), event_store=store)
+        assert runtime.persistence.persister is None
+
+        await runtime.event_bus.emit(_ev(1, "SessionCreated"))
+        assert len(await store.read_by_session("s1")) == 1   # gate 已确认提交
+
+        await runtime.persistence.detach()                    # 空壳 detach：无订阅可停
+        await runtime.event_bus.emit(_ev(2, "RunStarted"))
+        assert len(await store.read_by_session("s1")) == 2    # 提交不因 detach 停

@@ -78,6 +78,12 @@ Loop Engine          reason → act → observe → finalize
 EventBus             事件总线，所有状态变更的唯一出口
 ```
 
+> **证据投递（尚未实现）**：知识检索（KnowledgeProvider）与语义召回（recall_semantic）命中的内容目前**被装配、进预算、然后在渲染层丢弃**——`reference` / `summary` 两类块没有渲染路径。这是已知缺口，投递与相关性裁剪留待后续单独实现。在那之前装配层对它们发 warning（`no rendering path for block kind(s)`），不留静默盲区。
+>
+> **工具面预算口径（2026-09 起，spec: context-budget）**：装配预算先扣工具面预留（名称 + 描述 + 入参 schema，按能力快照现算，`AssembledPrompt.metadata.tools_reserved_tokens` 可读）——工具声明不参与裁剪，预算压力由预留承担；溢出报错仍报真窗口。act 循环内增量估算追踪工具面指纹（覆盖 name+description+schema 的规范化定义哈希——同名工具 schema 更新可感知）：运行期 pin 大 schema 后估算立即增长（`max_tokens` 随之收紧）；工具面不变时增量行为与旧口径一致。发送前超限**不硬拒**（明示决策）：收紧 max_tokens + WARNING 留痕 + 既有比例机制触发下轮压缩。估算与实际 usage 的偏差留工具面分项记录（指纹/估算/实测同现于回喂日志）。
+>
+> **压缩摘要保真（2026-09 起，spec: compact-fidelity）**：task 域（L3 坍缩）与 agent 域（L1 折叠）的压缩 digest 按五个固定小节生成——`## Goal / ## Constraints / ## Done / ## Remaining / ## Evidence`（Evidence 可缺）；落库前宽松解析，缺必需小节整文降级存档（metadata `digest_degraded: true`）、不中断压缩。`## Evidence` 引用可回取的工具产出（`results__read_tool_output(invocation_id=...)`）。验收分三层：管道层与请求层（cue 契约）在 CI（`tests/unit/test_compact_fidelity.py`）；**语义质量层不入 CI**——真模型是否按 cue 保留约束，发布前人工运行 `python benchmarks/compact_fidelity_eval.py`（需真实 LLM key）。**不可逆边界**：对话文本原文在 fold 后不可恢复（既有 supersede 语义不变，本契约不承诺原文回取）；可回取面仅限工具产出（结果存储）与图片（既有 ref 机制）。段摘要（act_recap / Progress So Far）不在本契约范围（逐段生成、消费方为观察锚点，见 ARCHITECTURE）。
+
 这些**协议**是对外的接入面。外部系统只需实现其中一个协议，ctx-weft 自动用上（LLM 详见
 [LLM 接入](#llm-接入) 一节）：
 
@@ -335,8 +341,6 @@ template = AgentTemplate(
     loop_config=LoopConfig(
         max_turns_per_act=10,       # 单个 ActStep 最多多少轮 LLM 调用
         max_turns_per_observe=5,
-        max_turns_per_agent=20,
-        timeout_per_step_sec=120,
         failure_threshold=3,
         max_spawn_depth=4,          # 子 agent 最大嵌套深度
         compact_token_ratio=0.8,    # token 占 context_limit 比例超过则压缩
@@ -613,6 +617,14 @@ class RunHandle:
 
 ## 事件系统
 
+> **对话配对完整性（2026-09 起，spec: conversation-integrity）**：assistant 回合摄入时把 LLM 分配的 tool_call wire id 替换为内部唯一标识（`tc_{seq36}_{ord36}_{hash12}`，`[a-z0-9_]`、≤64 字符）——模型复用 `call_1` 这类短 id 不再造成跨轮次/跨任务的结果错配。**值域迁移注记**：事件 payload（`CapabilityInvoked` / `CapabilityFinished` / `LLMResponseFinished.tool_calls`）与 HITL 请求中的 `tool_call_id` 从裸 wire id 变为内部标识；原始 id 保留在 assistant 记录 metadata（`tool_calls[].raw_id`，伴随 `op_id`）供追溯。宿主面板若按 id 展示/匹配需知悉；存量记录不迁移（配对行为不回退，重复歧义在发送前留 ERROR 痕迹）。
+>
+> **快照恢复（2026-09 起，spec: snapshot-recovery）**：快照边界 = 已确认提交位置（`committed_head` 一致切面），恢复增量按 position 区间；旧格式快照自动忽略并全量重建，无需手工迁移事件数据（存量库回填用 `scripts/migrate_event_positions.py`）。
+>
+> **执行时长/轮数限制（2026-09 起）**：core **不提供**任务级 deadline 或轮数上限——这是宿主的策略，不是 SDK 的职责。需要超时就在宿主侧计时并调 `cancel_task` / `cancel_agent`；需要 provider 级超时就在 provider 自己的工具实现里做。三个从未被执行的旧字段（`max_turns_per_agent` / `timeout_per_step_sec` / `Task.timeout_ms`）**已删除**——它们声明了限制却无任何运行时消费者，留着只会让宿主以为有防线。`max_turns_per_act` / `max_turns_per_observe` 等**真正生效**的循环上限不受影响。
+
+> **提交策略（2026-09 起，spec: event-commit）**：默认 `event_commit_policy="required"`——事件先经提交门确认存储写入、再对外通知（存储失败显式抛 `PersistenceUnavailableError` 并隔离会话）。**自定义 EventBus 必须实现 `attach_commit_gate` 扩展**，否则 required 模式构造期失败；不接受该约束的宿主可显式配置 `RuntimeConfig(event_commit_policy="best_effort")` 退回旧的吞错路径（启动告警、不可靠恢复）。
+
 所有状态变更都通过事件总线发布，append-only。
 
 ### Event 结构
@@ -668,6 +680,14 @@ async for ev in runtime.event_bus.stream(EventFilter(session_id="ses_xxx")):
 ---
 
 ## 内置 Provider
+
+### 工具长输出的收敛与回取（spec: tool-result-recovery）
+
+工具输出超过 `spill_threshold`（默认 4000 字符）时：全文交给 **`SpillSink`**（core 对「超长输出去哪」的唯一契约，靠 `isinstance` 从已注册 provider 里发现），上下文（对话与 memory）只承载**收敛版** = sink 返回的**取回说明**（整句由 sink 自己写，点名用哪个工具取回；gateway 原样嵌入）+ 全长 + 头部预览 + **尾部预览**（`spill_preview_chars` / `spill_tail_chars`）。
+
+宿主注册哪种 sink 决定能力上限：`FilesystemToolsProvider` 落盘进 workspace，说明里点名 `fs__read_file(path=..., offset=1, limit=500)`；**`ResultsCapabilityProvider`** 落进内存 LRU 并自带 `results__read_tool_output(invocation_id, offset | tail, limit)` 工具，**模型能分页/尾部取回全文**（invocation_id 每次执行一枚，取最新收敛文本里的值）。该 provider 同时是 SpillSink 与 ToolCapabilityProvider，注册一次两个角色齐备。**都不注册**则超长输出硬截断。
+
+四个重放/补写入口（账本 completed 短路重放、恢复补写、裁决作结、宿主补录）统一过收敛——重放时再 spill 一次即可：可回读的 sink 借此在逐出/重启后重新入库，落盘的 sink 重写同名文件无害。无 sink 或 spill 抛错 → 收敛版显式标注 `not recoverable`，不留取不回来的引用。
 
 ### InMemoryMemoryProvider
 

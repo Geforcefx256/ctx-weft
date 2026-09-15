@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+from ctx_weft.core.utils.task_ref import task_ref
+
 import pytest
 
 from ctx_weft.core import CtxWeftRuntime
@@ -59,7 +61,7 @@ async def _seed_running_ack(mem, child: Task) -> None:
     ctx = _ctx()
     ts, tcid = await _ensure_dispatch_frame(mem, parent_scope, child, ctx)
     await _put_dispatch_result(
-        mem, parent_scope, child, _dispatch_running_ack(child.title), ts, ctx, replace=False,
+        mem, parent_scope, child, _dispatch_running_ack(task_ref(child)), ts, ctx, replace=False,
         tool_call_id=tcid,
     )
 
@@ -81,7 +83,7 @@ async def test_same_agent_started_task_ack_replaced_and_nested_finish_pair() -> 
     # ack 终态化：旧 running ack 被 supersede，只剩一条取消文案（配对 tool_call_id=call-1）
     ack = [r for r in tool_recs if r.metadata.get("tool_call_id") == "call-1"]
     assert len(ack) == 1
-    assert "Sub-task 'Child c1' was cancelled before completion (user_cancel)" in ack[0].content
+    assert "Sub-task 'Child c1' (c1) was cancelled before completion (user_cancel)" in ack[0].content
     assert "its partial execution below is incomplete" in ack[0].content
 
     # 嵌套 finish 对（同 agent 共享 scope）：assistant 槽收尾标记 + tool 槽 [outcome=cancelled]

@@ -64,7 +64,7 @@ def test_fresh_path_reads_spec_from_block_not_task():
     blocks = [_spec_block(title="BLOCK Title", description="BLOCK Desc",
                           user_prompt="BLOCK message")]
     text = _text(comp._build_actor_messages(blocks, _req(task)))
-    assert "## Current Task\nBLOCK Title\nBLOCK Desc" in text
+    assert "## Current Task\n'BLOCK Title' (t1)\nBLOCK Desc" in text
     assert "## Current Message\nBLOCK message" in text
     assert "WRONG" not in text  # nothing from request.task leaked
 
@@ -81,7 +81,7 @@ def test_inmemory_path_frames_existing_turn_with_block_title():
     blocks = [hist, _spec_block(title="BLOCK Title", description="BLOCK Desc")]
     text = _text(comp._build_actor_messages(blocks, _req(task)))
     # in-place decoration uses the block's title + the history turn's raw message (once)
-    assert "## Current Task\nBLOCK Title\nBLOCK Desc" in text
+    assert "## Current Task\n'BLOCK Title' (t1)\nBLOCK Desc" in text
     assert "## Current Message\nthe real user message" in text
     assert text.count("the real user message") == 1
     assert "WRONG" not in text
@@ -94,5 +94,5 @@ def test_fallback_to_task_when_no_spec_block():
     task = _task(title="Fallback Title", description="Fallback Desc",
                  user_prompt="fallback msg", user_prompt_in_memory=False)
     text = _text(comp._build_actor_messages([], _req(task)))
-    assert "## Current Task\nFallback Title\nFallback Desc" in text
+    assert "## Current Task\n'Fallback Title' (t1)\nFallback Desc" in text
     assert "## Current Message\nfallback msg" in text

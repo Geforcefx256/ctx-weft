@@ -33,7 +33,7 @@ async def test_actor_messages_always_end_with_user() -> None:
     request = SimpleNamespace(task=task, purpose="act")
     msgs = DefaultComposer()._build_actor_messages(blocks, request)
     assert msgs[-1].role == "user"
-    assert "You are still working on the task: X" in msgs[-1].content
+    assert "You are still working on the task: 'X'" in msgs[-1].content
 
 
 async def test_observer_reuses_act_conversation_plus_observe_message() -> None:

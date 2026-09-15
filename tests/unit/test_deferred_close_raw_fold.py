@@ -150,7 +150,7 @@ async def test_slot_hit_folds_raw_immediately() -> None:
 
     turns = await mem.recall_recent(scope, [T.AGENT_CONVERSATION_TURN], 100, _pctx())
     tool = [r for r in turns if r.role == "tool"]
-    assert tool and tool[0].content == "[task: Root] bg_sum", \
+    assert tool and tool[0].content == "[task: 'Root' (t1)] bg_sum", \
         f"slot 命中 finish tool 应为真报告；实得 {[r.content for r in tool]!r}"
     assert await _active_raw(mem, scope) == [], \
         "真摘要已落地（slot 命中替换后）应立即补删末段 raw"

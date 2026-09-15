@@ -534,7 +534,7 @@ def test_resumed_task_directive_and_capabilities_on_history_pointer_on_fallback(
     # the trailing dynamic-context message: without extra["act_resume_cue"] the composer's
     # structural fallback line anchors the task and asks to continue with the remaining work
     # (canonical cue lives in act_guidance.py); the full listing stays off it — pointer only
-    assert "You are still working on the task: T" in last
+    assert "You are still working on the task: 'T'" in last
     assert "continue with only the remaining work" in last
     assert "### Available Tools" not in last
     assert "Capabilities section of the current task message above" in last

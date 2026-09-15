@@ -24,6 +24,9 @@ from ctx_weft.protocols.capability import (
 )
 from ctx_weft.providers.llm.mock import MockLLMAdapter, MockResponse
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
+from ctx_weft.protocols import MemoryScope as _MS
+from ctx_weft.protocols.memory import MemoryKind as _MK
+_MEM_TASK_SCOPE = _MS.TASK
 from tests.integration.test_minimal_loop import InlineAgentTemplateProvider, make_echo_template, make_runtime
 
 pytestmark = pytest.mark.asyncio
@@ -36,7 +39,10 @@ class _RecordingTool(ToolCapabilityProvider):
         self.invoked: list[dict] = []
 
     async def list(self, ctx) -> list[ToolCapability]:
-        return [ToolCapability(id="test:web", name="web", description="fetch a page")]
+        # wp6（spec: tool-operations）：声明 idempotent —— 崩溃后同 op_id 重跑恰好一次。
+        # 默认 reviewed 的行为由 test_tool_outcome_not_rerun.py 钉（作结、不重跑）。
+        return [ToolCapability(id="test:web", name="web", description="fetch a page",
+                               recovery_policy="idempotent")]
 
     async def retrieve(self, ctx) -> list[ToolCapability]:
         return await self.list(ctx)        # 让 CapabilityResolver 绑定 web 进 cache
@@ -65,7 +71,10 @@ async def test_crash_mid_tool_reinvokes_dangling_via_reconcile() -> None:
     tool = _RecordingTool()
     runtime.providers.register_capability(tool)
 
-    sid, tid, aid, tcid = "ses_r", "tsk_r", "agt_root", "tc1"
+    from ctx_weft.core.utils.ids import mint_call_id
+    # tool_call 的 id 是摄入点铸造的内部标识——它同时就是账本键。
+    tcid = mint_call_id(anchor="rec_r", ordinal=0, raw_id="tc1", turn_seq=0)
+    sid, tid, aid = "ses_r", "tsk_r", "agt_root"
     ts = datetime(2026, 6, 13, tzinfo=timezone.utc)
 
     def ev(seq, type_, **payload):
@@ -93,6 +102,17 @@ async def test_crash_mid_tool_reinvokes_dangling_via_reconcile() -> None:
     await mem.ingest(MemoryEvent(type=MemoryEventType.LLM_RESPONSE, address=scope, content="",
         timestamp=ts, role="assistant",
         metadata={"tool_calls": [{"id": tcid, "name": "test__web", "input": {"url": "x"}}]}), pctx)
+
+    # 注入「崩溃前调用过」的事实：一条 CapabilityInvoked、没有 Finished
+    # ——这正是账本时代 `status=started` 的等价物，idempotent 分支的输入。
+    from ctx_weft.core.utils.clock import now_utc as _now
+    from ctx_weft.protocols.events import Event as _Ev, EventType as _ET
+
+    await runtime.event_store.append(_Ev(
+        id="evt_seed_invoked", type=_ET.CAPABILITY_INVOKED, session_id=sid,
+        run_id="r_seed", sequence=1, timestamp=_now(),
+        payload={"tool_call_id": tcid, "invocation_id": "inv_first",
+                 "capability_name": "test__web", "capability_id": "test:web"}))
 
     with mock.patch(
         "ctx_weft.core.loop.steps.background_observe.launch_background_observe",

@@ -117,10 +117,12 @@ async def test_interrupt_between_tools_cancels_not_started():
     assert task.status == "ACTIVE"
     assert provider.calls == ["mcp:t:a"]            # tc_b never invoked
     res = await _tool_results(mem, ctx, state.scope)
-    by_id = {r.metadata.get("tool_call_id"): r for r in res}
-    assert by_id["c_a"].metadata.get("interrupted") is not True   # completed normally
-    assert by_id["c_b"].metadata.get("cancelled") is True
-    assert CANCELLED_MARK in by_id["c_b"].content
+    # tool_call_id 已是摄入点铸造的内部标识（spec: conversation-integrity），按 tool_name
+    # 索引——被断言的是「哪个调用得到什么标记」，与 id 值域无关。
+    by_name = {r.metadata.get("tool_name"): r for r in res}
+    assert by_name["mcp__t__a"].metadata.get("interrupted") is not True   # completed normally
+    assert by_name["mcp__t__b"].metadata.get("cancelled") is True
+    assert CANCELLED_MARK in by_name["mcp__t__b"].content
 
 
 async def test_interrupt_during_tool_marks_interrupted_and_cancels_rest():
@@ -143,7 +145,8 @@ async def test_interrupt_during_tool_marks_interrupted_and_cancels_rest():
     # park 不写状态：AWAITING_HUMAN 由 TaskManager 据 RunOutcome 落（Task 4）
     assert task.status == "ACTIVE"
     res = await _tool_results(mem, ctx, state.scope)
-    by_id = {r.metadata.get("tool_call_id"): r for r in res}
-    assert by_id["c_a"].metadata.get("interrupted") is True
-    assert INTERRUPTED_MARK in by_id["c_a"].content
-    assert by_id["c_b"].metadata.get("cancelled") is True
+    # 同上：按 tool_name 索引（内部标识值域下的等价断言）。
+    by_name = {r.metadata.get("tool_name"): r for r in res}
+    assert by_name["mcp__t__a"].metadata.get("interrupted") is True
+    assert INTERRUPTED_MARK in by_name["mcp__t__a"].content
+    assert by_name["mcp__t__b"].metadata.get("cancelled") is True

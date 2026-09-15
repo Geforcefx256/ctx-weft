@@ -29,6 +29,7 @@ from ctx_weft.core.capabilities.control_tools import FINISH_TASK_NAME
 from ctx_weft.core.models.task import NormalTaskSettings
 from ctx_weft.core.utils.estimate import effective_limit
 from ctx_weft.core.utils.clock import now_utc
+from ctx_weft.core.utils.ids import MintedCall, generate_id, mint_turn_call_ids
 from ctx_weft.protocols import MemoryEvent, MemoryKind, MemoryScope
 from ctx_weft.protocols.hitl import (
     HITL_FORM_WAIT,
@@ -93,8 +94,11 @@ class ActStep(Step):
                 baseline_msg_count = sent_msg_count
 
             # 3) assistant 回合落 memory + 接回 message 历史 + 记 transcript
-            asst_tool_dicts = await _ingest_assistant_turn(
-                state, ctx, turn.text, turn.tool_calls, turn.usage, turn_num)
+            persisted_turn = await _ingest_assistant_turn(
+                state, ctx, turn.text, turn.tool_calls, turn.usage, turn_num,
+                anchor=turn.anchor, minted=turn.minted)
+            asst_tool_dicts = persisted_turn.tool_calls
+            state.extra["assistant_record_id"] = persisted_turn.record_id
             current_messages.append(LLMMessage(
                 role="assistant", content=turn.text, tool_calls=asst_tool_dicts,
                 reasoning_content=turn.reasoning or None))
@@ -370,6 +374,10 @@ class _LLMTurnOutput:
     reasoning: str
     tool_calls: list[ToolCall]
     usage: LLMUsage
+    # 摄入锚（预铸的 assistant 记录 id，ingest 按 MemoryEvent.id 采纳）与铸造伴随。
+    # tool_calls 内的 id 已是内部标识；minted 保留原始 wire id / ordinal 供落库伴随字段。
+    anchor: str = ""
+    minted: list[MintedCall] = dataclasses.field(default_factory=list)
 
 
 async def _run_llm_turn(
@@ -454,6 +462,18 @@ async def _run_llm_turn(
             launch_background_observe(state, ctx, boundary="interrupt")
         await _park_for_interrupt(state, ctx, edit=not has_partial)
 
+    # 摄入前铸造内部调用标识（spec: conversation-integrity）：LLM 复用 wire id（call_1
+    # 类短值）是常态，跨轮次/跨任务重建后按裸 id 配对会错配。本函数是唯一供值点——
+    # 事件 payload、memory 记录、current_messages、gateway/HITL 全部消费同一次铸造的
+    # 值。锚 = 预铸的 assistant 记录 id（ingest 经 MemoryEvent.id 采纳，见
+    # _ingest_assistant_turn），跨平面一致且与 tool_call_id 派生同源。observe 的
+    # run_observe_react 对自己的回合同口径（live 平面，不入 memory）。
+    anchor = generate_id("asst")
+    minted: list[MintedCall] = []
+    if tool_calls:
+        minted = mint_turn_call_ids(tool_calls, anchor=anchor, turn_seq=turn_num)
+        tool_calls = [m.call for m in minted]
+
     # token 自校准回喂：真实 usage 与发送前估算段作比（基线不参与），喂给该模型 tokenizer。
     # 估算段取 PROMPT_EST_SEG_KEY（tokenizer.count 直接产出）而非
     # prompt_token_estimate − base——整份路径上返回值可能被 max(full, ctx_tokens) floor 成
@@ -462,6 +482,15 @@ async def _run_llm_turn(
     est_seg = llm_request.metadata.get(PROMPT_EST_SEG_KEY)
     if usage.prompt_tokens > 0 and est_seg is not None and base is not None:
         ctx.llm.tokenizer.observe(est_seg, usage.prompt_tokens - base)
+        # spec: tool-schema-budget——偏差留痕（SHALL）：工具面分项（指纹/估算）与实测同现，
+        # 供校准与回归分析（R4「偏差可归因」）。
+        guard = getattr(agent, "loop_guard", None)
+        logger.info(
+            "token estimate feedback: est_seg=%s base=%s actual_prompt=%d "
+            "tools_signature=%s tools_est=%d",
+            est_seg, base, usage.prompt_tokens,
+            getattr(guard, "last_tools_signature", ""),
+            getattr(guard, "last_tools_est", 0))
 
     await ctx.event_bus.emit(make_event(
         state, EventType.LLM_RESPONSE_FINISHED,
@@ -475,7 +504,9 @@ async def _run_llm_turn(
             "llm_model": model, "llm_account": llm_account,
             "finish_reason": "tool_use" if tool_calls else "stop", "turn": turn_num}))
 
-    return _LLMTurnOutput(text=text, reasoning=reasoning, tool_calls=tool_calls, usage=usage)
+    return _LLMTurnOutput(
+        text=text, reasoning=reasoning, tool_calls=tool_calls, usage=usage,
+        anchor=anchor, minted=minted)
 
 
 async def _account_tokens(state: LoopState, ctx: LoopContext, usage: LLMUsage) -> bool:
@@ -513,22 +544,49 @@ async def _account_tokens(state: LoopState, ctx: LoopContext, usage: LLMUsage) -
     )
 
 
+@dataclasses.dataclass
+class PersistedAssistantTurn:
+    """`_ingest_assistant_turn` 的结构化返回（spec: tool-operations，wp5）。
+
+    ``record_id`` 是 LLM_RESPONSE 回合的 memory 记录 id——tool_call_id 的派生输入之一
+    （确定性派生 → 同一逻辑调用跨重启同 id）。``tool_calls`` 直通旧形态（message
+    重建消费点零语义变化）。
+    """
+
+    record_id: str
+    tool_calls: list[dict]
+
+
 async def _ingest_assistant_turn(
     state: LoopState, ctx: LoopContext, text: str, tool_calls: list[ToolCall],
     usage: LLMUsage, turn_num: int,
-) -> list[dict]:
-    """把本轮 assistant 回合入 task 层 memory；返回完整 tool_call dicts 供 message 重建。
+    anchor: str = "", minted: list[MintedCall] | None = None,
+) -> PersistedAssistantTurn:
+    """把本轮 assistant 回合入 task 层 memory；返回结构化（record_id + tool_calls）。
 
     派发(submit_*)/silent 工具的 tool_call 排除出 LLM_RESPONSE.metadata（派发落 agent 层
     delegate conversation turn、silent 结果不入对话），避免无配对 TOOL_RESULT 的悬挂调用破坏
     无损重建（spec 2026-06-28 §2.3）。
+
+    anchor（spec: conversation-integrity）：预铸的记录 id，经 MemoryEvent.id 交给 provider
+    采纳——它同时是内部调用标识与 tool_call_id 的派生锚，三者由此同源。minted 携带每个
+    调用的 raw wire id 与 ordinal，随 metadata 落库（raw_tool_call_id 供追溯）；
+    两者缺省（旧测试直调 / 无工具回合）时退化为无伴随字段的旧行为。
     """
     from ctx_weft.core.loop.capability_gateway import DISPATCH_TOOLS, SILENT_TOOLS
-    asst_tool_dicts = [{"id": tc.id, "name": tc.name, "input": tc.arguments} for tc in tool_calls]
+    by_ordinal = {m.ordinal: m for m in (minted or [])}
+    asst_tool_dicts: list[dict] = []
+    for i, tc in enumerate(tool_calls):
+        d: dict = {"id": tc.id, "name": tc.name, "input": tc.arguments}
+        m = by_ordinal.get(i)
+        if m is not None:
+            d["raw_tool_call_id"] = m.raw_id
+        asst_tool_dicts.append(d)
     _excluded = DISPATCH_TOOLS | SILENT_TOOLS
     non_dispatch_tool_dicts = [d for d in asst_tool_dicts if d["name"] not in _excluded]
-    await ctx.memory.ingest(
+    record_id = await ctx.memory.ingest(
         MemoryEvent(
+            id=anchor or None,
             kind=MemoryKind.CONVERSATION_TURN, scope=MemoryScope.TASK,
             address=state.scope,
             content=text,
@@ -543,7 +601,7 @@ async def _ingest_assistant_turn(
         ),
         ctx.provider_ctx,
     )
-    return asst_tool_dicts
+    return PersistedAssistantTurn(record_id=record_id or "", tool_calls=asst_tool_dicts)
 
 
 async def _maybe_predispatch_compact(
@@ -589,6 +647,8 @@ async def _execute_tool_calls(
     ctx.run_phase.in_tool_loop = True
 
     for i, tc in enumerate(tool_calls):
+        # 账本键就是 tc.id（摄入点铸造的内部标识），gateway 自己从 tool_call_id 取——
+        # 调用侧不再铸第二条身份、也不再经共享 provider_ctx 转移所有权。
         # 工具间命中：软打断 → 本 tc 及之后全部「未开始」→ 补「已取消」+ park；硬取消 → CancelledError。
         if _interrupt_pending(ctx):
             for rest in tool_calls[i:]:
@@ -719,24 +779,16 @@ async def _ingest_synthetic_tool_result(
     state: LoopState, ctx: LoopContext, tc: ToolCall, content: str, *,
     interrupted: bool = False, cancelled: bool = False,
 ) -> None:
-    """为被打断/未执行的工具补一条 TOOL_RESULT，使 tool_call↔result 一一对应（无 dangling）。"""
-    await ctx.memory.ingest(
-        MemoryEvent(
-            kind=MemoryKind.CONVERSATION_TURN, scope=MemoryScope.TASK,
-            address=state.scope,
-            content=content,
-            timestamp=now_utc(),
-            role="tool",
-            metadata={
-                "tool_name": tc.name,
-                "tool_call_id": tc.id,
-                "is_error": True,
-                "interrupted": interrupted,
-                "cancelled": cancelled,
-            },
-        ),
-        ctx.provider_ctx,
-    )
+    """为被打断/未执行的工具补一条 TOOL_RESULT，使 tool_call↔result 一一对应（无 dangling）。
+
+    走 `ingest_tool_result`：记录 id 必须是确定性的那一个，否则这条补位在 dangling 判定
+    眼里不存在——「补它就是为了不悬挂」这个目的会落空，恢复时该调用被重新执行一遍。
+    """
+    from ctx_weft.core.loop.capability_gateway import ingest_tool_result
+    await ingest_tool_result(
+        ctx.memory, ctx.provider_ctx, state.scope,
+        tool_call_id=tc.id, content=content, is_error=True, tool_name=tc.name,
+        extra_metadata={"interrupted": interrupted, "cancelled": cancelled})
 
 
 async def _await_tool_or_stop(invoke_task: "asyncio.Future", ctx: LoopContext) -> bool:

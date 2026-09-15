@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -85,6 +85,7 @@ from ctx_weft.core.models.errors import (
 )
 from ctx_weft.core.utils.clock import now_utc
 from ctx_weft.core.utils.ids import generate_id
+from ctx_weft.core.utils.task_ref import task_ref
 from ctx_weft.protocols import (
     AgentTemplate,
     Capability,
@@ -106,7 +107,7 @@ from ctx_weft.protocols.capability import (
     SkillCapabilityProvider,
     qualify,
 )
-from ctx_weft.protocols.events import EventBus
+from ctx_weft.protocols.events import EventBus, PersistenceUnavailableError
 from ctx_weft.protocols.hitl import (
     HITL_OUTCOME_ACCEPTED,
     PREFACE_AFTER_INTERRUPT,
@@ -306,6 +307,9 @@ class TurnHandle:
     template_id: str
     event_bus: EventBus
     _state: LoopState | None = None
+    # 存储不可用健康查询（spec: event-commit）：runtime 构造时注入；None（测试替身）
+    # 表示无健康面，wait_for_finish 按旧行为等超时。
+    _storage_health: "Callable[[str], str | None] | None" = None
 
     async def events(self) -> AsyncIterator[Event]:
         from ctx_weft.protocols.events import EventFilter
@@ -459,10 +463,25 @@ class TurnHandle:
             async with asyncio.timeout(timeout):
                 stream = self.event_bus.stream(
                     EventFilter(agent_id=self.agent_id, task_id=self.task_id)
-                )
+                ).__aiter__()
                 seen_recap_run_ids: set[str] = set()
                 waiting_for_run_id: str | None = None
-                async for ev in stream:
+                # 轮询式消费（spec: event-commit）：存储隔离后**没有事件再流出**，
+                # 健康检查不能只在「收到事件」时做——每个 tick 先查健康再等下一条，
+                # 0.25s 内把 PersistenceUnavailableError 交给宿主，不等通用超时。
+                while True:
+                    if self._storage_health is not None:
+                        reason = self._storage_health(self.session_id)
+                        if reason is not None:
+                            raise PersistenceUnavailableError(
+                                f"session {self.session_id!r} is storage_unavailable: "
+                                f"{reason}")
+                    try:
+                        ev = await asyncio.wait_for(stream.__anext__(), timeout=0.25)
+                    except TimeoutError:
+                        continue          # 本 tick 无事件：回到健康检查
+                    except StopAsyncIteration:
+                        break
                     if ev.type == EventType.TASK_RECAP_DONE:
                         seen_recap_run_ids.add(ev.run_id)
                         if waiting_for_run_id is not None and ev.run_id == waiting_for_run_id:
@@ -482,7 +501,8 @@ class TurnHandle:
 async def _task_has_dangling_tool_call(memory, scope, provider_ctx) -> bool:
     """该 scope 最近一个 assistant turn 是否存在「有 tool_call、无 TOOL_RESULT」（spec/07 §6）。"""
     from ctx_weft.core.loop.steps.reconcile import _dangling_tool_calls
-    return bool(await _dangling_tool_calls(memory, scope, provider_ctx))
+    dangling, _ = await _dangling_tool_calls(memory, scope, provider_ctx)
+    return bool(dangling)
 
 
 
@@ -564,15 +584,58 @@ class CtxWeftRuntime:
             from ctx_weft.providers.events import InMemoryEventStore
             event_store = InMemoryEventStore()
         self.event_store = event_store
-        # 单一入口交给 attach_persistence（spec 2026-08-29 §6.4 + final review R15）：
-        # ① EventPersister 与 SnapshotWriter 的订阅顺序契约（persister 必须先于 snapshot
-        #   writer 订阅，否则 rebuild_view 看不到当前事件）统一由它保证，宿主不必懂顺序；
-        # ② snapshot_every_n=0（默认）时不接 SnapshotWriter —— 与改造前行为零变化；
-        # ③ 返回的 handle 存成**公开**属性 `self.persistence`（而不是私有的
-        #   `_event_persister`），因为 `EventPersister.detach` 的 docstring 明确要求宿主
-        #   换持久 store 时调用 detach，私有且无调用点会让那个用例本就是坏的。
-        self.persistence = attach_persistence(
-            self._event_bus, self.event_store, snapshot_every_n=snapshot_every_n)
+        # 有序提交是 EventStore 的必需部分（spec: event-log），**与提交策略无关**：
+        # 恢复路径（rebuild_view / SnapshotWriter）无条件走 position 一致切面，没有
+        # 按 ID 排序的回落分支。这里做的是契约校验而非能力协商——Protocol 的
+        # @abstractmethod 只拦得住显式继承的实现，鸭子类型 store 缺方法要到第一次
+        # 提交才炸，那时错误已经离现场很远。
+        from ctx_weft.protocols.events import supports_ordered_commit
+        if not supports_ordered_commit(self.event_store):
+            raise ValueError(
+                f"EventStore {type(self.event_store).__name__} 未实现有序提交："
+                "append_batch / read_range / committed_head 三者必须齐全（spec: event-log）。"
+                "按事件 ID 排序的 store 不是「功能少一点」，而是恢复语义错误——延迟提交的"
+                "事件会永久落在快照游标之外，两条恢复路径给出不同的世界且不报错"
+                "（可靠性方案 H2）。内置 InMemoryEventStore / SqlEventStore 均已实现；"
+                "自定义 store 请参照 tests/unit/test_ordered_event_store_conformance.py。")
+        # 存储不可用健康表（spec: event-commit）：session_id → 原因。CommitGate 失败时
+        # **先标记后抛**；公开查询走 storage_health()。内存态——崩溃后由持久日志重建。
+        self._storage_unavailable: dict[str, str] = {}
+        # 提交策略分岔（spec: event-commit，change reliability-wp3）：
+        # - required（默认）：CommitGate 接进 emit 路径（提交确认先于通知）；persister
+        #   不再接线；SnapshotWriter（若启用）单独接——它消费的已是确认提交流。
+        # - best_effort：旧 attach_persistence 路径（吞存储错误），启动告警、不可靠恢复。
+        policy = self._config.event_commit_policy
+        if policy not in ("required", "best_effort"):
+            raise ValueError(
+                f"event_commit_policy must be 'required' or 'best_effort', got {policy!r}")
+        if policy == "required":
+            attacher = getattr(self._event_bus, "attach_commit_gate", None)
+            if not callable(attacher):
+                raise ValueError(
+                    "event_commit_policy='required' 需要支持提交门的事件总线（实现 "
+                    "EventBus.attach_commit_gate：emit/commit_provisional 在 fanout 前 "
+                    "先经 gate 确认存储提交）。InProcessEventBus 已支持；自定义总线请实现"
+                    "该扩展，或显式配置 event_commit_policy='best_effort' 并接受丢事件风险。")
+            from ctx_weft.core.events.commit_gate import CommitGate
+            self._event_bus.attach_commit_gate(CommitGate(
+                self.event_store, on_unavailable=self._mark_storage_unavailable))
+            from ctx_weft.providers.events import PersistenceHandle
+            writer = None
+            if snapshot_every_n > 0:
+                from ctx_weft.providers.events.snapshot import SnapshotWriter
+                writer = SnapshotWriter(self.event_store, self._event_bus,
+                                        every_n_events=snapshot_every_n)
+            # handle 统一暴露：required 模式 persister=None（提交走 gate）、writer 可 detach。
+            self.persistence = PersistenceHandle(None, writer)
+        else:
+            logger.warning(
+                "event_commit_policy='best_effort'：存储失败将被吞掉（不可靠恢复）；"
+                "仅建议显式接受丢事件的观测用途。")
+            # 旧路径（spec 2026-08-29 §6.4 + final review R15）：persister 必须先于
+            # snapshot writer 订阅；handle 存公开属性 persistence 供宿主 detach。
+            self.persistence = attach_persistence(
+                self._event_bus, self.event_store, snapshot_every_n=snapshot_every_n)
 
         # Auto-register 内置 providers（与用户注册的 providers 无关）
         control_provider = ControlCapabilityProvider()
@@ -646,7 +709,6 @@ class CtxWeftRuntime:
             event_bus=self._event_bus,
             task_max_concurrent=self._config.task_max_concurrent,
             task_max_retries=self._config.task_max_retries,
-            default_task_timeout_ms=self._config.default_task_timeout_ms,
         )
         # SM 的输入端：只认 TaskManager 的四类事件（_INPUT_BY_EVENT），本 task
         # 之后 TM 还没开始发这三条信号，运行时行为不变（docs/events-v2.md §2.1.1）。
@@ -826,6 +888,25 @@ class CtxWeftRuntime:
         per.pop(task_id, None)
         if not per:
             self._run_tokens.pop(session_id, None)
+
+    # ── 存储不可用健康（spec: event-commit）────────────────────────────────────
+
+    def _mark_storage_unavailable(self, session_id: str, cause: BaseException) -> None:
+        """CommitGate 失败回调：先标记后抛（并发路径读到的健康状态与异常一致）。"""
+        prev = self._storage_unavailable.get(session_id)
+        if prev is None:
+            self._storage_unavailable[session_id] = f"{type(cause).__name__}: {cause}"
+            logger.error(
+                "session %s enters storage_unavailable isolation: %r", session_id, cause)
+
+    def storage_health(self, session_id: str) -> str | None:
+        """None = 健康；否则返回隔离原因（storage_unavailable）。"""
+        return self._storage_unavailable.get(session_id)
+
+    def clear_storage_isolation(self, session_id: str) -> None:
+        """宿主确认存储恢复后解除隔离（恢复流程须先按 batch_id 收口未知提交）。"""
+        if self._storage_unavailable.pop(session_id, None) is not None:
+            logger.info("session %s storage isolation cleared", session_id)
 
     async def pause_session(self, session_id: str) -> bool:
         """软打断（spec 2026-07-05）：放弃其余在途/排队任务，只留 root agent 当前那一轮。
@@ -1516,14 +1597,19 @@ class CtxWeftRuntime:
             task_id=root_task.id,
             template_id=params.template_id,
             event_bus=self._event_bus,
+            _storage_health=self.storage_health,
         )
 
         if not params.resume:
+            # resume 分支已在推 root task 之前解析过模板（见上）——那一步不能挪到这里，
+            # 复用活 owner 时中间不能留 await。
             template = await self._template_lookup.get_template(
                 params.template_id,
                 None,
                 ctx=ProviderContext(session_id=session.id, tenant_id=params.tenant_id),
             )
+        task_manager.set_unhealthy_check(
+            lambda sid: self.storage_health(sid) is not None)  # spec: event-commit
         task_manager.set_runner(self._make_task_runner(
             session=session,
             template=template,
@@ -1955,7 +2041,7 @@ class CtxWeftRuntime:
                     memory, parent_scope, t, provider_ctx)
                 await _put_dispatch_result(
                     memory, parent_scope, t,
-                    f"Sub-task '{t.title}' was cancelled mid-run (session failure threshold hit); "
+                    f"Sub-task {task_ref(t)} was cancelled mid-run (session failure threshold hit); "
                     f"its partial execution below is incomplete.",
                     ts, provider_ctx, replace=True, tool_call_id=tool_call_id,
                 )
@@ -1974,7 +2060,7 @@ class CtxWeftRuntime:
                     task_id=root_task.id, agent_id=session.root_agent_id,
                 )
                 summary = "Failure threshold hit — consecutive failures: " + "; ".join(
-                    f"{i}) {title}: {reason}" for i, (title, reason) in enumerate(failures, start=1)
+                    f"{i}) {ref}: {reason}" for i, (ref, reason) in enumerate(failures, start=1)
                 )
                 await _synthesize_dispatch_pair(
                     memory, scope, root_task,
@@ -2255,6 +2341,8 @@ class CtxWeftRuntime:
         # （Task 11）：这里为此重付一次 `rebuild_view` 的代价，换来两处永不漂移。
         await self._load_agents_of(session.id, tenant_id=session.tenant_id)
 
+        task_manager.set_unhealthy_check(
+            lambda sid: self.storage_health(sid) is not None)  # spec: event-commit
         task_manager.set_runner(self._make_task_runner(
             session=session,
             template=template,
@@ -2287,9 +2375,12 @@ class CtxWeftRuntime:
                 boundary=info.get("boundary") or "finish",
             )
 
-        self._register_and_drain(session, task_manager)
+        # spec: task-handoff——恢复期的永久阻塞扫描（restore 重建依赖后、首次 drain 前）：
+        # 崩溃窗口里 A 的 FAILED 已落盘、B 的级联取消未落盘时，A 的失败回调不会重放，
+        # 靠这一趟幂等补扫把 B 判定并落终态，否则 B 永久 PENDING。
+        await task_manager.dispose_blocked_dependents()
 
-        # 无可恢复 task（所有 task 已终态）但 session 因崩溃未落终态 → 显式收尾：
+        self._register_and_drain(session, task_manager)
         # gather 重跑的后台 recap 后发 SESSION_FINISHED（终态镜像 on_task_finished）。
         # `keep_alive` 短路这一步：`_start_task_for_agent` 调用这里正是为了拿到一个能塞
         # 新 task 的活 TM，紧接着就要 push——在那之前 finalize 一次（发 SessionFinished、
@@ -2849,6 +2940,7 @@ class CtxWeftRuntime:
             task_id=task_id,
             template_id=rec.template_id,
             event_bus=self._event_bus,
+            _storage_health=self.storage_health,
         )
 
     async def _hydrate_agent_for_send(self, agent_id: str, session_id: str | None) -> None:
@@ -3623,12 +3715,10 @@ class CtxWeftRuntime:
     async def _read_session_events_of_types(
         self, session_id: str, types: "tuple[EventType, ...]",
     ) -> "list[Event]":
-        """轻查询取该 session 的指定类型事件；EventStore 未实现轻查询时退化为全量读 + 内存过滤。"""
-        try:
-            return await self.event_store.read_session_events_of_types(session_id, types)
-        except NotImplementedError:
-            return [e for e in await self.event_store.read_by_session(session_id)
-                    if e.type in types]
+        """轻查询取该 session 的指定类型事件（降级逻辑与 capability 折叠共用一份）。"""
+        from ctx_weft.core.control.reducers import load_events_of_types
+
+        return await load_events_of_types(self.event_store, session_id, types)
 
     async def _hydrate_snapshot_messages(self, snapshot, session_id: str) -> None:
         """把 `decisions_for` 里的 **event 侧** 内容还原成 memory 侧可用的形态。
@@ -3811,8 +3901,10 @@ class CtxWeftRuntime:
             memory=memory,
             event_bus=self._event_bus,
             provider_authorizers=self.providers.get_capability_authorizers(),
+            rerun_authorizers=self.providers.get_capability_rerun_authorizers(),
             spill_threshold=self._config.spill_threshold,
             spill_preview_chars=self._config.spill_preview_chars,
+            spill_tail_chars=self._config.spill_tail_chars,
             memory_blob_store=self.providers.get_memory_blob_store(),
         )
 
@@ -3840,6 +3932,7 @@ class CtxWeftRuntime:
             skill_provider_index=skill_index,
             cancel_token=cancel_token,
             task_manager=task_manager,
+            event_store=self.event_store,
             hitl=self.hitl,
             waiter=HitlWaiter(self.hitl_registry, timeout_sec=self._hitl_timeout_sec),
             pause_token=pause_token,
@@ -3908,7 +4001,6 @@ class CtxWeftRuntime:
             "run_id": run_id,
             "initial_step": initial_step,
         }, origin=EventOrigin.RUNTIME))
-
         run_error: BaseException | None = None
         was_cancelled = False
         cancel_takes_effect = False
@@ -3987,6 +4079,14 @@ class CtxWeftRuntime:
             # task 级事实（TaskInterrupted）不在这里发：outage 的 RunOutcome 带着
             # retriable=False 交给 TaskManager，由处置表判成 INTERRUPTED 并发出——
             # 「outage 从不原地重试」的判据从路径隔离变成了这个显式标志位（Task 4）。
+        except PersistenceUnavailableError as exc:
+            # spec: event-commit——存储不可用：不进通用重试语义。task 状态不动、
+            # 不发 RUN_INTERRUPTED/终态事件（emit 同样要过提交门、会再撞同一故障）；
+            # 会话已由 CommitGate 先标记 storage_unavailable，drain 停止派发。
+            # re-raise 交 TaskManager 的同名分支收尾（那边同样不再发任何事件）。
+            run_error = exc
+            logger.error("_run_loop: task %s halted — session storage unavailable", task.id)
+            raise
         except Exception as exc:
             run_error = exc
             # 这份 outcome **不是**给 TaskManager 的（本分支下面 `raise run_error`，
@@ -4058,19 +4158,23 @@ class CtxWeftRuntime:
                 state.run_outcome.kind if state.run_outcome is not None
                 else RunOutcomeKind.COMPLETED
             )
-            await self._event_bus.emit(make_event(state, EventType.RUN_FINISHED, payload={
-                "outcome": outcome_kind.value,
+            # spec: event-commit——存储隔离后 finally 的收尾事件不再发：emit 要过
+            # 提交门，会再撞同一故障并把 PersistenceUnavailableError 抛出 finally、
+            # 掩掉真正的 run_error。会话状态由健康表承载，不缺这条事件。
+            if not isinstance(run_error, PersistenceUnavailableError):
+                await self._event_bus.emit(make_event(state, EventType.RUN_FINISHED, payload={
+                    "outcome": outcome_kind.value,
                 # `final_status` 已废弃，下个周期删除——host 应改读上面的 `outcome`
                 # （run 词表）。Task 4 起 run 不再写 task 状态，故这里只是**发 RUN_FINISHED
                 # 那一刻** task 的状态（多半仍是 ACTIVE）：真正的终态由随后 TaskManager 的
                 # 处置写定，靠它推 task 状态的 host 一定要改。
-                "final_status": task.status,
-                "will_retry": will_retry,
-                "total_events": state.sequence_counter,
-                "total_turns": len(state.transcript),
-                "error": str(run_error) if run_error else None,
-                "error_type": type(run_error).__name__ if run_error else None,
-            }, origin=EventOrigin.RUNTIME))
+                    "final_status": task.status,
+                    "will_retry": will_retry,
+                    "total_events": state.sequence_counter,
+                    "total_turns": len(state.transcript),
+                    "error": str(run_error) if run_error else None,
+                    "error_type": type(run_error).__name__ if run_error else None,
+                }, origin=EventOrigin.RUNTIME))
 
         if run_error is not None:
             raise run_error
@@ -4126,6 +4230,7 @@ class CtxWeftRuntime:
             template_id=template.id,
             event_bus=self._event_bus,
             _state=state,
+            _storage_health=self.storage_health,
         )
         return state, handle
 

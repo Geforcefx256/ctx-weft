@@ -244,23 +244,46 @@ class ContextAssembler:
     deps: AssemblerDeps
 
     async def assemble(self, request: ContextRequest) -> AssembledPrompt:
-        """1) 并发触发所有 sources；2) budget；3) compose。"""
+        """1) 并发触发所有 sources；2) budget（先扣工具面预留）；3) compose。"""
         all_blocks: list[ContextBlock] = []
         async with asyncio.TaskGroup() as tg:
             futs = [tg.create_task(self._collect(s, request)) for s in self.sources]
         for f in futs:
             all_blocks.extend(f.result())
 
-        # budget
+        # budget：内容预算 = 有效窗口 − 工具面预留（spec: tool-schema-budget）。工具
+        # schema 是每个请求的固定占用（API tools 参数随请求下发且不受裁剪）——不预留
+        # 则窗口实际超限。预留按当次装配的能力快照现算；compact 工具面恒空 → 零预留；
+        # cache 缺失（测试直构 assembler）→ 零预留、行为同旧。指纹供 act 循环增量估算
+        # 感知工具面变化。
         token_limit = effective_limit(
             request.session.context_limit, request.session.reserved_output_tokens
         )
-        kept = await self.budget.apply(all_blocks, token_limit, request)
+        tools_reserved, tools_sig = self._tools_reservation(request)
+        kept = await self.budget.apply(
+            all_blocks, max(0, token_limit - tools_reserved), request,
+            overflow_limit=token_limit)
 
         # compose
         prompt = await self.composer.compose(kept, request)
         self._install_live_tools(prompt, request)
+        prompt.metadata["tools_reserved_tokens"] = tools_reserved
+        prompt.metadata["tools_signature"] = tools_sig
         return prompt
+
+    def _tools_reservation(self, request: ContextRequest) -> tuple[int, str]:
+        """装配期工具面预留与指纹（紧凑口径：compact / 无 cache → (0, "")）。"""
+        cache = self.deps.capability_cache
+        if cache is None or request.purpose == "compact":
+            return 0, ""
+        from ctx_weft.core.assembler.sources.capability import build_llm_tools
+        from ctx_weft.core.utils.estimate import estimate_tools_tokens, tools_signature
+
+        agent_id = getattr(request.agent, "id", "") or self.deps.agent_id
+        task_id = getattr(request.task, "id", "") or getattr(
+            self.deps.provider_ctx, "task_id", "")
+        snapshot = build_llm_tools(cache.available(agent_id, task_id), request.purpose)
+        return estimate_tools_tokens(snapshot, request.token_counter), tools_signature(snapshot)
 
     def _install_live_tools(self, prompt: AssembledPrompt, request: ContextRequest) -> None:
         """给 prompt 装上活工具面：每次读 `.tools` 都问 CapabilityCache 现算。

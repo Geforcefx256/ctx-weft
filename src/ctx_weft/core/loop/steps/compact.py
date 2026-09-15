@@ -19,6 +19,7 @@ from __future__ import annotations
 import dataclasses
 import inspect
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from typing import Any
@@ -46,6 +47,58 @@ logger = logging.getLogger(__name__)
 # _TASK_LAYER_TYPES/_TASK_BODY_TYPES 五类型；跨 task 聚合用半址（task_id=None）。
 _TASK_VIEW_KINDS = [MemoryKind.CONVERSATION_TURN, MemoryKind.SUMMARY, MemoryKind.TOOL_AUDIT]
 
+# ── 结构化 digest（spec: compact-fidelity）───────────────────────────────────
+# 五小节契约（cue 见 composer 的两域 instruction）；Evidence 允许缺，其余必需。
+DIGEST_SECTIONS = ("Goal", "Constraints", "Done", "Remaining", "Evidence")
+REQUIRED_DIGEST_SECTIONS = DIGEST_SECTIONS[:4]
+
+_DIGEST_SECTION_RE = {
+    name: re.compile(rf"^## {name}[ \t]*\n(.*?)(?=^## |\Z)", re.S | re.M)
+    for name in DIGEST_SECTIONS
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class ParsedDigest:
+    """解析后的 digest：text 为落库形态（结构化时即原文），degraded 标降级。
+
+    sections 供断言/评测消费（name → 小节正文；Evidence 可缺）。降级 = 整文作 digest
+    （散文 digest 仍可用，不重试不中断——重试一次 LLM 调用换不回格式保证）。
+    """
+
+    text: str
+    degraded: bool
+    sections: dict[str, str] = dataclasses.field(default_factory=dict)
+
+
+def parse_structured_digest(text: str) -> ParsedDigest:
+    """宽松解析（spec: compact-fidelity）：抓 `## <Name>` 小节；Goal/Constraints/
+    Done/Remaining 任一缺失（或空）→ 整文作 digest、degraded=True。旧散文 digest
+    （本 change 之前的数据）天然走降级路径，无需迁移。"""
+    sections: dict[str, str] = {}
+    for name in DIGEST_SECTIONS:
+        m = _DIGEST_SECTION_RE[name].search(text)
+        if m and m.group(1).strip():
+            sections[name] = m.group(1).strip()
+    degraded = any(name not in sections for name in REQUIRED_DIGEST_SECTIONS)
+    return ParsedDigest(text=text, degraded=degraded, sections=sections)
+
+
+async def _resolve_digest(value) -> ParsedDigest:
+    """把 summarize 的产物（ParsedDigest / 旧测试桩的裸 str / 取值的零参协程）归一。
+
+    兼容裸 str 是刻意的：既有测试大量 monkeypatch summarize_for_compact 返回 str，
+    落库点不应对替身形态敏感（str → 无小节 → degraded，语义自洽）。"""
+    if dataclasses.is_dataclass(value) and isinstance(value, ParsedDigest):
+        return value
+    if isinstance(value, str):
+        return parse_structured_digest(value)
+    if inspect.isawaitable(value):
+        return await _resolve_digest(await value)
+    if callable(value):
+        return await _resolve_digest(value())
+    raise TypeError(f"unsupported digest payload: {type(value)!r}")
+
 
 def _media_enabled(ctx) -> bool:
     """L0.5 与 §6.1 前置降级的总闸：只有真接了**可外部化**的 `MemoryBlobStore` 时才跑。
@@ -72,11 +125,13 @@ def _agent_half(scope) -> MemoryAddress:
 
 async def summarize_for_compact(
     state: LoopState, ctx: LoopContext, *, scope: str = "task"
-) -> str:
-    """装配 purpose="compact" 上下文 + 一次 LLM 摘要，返回摘要文本。
+) -> ParsedDigest:
+    """装配 purpose="compact" 上下文 + 一次 LLM 摘要，返回解析后的 digest。
 
     scope 选 cue（composer 据 extra["compact_scope"] 分流）："task"=整段执行摘要（默认，
-    observe 兜底与坍缩共用）；"agent"=派发经验摘要。
+    observe 兜底与坍缩共用）；"agent"=派发经验摘要。两域 cue 均要求五小节结构（spec:
+    compact-fidelity）；产出经 parse_structured_digest 宽松解析——缺必需节整文降级
+    （degraded=True），不重试、不中断。
 
     LLM 摘要是 compact 的硬依赖（compact + observe 回退档共用本函数）：瞬时故障由
     stream_llm_resilient 自愈，自愈耗尽抛 LLMOutageError → 走 INTERRUPTED。**不再**在
@@ -175,7 +230,8 @@ async def summarize_for_compact(
                 "usage": dataclasses.asdict(usage),
                 "llm_model": model, "llm_account": llm_account,
                 "finish_reason": "stop", "turn": 0}))
-    return summary_text
+    # spec: compact-fidelity——落库前宽松解析（缺必需节整文降级，不中断）。
+    return parse_structured_digest(summary_text)
 
 
 # 坍缩 USER_PROMPT 的两节分隔标记；再坍缩时据此切出「原始消息」节，保持有界。
@@ -195,7 +251,7 @@ def _original_section(content: str) -> str:
 
 
 async def collapse_task_layer(
-    state, ctx, keep_last: int, summary_text: str
+    state, ctx, keep_last: int, summary_text: "str | ParsedDigest",
 ) -> int:
     """task compact（二级压缩）：把当前 task 层超过 keep_last 的早期回合（含原始 USER_PROMPT
     与 observer 的 `## Progress So Far`）整体坍缩成一条新 USER_PROMPT，content = 原始消息 +
@@ -203,7 +259,8 @@ async def collapse_task_layer(
 
     坍缩物是 USER_PROMPT 而非 assistant 摘要：composer 据 mtype=="user_prompt"+task_id 定位当前
     task 贴 `## Current Task/## Current Message` 框，故当前运行 task 坍缩后框架不丢；已结束胶囊被
-    跨 task 召回时它就是一条背景 message。
+    跨 task 召回时它就是一条背景 message。summary_text 兼容裸 str（旧测试桩）；degraded 标记
+    随 metadata 落库（spec: compact-fidelity）。
     """
     memory = ctx.memory
     recs = await memory.load_view(
@@ -245,7 +302,8 @@ async def collapse_task_layer(
     anchor_ts = anchor_src.timestamp - timedelta(microseconds=1)
 
     ids = [r.id for r in fold]
-    collapsed = f"{original}{COLLAPSE_DELIM}{summary_text or '[Context compacted]'}"
+    digest = await _resolve_digest(summary_text)
+    collapsed = f"{original}{COLLAPSE_DELIM}{digest.text or '[Context compacted]'}"
     # v2 P3d：遗忘+坍缩物一次原子 fold（旧徒手 supersede+ingest 有崩溃丢摘要窗口）
     await memory.fold(ids, [
         MemoryEvent(
@@ -255,7 +313,8 @@ async def collapse_task_layer(
             timestamp=anchor_ts,
             role="user",
             metadata={"task_id": state.scope.task_id, "collapsed": True,
-                      "keep_last": keep_last, "folded_count": len(fold)},
+                      "keep_last": keep_last, "folded_count": len(fold),
+                      "digest_degraded": digest.degraded},
             # 上面 §6.1 的前置降级把折区的真图换成了 L0.5 占位，`original` 节又把其中
             # 一部分逐字带进了坍缩物——那些 ref 于是**仍在视图里、仍被 get_image 定位得到**，
             # 而承载它们的原记录正要被这一次 fold 全部 supersede。占位是文本，GC 的 mark
@@ -364,8 +423,10 @@ async def _count_root_residues(state: LoopState, ctx: LoopContext) -> int:
     return len(top)
 
 
-async def fold_root_experience(state: LoopState, ctx: LoopContext, keep_last: int,
-                               summary_text: str | Callable[[], Awaitable[str]]) -> int:
+async def fold_root_experience(
+        state: LoopState, ctx: LoopContext, keep_last: int,
+        summary_text: "str | ParsedDigest | Callable[[], Awaitable[str | ParsedDigest]]",
+) -> int:
     """跨层折叠 fold：task 的详细度只 3 级（spec 2026-06-29 重订，删 L1 黑盒中间态）。
 
     - **执行中**：RUNNING/SUSPENDED → task 层 raw（每条工具调用展开），不在本函数管辖。
@@ -492,7 +553,9 @@ async def fold_root_experience(state: LoopState, ctx: LoopContext, keep_last: in
     # 保下来的**最新的**图会先被 `content_to_text` 拍扁进摘要输入（连占位都没有、
     # ref 彻底没了），紧接着记录就被下面的 `fold()` supersede → 老图留下可取回的占位、
     # 最新的图反而痕迹全无，正是 §6.1 开头写的「优先级完全颠倒」。
-    summary = summary_text if isinstance(summary_text, str) else await summary_text()
+    # 兼容裸 str / 零参协程（既有测试桩形态）——统一经 _resolve_digest（spec:
+    # compact-fidelity，degraded 随 metadata 落库）。
+    digest = await _resolve_digest(summary_text)
 
     # 折出新摘要：仅当确有单元被折时写（纯遗忘 = fold(ids, [])）
     if not fold_top:
@@ -514,7 +577,7 @@ async def fold_root_experience(state: LoopState, ctx: LoopContext, keep_last: in
         if (r.address.task_id if r.address else r.metadata.get("task_id")) in surviving:
             kept_ts.append(r.timestamp)
     anchor_ts = (min(kept_ts) if kept_ts else now_utc())
-    folded_summary = summary or "[Experience compacted]"
+    folded_summary = digest.text or "[Experience compacted]"
     # v2 P3d：跨层遗忘 + 新摘要一次原子 fold（关旧「raw 已删而摘要未写」窗口）
     await memory.fold(ids, [
         MemoryEvent(
@@ -523,7 +586,8 @@ async def fold_root_experience(state: LoopState, ctx: LoopContext, keep_last: in
             content=folded_summary,
             timestamp=anchor_ts - timedelta(microseconds=1),
             role="user",
-            metadata={"keep_last": keep_last, "folded_count": len(fold_top)},
+            metadata={"keep_last": keep_last, "folded_count": len(fold_top),
+                      "digest_degraded": digest.degraded},
             # 同 collapse_task_layer 处：摘要输入里含 L0.5 占位（§6.1 的前置降级刚写下），
             # 模型**可能**把某个 ref 逐字抄进摘要。抄进来了就仍能被 get_image 定位到，
             # 故必须声明；没抄进来则 `placeholder_refs` 返回空表，这里恒为 no-op。

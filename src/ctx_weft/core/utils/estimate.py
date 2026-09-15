@@ -150,3 +150,55 @@ def estimate_tool_calls_tokens(tool_calls: "list[dict] | None", *, count: Callab
         total += count(str(tc.get("name", "")))
         total += count(_dumps_for_estimate(tc.get("arguments", tc.get("input", {}))))
     return total
+
+
+# ── 工具面（API tools 参数）费率与指纹（spec: tool-schema-budget）────────────
+
+
+def _tool_field(t: Any, name: str) -> Any:
+    """LLMTool（dataclass）与 dict 形态统一取字段。"""
+    v = getattr(t, name, None)
+    if v is None and isinstance(t, dict):
+        v = t.get(name)
+    return v
+
+
+def _canonical_tools_dump(tools: "list[Any] | None") -> list[str]:
+    """规范化工具定义转储（与估算/指纹同源）：按 name 排序，每工具
+    name + description + input_schema（**key 排序** JSON——指纹对键序鲁棒，估算共用
+    同一份转储）。指纹必须覆盖与估算完全相同的输入——仅哈希名称集合不足以感知同名
+    工具的定义更新（schema 变大 = 成本变化）。"""
+    if not tools:
+        return []
+    parts: list[str] = []
+    for t in sorted(tools, key=lambda x: str(_tool_field(x, "name") or "")):
+        parts.append(str(_tool_field(t, "name") or ""))
+        parts.append(str(_tool_field(t, "description") or ""))
+        schema = _tool_field(t, "input_schema") or {}
+        try:
+            parts.append(json.dumps(schema, ensure_ascii=False, sort_keys=True))
+        except Exception:  # pragma: no cover —— 防御（不可序列化 schema）
+            parts.append(str(schema))
+    return parts
+
+
+def estimate_tools_tokens(
+    tools: "list[Any] | None", count: Callable[[str], int] | None = None,
+) -> int:
+    """工具面 token 估算（name + description + schema JSON）——单一真源。
+
+    取代 prepare._estimate_assembled_tokens 与 llm_gateway._estimate_request_tokens
+    里两份重复的内联公式（口径逐值一致）。"""
+    count = count or estimate_tokens
+    return sum(count(p) for p in _canonical_tools_dump(tools))
+
+
+def tools_signature(tools: "list[Any] | None") -> str:
+    """工具面指纹：规范化定义转储（name+description+schema，见 _canonical_tools_dump）
+    的稳定哈希。空面 = 空串。工具面不变时与上次哈希比较即跳过估算增量。"""
+    import hashlib
+
+    dump = _canonical_tools_dump(tools)
+    if not dump:
+        return ""
+    return hashlib.sha256("\x1f".join(dump).encode("utf-8", "replace")).hexdigest()[:16]

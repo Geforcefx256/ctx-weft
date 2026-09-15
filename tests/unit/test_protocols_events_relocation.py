@@ -313,12 +313,20 @@ def test_deleted_shims_do_not_come_back() -> None:
     """
     import importlib
 
-    for mod in ("ctx_weft.core.events", "ctx_weft.core.events.types",
+    # 2026-09-11（reliability-wp3，spec: event-commit）有意恢复 `ctx_weft.core.events`
+    # **作为编排子包**（仅 commit_gate.py——提交门，方案 §8-WP3 明令「位于编排层」）。
+    # 本用例防的仍是 re-export shim 复活：core/events/__init__.py 不得转发任何契约
+    # 符号（契约唯一路径 protocols.events），shim 子模块（types/bus）仍然必须不存在。
+    for mod in ("ctx_weft.core.events.types",
                 "ctx_weft.core.events.bus", "ctx_weft.core.state.event_store"):
         try:
             importlib.import_module(mod)
+            raise AssertionError(f"{mod} 应当已删除——re-export shim 禁止复活")
         except ImportError:
-            continue
-        raise AssertionError(
-            f"{mod} 应当已删除——契约请从 ctx_weft.protocols.events 引入，"
-            "内置实现请从 ctx_weft.providers.events 引入")
+            pass
+    import ctx_weft.core.events as _ce  # noqa: F401 —— 编排子包本身存在（仅提交门）
+    assert not [n for n in getattr(_ce, "__all__", []) or []
+                if n not in ()], "core/events 不得 re-export 契约符号"
+    _banned = ("Event", "EventBus", "EventStore", "EventType", "RunSnapshot")
+    _leaked = [n for n in dir(_ce) if n in _banned]
+    assert not _leaked, f"core/events 不得转发契约符号: {_leaked}"

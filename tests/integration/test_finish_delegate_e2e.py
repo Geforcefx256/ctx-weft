@@ -80,7 +80,8 @@ class _RouterLLM(MockLLMAdapter):
         self._act_calls += 1
         if self._act_calls == 1:
             # Root act: finish + delegate IN THE SAME BATCH (the case under test).
-            # 交付物 = 收尾回合正文（finish_task 没有 result 参数，见 act._compose_final_outputs）。
+            # 交付物 = 收尾回合正文（finish_task 不带 result 参数——未声明参数会被
+            # gateway 严格校验拒绝，见 spec: capability-gateway）。
             return self._stream(MockResponse(text="root done", tool_calls=[
                 ToolCall(id=self._id("fin"), name="control__finish_task",
                          arguments={}),

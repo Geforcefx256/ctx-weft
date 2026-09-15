@@ -70,10 +70,10 @@ def build_reopen_prompt(
     if prev_output:
         sections.append(f"## Previous attempt (rejected)\n{prev_output}")
     if upstream is not None:
-        head_title, head_reason = upstream
+        head_ref, head_reason = upstream
         sections.append(
             f"## Upstream task revised\n"
-            f"Predecessor '{head_title}' was reopened (reason: {head_reason}). "
+            f"Predecessor {head_ref} was reopened (reason: {head_reason}). "
             f"Its updated result appears in the conversation above. "
             f"Redo this task based on the updated result."
         )

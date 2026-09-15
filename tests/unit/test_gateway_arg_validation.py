@@ -1,4 +1,7 @@
-"""Gateway 参数校验（spec B）：只拦 required/type/enum，忽略 additionalProperties/format。"""
+"""Gateway 参数校验（spec B）：只拦 required/type/enum，忽略 additionalProperties/format。
+
+控制工具（spec: capability-gateway）例外收紧：未知顶层参数显式拒绝并回灌错误。
+"""
 
 from __future__ import annotations
 
@@ -9,6 +12,10 @@ from ctx_weft.providers.events import InProcessEventBus
 from ctx_weft.core.loop.capability_gateway import CapabilityGateway, _validate_args
 from ctx_weft.core.loop.driver import LoopContext, LoopState
 from ctx_weft.core.capabilities.cache import CapabilityCache
+from ctx_weft.core.capabilities.control_tools import (
+    _CONTROL_TOOLS,
+    ControlCapabilityProvider,
+)
 from ctx_weft.protocols import MemoryAddress, ProviderContext
 from ctx_weft.protocols.capability import (
     CapabilityEvent,
@@ -199,3 +206,17 @@ async def test_invoke_raw_wrapper_error_truncates_huge_text() -> None:
     assert res.is_error is True
     assert len(res.content) < 2000  # 截断，不整段回灌
     assert "truncated" in res.content
+
+
+# ── 非控制工具的剥键语义（未知键静默剥除，fail-open）──────────────────────
+
+
+async def test_non_control_unknown_key_still_stripped_silently() -> None:
+    # 回归锚：收紧只限控制工具；外部工具保持剥键容错（与 test_invoke_strips_unknown_keys_
+    # before_provider 同行为，并排在此处钉住对照契约）
+    p = _Echo({"type": "object", "properties": {"q": {"type": "string"}}})
+    mem, state, ctx = _state_ctx()
+    res = await _gw(p, mem).invoke("mcp__a__search", {"q": "x", "junk": 99}, state, ctx)
+    assert res.is_error is False
+    assert not res.is_error, "未知键应被静默剥除，不产生错误反馈"
+    assert p.received == {"q": "x"}

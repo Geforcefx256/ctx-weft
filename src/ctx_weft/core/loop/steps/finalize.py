@@ -19,6 +19,7 @@ from ctx_weft.core.orchestrator.task.disposition import RunOutcome, RunOutcomeKi
 from ctx_weft.core.utils.content import content_to_text, image_tokens
 from ctx_weft.core.utils.clock import as_utc, now_utc
 from ctx_weft.core.utils.ids import generate_id
+from ctx_weft.core.utils.task_ref import task_ref, task_ref_parts
 from ctx_weft.protocols import MemoryEvent, MemoryEventType, MemoryKind, MemoryScope, MemoryAddress
 from ctx_weft.protocols.capability import qualify
 
@@ -26,16 +27,19 @@ logger = logging.getLogger(__name__)
 
 # v2 P3：旧类型清单常量（_OWN_CONV_TYPES/_FINAL_RAW_TYPES）随读侧 kind+role 谓词化删除。
 
-def _dispatch_running_ack(title: str) -> str:
+def _dispatch_running_ack(ref: str) -> str:
     """派发对 tool 槽的 **running 态**：子任务真正 start 时写，close 时被 `_dispatch_ack` 终态替换。
 
     与终态同理不含任何子任务产出——此刻也还没有。只说明「在跑」+ 导读下方的内联执行。
+
+    ``ref`` 是 `task_ref` 的规范称呼（标题 + id）。带 id 是必须的：这条会在重建对话里
+    **顶掉** delegate 时那条带 id 的活回执，只印标题的话模型下一回合就拿不到句柄了。
     """
-    return f"Sub-task '{title}' is running now — its execution follows below."
+    return f"Sub-task {ref} is running now — its execution follows below."
 
 
 # 同 agent 派发：派发对 tool 结果（不含任何子任务结果，spec 2026-06-30 §2.5）。
-def _dispatch_ack(title: str, outcome: str) -> str:
+def _dispatch_ack(ref: str, outcome: str) -> str:
     """同 agent 派发对的 tool 槽：终态 + 内联导读，**绝不含子任务产出**。
 
     「不回填真实结果」是结构性的，不是保守：llm_gateway.reorder_tool_results_after_calls 会把
@@ -51,7 +55,7 @@ def _dispatch_ack(title: str, outcome: str) -> str:
     """
     verdict = "FAILED" if outcome == "fail" else "completed"
     return (
-        f"Sub-task '{title}' ran here — outcome: {verdict}. Its execution is inlined "
+        f"Sub-task {ref} ran here — outcome: {verdict}. Its execution is inlined "
         f"below, ending with its own {qualify('control:finish_task')} and the final reply "
         "it delivered."
     )
@@ -169,7 +173,12 @@ async def _ensure_dispatch_frame(memory, parent_scope, task, provider_ctx):
                       "child_task_id": task.id,
                       "tool_calls": [{"id": tool_call_id,
                                       "name": task.origin_tool_name or START_TASK_NAME,
-                                      "input": {"title": task.title,
+                                      # task_id 进**渲染面**：`child_task_id` 一直在
+                                      # 同一个 metadata 里，但那是给 `_is_frame_of` 用的
+                                      # 内部键，模型看不到——于是重建历史里「我派发了谁」
+                                      # 只剩标题，同名兄弟无法区分。
+                                      "input": {"task_id": task.id,
+                                                "title": task.title,
                                                 "description": task.description or ""}}]},
         ),
         provider_ctx,
@@ -251,13 +260,13 @@ async def ensure_dispatch_frame_at_start(state, ctx) -> None:
     ts, tool_call_id = await _ensure_dispatch_frame(
         ctx.memory, parent_scope, task, ctx.provider_ctx)
     await _put_dispatch_result(
-        ctx.memory, parent_scope, task, _dispatch_running_ack(task.title), ts, ctx.provider_ctx,
+        ctx.memory, parent_scope, task, _dispatch_running_ack(task_ref(task)), ts, ctx.provider_ctx,
         replace=False, tool_call_id=tool_call_id,
     )
 
 
-def _finish_report_prefix(title: str, outcome: str) -> str:
-    """finish 对 tool 槽的前缀：`[task: <title>] ` 标明归属（+ fail 标记）。
+def _finish_report_prefix(ref: str, outcome: str) -> str:
+    """finish 对 tool 槽的前缀：`[task: '<title>' (<id>)] ` 标明归属（+ fail 标记）。
 
     归属标记的必要性：finish 对的 assistant 槽是**无参**收尾标记（`finish_task{}`，反转契约），
     自身不带任何归属信息。派发侧不存在这个问题——框带 `input:{title, description}` 自描述；
@@ -273,9 +282,11 @@ def _finish_report_prefix(title: str, outcome: str) -> str:
     与既有 `[outcome=fail]` 同一惯例，标明这条 finish 对是取消收尾而非正常/失败终态。
     """
     parts: list[str] = []
-    title = (title or "").strip()
-    if title:
-        parts.append(f"[task: {title}]")
+    ref = (ref or "").strip()
+    if ref:
+        # 带 id 才真的消歧：本前缀存在的理由就是「同 agent 嵌套时两组同形的 finish 对
+        # 只能靠正文猜归属」，而同名兄弟任务恰好让只印标题的版本原地失效。
+        parts.append(f"[task: {ref}]")
     if outcome == "fail":
         parts.append("[outcome=fail]")
     elif outcome == "cancelled":
@@ -287,7 +298,7 @@ def _finish_report_prefix(title: str, outcome: str) -> str:
 # 随末段 raw 一起被删；锚点把它留在 task 层胶囊里。提示词用 assistant 第一人称，与
 # 「以上为系统压缩摘要」的尾注互不交叉（各自只描述自己那条消息的正文）。
 FINAL_REPLY_NOTE = (
-    "[Final reply for task '{title}' — the answer I delivered on finishing it, "
+    "[Final reply for task {ref} — the answer I delivered on finishing it, "
     "verbatim; not a summary.]"
 )
 FINAL_REPLY_NOTE_UNTITLED = (
@@ -333,9 +344,9 @@ def _recap_block(act_recap: str) -> str:
     return f"{body}\n\n{PROCESS_RECAP_NOTE}"
 
 
-def _final_reply_block(title: str, reply: str) -> str:
+def _final_reply_block(ref: str, reply: str) -> str:
     """锚点正文 = 前置提示 + 答复原文 + 收束尾注。"""
-    note = (FINAL_REPLY_NOTE.format(title=title.strip()) if (title or "").strip()
+    note = (FINAL_REPLY_NOTE.format(ref=ref.strip()) if (ref or "").strip()
             else FINAL_REPLY_NOTE_UNTITLED)
     return f"{note}\n\n{reply.strip()}\n\n{FINAL_REPLY_CLOSING_NOTE}"
 
@@ -361,9 +372,11 @@ def build_finish_slots(*, scope, task_id: str, parent_task_id, title: str, outco
 
     时间戳按槽位递增 1µs：顺序由写入点定死，不依赖后续记录的时刻。
     """
+    # 任务的规范称呼（标题 + id）在此合成：本函数本来就同时持有两者，调用方无需改动。
+    ref = task_ref_parts(task_id, title)
     md = {"origin_task_id": task_id, "parent_task_id": parent_task_id}
     call = [{"id": tool_call_id, "name": qualify("control:finish_task"), "input": {}}]
-    report = f"{_finish_report_prefix(title, outcome)}"              f"{_finish_tool_text(task_summary, act_recap, outcome)}"
+    report = f"{_finish_report_prefix(ref, outcome)}"              f"{_finish_tool_text(task_summary, act_recap, outcome)}"
     reply = (final_reply or "").strip()
 
     def turn(content, ts, role, extra):
@@ -381,7 +394,7 @@ def build_finish_slots(*, scope, task_id: str, parent_task_id, title: str, outco
     if reply:
         return [
             turn(_recap_block(act_recap), base, "assistant", {}),
-            turn(_final_reply_block(title, reply), base + timedelta(microseconds=1),
+            turn(_final_reply_block(ref, reply), base + timedelta(microseconds=1),
                  "assistant", {"tool_calls": call, "final_reply": True}),
             turn(report, base + timedelta(microseconds=2), "tool", {"tool_call_id": tool_call_id}),
         ]
@@ -538,7 +551,7 @@ async def _close_one(memory, state, task, mem_content: str, outcome: str, ctx,
             frame_ts, frame_tcid = await _ensure_dispatch_frame(
                 memory, parent_scope, task, ctx.provider_ctx)
             await _put_dispatch_result(
-                memory, parent_scope, task, _dispatch_ack(task.title, outcome), frame_ts,
+                memory, parent_scope, task, _dispatch_ack(task_ref(task), outcome), frame_ts,
                 ctx.provider_ctx, replace=True, tool_call_id=frame_tcid,
             )
             # 嵌套合成子自己的 finish 对（写进共享 agent scope，@close 时刻）
@@ -608,7 +621,7 @@ async def synthesize_cancel_closure(memory, session_id: str, task, provider_ctx,
             return
         frame_ts, frame_tcid = found
         ack_text = (
-            f"Sub-task '{task.title}' was cancelled before completion ({reason_text}); "
+            f"Sub-task {task_ref(task)} was cancelled before completion ({reason_text}); "
             f"its partial execution below is incomplete."
         )
         await _put_dispatch_result(

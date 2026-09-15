@@ -22,6 +22,8 @@ from ctx_weft.core.utils.clock import now_utc
 from ctx_weft.core.utils.ids import generate_id
 from ctx_weft.protocols.context import ProviderContext
 
+
+
 if TYPE_CHECKING:
     from ctx_weft.protocols import ContentPart
 
@@ -80,7 +82,6 @@ class SessionRegistry:
     event_bus: EventBus
     task_max_concurrent: int = 4
     task_max_retries: int = 3
-    default_task_timeout_ms: int = 60_000
 
     #: session_id → 容器状态（tenant + 成员 agent 集合）。
     _states: dict[str, _SessionState] = field(default_factory=dict, init=False, repr=False)
@@ -111,7 +112,7 @@ class SessionRegistry:
         ``provisional=True`` 与 ALM 同理：这是进程内登记表，成员集合要反映当下的真实，
         不受未提交窗口影响。
         """
-        self.event_bus.subscribe(None, self.handle_event, provisional=True)
+        self.event_bus.subscribe(None, self.handle_event, provisional=True, required=True)
 
     async def handle_event(self, ev: Event) -> None:
         """总线回调。把新登场的 agent 收进该 session 的成员集合，别的一概不管。"""
@@ -344,7 +345,6 @@ class SessionRegistry:
             # 后台作业没有人会发下一条消息，interactive 的纯文本 park 就是永久挂起——
             # 没有人来应答，那条 HITL 也永远不会被终局。
             interaction_mode="auto" if unattended else "interactive",
-            timeout_ms=self.default_task_timeout_ms,
             created_at=now_utc(),
         )
         if task_manager is None:

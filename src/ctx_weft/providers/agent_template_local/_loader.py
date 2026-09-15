@@ -47,6 +47,8 @@ from ctx_weft.protocols.template import (
 logger = logging.getLogger(__name__)
 
 
+
+
 class TemplateLoader:
     """解析 template 目录（SOUL.md + ROLE.md）→ AgentTemplate。"""
 
@@ -182,8 +184,6 @@ def _parse_loop_config(raw: dict) -> LoopConfig:
     return LoopConfig(
         max_turns_per_act=int(raw.get("max_turns_per_act", 50)),
         max_turns_per_observe=int(raw.get("max_turns_per_observe", 5)),
-        max_turns_per_agent=int(raw.get("max_turns_per_agent", 20)),
-        timeout_per_step_sec=int(raw.get("timeout_per_step_sec", 120)),
         # 这是**配置 schema 的字段名**（模板作者面向），不是判别值。它与
         # CancelReason.FAILURE_THRESHOLD 今天恰好同名，但两者是各自独立演进的契约：
         # 前者对模板作者、后者对 host。若把 key 绑上枚举，日后改判别值的名字会让

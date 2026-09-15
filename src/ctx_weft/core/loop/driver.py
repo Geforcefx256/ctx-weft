@@ -8,12 +8,12 @@ from __future__ import annotations
 import dataclasses
 import logging
 from abc import abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from ctx_weft.core.assembler import AssembledPrompt, ContextAssembler
 from ctx_weft.core.utils.event import new_event
-from ctx_weft.protocols.events import Event, EventBus, EventType
+from ctx_weft.protocols.events import Event, EventBus, EventStore, EventType
 from ctx_weft.core.models.agent import Agent
 from ctx_weft.core.models.session import Session
 from ctx_weft.core.models.task import Task
@@ -147,6 +147,11 @@ class LoopContext:
     config: Any = None
     # TaskManager 引用（Phase 5+）；PrepareStep compact dispatch 用；None 时退化为 inline compact
     task_manager: TaskManager|None = None
+    #: 事件流的**读侧**（spec: tool-operations）。`event_bus` 只有 emit / subscribe，
+    #: 而恢复判据要折 capability 事件——读取一律经 `reducers.load_events_of_types`
+    #: （按类型轻查询，store 不支持时降级为全量读 + 内存过滤）。
+    #: None（宿主直构 / 测试替身）→ 折不出事实，调用方按「无从判断」保守处理。
+    event_store: "EventStore | None" = None
     # HITL：管账的 service 与管栈的 waiter 分开持有——旧实现把两者塞进一个对象，
     # 于是编排层被迫认识协程栈（spec §3）。
     hitl: "HitlService | None" = None

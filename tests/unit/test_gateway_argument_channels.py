@@ -1,11 +1,12 @@
-"""Gateway 执行参数与审计参数分离。
+"""Gateway 执行参数与审计参数分离（spec: capability-gateway；上游方案 H4 / WP1）。
 
-三条通道：
+三条通道（design D1）：
   original_arguments  调用方入参，全程不被修改（审批指纹 invocation_key 用它）
   effective_arguments 授权/HITL 修改 + schema 校验后的参数——不脱敏，传 Provider
   audit_arguments     对 effective 的脱敏副本——只进事件与 TOOL_AUDIT
 
-修复前 Provider 收到的是脱敏后的 '***'——①② 两组钉住这个回归；③④⑤ 钉住既有正确部分。
+基线（修复前）Provider 收到脱敏后的 '***'（探针 H4 实测）——①② 两组在本文件
+落地时必须先红，是「现象成立」的回归证据；③④⑤ 钉住既有正确部分。
 """
 from __future__ import annotations
 

@@ -52,23 +52,23 @@ def _img(tag: str) -> ImagePart:
 #
 # 真实输出（逐字节抄录，未经推导）：
 #   messages[0].content ==
-#     '## Current Task\nPPTX转PDF\n转 PDF\n\n## Opening Message\n检查工作目录'
+#     '## Current Task\n'PPTX转PDF' (t1)\n转 PDF\n\n## Opening Message\n检查工作目录'
 #   messages[2].content ==
 #     '## Current Message\n把这个 ppt 转 pdf\n\n'
 #     '（Reply in the same language as the Current Message above.）'
 #
 # 单条（首条即最新，A 形态合并框）：
 #   messages[0].content ==
-#     '## Current Task\nPPTX转PDF\n转 PDF\n\n## Current Message\n把这个 ppt 转 pdf\n\n'
+#     '## Current Task\n'PPTX转PDF' (t1)\n转 PDF\n\n## Current Message\n把这个 ppt 转 pdf\n\n'
 #     '（Reply in the same language as the Current Message above.）'
 
-_EXPECT_OPENING = "## Current Task\nPPTX转PDF\n转 PDF\n\n## Opening Message\n检查工作目录"
+_EXPECT_OPENING = "## Current Task\n'PPTX转PDF' (t1)\n转 PDF\n\n## Opening Message\n检查工作目录"
 _EXPECT_CURRENT = (
     "## Current Message\n把这个 ppt 转 pdf\n\n"
     "（Reply in the same language as the Current Message above.）"
 )
 _EXPECT_COMBINED = (
-    "## Current Task\nPPTX转PDF\n转 PDF\n\n## Current Message\n把这个 ppt 转 pdf\n\n"
+    "## Current Task\n'PPTX转PDF' (t1)\n转 PDF\n\n## Current Message\n把这个 ppt 转 pdf\n\n"
     "（Reply in the same language as the Current Message above.）"
 )
 

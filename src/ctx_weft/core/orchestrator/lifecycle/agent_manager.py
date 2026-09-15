@@ -176,7 +176,9 @@ class AgentLifecycleManager:
         派发出去的 agent 停在 `idle`，`pause_agent` 会拿 `AgentNotRunningError` 拒掉那个
         窗口里的暂停请求、host 的会话状态折叠会把会话判成上一轮终态，并发闸门一并失效。
         """
-        self.event_bus.subscribe(None, self.handle_event, provisional=True)
+        # required=True（spec: event-commit）：必要状态消费者——异常穿出 emit，
+        # 不再被 bus 吞掉；推测态照看（provisional）不变。
+        self.event_bus.subscribe(None, self.handle_event, provisional=True, required=True)
 
     async def handle_event(self, ev: Event) -> None:
         """总线回调。**只读事件、只喂状态机**，不碰其他组件。

@@ -77,7 +77,7 @@ def test_lone_root_still_shows_itself_in_tree():
     cur = _task("t1", "Current", "ACTIVE")
     g = build_act_guidance(_cur(title="Current", id="t1"), _tm(tasks=[cur]))
     assert "## The overall plan (▶ = your current task):" in g
-    assert "- [ACTIVE] ▶ Current" in g
+    assert "- [ACTIVE] ▶ 'Current' (t1)" in g
     assert "do NOT do them yourself" not in g
     assert "Do not start the other tasks yourself." not in g
     assert "control__finish_task" in g
@@ -95,13 +95,14 @@ def test_anchor_line_always_present_description_not_duplicated():
     # 每个 act 回合都有当前任务锚定行（长对话里 ## Current Task 框远在历史深处）；
     # description 不重复（由 Current Task 框承载）。
     g = build_act_guidance(_cur(title="T", description="D"), _tm())
-    assert "Current task: T" in g.split("\n")
+    assert "Current task: 'T' (t1)" in g.split("\n")
     assert "Description: D" not in g
 
 
-def test_anchor_line_falls_back_when_untitled():
+def test_anchor_line_uses_bare_id_when_untitled():
+    """无标题时锚定行退化为裸 id——id 本身就是可用的句柄，比「见上文」有信息量。"""
     g = build_act_guidance(_cur(title=""), _tm())
-    assert "Current task: (as framed in the conversation above)" in g
+    assert "Current task: t1" in g.split("\n")
 
 
 def test_ask_user_reminder_present_in_all_modes():
@@ -127,8 +128,8 @@ def test_tree_lists_nonterminal_with_status_and_current_marker():
     sib = _task("t2", "Publish", "PENDING")
     g = build_act_guidance(_cur(id="t1"), _tm(tasks=[cur, sib]))
     assert "## The overall plan" in g
-    assert "- [ACTIVE] ▶ Write report" in g
-    assert "- [PENDING] Publish" in g
+    assert "- [ACTIVE] ▶ 'Write report' (t1)" in g
+    assert "- [PENDING] 'Publish' (t2)" in g
     assert "do NOT do them yourself" in g
     assert "Do not start the other tasks yourself." in g
 
@@ -154,8 +155,8 @@ def test_child_task_indented_under_parent():
     parent = _task("t1", "Parent", "SUSPENDED")
     child = _task("t2", "Child", "PENDING", parent="t1")
     g = build_act_guidance(_cur(id="t1"), _tm(tasks=[parent, child]))
-    assert "- [SUSPENDED] ▶ Parent" in g
-    assert "  - [PENDING] Child" in g
+    assert "- [SUSPENDED] ▶ 'Parent' (t1)" in g
+    assert "  - [PENDING] 'Child' (t2)" in g
 
 
 def test_orphan_nonterminal_promoted_to_root():
@@ -163,8 +164,8 @@ def test_orphan_nonterminal_promoted_to_root():
     cur = _task("t1", "Current", "ACTIVE")
     orphan = _task("t2", "Orphan", "PENDING", parent="tX")
     g = build_act_guidance(_cur(id="t1"), _tm(tasks=[cur, orphan]))
-    assert "- [PENDING] Orphan" in g
-    assert "  - [PENDING] Orphan" not in g
+    assert "- [PENDING] 'Orphan' (t2)" in g
+    assert "  - [PENDING] 'Orphan' (t2)" not in g
 
 
 def test_untitled_task_uses_start_prompt_as_label():
@@ -172,7 +173,7 @@ def test_untitled_task_uses_start_prompt_as_label():
     cur = _task("t1", "Current", "ACTIVE")
     root = _task("tsk_01", "", "ACTIVE", user_prompt="Summarize the quarterly report\nand email it")
     g = build_act_guidance(_cur(id="t1"), _tm(tasks=[cur, root]))
-    assert "- [ACTIVE] Summarize the quarterly report" in g
+    assert "- [ACTIVE] 'Summarize the quarterly report'" in g
     assert "(untitled" not in g
 
 
@@ -189,7 +190,8 @@ def test_untitled_task_no_prompt_falls_back_to_id_prefix():
     cur = _task("t1", "Current", "ACTIVE")
     blank = _task("abcdef123456", "", "PENDING")
     g = build_act_guidance(_cur(id="t1"), _tm(tasks=[cur, blank]))
-    assert "(untitled abcdef)" in g
+    # 无标题且无 prompt → 裸 id（此前只印前 6 位，取不回来）
+    assert "- [PENDING] abcdef123456" in g
 
 
 def test_finished_children_listed_with_no_redo_emphasis():
@@ -200,10 +202,10 @@ def test_finished_children_listed_with_no_redo_emphasis():
     g = build_act_guidance(_cur(id="t1"), _tm(tasks=[parent, c1, c2]))
     assert "ALREADY COMPLETED" in g
     assert "Do NOT redo their work" in g
-    assert "- [FINISHED] Research" in g
-    assert "- [FINISHED] Draft" in g
+    assert "- [FINISHED] 'Research' (t2)" in g
+    assert "- [FINISHED] 'Draft' (t3)" in g
     # 树里仍只有非终态节点
-    assert "▶ Parent" in g
+    assert "▶ 'Parent' (t1)" in g
     assert "  - [FINISHED]" not in g.split("ALREADY COMPLETED")[0]
 
 
@@ -212,7 +214,7 @@ def test_finished_child_renders_outputs_result_snippet():
     parent = _task("t1", "Parent", "ACTIVE")
     c1 = _task("t2", "Research", "FINISHED", parent="t1", outputs="Found 3 key sources on X.")
     g = build_act_guidance(_cur(id="t1"), _tm(tasks=[parent, c1]))
-    assert "- [FINISHED] Research" in g
+    assert "- [FINISHED] 'Research'" in g
     assert "    → Found 3 key sources on X." in g
 
 
@@ -239,7 +241,7 @@ def test_finished_child_no_result_renders_title_only():
     parent = _task("t1", "Parent", "ACTIVE")
     c1 = _task("t2", "Research", "FINISHED", parent="t1")
     g = build_act_guidance(_cur(id="t1"), _tm(tasks=[parent, c1]))
-    assert "- [FINISHED] Research" in g
+    assert "- [FINISHED] 'Research'" in g
     assert "→" not in g.split("ALREADY COMPLETED")[1]
 
 
@@ -282,8 +284,8 @@ def test_mixed_naive_aware_created_at_does_not_crash_sort():
     # 两序都跑一遍，确保比较两侧混排都归一（naive<aware 与 aware<naive 各触发一次）。
     for tasks in ([parent, c_recovered, c_live], [parent, c_live, c_recovered]):
         g = build_act_guidance(_cur(id="t1"), _tm(tasks=tasks))
-        assert "- [FINISHED] Recovered" in g
-        assert "- [FINISHED] Live" in g
+        assert "- [FINISHED] 'Recovered' (t2)" in g
+        assert "- [FINISHED] 'Live' (t3)" in g
 
 
 def test_finished_children_of_other_tasks_not_listed():
@@ -380,7 +382,7 @@ def test_composer_places_capabilities_before_guidance_at_tail():
 def test_resume_cue_anchors_task_and_remaining_work():
     from ctx_weft.core.loop.steps.act_guidance import build_resume_cue
     cue = build_resume_cue(_cur(title="Fix importer", id="t1"), _tm())
-    assert "the task: Fix importer" in cue
+    assert "the task: 'Fix importer' (t1)" in cue
     assert "do not redo" in cue and "remaining work" in cue
     # 无已完成子任务 → 不指向 guidance 清单
     assert "situational notes" not in cue
@@ -392,9 +394,9 @@ def test_resume_cue_points_to_completed_list_only_when_children_finished():
     child = _task("t2", "Research", "FINISHED", parent="t1")
     cue = build_resume_cue(_cur(title="Parent", id="t1"), _tm(tasks=[parent, child]))
     assert "situational notes" in cue and "re-delegating" in cue
-    # 无 title 回退
+    # 无 title → 退化为裸 id（仍是可用句柄，不再是「见上文」）
     cue2 = build_resume_cue(_cur(title="", id="t1"), _tm())
-    assert "the task above" in cue2
+    assert "the task: t1" in cue2
 
 
 def test_composer_uses_extra_resume_cue_as_turn_opener():

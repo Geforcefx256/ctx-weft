@@ -21,16 +21,30 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from ctx_weft.protocols.events import Event, EventStore, RunSnapshot
+from ctx_weft.protocols.events import (
+    CommitReceipt,
+    Event,
+    EventConflictError,
+    EventStore,
+    RunSnapshot,
+    StoredEvent,
+)
 from ctx_weft.providers._sqlalchemy import make_session_factory
 from ctx_weft.providers.events._lifecycle import (
     LIFECYCLE_EVENT_TYPES,
     replay_lifecycle,
 )
-from ctx_weft.providers.events.store.sql.models import Base, EventModel, SnapshotModel
+from ctx_weft.providers.events.store.sql.models import (
+    Base,
+    EventBatchModel,
+    EventModel,
+    SessionHeadModel,
+    SnapshotModel,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +52,7 @@ __all__ = ["SqlEventStore", "open_sqlite_event_store"]
 
 
 class SqlEventStore(EventStore):
-    """SQLAlchemy-backed event store。"""
+    """SQLAlchemy-backed event store（含有序提交扩展，spec: event-log）。"""
 
     def __init__(
         self,
@@ -49,50 +63,179 @@ class SqlEventStore(EventStore):
         self._factory = session_factory
         self._keep_snapshots = max(1, keep_snapshots)
 
-    # ── 写 ────────────────────────────────────────────────────────────────────
+    # ── 写（有序提交扩展：原子批次）──────────────────────────────────────
+
+    async def append_batch(
+        self, session_id: str, batch_id: str, events: list[Event],
+    ) -> CommitReceipt:
+        """整批原子提交。
+
+        分配走会话 head 行的**同事务原子 UPDATE**（禁无锁 MAX+1）：head upsert 是事务内
+        第一条写语句——SQLite 立即取写锁（BEGIN IMMEDIATE 等价），PG 端由 UPDATE 取行锁，
+        两个连接争用同会话时天然串行化。batch 表主键承担幂等与并发下的最终判定：竞态
+        重放撞 PK → 回滚后走比对路径（原 receipt / EventConflictError）。
+        """
+        if not events:
+            raise ValueError("append_batch: empty batch")
+        for e in events:
+            if e.session_id != session_id:
+                raise ValueError(
+                    f"append_batch: event {e.id} session {e.session_id!r} != batch session "
+                    f"{session_id!r}（批内事件必须同属一个 session）")
+
+        # 快路径：已提交过的 batch 直接比对（确认丢失后的原样重试，无写放大）
+        async with self._factory() as db:
+            row = await db.get(EventBatchModel, batch_id)
+            if row is not None:
+                return await self._receipt_for_committed(db, row, events)
+
+        try:
+            async with self._factory() as db, db.begin():
+                # 1) head upsert（写语句，立即取写锁/行锁）
+                await db.execute(text(
+                    "INSERT INTO event_session_head (session_id, next_position) "
+                    "VALUES (:sid, 0) ON CONFLICT (session_id) DO NOTHING"),
+                    {"sid": session_id})
+                # 2) 原子推进（SQLite/PG 同语法；这是串行化点）
+                await db.execute(text(
+                    "UPDATE event_session_head SET next_position = next_position + :n "
+                    "WHERE session_id = :sid"),
+                    {"n": len(events), "sid": session_id})
+                # 3) 读回分配区间
+                head = (await db.execute(
+                    select(SessionHeadModel).where(
+                        SessionHeadModel.session_id == session_id))).scalar_one()
+                start = head.next_position - len(events)
+                # 4) 整批事件（position 连续递增；(session_id,position) 唯一与 event.id
+                #    主键承担兜底不变式——重复提交的 id 在这里撞 IntegrityError）
+                for i, e in enumerate(events):
+                    db.add(self._to_row(e, position=start + i + 1))
+                # 5) 幂等账
+                db.add(EventBatchModel(
+                    batch_id=batch_id, session_id=session_id,
+                    first_position=start + 1, event_count=len(events)))
+                receipt = CommitReceipt(
+                    batch_id=batch_id,
+                    records=tuple(StoredEvent(event=e, position=start + i + 1)
+                                  for i, e in enumerate(events)))
+            return receipt
+        except IntegrityError:
+            # 撞 batch PK（并发同 batch_id 已提交）或撞已提交 event.id——回滚后按已提交
+            # 内容判定：原样 → 原 receipt；否则 EventConflictError。
+            async with self._factory() as db:
+                row = await db.get(EventBatchModel, batch_id)
+                if row is not None:
+                    return await self._receipt_for_committed(db, row, events)
+                raise EventConflictError(
+                    f"append_batch {batch_id!r}: event id already committed in another "
+                    f"batch (integrity violation rolled back)") from None
+
+    async def _receipt_for_committed(
+        self, db: AsyncSession, row: EventBatchModel, events: list[Event],
+    ) -> CommitReceipt:
+        """已提交批次的幂等/冲突判定：内容逐字段一致（忽略 position）→ 原 receipt。"""
+        stored_rows = (await db.execute(
+            select(EventModel).where(EventModel.id.in_([e.id for e in events]))
+            .order_by(EventModel.position))).scalars().all()
+        stored_by_id = {r.id: r for r in stored_rows}
+        if len(stored_rows) == len(events):
+            same = all(
+                self._row_matches(r, e)
+                for e, r in ((e, stored_by_id.get(e.id)) for e in events)
+            )
+            if same:
+                records = tuple(
+                    StoredEvent(event=e, position=stored_by_id[e.id].position)
+                    for e in events)
+                return CommitReceipt(batch_id=row.batch_id, records=records)
+        raise EventConflictError(
+            f"batch {row.batch_id!r} already committed with different content")
+
+    @staticmethod
+    def _row_matches(row: EventModel, event: Event) -> bool:
+        return (
+            row.id == event.id
+            and row.run_id == event.run_id
+            and row.session_id == event.session_id
+            and row.task_id == event.task_id
+            and row.agent_id == event.agent_id
+            and row.tenant_id == event.tenant_id
+            and row.type == event.type
+            and row.sequence == event.sequence
+            and json.loads(row.payload_json) == event.payload
+            and json.loads(row.metadata_json) == event.metadata
+            and row.causation_id == event.causation_id
+            and row.origin == event.origin
+            and row.schema_version == event.schema_version
+        )
+
+    @staticmethod
+    def _to_row(event: Event, *, position: int) -> EventModel:
+        return EventModel(
+            id=event.id,
+            run_id=event.run_id,
+            session_id=event.session_id,
+            task_id=event.task_id,
+            agent_id=event.agent_id,
+            tenant_id=event.tenant_id,
+            type=event.type,
+            sequence=event.sequence,
+            payload_json=json.dumps(event.payload),
+            metadata_json=json.dumps(event.metadata),
+            causation_id=event.causation_id,
+            origin=event.origin,
+            schema_version=event.schema_version,
+            position=position,
+            timestamp=event.timestamp,
+        )
 
     async def append(self, event: Event) -> None:
-        async with self._factory() as db, db.begin():
-            db.add(EventModel(
-                id=event.id,
-                run_id=event.run_id,
-                session_id=event.session_id,
-                task_id=event.task_id,
-                agent_id=event.agent_id,
-                tenant_id=event.tenant_id,
-                type=event.type,
-                sequence=event.sequence,
-                payload_json=json.dumps(event.payload),
-                metadata_json=json.dumps(event.metadata),
-                causation_id=event.causation_id,
-                origin=event.origin,
-                schema_version=event.schema_version,
-                timestamp=event.timestamp,
-            ))
+        """单事件 = 单事件批次（batch_id 确定性取 event.id；spec: event-log 兼容要求）。"""
+        await self.append_batch(event.session_id, event.id, [event])
 
     # ── 读 ────────────────────────────────────────────────────────────────────
 
     async def read_by_session(self, session_id: str) -> list[Event]:
-        """按 id（ULID，字典序即时间序）升序返回该 session 的全部事件。"""
+        """提交序（= position 序）；存量 NULL 行排前、按 id 序（迁移前后的确定性口径）。"""
         async with self._factory() as db:
             result = await db.execute(
                 select(EventModel)
                 .where(EventModel.session_id == session_id)
-                .order_by(EventModel.id)
+                .order_by(
+                    # (position IS NULL) → 0 排前；SQLite/PG 同义表达式
+                    text("CASE WHEN events.position IS NULL THEN 0 ELSE 1 END"),
+                    EventModel.position,
+                    EventModel.id,
+                )
             )
             return [_row_to_event(r) for r in result.scalars().all()]
 
-    async def read_after(self, session_id: str, after_event_id: str) -> list[Event]:
+    async def read_range(
+        self,
+        session_id: str,
+        *,
+        after_position: int = 0,
+        through_position: int | None = None,
+    ) -> list[StoredEvent]:
+        """按 position 升序读 (after, through]；只含已提交（position 非空）的事件。"""
+        conds = [
+            EventModel.session_id == session_id,
+            EventModel.position.isnot(None),
+            EventModel.position > after_position,
+        ]
+        if through_position is not None:
+            conds.append(EventModel.position <= through_position)
         async with self._factory() as db:
             result = await db.execute(
-                select(EventModel)
-                .where(
-                    EventModel.session_id == session_id,
-                    EventModel.id > after_event_id,
-                )
-                .order_by(EventModel.id)
-            )
-            return [_row_to_event(r) for r in result.scalars().all()]
+                select(EventModel).where(*conds).order_by(EventModel.position))
+            return [StoredEvent(event=_row_to_event(r), position=r.position)
+                    for r in result.scalars().all()]
+
+    async def committed_head(self, session_id: str) -> int:
+        # next_position 存的是「最后已分配的 position」（0 = 无提交），即 head 本身
+        async with self._factory() as db:
+            head = await db.get(SessionHeadModel, session_id)
+            return head.next_position if head else 0
 
     async def read_session_events_of_types(
         self, session_id: str, types: "tuple[str, ...]",
@@ -106,7 +249,11 @@ class SqlEventStore(EventStore):
                     EventModel.session_id == session_id,
                     EventModel.type.in_(tuple(str(t) for t in types)),
                 )
-                .order_by(EventModel.id)
+                .order_by(
+                    text("CASE WHEN events.position IS NULL THEN 0 ELSE 1 END"),
+                    EventModel.position,
+                    EventModel.id,
+                )
             )
             return [_row_to_event(r) for r in result.scalars().all()]
 
@@ -157,6 +304,9 @@ class SqlEventStore(EventStore):
                 last_event_sequence=snapshot.last_event_sequence,
                 state_blob_json=json.dumps(snapshot.state_blob),
                 snapshot_reason=snapshot.snapshot_reason,
+                last_commit_position=snapshot.last_commit_position,
+                projection_version=snapshot.projection_version,
+                chain_depth=snapshot.chain_depth,
                 created_at=snapshot.snapshot_at,
             ))
             await db.flush()          # 让新行参与下面的「保留最新」排序
@@ -202,6 +352,9 @@ class SqlEventStore(EventStore):
                 state_blob=json.loads(row.state_blob_json),
                 snapshot_reason=row.snapshot_reason,
                 snapshot_at=row.created_at,
+                last_commit_position=row.last_commit_position,
+                projection_version=row.projection_version if row.projection_version is not None else 1,
+                chain_depth=row.chain_depth if row.chain_depth is not None else 0,
             )
 
 
@@ -236,11 +389,39 @@ async def open_sqlite_event_store(
 
     测试与单机部署用。宿主接 postgres 时自带 engine / migration，直接构造
     ``SqlEventStore(session_factory)`` 即可，不必走这里。
+
+    存量库兼容（spec: event-log）：``create_all`` 只建缺失的表，不会给既有 ``events``
+    表加列/索引——这里显式补：``ALTER TABLE ADD COLUMN position``（幂等探测）+
+    ``CREATE UNIQUE INDEX IF NOT EXISTS uq_events_session_position``。NULL 不参与
+    唯一碰撞，迁移前新旧行共存无碍；回填归 ``scripts/migrate_event_positions.py``。
+    连接带 ``timeout=15``（sqlite3 busy timeout）：双连接争用同会话 head 时等待而非
+    立即报 database is locked。
     """
-    engine, factory = make_session_factory(f"sqlite+aiosqlite:///{db_path}")
+    engine, factory = make_session_factory(
+        f"sqlite+aiosqlite:///{db_path}", connect_args={"timeout": 15})
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            # create_all 只建缺失的表；既有 events 表的 position 列要显式补（幂等探测）
+            cols = await conn.execute(text("PRAGMA table_info(events)"))
+            if "position" not in {r[1] for r in cols}:
+                await conn.execute(text("ALTER TABLE events ADD COLUMN position INTEGER"))
+            await conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_events_session_position "
+                "ON events (session_id, position)"))
+            # spec: snapshot-recovery——既有 event_snapshots 表补两列（旧行 NULL/1 =
+            # legacy 快照，恢复路径据此忽略走全量重建）
+            snap_cols = {r[1] for r in await conn.execute(
+                text("PRAGMA table_info(event_snapshots)"))}
+            if "last_commit_position" not in snap_cols:
+                await conn.execute(text(
+                    "ALTER TABLE event_snapshots ADD COLUMN last_commit_position INTEGER"))
+            if "projection_version" not in snap_cols:
+                await conn.execute(text(
+                    "ALTER TABLE event_snapshots ADD COLUMN projection_version INTEGER"))
+            if "chain_depth" not in snap_cols:
+                await conn.execute(text(
+                    "ALTER TABLE event_snapshots ADD COLUMN chain_depth INTEGER"))
         yield SqlEventStore(factory, keep_snapshots=keep_snapshots)
     finally:
         await engine.dispose()

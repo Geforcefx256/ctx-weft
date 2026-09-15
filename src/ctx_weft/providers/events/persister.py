@@ -65,9 +65,11 @@ class PersistenceHandle:
         self.snapshot_writer = snapshot_writer
 
     async def detach(self) -> None:
+        """persister 可为 None（required 模式：提交经 CommitGate，无 persister 订阅）。"""
         if self.snapshot_writer is not None:
             await self.snapshot_writer.detach()
-        await self.persister.detach()
+        if self.persister is not None:
+            await self.persister.detach()
 
 
 def attach_persistence(

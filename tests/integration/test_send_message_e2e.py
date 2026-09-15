@@ -91,7 +91,7 @@ class _GatedRouterLLM(MockLLMAdapter):
 
     async def _gated_finish(self, request):
         await self.release_gate.wait()
-        # 交付物 = 收尾回合正文（finish_task 没有 result 参数，见 act._compose_final_outputs）
+        # 交付物 = 收尾回合正文（finish_task 不带未声明参数，spec: capability-gateway）
         async for chunk in self._stream(MockResponse(text="done", tool_calls=[
             ToolCall(id=self._id("fin"), name="control__finish_task",
                      arguments={}),

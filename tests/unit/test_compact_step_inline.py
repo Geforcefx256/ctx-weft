@@ -163,4 +163,5 @@ async def test_compact_noop_when_nothing_foldable():
 async def test_summarize_for_compact_returns_llm_text():
     from ctx_weft.core.loop.steps.compact import summarize_for_compact
     out = await summarize_for_compact(_state(), _ctx(_FakeMemory({})))
-    assert out == "SUMMARY"
+    # spec: compact-fidelity——返回 ParsedDigest；散文输出整文落库 + degraded。
+    assert out.text == "SUMMARY" and out.degraded is True

@@ -220,7 +220,8 @@ async def test_gateway_emits_stream_events_for_compact_origin_and_pairs_with_res
 
     out = await summarize_for_compact(state, ctx, scope="task")
 
-    assert out == "hello"
+    # spec: compact-fidelity——返回 ParsedDigest；散文输出整文落库 + degraded。
+    assert out.text == "hello" and out.degraded is True
     started = [e for e in bus.events if e.type == EventType.LLM_REQUEST_STARTED]
     prompt_sent = [e for e in bus.events if e.type == EventType.LLM_PROMPT_SENT]
     tokens = [e for e in bus.events if e.type == EventType.LLM_TOKEN_STREAMED]

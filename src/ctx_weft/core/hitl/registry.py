@@ -36,6 +36,10 @@ _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 #: 只有 gateway（授权步）与工具 provider（工具步）自己需要区分（Task 4.5）。
 HITL_STAGE_AUTHZ = "authz"
 HITL_STAGE_TOOL = "tool"
+#: 重跑授权（spec: tool-operations）——崩溃恢复时问「这次还该不该再跑」。
+#: 必须与 AUTHZ 分开：同一个 tool_call 的事前授权决定与重跑决定是两件事，
+#: 共用缓存键会让前者的「批准」被当成后者的「可以重跑」。
+HITL_STAGE_RERUN = "rerun"
 
 
 class WaitSlot(Protocol):

@@ -12,13 +12,18 @@ from dataclasses import dataclass
 class RuntimeConfig:
     hitl_timeout_sec: int | None = None
     hitl_max_resolved: int = 1000
+    # 事件提交策略（spec: event-commit）：required（默认）= emit 先经 CommitGate 确认
+    # 存储提交再对外通知，存储失败显式抛 PersistenceUnavailableError 并隔离会话；
+    # best_effort = 旧观察者路径（吞存储错误），启动告警、不可靠恢复。
+    event_commit_policy: str = "required"
     task_max_concurrent: int = 4
     task_max_retries: int = 3
     default_token_budget: int = 200_000
-    default_task_timeout_ms: int = 60_000
     # 工具输出落盘（spill）阈值：CapabilityGateway 读取。host 可覆盖。
     spill_threshold: int = 4000
     spill_preview_chars: int = 1000
+    # spec: tool-result-recovery——收敛版尾部预览字符数（错误/结论高发区立即止血）。
+    spill_tail_chars: int = 1000
     # LLM 瞬时故障自愈预算（stream_llm_resilient 读取；默认=历史安全值）
     llm_self_heal_max_attempts: int = 8
     llm_self_heal_max_duration_sec: float = 300.0

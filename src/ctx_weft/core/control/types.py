@@ -67,10 +67,13 @@ class TaskView:
     dag_deps: list[str] = field(default_factory=list)
     priority: int = 5
     max_retries: int = 3
-    timeout_ms: int = 60_000
     tenant_id: str = "default"
     outputs: Any = None
     error: str | None = None
+    # spec: task-handoff——终态事件的结局码（当前唯一写入者：依赖阻塞取消
+    # BLOCKED_BY_FAILED_DEP）与阻塞源任务 id。存量事件无此键 → None。
+    error_code: str | None = None
+    blocked_by_task_id: str | None = None
     created_at: datetime | None = None
     finished_at: datetime | None = None
 

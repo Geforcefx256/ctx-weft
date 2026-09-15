@@ -297,10 +297,12 @@ class _WireCapturingOpenAILLM(_PlaceholderReadingLLM, OpenAIMultimodalAdapter):
 
 # ── 会话跑手 ──────────────────────────────────────────────────────────────────
 #
-# context_limit=4300 / reserved_output_tokens=0：
+# context_limit=6000 / reserved_output_tokens=0 / compact_token_ratio=0.5：
 #   - 两张图约 2×1600 token，pin 成 priority-0 的 user_prompt 不可裁，故上限必须
-#     容得下它（否则 budget.py 抛 ContextOverflowError，压根走不到 compact）；
-#   - 同时首轮装配量 / 4300 ≥ compact_token_ratio(0.8) → PrepareStep 真的触发
+#     容得下它（否则 budget.py 抛 ContextOverflowError，压根走不到 compact）——
+#     spec: tool-schema-budget 起装配预算先扣**工具面预留**（控制工具 + 回读工具
+#     的 schema 是真实请求占用），窗口要按「地板 + 预留」配，4300 已不够；
+#   - 同时首轮装配量 / 6000 ≥ compact_token_ratio(0.5) → PrepareStep 真的触发
 #     escalating_compact，L0.5 才有机会跑。
 # compact_keep_recent_images=1：保住**最新**那张（取回后是取回的那张），确保被降的是
 #   最老的 A，且下一轮不会把刚取回的图又降掉。
@@ -337,7 +339,7 @@ async def _run_session(*, llm, blob_store, batch_with_echo: bool = False,
     resolver = InlineAgentTemplateProvider()
     resolver.register(_dc.replace(
         make_echo_template(),
-        loop_config=LoopConfig(compact_keep_recent_images=1)))
+        loop_config=LoopConfig(compact_keep_recent_images=1, compact_token_ratio=0.5)))
     llm.batch_with_echo = batch_with_echo
     runtime = make_runtime(llm=llm, agent_provider=resolver)
     memory = InMemoryMemoryProvider()
@@ -350,7 +352,7 @@ async def _run_session(*, llm, blob_store, batch_with_echo: bool = False,
     handle = await runtime.start_session(SessionStartParams.create(
         template_id="agent:tpl_echo",
         user_prompt=_prompt() if prompt is None else prompt,
-        context_limit=4300, reserved_output_tokens=0))
+        context_limit=6000, reserved_output_tokens=0))
     # 不经 wait_for_finish：本文件要看 close 边界后台 observe 折叠落地**前**的中间状态
     # （见 _wait_task_terminal docstring），故只等 task 到终态。
     state = await _wait_task_terminal(handle, timeout=20.0)

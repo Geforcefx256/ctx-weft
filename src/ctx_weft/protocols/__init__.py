@@ -1,7 +1,11 @@
 """ctx-weft 协议层。
 
 定义 V1 的硬契约：
-- Authorizer / AuthorizationDecision（capability 授权契约）
+- Authorizer / AuthorizationDecision（capability 授权契约：「这次该不该跑」）
+- RerunAuthorizer / RerunContext（崩溃恢复时「已经跑过一次、结果不明，还该不该再跑」。
+  与 Authorizer 分开注册、分开解析：默认放行型 authorizer 对后一个问题会答「允许」，
+  等于自动重跑副作用）
+- RecoveryPolicy（provider 在自己的 ToolCapability 上声明：重跑安不安全）
 - KnowledgeProvider（§4.2）
 - MemoryProvider（§4.3，统一协议：ingest + recall_* + subscribe + apply_compact）
 - CapabilityProvider（§4.4）
@@ -26,6 +30,9 @@ from ctx_weft.protocols.capability import (
     CapabilityProvider,
     CapabilityProviderInfo,
     Purpose,
+    RecoveryPolicy,
+    RerunAuthorizer,
+    RerunContext,
     SessionScopedCapabilityProvider,
     SkillCapability,
     SkillCapabilityProvider,
@@ -128,6 +135,9 @@ __all__ = [
     "AgentCapabilityProvider",
     "AuthorizationDecision",
     "Authorizer",
+    "RerunAuthorizer",
+    "RerunContext",
+    "RecoveryPolicy",
     "Capability",
     "CapabilityEvent",
     "CapabilityProvider",

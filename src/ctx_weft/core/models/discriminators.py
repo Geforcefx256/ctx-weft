@@ -40,3 +40,8 @@ class TaskErrorCode(StrEnum):
     BY_OBSERVER = "TASK_FAILED_BY_OBSERVER"
     RETRY_EXHAUSTED = "TASK_FAILED_RETRY_EXHAUSTED"
     BY_THRESHOLD = "TASK_FAILED_BY_THRESHOLD"
+    # spec: task-handoff——依赖阻塞取消：前序依赖落 FAILED/CANCELED、后继判明
+    # 永不可满足而落 CANCELED 的结局码。区别于用户取消：不改写会话终态、不计失败阈值。
+    # 注：工具结果不确定**不在此列**——它是一种工具结果而非 task 结局，不设专属错误码
+    # （spec: tool-operations）。
+    BLOCKED_BY_FAILED_DEP = "BLOCKED_BY_FAILED_DEP"

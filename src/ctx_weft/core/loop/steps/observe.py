@@ -28,6 +28,7 @@ from ctx_weft.core.loop.llm_gateway import (
     request_prompt_estimate, resolve_llm_identity, stream_llm_resilient,
 )
 from ctx_weft.core.capabilities.control_tools import REPORT_TASK_OUTCOME_NAME, ControlResult
+from ctx_weft.core.utils.ids import generate_id, mint_turn_call_ids
 
 if TYPE_CHECKING:
     from ctx_weft.core.models.task import Task
@@ -109,6 +110,15 @@ async def run_observe_react(
         if accumulated_text:
             last_text = accumulated_text
 
+        # 摄入前铸造内部调用标识（spec: conversation-integrity，与 act._run_llm_turn 同口径）：
+        # observer 回合不入 task 层 memory（工具是 SILENT/控制面），锚仅取唯一性、不持久；
+        # live 消息面（current_messages 的 tool_call↔result 配对）与事件 payload 用同一份值。
+        if tool_calls:
+            tool_calls = [
+                m.call for m in mint_turn_call_ids(
+                    tool_calls, anchor=generate_id("asst"), turn_seq=round_num)
+            ]
+
         # 更新 loop_guard（对齐 miniAgents _run_observer：取 actor/observer 的最大值）
         if usage.prompt_tokens > 0:
             agent.loop_guard.context_tokens = max(
@@ -171,7 +181,7 @@ async def run_observe_react(
                 content = result.content
                 # terminal 工具的失败（is_error，如参数非法）不终止循环：错误内容照常 append
                 # 进 messages（下方）供模型下一轮改参重试；只有成功结果才是终止结果。否则一次
-                # 坏调用的错误文案会被当成 Process Report 终结整个观察。
+                # 坏调用的错误文案会被当成 Process Report 终结整个观察（spec: capability-gateway）。
                 if tc.name == terminal_tool_name and not result.is_error:
                     terminal_result = result
             else:
@@ -328,11 +338,16 @@ class ObserveStep(Step):
                 child = tm.get_task(cid)
                 if child is None:
                     continue
-                subtask_reviews.append({
+                entry = {
                     "task_id": child.id,
                     "title": child.title or "",
                     "outcome": (child.status or "").lower(),
-                })
+                }
+                # spec: task-handoff——依赖阻塞取消的子任务带解释性 note（error_code
+                # 区分于用户取消），父观察面据此知道「没跑是因为前序失败」。
+                if child.status == "CANCELED" and child.error_code:
+                    entry["note"] = child.error or child.error_code
+                subtask_reviews.append(entry)
         request = ContextRequest(
             purpose="observe",
             scope=state.scope,

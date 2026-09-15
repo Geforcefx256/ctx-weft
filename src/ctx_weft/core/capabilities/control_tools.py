@@ -19,9 +19,11 @@ from ctx_weft.core.capabilities.schema import extract_schema
 from ctx_weft.core.utils.clock import now_utc
 from ctx_weft.core.utils.headings import SUBTASKS_REVIEW_HEADING
 from ctx_weft.core.utils.ids import generate_id
+from ctx_weft.core.utils.task_ref import task_ref
 from ctx_weft.core.models.task import NormalTaskSettings
 from ctx_weft.protocols.capability import (
     CapabilityEvent,
+    RecoveryPolicy,
     CapabilityProviderInfo,
     Purpose,
     SessionScopedCapabilityProvider,
@@ -154,6 +156,15 @@ def control_tool(*, purposes: list[Purpose], input_schema: dict[str, Any] | None
             description=first_line,
             input_schema=input_schema or extract_schema(fn),  # extract_schema 默认排除 "ctx"
             side_effects=False,
+            # spec: tool-operations「控制工具单独核验」——控制工具的副作用**全在 core
+            # 自己手里**，逐个核过都是同身份幂等的状态迁移，所以崩溃后按 idempotent
+            # 直接重跑，不必问重跑授权（问也没人答得了：外部系统里根本没有对应物）：
+            #   finish_task / report_task_outcome  同身份幂等的 task 状态迁移
+            #   ask_user                           复用既有 HITL 请求（决定缓存门控）
+            #   delegate_task / delegate_plan      经 gateway 的 completed 短路防双建
+            # 这是**声明**而不是 gateway 里的一条按名字前缀的特判：判据本来就是「这个
+            # 工具重跑安不安全」，那正是本字段的含义；写成特判则两处都要记得同步。
+            recovery_policy=RecoveryPolicy.IDEMPOTENT,
         )
         _CONTROL_TOOLS[fn.__name__] = (cap, fn)
         return fn
@@ -184,7 +195,6 @@ def delegate_task(
         "for the user. Default False = autonomous (the actor must call finish_task "
         "to finish).",
     ] = False,
-    inputs: Annotated[dict, "Optional input data for the sub-task"] = None,
     *,
     ctx: ControlContext = None,
 ) -> ControlResult:
@@ -227,7 +237,9 @@ def delegate_task(
 
     ctx.task.suspend_requested = True     # 路由意图；task 落 SUSPENDED 归 TaskManager
     ctx.task.actor_done = True
-    return ControlResult(content=f"Sub-task '{title}' scheduled.")
+    # spec: task-handoff——回执带标题 + id：id 是模型后续审核/引用的稳定句柄，标题让
+    # 它对得上自己刚派的是哪一个。
+    return ControlResult(content=f"Sub-task {task_ref(child)} scheduled.")
 
 
 @control_tool(purposes=["act"])
@@ -237,7 +249,7 @@ def delegate_plan(
         (
             "Ordered list of task specs. Each item: "
             "title (str, the sub-task's goal only — no dispatch flags), "
-            "description (str, WHAT the sub-task must achieve — its goal only; no HOW, and do NOT "
+            "description (str, WHAT the sub-task must achieve — its goal/content only; no HOW, and do NOT "
             "restate use_subagent/inherit_memory/skill in the text: it becomes the sub-task's own "
             "`## Current Task` and off-goal words mislead it), "
             "task_prompt (str, detailed prompt — goal/content only, same rule as description), "
@@ -245,13 +257,16 @@ def delegate_plan(
             "use_subagent (bool), subagent_template (str), "
             "inherit_memory (bool, default true), "
             "interactive (bool, default false — true makes the task human-interactive: "
-            "a plain-text turn pauses for the user instead of requiring control__finish_task)."
+            "a plain-text turn pauses and waits for the user instead of requiring control__finish_task). "
+            "Tasks run strictly in order and each one starts ONLY if its predecessor succeeded — "
+            "if a step fails, the rest are canceled. Put independent work in separate "
+            "control__delegate_task calls instead, so one failure does not cancel the others."
         ),
     ],
     *,
     ctx: ControlContext = None,
 ) -> ControlResult:
-    """Delegate SEVERAL ordered sub-tasks in one call (each runs after the previous); the current task suspends until they all finish. For a single sub-task use control__delegate_task; to finish your OWN task use control__finish_task."""
+    """Delegate SEVERAL ordered sub-tasks in one call (each runs after the previous); the current task suspends until they all finish. For a single sub-task use control__delegate_task; to finish your OWN task, use control__finish_task."""
     from ctx_weft.core.models.task import Task as TaskModel
 
     if not isinstance(tasks, list):
@@ -261,11 +276,12 @@ def delegate_plan(
     if ctx is None or ctx.task_manager is None or ctx.task is None:
         return ControlResult(content=_PLAN_DISPATCH_ACK)
 
+    prepared: list[dict] = [spec for spec in tasks if isinstance(spec, dict)]
+
     titles: list[str] = []
+    child_refs: list[str] = []
     prev_ids: list[str] = []
-    for spec in tasks:
-        if not isinstance(spec, dict):
-            continue
+    for spec in prepared:
         title = spec.get("title", "subtask")
         child = TaskModel(
             id=generate_id("tsk"),
@@ -296,13 +312,20 @@ def delegate_plan(
             blocked_by=[prev_ids[-1]] if prev_ids else None,
         )
         prev_ids.append(child.id)
+        child_refs.append(task_ref(child))
         titles.append(title)
 
     if isinstance(ctx.task.settings, NormalTaskSettings):
         ctx.task.settings.spawn_titles = titles
     ctx.task.suspend_requested = True     # 路由意图；task 落 SUSPENDED 归 TaskManager
     ctx.task.actor_done = True
-    return ControlResult(content=_PLAN_DISPATCH_ACK)
+    # spec: task-handoff——回执逐条给「标题 + id」，而不是一串裸 id：只给 id 列表的话
+    # 模型得靠位置去对应自己刚传的 spec 顺序，同名任务更是无从分辨。
+    # 句子本体从 `_PLAN_DISPATCH_ACK` 拼，不重打字面量（重打两处必然漂）。
+    listing = "; ".join(f"{i}. {ref}" for i, ref in enumerate(child_refs, start=1))
+    return ControlResult(content=(
+        f"{_PLAN_DISPATCH_ACK.rstrip('.')}, in this order: {listing}."
+    ))
 
 
 @control_tool(purposes=["act"])
@@ -332,56 +355,87 @@ def _collect_reviews(
 ) -> tuple[dict[str, str], str]:
     """匹配**自己派生的子任务**的 review，返回 ({待 reopen 的子任务 id: reasoning}, 给 LLM 的摘要)。
 
-    每条 review: {task_title, review_status('confirmed'|'reopen'|'skip'), reasoning}。
+    每条 review: {task_id, review_status('confirmed'|'reopen'|'skip'), reasoning}。
 
     权限范围：只有当前 task 直接派生的子任务（children_of）才能被 review / reopen。
     同 plan 前序仅作只读上下文（经 memory recall 以对话形态出现，无专门段），不可在此操作；
-    任何不在子任务集合内的标题都会被拒绝并在摘要里反馈给 LLM。
+    任何不在子任务集合内的 task_id 都会被拒绝并在摘要里反馈给 LLM。
+
+    条目级显式校验（spec: task-handoff）：gateway 的控制工具严格校验只查顶层参数，
+    嵌套条目它不管——所以在这里逐条把关：缺 task_id / task_id 非字符串 / 携带未知
+    字段（含旧 task_title）→ 该条目拒绝且回执说明，其余合法条目照常生效。同名、
+    改名、顺序变化都不影响配对（键是稳定 id，标题仅展示）。
 
     本函数**不直接改状态**——仅收集需 reopen 的 FINISHED 子任务及其 reasoning，交由
     ControlCapabilityProvider 通过 TaskManager.reopen_chain(id, reason) 正规重排
     （head + 其 plan 后续一并入队 + 重写 user_prompt + 发 TASK_REQUEUED）。reasoning 会成为重做指令。
-    'confirmed' / 'skip' 仅记录摘要。按标题精确匹配。
+    'confirmed' / 'skip' 仅记录摘要。按 task_id 精确匹配。
     """
     if not isinstance(task_reviews, list) or ctx.task_manager is None or ctx.task is None:
         return {}, ""
 
+    allowed_keys = {"task_id", "review_status", "reasoning"}
     child_ids = ctx.task_manager.children_of(ctx.task.id)
-    children = {t.title: t for t in ctx.task_manager.all_tasks() if t.id in child_ids}
+    children = {t.id: t for t in ctx.task_manager.all_tasks() if t.id in child_ids}
 
     reopen: dict[str, str] = {}
     applied: list[str] = []
     denied: list[str] = []
     for review in task_reviews:
         if not isinstance(review, dict):
+            denied.append("non-object entry")
             continue
-        title = review.get("task_title", "")
+        # 条目级校验：缺 task_id / 非字符串 / 未知字段（含旧 task_title）→ 整条拒绝
+        task_id = review.get("task_id")
+        unknown = set(review) - allowed_keys
+        if not isinstance(task_id, str) or not task_id:
+            # 「旧式条目」的真实形态就走这一支——`{task_title, review_status, reasoning}`
+            # 没有 task_id，够不到下面那个 unknown 分支。所以引导语必须写在这里。
+            denied.append(f"entry without a valid string 'task_id' ({sorted(review)}); "
+                          "reference sub-tasks by their task_id — 'task_title' is no "
+                          "longer accepted")
+            continue
+        if unknown:
+            denied.append(f"{task_id!r} (unknown field(s) {sorted(unknown)}; "
+                          "use exactly task_id / review_status / reasoning)")
+            continue
         review_status = review.get("review_status", "")
         reasoning = review.get("reasoning", "")
-        target = children.get(title)
+        target = children.get(task_id)
         if target is None:
-            denied.append(f"{title!r}")  # 非自己的子任务（含前序 / 其它）→ 越权
+            denied.append(f"{task_id!r}")  # 非自己的子任务（含前序 / 其它）→ 越权
             continue
+        ref = task_ref(target)
+        # 以下两条此前是**静默 continue**：条目合法、在权限范围内，却既不进 applied 也不进
+        # denied，模型收到的回执里它就这么消失了。而 schema 明写 `reasoning (str, required)`
+        # 且只枚举三种 review_status——承诺了契约就得在违约时说话。
         if not reasoning:
+            denied.append(f"{ref} (missing 'reasoning'; it is required — for 'reopen' it "
+                          "becomes the revision instruction)")
+            continue
+        if review_status not in ("reopen", "confirmed", "skip"):
+            denied.append(f"{ref} (unknown review_status {review_status!r}; "
+                          "use 'confirmed' | 'reopen' | 'skip')")
             continue
         if review_status == "reopen":
             if target.status == "FINISHED":
                 reopen[target.id] = reasoning
-                applied.append(f"reopened {title!r} (+ its plan successors)")
+                applied.append(f"reopened {ref} (+ its plan successors)")
             else:
                 # 已是 PENDING/进行中，本来就会跑，无需 reopen
-                applied.append(f"already active {title!r}")
+                applied.append(f"already active {ref}")
         elif review_status == "confirmed":
-            applied.append(f"confirmed {title!r}")
-        elif review_status == "skip":
-            applied.append(f"skipped {title!r}")
+            applied.append(f"confirmed {ref}")
+        else:  # skip（枚举已在上面校验过，这里不会有第四种）
+            applied.append(f"skipped {ref}")
 
     parts: list[str] = []
     if applied:
         parts.append(f"Reviews applied: {'; '.join(applied)}.")
     if denied:
         parts.append(
-            f"Ignored (out of scope — you may only review your own sub-tasks): {'; '.join(denied)}."
+            f"Ignored (invalid or out of scope — reference YOUR OWN sub-tasks by task_id "
+            f"exactly as listed): {'; '.join(denied)}."
         )
     summary = ("\n" + " ".join(parts)) if parts else ""
     return reopen, summary
@@ -429,8 +483,13 @@ def report_task_outcome(
         f"'{SUBTASKS_REVIEW_HEADING}' section in the context. You may NOT review anything "
         "else (upstream/predecessor tasks appear as read-only conversation context); "
         "such entries are rejected. "
-        f"Each entry: task_title (str, exact match of the title shown in '{SUBTASKS_REVIEW_HEADING}'), "
-        "review_status ('confirmed'|'reopen'|'skip'), reasoning (str, required). "
+        f"Each entry is an object with exactly these fields: task_id (str — the id in "
+        f"parentheses after each title under '{SUBTASKS_REVIEW_HEADING}', NOT the title "
+        "itself), review_status ('confirmed'|'reopen'|'skip'), reasoning (str, required). "
+        "An entry is rejected individually — and the receipt says why — if it has no "
+        "string task_id (including old-style entries keyed by 'task_title'), carries any "
+        "other field, names a task that is not your own sub-task, omits reasoning, or "
+        "uses a review_status outside the three values above. "
         "'reopen' re-runs that FINISHED sub-task from scratch: its previous output is "
         "automatically shown to the re-run and your 'reasoning' becomes the revision "
         "instruction — so write 'reasoning' as concrete, actionable feedback (what is "

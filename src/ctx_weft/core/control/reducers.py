@@ -7,6 +7,7 @@ RunStateView.sessions / .tasks 包含完整的 Session/Task 投影。
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
@@ -190,12 +191,15 @@ def serialize_view(view: RunStateView) -> dict[str, Any]:
                 "origin_tool_name": t.origin_tool_name,
                 "settings_raw": t.settings_raw,
                 "dag_deps": t.dag_deps,
+                # spec: task-handoff——两个新字段进快照（error_code /
+                # blocked_by_task_id）；旧快照无键 → deserialize 落缺省。
                 "priority": t.priority,
                 "max_retries": t.max_retries,
-                "timeout_ms": t.timeout_ms,
                 "tenant_id": t.tenant_id,
                 "outputs": t.outputs,
                 "error": t.error,
+                "error_code": getattr(t, "error_code", None),
+                "blocked_by_task_id": getattr(t, "blocked_by_task_id", None),
                 "created_at": _dt(t.created_at),
                 "finished_at": _dt(t.finished_at),
             }
@@ -264,10 +268,11 @@ def deserialize_view(data: dict[str, Any]) -> RunStateView:
             dag_deps=t.get("dag_deps", []),
             priority=t.get("priority", 5),
             max_retries=t.get("max_retries", 3),
-            timeout_ms=t.get("timeout_ms", 60_000),
             tenant_id=t.get("tenant_id", "default"),
             outputs=t.get("outputs"),
             error=t.get("error"),
+            error_code=t.get("error_code"),
+            blocked_by_task_id=t.get("blocked_by_task_id"),
             created_at=_dt(t.get("created_at")),
             finished_at=_dt(t.get("finished_at")),
         )
@@ -305,23 +310,80 @@ def deserialize_view(data: dict[str, Any]) -> RunStateView:
     )
 
 
-async def rebuild_view(event_store: Any, session_id: str) -> RunStateView:
-    """Rebuild RunStateView via snapshot + delta, or full replay as fallback.
+#: 恢复路径认可的投影版本（spec: snapshot-recovery）：不匹配的快照被忽略走全量。
+#: 与 SnapshotWriter.PROJECTION_VERSION 同步 bump。
+_PROJECTION_VERSION = 1
 
-    Works with any EventStore; snapshot methods are optional (NotImplementedError → full replay).
+
+def snapshot_is_usable(
+    snapshot: Any, head: int, *, max_chain_depth: int | None = None,
+) -> bool:
+    """该快照能否作为增量基底（spec: snapshot-recovery）。
+
+    **恢复侧与写入侧共用这一套判据**——两边各写一遍是漂移的现成来源：判据一旦分叉，
+    writer 会基于一张 reader 根本不认的快照做增量，两路等价就此失守。
+
+    四条硬判据（任一不满足 → 不可用，调用方全量重建）：
+
+    1. 有快照；
+    2. 带 ``last_commit_position``——缺它就是改造前的存量快照，位置不可猜；
+    3. ``projection_version`` 与当前实现一致——apply 语义变过则旧 blob 不可复用；
+    4. 位置不超前于 ``head``——引用未来位置说明数据异常。
+
+    ``max_chain_depth``：仅**写入侧**传。快照链每增量一次深一层，达到上限即强制一次
+    全量重锚，把「serialize/deserialize 往返有损」这类逐次累积的偏差限制在常数级内。
+    恢复侧不传——读一张已存在的快照时，链深不影响这一次读取的正确性，那是写入策略。
+    """
+    if snapshot is None:
+        return False
+    if getattr(snapshot, "last_commit_position", None) is None:
+        return False
+    if getattr(snapshot, "projection_version", 1) != _PROJECTION_VERSION:
+        return False
+    if snapshot.last_commit_position > head:
+        return False
+    if (max_chain_depth is not None
+            and getattr(snapshot, "chain_depth", 0) >= max_chain_depth):
+        return False
+    return True
+
+
+async def rebuild_view(event_store: Any, session_id: str) -> RunStateView:
+    """按快照+增量或全量回放重建 RunStateView（spec: snapshot-recovery，wp4 改造）。
+
+    恢复**只有一条口径**：position 一致切面。有序提交是 `EventStore` 的必需部分，
+    所以这里不再按 store 能力分路——没有「无 position 时怎么办」这个分支。
+
+    路径选择（按序）：
+
+    1. **快照 + 增量**（快照有效）：快照携带 ``last_commit_position``、
+       ``projection_version`` 匹配、且位置不超前于 ``committed_head``
+       → ``read_range((cursor, head])`` 增量 apply。
+    2. **全量回放**：无快照 / 快照缺 position（改造前的存量快照）/ 版本不匹配 /
+       引用未来位置（数据异常）→ ``read_range(0..head)`` 全量折。
+       忽略坏快照是性能降级不是数据丢失（日志是真相）。
+
+    「按事件 ID 取增量」这种读法已从 `EventStore` 彻底移除：ID 铸造序 ≠ 提交序，
+    按 ID 当游标正是 H2 的根因。
     """
     try:
         snapshot = await event_store.load_latest_snapshot(session_id)
     except NotImplementedError:
         snapshot = None
 
-    if snapshot:
+    head = await event_store.committed_head(session_id)
+    if snapshot_is_usable(snapshot, head):
         view = deserialize_view(snapshot.state_blob)
-        delta = await event_store.read_after(session_id, snapshot.last_event_id)
-        return apply_events(delta, view)
-
-    events = await event_store.read_by_session(session_id)
-    return reduce_events(events, run_id=session_id)
+        delta = await event_store.read_range(
+            session_id,
+            after_position=snapshot.last_commit_position,
+            through_position=head,
+        )
+        return apply_events([se.event for se in delta], view)
+    # 全量：忽略快照（存量/损坏/超前），按 position 序重放；重造快照由 writer 负责
+    stored = await event_store.read_range(
+        session_id, after_position=0, through_position=head)
+    return reduce_events([se.event for se in stored], run_id=session_id)
 
 
 def reduce_events(events: list[Event], run_id: str) -> RunStateView:
@@ -554,7 +616,6 @@ def _apply(view: RunStateView, ev: Event) -> None:
                 dag_deps=task_data.get("dag_deps", []),
                 priority=task_data.get("priority", 5),
                 max_retries=task_data.get("max_retries", 3),
-                timeout_ms=task_data.get("timeout_ms", 60_000),
                 tenant_id=ev.tenant_id or "default",
                 created_at=ev.timestamp,
             )
@@ -651,6 +712,17 @@ def _apply(view: RunStateView, ev: Event) -> None:
             elif t in (EventType.TASK_FAILED, EventType.TASK_INTERRUPTED):
                 msg = p.get("error_message")
                 if msg:
+                    task.error = msg
+            elif t == EventType.TASK_CANCELED:
+                # spec: task-handoff——依赖阻塞取消的结局码与阻塞源随 TASK_CANCELED
+                # payload 持久化；不读则回放后只剩 CANCELED、原因不可解释。
+                # 用户侧取消（reason 文本）也顺手折进 error，供恢复后观察面解释。
+                code = p.get("error_code")
+                if code:
+                    task.error_code = code
+                    task.blocked_by_task_id = p.get("blocked_by_task_id") or None
+                msg = p.get("reason") or p.get("error_message")
+                if msg and not task.error:
                     task.error = msg
 
     elif t == EventType.TASK_FINALIZED and ev.task_id:
@@ -921,3 +993,107 @@ def fold_hitl_snapshot(events: list[Event]) -> HitlSnapshot:
                 snap.decisions_for[key] = (decision, req.resume_state)
 
     return snap
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# capability 调用折叠（spec: tool-operations）
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# 一次工具调用在事件流里留下的痕迹，就是它的执行记录——不需要第二个存储。
+#
+# 曾经有一张 `operations` 表（`OperationStore` / `OperationRecord` / CAS revision）
+# 记同样的事。它的核心承诺是「在调 provider 之前把『我要动手了』持久确认下来」，
+# 而 `CapabilityInvoked` 经提交门 emit 时**本来就**是先拿到存储确认才返回的——
+# 那两次 CAS 是重复劳动。其余几档也各有归宿：
+#
+#   prepared      → 没有 INVOKED 就是没跑过（授权拒绝时事件流一条都没有）
+#   started       → 有 INVOKED、无 FINISHED
+#   completed     → 有 FINISHED，payload 带的正是进对话的那份收敛版
+#   waiting_human → HITL 有自己的事件集与 `fold_hitl_snapshot`
+#   revision CAS  → 唯一消费者（宿主并发处置 API）已删，无并发写者
+#
+# 与 `reduce_events` 的分工：那个折的是常驻状态（每步都读、进快照）；这个只在恢复
+# 与重入时问一次，所以和 `fold_hitl_snapshot` / `fold_pending_task_recap` 同类——
+# 折出来就用，不存。比 HITL 折叠还省一层：未决 HITL 的年龄没有上界所以不能截尾，
+# 而 dangling tool_call 必定在最后一个 assistant 回合之后，读最近一段即可。
+
+async def load_events_of_types(
+    store, session_id: str, types: "tuple[EventType, ...]",
+) -> list[Event]:
+    """按类型取该会话的事件——**本文件这些折叠的统一数据入口**。
+
+    `read_session_events_of_types` 是 `EventStore` 的可选扩展；未实现时退化为全量读 +
+    内存过滤。这段降级本来在 runtime 里是个只有一个调用方的私有方法，capability 折叠
+    落地后成了第二个需要它的人——与其各写各的，不如和折叠住在一起：需要它的理由完全
+    一样（「恢复决策按事件折叠，不必全量回放」）。
+    """
+    try:
+        return await store.read_session_events_of_types(session_id, types)
+    except NotImplementedError:
+        return [e for e in await store.read_by_session(session_id) if e.type in types]
+
+
+#: 折叠所需的事件类型。供事件库按类型过滤读取，无需全量回放。
+CAP_FOLD_EVENT_TYPES: tuple[EventType, ...] = (
+    EventType.CAPABILITY_INVOKED,
+    EventType.CAPABILITY_FINISHED,
+)
+
+
+@dataclass(frozen=True)
+class OperationFacts:
+    """一次逻辑调用在事件流里留下的痕迹。**折出来的，不存。**"""
+
+    #: 有 `CapabilityInvoked` = provider 被调用过，副作用可能已发生。
+    #: 反过来更有用：**没有就是确定没跑过**——gateway 的 `_record_invocation` 在
+    #: provider 之前、在授权与参数校验之后，所以拒绝与校验失败都不会留下这条。
+    invoked: bool = False
+    finished: bool = False
+    #: 各次执行尝试的 invocation_id，按事件顺序。
+    attempts: tuple[str, ...] = ()
+    #: `CapabilityFinished` 里那份结果——**就是进对话的收敛版**，重放直接用，
+    #: 不必也不该再生成一遍。
+    result: str | None = None
+    outcome: str | None = None
+    #: 结果原始长度。`> len(result)` 说明事件 payload 的 8000 上限把它截断了——
+    #: 只可能发生在 `spillable=False`（不收敛）的工具上，而那类全是只读可重新派生的。
+    result_length: int | None = None
+    last_attempt_at: "datetime | None" = None
+
+    @property
+    def truncated(self) -> bool:
+        """事件里这份结果是不是被截断的（重放前要据此决定重跑还是复用）。"""
+        return (self.result_length or 0) > len(self.result or "")
+
+
+def fold_operations(events: list[Event]) -> dict[str, OperationFacts]:
+    """按 tool_call_id 折 `CapabilityInvoked` / `CapabilityFinished`。
+
+    键是摄入点铸造的内部 tool_call 标识（`tc_...`）——裸 wire id 的调用同样会进来，
+    调用方自行按 `is_internal_call_id` 取舍（跨回合复用的裸 id 会互相覆盖，那是存量
+    数据的既定歧义，见 capability `conversation-integrity`）。
+    """
+    out: dict[str, OperationFacts] = {}
+    for ev in events:
+        payload = ev.payload or {}
+        tool_call_id = payload.get("tool_call_id") or ""
+        if not tool_call_id:
+            continue
+        facts = out.get(tool_call_id, OperationFacts())
+        if ev.type == EventType.CAPABILITY_INVOKED:
+            facts = replace(
+                facts,
+                invoked=True,
+                attempts=(*facts.attempts, payload.get("invocation_id", "")),
+                last_attempt_at=ev.timestamp,
+            )
+        elif ev.type == EventType.CAPABILITY_FINISHED:
+            facts = replace(
+                facts,
+                finished=True,
+                result=payload.get("result"),
+                outcome=payload.get("outcome"),
+                result_length=payload.get("result_length"),
+            )
+        out[tool_call_id] = facts
+    return out

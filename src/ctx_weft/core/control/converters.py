@@ -59,7 +59,6 @@ def task_from_projection(proj: TaskView) -> Task:
         dag_deps=list(proj.dag_deps),
         priority=proj.priority,
         max_retries=proj.max_retries,
-        timeout_ms=proj.timeout_ms,
         settings=deserialize_settings(proj.settings_raw),
         interaction_mode=proj.interaction_mode,  # type: ignore[arg-type]
         unattended=proj.unattended,
@@ -67,6 +66,7 @@ def task_from_projection(proj: TaskView) -> Task:
         origin_tool_name=proj.origin_tool_name or None,
         outputs=proj.outputs,
         error=proj.error,
+        error_code=proj.error_code,
         created_at=_as_utc_opt(proj.created_at),
         finished_at=_as_utc_opt(proj.finished_at),
         user_prompt_in_memory=prompt_in_memory,

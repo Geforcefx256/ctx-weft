@@ -83,7 +83,7 @@ class _SpawnLLM(MockLLMAdapter):
                              "subagent_template": SUB_TEMPLATE_REF,
                          }),
             ]), request)
-        # 交付物 = 收尾回合正文（finish_task 没有 result 参数，见 act._compose_final_outputs）
+        # 交付物 = 收尾回合正文（finish_task 不带未声明参数，spec: capability-gateway）
         return self._stream(MockResponse(text="done", tool_calls=[
             ToolCall(id=self._id("fin"), name="control__finish_task",
                      arguments={}),

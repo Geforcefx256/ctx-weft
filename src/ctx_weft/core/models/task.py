@@ -158,7 +158,6 @@ class Task:
 
     retry_count: int = 0
     max_retries: int = 3
-    timeout_ms: int = 60_000
 
     compensation: dict[str, Any] | None = None
     priority: int = 5
