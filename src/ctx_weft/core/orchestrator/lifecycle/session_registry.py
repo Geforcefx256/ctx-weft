@@ -142,8 +142,16 @@ class SessionRegistry:
         initial_task_settings: NormalTaskSettings | None = None,
         user_prompt_event_jsonable: "str | list[dict] | None" = None,
         unattended: bool = False,
-    ) -> tuple[Session, Task, TaskManager]:
+        with_root_task: bool = True,
+    ) -> tuple[Session, "Task | None", TaskManager]:
         """Create a new session, instantiate root agent, push initial task.
+
+        ``with_root_task=False`` —— **容器会话**（spec/09 §11）：建会话、实例化 root
+        agent、发 `SESSION_CREATED`，但**不推 root task**，第二个返回值为 `None`。
+        会话里的活全部由后续 `dispatch_task` 派进来。root agent 照常存在且 idle——
+        恢复链上「`root_agent_id` 非空」那条假设不破（`resume_session` 会拒 root 为空
+        的投影），只是它手上没有一条对话。
+        ``user_prompt`` 在这条路上应为 `""`：没有 root task 就没有「这一轮的用户输入」。
 
         ``unattended``：这一轮没有人看顾（后台自治作业）。原样落到 root task，并由
         `_make_root_task_manager` 强制 `interaction_mode="auto"`。见 `Task.unattended`。
@@ -223,6 +231,13 @@ class SessionRegistry:
             llm=ModelChoice(account=llm_account or "", model=llm_model or ""),
         )
         self.register_session(sid, tenant_id=tenant_id)
+
+        if not with_root_task:
+            # 容器会话：TM 照建（调用方随后要 set_runner + 接回调，不然派进来的 task
+            # 没人跑），但队列是空的。空队列上的 `drain()` 只是空转——会话终结信号只从
+            # `on_task_finished` / `finalize_idle_session` / `cancel_all` 发出，不会因为
+            # 「没有任务」就自己宣告结束。
+            return session, None, self._new_task_manager(session)
 
         root_task, task_manager = await self._make_root_task_manager(
             session, user_prompt, initial_task_settings, user_prompt_event_jsonable,
@@ -316,6 +331,24 @@ class SessionRegistry:
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
+    def _new_task_manager(self, session: Session) -> TaskManager:
+        """该 session 的 TaskManager——**唯一构造点**（`_make_root_task_manager` 与
+        容器会话分支共用）。
+
+        `set_session` 必须在任何 `push_task` 之前：`TaskManager._emit` 取
+        `self._session.tenant_id if self._session else "default"`，晚注入会让第一条
+        `TaskCreated` 落到 default 租户（总账 A5）。在构造点一并做掉，两个调用方就都
+        不可能忘。
+        """
+        tm = TaskManager(
+            session_id=session.id,
+            event_bus=self.event_bus,
+            max_concurrent=self.task_max_concurrent,
+            task_max_retries=self.task_max_retries,
+        )
+        tm.set_session(session)
+        return tm
+
     async def _make_root_task_manager(
         self,
         session: Session,
@@ -348,17 +381,12 @@ class SessionRegistry:
             created_at=now_utc(),
         )
         if task_manager is None:
-            task_manager = TaskManager(
-                session_id=session.id,
-                event_bus=self.event_bus,
-                max_concurrent=self.task_max_concurrent,
-                task_max_retries=self.task_max_retries,
-            )
-        # `push_task` 之前必须先注入 session：`TaskManager._emit` 取
+            task_manager = self._new_task_manager(session)
+        # 新建的 TM 已在 `_new_task_manager` 里注入过；这一句管的是**传进来的活 owner**
+        # （`resume_session` 复用它），它得被重新指向这一轮的 Session 对象。两条路都必须
+        # 在 `push_task` 之前完成：`TaskManager._emit` 取
         # `self._session.tenant_id if self._session else "default"`，晚注入会让 root
-        # task 的 TaskCreated 落到 default 租户（总账 A5）。runtime 侧后续仍会再调一次
-        # `set_session`（`start_session`/`recover_agent` 里另有用途——注入 llm 参数复用等），
-        # 幂等、原样保留。
+        # task 的 TaskCreated 落到 default 租户（总账 A5）。幂等，runtime 侧后续还会再调。
         task_manager.set_session(session)
         # root task 的 user_prompt 与 SESSION_CREATED 是同一份内容，故 event 侧载荷
         # 也是同一份——同样由调用方从原始 content 算好，不在这里重算（Task 3）。

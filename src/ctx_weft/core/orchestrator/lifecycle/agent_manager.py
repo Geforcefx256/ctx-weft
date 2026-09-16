@@ -396,6 +396,30 @@ class AgentLifecycleManager:
                 f"agent {agent_id} is running; retry later or pause/cancel it first"
             )
 
+    def assert_can_parent(self, agent_id: str) -> None:
+        """当**血缘父**（而非执行者）之前的同步守卫（spec/09 §7.2）。
+
+        与 `assert_can_receive` 的唯一差别是 **`running` 放行**。判据分岔的理由是
+        这个 agent 在两种场景里的角色不同：
+
+        - `assert_can_receive` —— 它要**亲自执行**接下来的 task。同 agent 不并发是硬
+          不变量（见 `_bind_task_manager` 的注释：同一 agent 上并发两个 run 会让它们
+          共用的 `CapabilityCache` 工具面互相 evict），所以 `running` 必须拒。
+        - `assert_can_parent` —— 它只提供 `parent_agent_id`（→ `spawn_depth`）与
+          `ModelChoice` 的继承，真正跑的是新 spawn 出来的子 agent。它的执行槽没被占用，
+          对话记忆也不被碰（`dispatch_task` 派发的是顶层 task，`parent_task_id is None`，
+          `finalize` 的派发框/bubble 两处准入判据都不成立）。`delegate_task` 一直就是
+          在父 agent **正在跑**的时候 spawn 子 agent 的——host 从外部做同一件事没有
+          理由更严。
+
+        `terminated` 仍然拒：往一个已被显式 cancel 的 agent 上接子树，接出来的东西归属
+        一个死掉的父，而 `cancel_session` 的逐 agent 终态化转手就会把它一并带走。
+
+        同步方法，理由同 `assert_can_receive`。
+        """
+        if self.status_of(agent_id) == "terminated":
+            raise AgentTerminatedError(f"agent {agent_id} already terminated")
+
     def children_of(self, agent_id: str) -> set[str]:
         return set(self._children.get(agent_id, ()))
 

@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ctx_weft.protocols import ContentPart
+    from ctx_weft.core.models.task import TaskInteractionMode
 
 from ctx_weft.core.assembler import (
     ContextAssembler,
@@ -147,14 +148,30 @@ def _latest_prior_root_task(task_manager: "TaskManager", t: "Task") -> "Task | N
 
 
 async def _copy_memory_for_inherit(
-    parent_task: "Task",
+    *,
+    source_agent_id: str,
     child_task: "Task",
     sub_agent: "Agent",
     memory: "MemoryProvider",
     session_id: str,
     tenant_id: str,
+    source_task_id: str | None = None,
 ) -> None:
-    """spawn 时把 parent agent 的当前召回视图复制进 child agent scope（spec Phase 2 2026-06-30）。
+    """spawn 时把 source agent 的当前召回视图复制进 child agent scope（spec Phase 2 2026-06-30）。
+
+    **第一参数是 agent 不是 task**（spec/09 §6）：这个函数从第一天起就是按 agent_id 取
+    记忆的（下面两次 `load_view` 都只给 `agent_id`，不给 `task_id`），从前收 `parent_task`
+    只是为了从它身上推出那个 agent id。改收 agent id 之后，「继承谁的记忆」可以由调用方
+    直接锚定——血缘（`parent_agent_id`）与记忆来源就此成为两个正交的轴，
+    `dispatch_task` 的「不从任何已有 agent 派生、但要它的上下文」才表达得出来。
+
+    ``source_task_id``：仅用于元数据标签，可空（显式指定 agent 时调用方常常并不关心
+    是哪条 task）。真正的来源标识是 `inherited_from_agent_id`，恒写。
+
+    **全 keyword-only**：第一个位置参数从 `Task` 变成了 `str`，而 Python 不会为此报错
+    ——旧的位置调用会把一个 Task 对象静默绑到 `source_agent_id` 上，`load_view` 拿它
+    当 agent_id 查，查空，于是「继承了个寂寞」而测试只在断言处才隐约红。加一道 `*`
+    让这类陈旧调用在调用点就 TypeError。
 
     镜像父此刻 AgentRecallSource 的两路召回：task 层 body（父自身 + 同 agent 兄弟，按 agent_id 跨 task）
     + agent 层对话回合（Phase 1 写的 start_task 框 / 跨 agent bubble / 同 agent finish 对）。二者按
@@ -165,8 +182,6 @@ async def _copy_memory_for_inherit(
     # 只是现在改为 mirror 而非「仅 OPEN-task body」）。
     from ctx_weft.protocols import MemoryAddress, MemoryEvent, MemoryEventType
 
-    parent_agent_id = parent_task.assigned_agent_id or parent_task.creator_agent_id
-    parent_scope = MemoryAddress(session_id=session_id, task_id=parent_task.id, agent_id=parent_agent_id)
     ctx = ProviderContext(session_id=session_id, tenant_id=tenant_id)
 
     # Mirror the parent agent's current recall view (spec Phase 2, 2026-06-30):
@@ -181,11 +196,11 @@ async def _copy_memory_for_inherit(
     # v2 P3a：body = TASK 视图默认 kinds（对话+段摘要，跨 task 半址）；frames = AGENT 视图
     # conversation turn（AGENT_COMPACT_SUMMARY = SUMMARY kind，天然排除）。
     body_records = await memory.load_view(
-        MemoryAddress(session_id=session_id, agent_id=parent_agent_id),
+        MemoryAddress(session_id=session_id, agent_id=source_agent_id),
         MemoryScope.TASK, ctx,
     )
     frame_records = await memory.load_view(
-        MemoryAddress(session_id=session_id, agent_id=parent_agent_id),
+        MemoryAddress(session_id=session_id, agent_id=source_agent_id),
         MemoryScope.AGENT, ctx, kinds=[MemoryKind.CONVERSATION_TURN],
     )
     combined = sorted(
@@ -194,7 +209,11 @@ async def _copy_memory_for_inherit(
     )
     child_scope = MemoryAddress(session_id=session_id, task_id=child_task.id, agent_id=sub_agent.id)
     for r in combined:  # chronological → re-ingest preserves order via fresh per-scope seq_no
-        md = {"inherited_from_task_id": parent_task.id}
+        # `inherited_from_agent_id` 恒写（真正的来源标识）；`inherited_from_task_id`
+        # 只在调用方给了源 task 时附上——显式锚定 agent 的路径没有「那条 task」可言。
+        md: dict = {"inherited_from_agent_id": source_agent_id}
+        if source_task_id:
+            md["inherited_from_task_id"] = source_task_id
         if r.role == "assistant" and r.metadata.get("tool_calls"):
             md["tool_calls"] = r.metadata["tool_calls"]
         if r.role == "tool" and r.metadata.get("tool_call_id"):
@@ -504,6 +523,27 @@ async def _task_has_dangling_tool_call(memory, scope, provider_ctx) -> bool:
     dangling, _ = await _dangling_tool_calls(memory, scope, provider_ctx)
     return bool(dangling)
 
+
+# ── SessionHandle ─────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class SessionHandle:
+    """`create_session` 的返回：一条**容器会话**的两个身份（spec/09 §11）。
+
+    **纯值对象，刻意没有 `wait_for_finish()` / `events()`。** `TurnHandle` 是「一次
+    交互」的句柄——它有一条 task 可等、有一条事件流可订。容器会话建出来时里面一件活
+    都没有，没有可等的东西；要等就等 `dispatch_task` 返回的那个 `TurnHandle`。
+
+    ``root_agent_id``：这条会话的 root agent，已实例化且 `idle`。它存在但手上没有对话
+    ——恢复链上「`root_agent_id` 非空」那条假设因此不破（`resume_session` 会拒 root 为
+    空的投影）。想让活直接落在它头上就 `dispatch_task(..., agent_id=root_agent_id)`；
+    想另起一棵树就不传 `agent_id`。
+    """
+
+    session_id: str
+    root_agent_id: str
+    template_id: str
 
 
 # ── CtxWeftRuntime ─────────────────────────────────────────────────────────────
@@ -1479,6 +1519,95 @@ class CtxWeftRuntime:
         return handle, state
 
     # ── Phase 4 full session ─────────────────────────────────────────────────
+
+    async def create_session(
+        self,
+        *,
+        template_id: str,
+        context_limit: int,
+        session_id: str | None = None,
+        tenant_id: str = "default",
+        llm_account: str | None = None,
+        llm_model: str | None = None,
+        token_budget: int = 200_000,
+        reserved_output_tokens: int = 8192,
+    ) -> SessionHandle:
+        """建一条**容器会话**：实例化 root agent、发 `SESSION_CREATED`，但**不推 root
+        task**（spec/09 §11）。会话里的活全部由后续 `dispatch_task` 派进来。
+
+        与 `start_session` 的分工只有一条：**这一轮有没有「用户的话」**。
+        `start_session` 收 `user_prompt` 并立刻拿它开一条对话式 root task；本方法没有
+        prompt 可收，建出来的会话是空的、静止的、随时可以被派活。所以本方法**不收**
+        `user_prompt` / `initial_task` / `unattended`——那三个描述的都是 root task，
+        而这里根本没有 root task。
+
+        **返回 `SessionHandle` 而非 `TurnHandle`**：后者的四个身份字段恒非空、其中
+        `task_id` 是「这次交互落到的 task」，空会话里没有这样一条 task，硬造一个
+        字段填不出来。要句柄就去 `dispatch_task` 拿。
+
+        **root agent 照常存在且 `idle`。** 它只是手上没有对话——「一个 session 恰有一个
+        非空 `root_agent_id`」这条恢复链上的假设不破（`resume_session` 会拒 root 为空
+        的投影）。之后 `dispatch_task(..., agent_id=handle.root_agent_id)` 把活落在它
+        头上，或者不传 `agent_id` 另起一棵树，两条都成立。
+
+        **TM 连 runner/回调一起接好**（走与 `start_session` 同一个 `_register_and_drain`）：
+        不接的话，`dispatch_task` 末尾那次 `drain()` 会撞上
+        `RuntimeError("No task runner registered")`——而它是 fire-and-forget 出去的，
+        撞了也只在日志里，任务就此静默搁浅。空队列上的那次 `drain()` 本身只是空转：
+        会话终结信号只从 `on_task_finished` / `finalize_idle_session` / `cancel_all`
+        发出，不会因为「一件活都没有」就自己宣告结束。
+        """
+        # 单例（`_bind_task_manager`）：给一个本进程里已经有主的 session_id 再建一次，
+        # 会造出第二个 TM、第二条 SESSION_CREATED。入口即拒，先于任何持久化。
+        if session_id and self._session_in_memory(session_id):
+            raise SessionAlreadyExistsError(session_id)
+
+        memory = self.providers.get_memory()
+        sm = self._session_registry
+
+        # 与 `start_session` 同一把 per-session 锁：从「查有没有活 owner」到「新 TM 登记
+        # 上」之间有 await，同一 session 上的并发入口插进来会各建一个。session_id 交给
+        # 下游现铸时不可能撞车，不必拿锁。
+        lock = (self._resume_locks.setdefault(session_id, asyncio.Lock()) if session_id
+                else contextlib.nullcontext())
+        async with lock:
+            if session_id and self._session_in_memory(session_id):
+                raise SessionAlreadyExistsError(session_id)   # 锁内复查
+            session, _no_root_task, task_manager = await sm.create_session(
+                template_id=template_id,
+                user_prompt="",              # 没有 root task 就没有「这一轮的用户输入」
+                tenant_id=tenant_id,
+                llm_model=llm_model,
+                llm_account=llm_account,
+                session_id=session_id,
+                context_limit=context_limit,
+                token_budget=token_budget,
+                reserved_output_tokens=reserved_output_tokens,
+                with_root_task=False,
+            )
+            # 模板在 create_session 内部已解析并校验过一次（入口即拒、不落库）；这里
+            # 再取一份对象给 runner 用，与 `start_session` 的写法一致。
+            template = await self._template_lookup.get_template(
+                template_id, None,
+                ctx=ProviderContext(session_id=session.id, tenant_id=tenant_id),
+            )
+            task_manager.set_unhealthy_check(
+                lambda sid: self.storage_health(sid) is not None)
+            task_manager.set_runner(self._make_task_runner(
+                session=session,
+                template=template,
+                template_id=template_id,
+                lm=sm.agent_lifecycle_manager,
+                memory=memory,
+                task_manager=task_manager,
+            ))
+            self._register_and_drain(session, task_manager)
+
+        return SessionHandle(
+            session_id=session.id,
+            root_agent_id=session.root_agent_id or "",
+            template_id=template_id,
+        )
 
     async def start_session(self, params: SessionStartParams) -> TurnHandle:
         """Create or resume a session and start execution.
@@ -3225,6 +3354,227 @@ class CtxWeftRuntime:
         asyncio.create_task(tm.drain())
         return task.id
 
+    # ── 宿主侧任务派发（spec/09）────────────────────────────────────────────────
+
+    async def dispatch_task(
+        self,
+        session_id: str,
+        content: "str | list[ContentPart]",
+        *,
+        agent_id: str | None = None,
+        settings: "NormalTaskSettings | dict | None" = None,
+        title: str = "",
+        description: str = "",
+        interaction_mode: "TaskInteractionMode" = "auto",
+        unattended: bool = False,
+        llm_account: str | None = None,
+        llm_model: str | None = None,
+    ) -> TurnHandle:
+        """在已有 session 上派发一条**全新的顶层 task**（spec/09）——`delegate_task` 的
+        host 侧对等物。
+
+        与 `send_message` 的分工：那个是**对话**（有活 task 就并进去，路由归 core），
+        这个是**派发**（永不注入既有 task，开不开新 agent、挂谁、继承谁全由调用方声明）。
+        与 `start_session(resume=True)` 的分工：那个开的是新一轮 root task，受
+        `UnfinishedTasksError`「弃轮禁止」约束；这个只是往活着的会话里加一条 task，
+        会话里有别的任务在跑时照样可用，也不发 `SessionResumed`。
+
+        `agent_id` × `settings.use_subagent` 两根轴决定 Task 上两个字段
+        （`creator_agent_id` / `assigned_agent_id`），后者才是真正驱动一切的东西：
+
+        | agent_id | use_subagent | creator | assigned | 效果 |
+        |----------|--------------|---------|----------|------|
+        | A        | False        | A       | A        | 挂 A 上跑，延续它的对话 scope |
+        | A        | True         | A       | 新铸     | 从 A 派生，`spawn_depth = A + 1` |
+        | None     | True         | ""      | 新铸     | 全新 agent 树，`parent=None`、depth 0 |
+        | None     | False        | —       | —        | `ValueError` |
+
+        第四格拒绝而不默认挂 root：「不指定 agent」与「要 root 跑」是两个意图，不替
+        调用方猜。要 root 就显式传 `agent_id=<root_agent_id>`。
+
+        **`Session.root_agent_id` 一个字节都不改**——新树只是 ALM 里一条
+        `parent_agent_id=None` 的 record，一个 session 下因此可以有多棵 agent 树。
+        `agent_ids_of_session` / `cancel_session` / `forget_session` 按 session 收全部
+        成员，森林与单树对它们没有区别。
+
+        **重放一致性**（spec/09 §3.1，本入口的地基）：`instantiate(parent_agent_id=X)`
+        的 `X` 恒等于 `task.creator_agent_id or None`，因为 `_rebuild_agents` 重放时正是
+        按 `creator or None` 推 parent/depth。两边字字对齐，崩溃重建折出同一棵森林。
+
+        **派生不污染 A 的对话**：这条 task 的 `parent_task_id` 是 `None`，`finalize` 的
+        派发框与 bubble 两处准入判据都不成立——A 是血缘上的父，不是对话上的父，它从
+        自己的视角看不到这次派发发生过。host 的派发不该凭空往一个正在对话的 agent 的
+        上下文里插入它没做过的工具调用。
+
+        守卫因此按「这个 agent 要不要亲自执行」分岔（`assert_can_receive` /
+        `assert_can_parent`，判据都收敛在 ALM 里）：要它执行则 `running` 拒；只当血缘父
+        则 `running` 放行——`delegate_task` 一直就是在父 agent 正跑的时候 spawn 子 agent 的。
+
+        返回的 `TurnHandle.agent_id` 是**真正执行这条 task 的 agent**（新建的情形下就是
+        本方法刚铸出来的那个 id，拿到即可用于后续 `send_message` / `get_agent` 寻址）。
+        要同步语义就 `await handle.wait_for_finish()`——**它等得准，但返回 `None`**：
+        `_state` 只由 runner 回填给它构造时拿到的那一个会话级句柄，本方法另铸的这个
+        （与 `send_message` 同一形状）不在回填链上。等待本身如实——判据是事件流上的
+        task 终态事件 + 那次 close 边界 recap，与会话级句柄同一条；拿不到的只是
+        `LoopState`。要终局信息就读 task 投影或订 `handle.events()`。
+        """
+        import dataclasses as _dc
+
+        from ctx_weft.core.models.errors import SessionNotFound
+        from ctx_weft.core.models.task import deserialize_settings
+        from ctx_weft.core.utils.content import content_to_text
+
+        # ── 1/2. tenant + 参数校验（零副作用、零 IO）──────────────────────────
+        tenant_id = await self._tenant_for_session(session_id)
+        s = settings if isinstance(settings, NormalTaskSettings) else (
+            deserialize_settings(settings) if settings is not None else NormalTaskSettings()
+        )
+        if not isinstance(s, NormalTaskSettings):
+            raise ValueError(
+                f"dispatch_task: settings must be NormalTaskSettings, got {type(s).__name__}"
+            )
+        if agent_id is None and not s.use_subagent:
+            raise ValueError(
+                "dispatch_task: agent_id=None requires settings.use_subagent=True "
+                "(that pair means 'start a fresh agent tree'). To run on the session's "
+                "root agent, pass agent_id=<root_agent_id> explicitly."
+            )
+        if s.use_subagent and not s.subagent_template:
+            # 入口自己 instantiate（见下），故必须手握**规范形式**的模板 id。会话的那一份
+            # 只活在 `_SessionTaskRunner._template_id` 里（`Session` 不带该字段，agent
+            # record 里存的是裸 id、不可逆向规范化），没有可靠的默认可回落——与其猜，
+            # 不如要求调用方说清楚要造一个什么型号的 agent。
+            raise ValueError(
+                "dispatch_task: settings.subagent_template is required when "
+                "use_subagent=True (qualified form, e.g. 'agent:researcher')"
+            )
+        if unattended and interaction_mode == "interactive":
+            # 不变式 `unattended ⟹ auto`。`_child_mode` 对 LLM 的请求是静默降级 + warning
+            # （调用方是模型，只能容错）；host 显式写了两个互斥参数，响亮报错才对。
+            raise ValueError(
+                "dispatch_task: unattended=True is incompatible with "
+                "interaction_mode='interactive' — nobody is there to answer the park"
+            )
+        if s.inherit_from_agent_id and not s.use_subagent:
+            # 分寸：`inherit_memory` 默认就是 True，`use_subagent=False` 时它静默无效是
+            # 既有行为（装配链只在 subagent 分支消费它），不动；但 `inherit_from_agent_id`
+            # 没有默认值，写了就一定有意图，无效必须说出来。
+            raise ValueError(
+                "dispatch_task: settings.inherit_from_agent_id only applies when "
+                "use_subagent=True (without a new agent there is nothing to copy into)"
+            )
+        # 瞬态累加器不接受外部输入（由 delegate_* 写、SuspendStep 清）。
+        s = _dc.replace(s, spawn_titles=[])
+
+        # ── 3. 活 owner TM（只读，不写任何注册表）─────────────────────────────
+        tm = self._task_managers.get(session_id)
+        if tm is None or not tm.is_alive():
+            # 冷复活走与 `_start_task_for_agent` 同一条事件重建路径，不另写一套。
+            # `keep_alive=True`：这个 TM 刚建好就要被塞新 task，不能让它对「没有可恢复
+            # task」得出「空历史报错」或「立刻 finalize 收尾」两个结论（见
+            # `recover_agent` docstring）。session 在事件日志里不存在 → 这里抛。
+            lock = self._resume_locks.setdefault(session_id, asyncio.Lock())
+            async with lock:
+                await self._recover_session_locked(session_id, keep_alive=True)
+            tm = self._task_managers.get(session_id)
+            if tm is None:
+                raise SessionNotFound(
+                    f"session {session_id!r} has no live TaskManager even after cold "
+                    f"recovery — this is a bug in the recovery path, not a transient "
+                    f"condition; do not retry blindly, file it"
+                )
+
+        # ── 4. agent 守卫（判据按「要不要亲自执行」分岔，spec/09 §7.2）─────────
+        reg = self._agent_lifecycle_manager
+        if agent_id is not None:
+            if reg.record_of(agent_id) is None:
+                # 与 `send_message` 同一条自愈：registry 的一次 miss 只说明「还没喂进来」
+                # （ALM 是只增不删的缓存、进程刚起来时整个是空的），不说明这个 agent
+                # 不存在。手握 session_id 就精确装填这一个 session。
+                await self._hydrate_agent_for_send(agent_id, session_id)
+            rec = reg.record_of(agent_id)
+            if rec is None:
+                raise AgentNotFound(f"unknown agent: {agent_id}")
+            if rec.session_id != session_id:
+                raise ValueError(
+                    f"agent {agent_id} belongs to session {rec.session_id!r}, "
+                    f"not {session_id!r}"
+                )
+            if s.use_subagent:
+                reg.assert_can_parent(agent_id)   # 只当血缘父：running 放行
+            else:
+                reg.assert_can_receive(agent_id)  # 要它亲自执行：running 拒
+
+        # ── 5. 内容门控（必须先于第 7 步的第一次 emit）────────────────────────
+        normalized, event_jsonable = await self._validate_and_normalize_content(
+            content, session_id, tenant_id=tenant_id,
+        )
+
+        # ── 6/7. 铸 task id，需要新 agent 则就地 instantiate ──────────────────
+        # 为什么入口自己建、不交给 `assemble`：`TurnHandle.agent_id` 恒非空要求返回时
+        # 就知道执行者是谁，而 `assemble` 要到派发那一刻才跑。预建之后 assemble 走
+        # `materialize` 分支（`assigned_agent_id` 已非空），与「子 agent 重派发 / 恢复」
+        # 同一条路，不新增分支。副作用是 `SpawnDepthExceeded` 提前到这里同步抛出——
+        # 对调用方更好：派发失败当场知道，而不是事后从事件流里发现。
+        task_id = generate_id("tsk")
+        if s.use_subagent:
+            ctx = ProviderContext(session_id=session_id, tenant_id=tenant_id)
+            sub_tmpl_id = await self._template_lookup.resolve_qualified(
+                s.subagent_template, ctx)
+            new_agent, _ = await reg.instantiate(
+                template_id=sub_tmpl_id, session_id=session_id, tenant_id=tenant_id,
+                # 见 docstring 的重放一致性一段：恒等于 `creator_agent_id or None`。
+                parent_agent_id=agent_id,
+                task_id=task_id, ctx=ctx,
+                # 显式给了才传；省略则沿用 instantiate 既有语义（派生继承父的选择，
+                # 无父落 ModelChoice() 跟随账号默认）。
+                llm=(ModelChoice(account=llm_account or "", model=llm_model or "")
+                     if (llm_account or llm_model) else None),
+            )
+            exec_agent_id, template_id = new_agent.id, new_agent.template_id
+        else:
+            exec_agent_id = agent_id or ""
+            template_id = reg.record_of(exec_agent_id).template_id  # type: ignore[union-attr]
+
+        # ── 8/9. 建 Task 并入队 ───────────────────────────────────────────────
+        task = Task(
+            id=task_id,
+            session_id=session_id,
+            status="ACTIVE",
+            tenant_id=tenant_id,
+            # 顶层 task：与 root task 平级，不参与 `_try_resume_parent` 的父子唤醒，
+            # 也不会让 finalize 往创建者的 scope 铸派发框（见 docstring）。
+            parent_task_id=None,
+            creator_agent_id=agent_id or "",
+            assigned_agent_id=exec_agent_id,
+            title=title,
+            description=description or content_to_text(normalized)[:200],
+            user_prompt=normalized,
+            user_prompt_event_jsonable=event_jsonable,
+            settings=s,
+            unattended=unattended,
+            interaction_mode=interaction_mode,
+            created_at=now_utc(),
+        )
+        # `provisional=False`（对比 `_start_task_for_agent` 的 True）：未提交窗口是给
+        # 「一条用户消息开出的一轮」准备的——LLM 没开口前不算发生、用户按暂停可整轮
+        # 丢弃。host 的一次显式派发不是对话轮，**创建即事实**，与 `_flush_staged` 推
+        # 委派子任务同口径。
+        await tm.push_task(task, user_prompt_event_jsonable=event_jsonable)
+
+        # ── 10/11/12 ─────────────────────────────────────────────────────────
+        # 路由的 current_task 记在**执行者**头上，不是血缘父——派生场景下 A 并不跑它。
+        reg.set_current_task(exec_agent_id, task.id)
+        asyncio.create_task(tm.drain())
+        return TurnHandle(
+            session_id=session_id,
+            agent_id=exec_agent_id,
+            task_id=task.id,
+            template_id=template_id,
+            event_bus=self._event_bus,
+            _storage_health=self.storage_health,
+        )
+
     async def reply_to_hitl(self, reply: "HitlReply") -> "HitlRequestView | None":
         """host 应答的唯一入口。返回已终局请求的视图；已终局再答 → `None`。
 
@@ -4309,7 +4659,13 @@ class _SessionTaskRunner:
                 if not t.assigned_agent_id:
                     agent, tmpl = await self._registry.instantiate(
                         template_id=sub_tmpl_id, session_id=sess_id, tenant_id=tenant_id,
-                        parent_agent_id=t.creator_agent_id, task_id=t.id, ctx=ctx,
+                        # `or None`：`instantiate` 的判据是 `is not None`，空串会被当成
+                        # 一个真父落进 `_register_fallback("")`，给一个不存在的 agent 建
+                        # record。创建者为空 = 无父 = 森林里的一棵新树（spec/09 §3.1），
+                        # 这正是 `_rebuild_agents` 重放时 `creator or None` 的同一口径——
+                        # 两边必须字字对齐，否则内存态与重放态的 parent/depth 会分叉。
+                        parent_agent_id=t.creator_agent_id or None,
+                        task_id=t.id, ctx=ctx,
                     )
                     # instantiate() 刻意不解模型（惰性不变量）；这里现解一次供
                     # AgentBinding.model——不缓存，现解现弃是设计的一部分
@@ -4333,17 +4689,28 @@ class _SessionTaskRunner:
                 ))
                 t.assigned_agent_id = agent.id
                 if s.inherit_memory and not t.user_prompt_in_memory:
-                    # Parented sub-tasks copy from their parent; a root turn dispatched
-                    # straight to a sub-agent has no parent_task_id, so fall back to the
-                    # previous root task (else its sub-agent starts blank — no session memory).
-                    src_t = (
-                        self._task_manager.get_task(t.parent_task_id) if t.parent_task_id
-                        else _latest_prior_root_task(self._task_manager, t)
-                    )
-                    if src_t:
+                    # 继承源三级，**显式优先**（spec/09 §6）：
+                    #   ① settings.inherit_from_agent_id —— host 直接锚定，绕过推导。
+                    #      血缘与记忆来源是正交的两个轴：跨树继承（新树 agent 拿 root
+                    #      的上下文）只能由这一级表达。
+                    #   ② 父任务的 agent —— 委派子任务的既有行为。
+                    #   ③ 上一条 root task 的 agent —— 直派 sub-agent 的 root 回合没有
+                    #      parent_task_id，不回落它的话子 agent 会空手起跑。
+                    # ②③ 逐字保留，存量行为零变化。
+                    src_aid, src_tid = s.inherit_from_agent_id, None
+                    if not src_aid:
+                        src_t = (
+                            self._task_manager.get_task(t.parent_task_id) if t.parent_task_id
+                            else _latest_prior_root_task(self._task_manager, t)
+                        )
+                        if src_t:
+                            src_aid = src_t.assigned_agent_id or src_t.creator_agent_id or ""
+                            src_tid = src_t.id
+                    if src_aid:
                         await _copy_memory_for_inherit(
-                            parent_task=src_t, child_task=t, sub_agent=agent,
+                            source_agent_id=src_aid, child_task=t, sub_agent=agent,
                             memory=self._memory, session_id=sess_id, tenant_id=tenant_id,
+                            source_task_id=src_tid,
                         )
                 initial = await self._reconcile_or(t, agent, "prepare")
                 return AgentBinding(agent_id=agent.id, agent=agent, template=tmpl,

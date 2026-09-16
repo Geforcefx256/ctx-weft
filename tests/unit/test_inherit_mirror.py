@@ -61,9 +61,11 @@ async def test_inherit_mirrors_frames_and_bubbles():
                       settings=NormalTaskSettings())
     sub_agent = type("A", (), {"id": "agB"})()
 
+    # spec/09 §6：第一参数改收 agent id（血缘与记忆来源正交）；源 task 只作元数据标签。
     await _copy_memory_for_inherit(
-        parent_task=parent_task, child_task=child_task, sub_agent=sub_agent,
-        memory=mem, session_id=sess, tenant_id="default")
+        source_agent_id=parent_task.assigned_agent_id, child_task=child_task,
+        sub_agent=sub_agent, memory=mem, session_id=sess, tenant_id="default",
+        source_task_id=parent_task.id)
 
     child_scope = MemoryAddress(session_id=sess, task_id="andy", agent_id="agB")
     turns = await mem.recall_recent(child_scope, [T.AGENT_CONVERSATION_TURN], 100, _ctx())
@@ -82,5 +84,6 @@ async def test_inherit_mirrors_frames_and_bubbles():
                         and any(tc.get("id") == "tc_lily" for tc in (t.metadata.get("tool_calls") or []))]
     assert preceding_frames, "Lily's body must be preceded by its start_task frame (no naked leak)"
 
-    # everything carries inherited_from_task_id
+    # everything carries both provenance tags (agent id is the real one, task id is optional)
+    assert all(t.metadata.get("inherited_from_agent_id") == parent_agent for t in chrono)
     assert all(t.metadata.get("inherited_from_task_id") == parent_task_id for t in chrono)

@@ -35,6 +35,14 @@ class NormalTaskSettings:
     use_subagent: bool = False
     subagent_template: str = ""
     inherit_memory: bool = True
+    # 继承源的**显式**指定（spec/09 §6）：`inherit_memory` 回答「要不要继承」，本字段
+    # 回答「继承谁的」。留空 = 沿用推导（父任务的 agent → 上一条 root task 的 agent），
+    # 存量行为逐字不变；非空则直接锚定该 agent，绕过整条推导。
+    # 之所以住在 settings 而不是 Task 上：它是**装配决策**（这个 agent 起跑时手里有什么），
+    # 与 use_subagent/subagent_template 同族，且只在装配那一刻被读一次——不像
+    # interaction_mode/unattended 那样要被 reducer、HitlService、restore 反复直读，
+    # 不需要自己的投影槽位，跟着 settings_raw 走即可。
+    inherit_from_agent_id: str = ""
     purpose: str = "act"
     # Transient accumulator: written by submit_* control tools, cleared by SuspendStep.
     spawn_titles: list[str] = field(default_factory=list)
