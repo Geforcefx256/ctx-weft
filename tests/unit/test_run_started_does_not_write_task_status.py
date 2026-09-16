@@ -16,7 +16,7 @@ T5 为「每个 run_id 都有起止」这条不变量，给 recap / recognize_in
 from __future__ import annotations
 
 from ctx_weft.core.control.reducers import reduce_events
-from ctx_weft.core.utils import now_utc
+from ctx_weft.core.utils.clock import now_utc
 from ctx_weft.protocols.events import Event, EventType
 
 

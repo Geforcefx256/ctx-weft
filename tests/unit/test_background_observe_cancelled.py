@@ -27,7 +27,7 @@ import pytest
 
 import ctx_weft.core.loop.steps.background_observe as bo
 import ctx_weft.core.loop.steps.observe as _obs_mod
-from ctx_weft.core.orchestrator.task_disposition import RunOutcomeKind
+from ctx_weft.core.orchestrator.task.disposition import RunOutcomeKind
 from ctx_weft.protocols.events import EventType
 
 
