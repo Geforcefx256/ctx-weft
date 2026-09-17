@@ -260,6 +260,13 @@ async def test_multiround_retry_accumulates_then_l3_collapses_e2e(monkeypatch):
     for r in range(4):
         task.status = "ACTIVE"       # 复位（finalize 上一轮把它标成 PENDING/retry）
         task.retry_count = 0         # 由本循环掌控轮数，不让 max_retries 提前收尾
+        # observe 的 `_apply_assessment` 会置 actor_done=True，生产路径由
+        # `TaskManager._run_task` 在每个 run 入口复位（见 observe.py 该函数的 docstring）——
+        # 本测试绕过 _run_task 直接循环 `_execute_task`，这一句是那个复位的等价物。
+        # 本分支上机械判决走的是「直接返回 retry、不经 _apply_assessment」那条，所以漏了它
+        # 也碰巧不咬人；但 act 现在把 actor_done 判在 context_limit **之前**，一旦这个巧合
+        # 变了，第二个 run 就会在第一轮工具跑完后直接按 actor_done 退出。
+        task.actor_done = False
         state, _ = await runtime._execute_task(
             session=session, task=task, agent=agent, template=template,
             run_id=f"run{r}", memory=mem, resolved_model=resolved_model, task_manager=tm)
