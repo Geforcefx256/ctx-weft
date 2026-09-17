@@ -250,25 +250,90 @@ def _original_section(content: str) -> str:
     return content
 
 
+def _rendered_only(recs: list) -> list:
+    """去掉装配时不渲染的记录（TOOL_AUDIT）。
+
+    `AgentRecallSource` 只取对话回合 + 摘要进 prompt；审计记录只在 memory 里留痕。凡是
+    「保留多少条给模型看」的计数都该按这个口径数，否则审计会白占名额。`getattr` 容忍测试桩。
+    """
+    return [r for r in recs if getattr(r, "kind", None) is not MemoryKind.TOOL_AUDIT]
+
+
+def _split_for_collapse(recs: list, keep_last: int) -> tuple[list, list]:
+    """把 task 层视图切成 (折区, 保留区)：保留**至少** keep_last 条会被渲染的记录，并对齐回合边界。
+
+    两条规则，缺一条都会让保留区在模型眼里变空：
+
+    1. **按渲染口径数名额**。TOOL_AUDIT 不进 prompt，不占 keep_last。
+    2. **切点不落在一轮中间**。保留区里的每条工具结果，发起它的 assistant 也必须在保留区；
+       否则结果成孤儿，发送前被 `drop_orphan_tool_results` 静默丢掉。一轮并行调两个工具时，
+       旧的「最后 N 条记录」切法留下的是 `[result, audit, result]`，渲染出来 0 条。
+
+    对齐只会让切点往前挪（保留更多），所以保留区可能超过 keep_last 条——keep_last 是下限。
+    按 tool_call_id 找归属而不是「往前跳过连续的 tool 记录」：工具结果与 assistant 之间可能
+    夹着别的记录（审计、异步回填），只看相邻关系会漏。
+    """
+    if keep_last <= 0:
+        return list(recs), []
+    cut, seen = len(recs), 0
+    for i in range(len(recs) - 1, -1, -1):
+        if getattr(recs[i], "kind", None) is MemoryKind.TOOL_AUDIT:
+            continue
+        seen, cut = seen + 1, i
+        if seen >= keep_last:
+            break
+    if seen < keep_last:
+        return [], list(recs)
+    while True:
+        kept_call_ids = {r.metadata.get("tool_call_id") for r in recs[cut:]
+                         if r.role == "tool" and r.metadata.get("tool_call_id")}
+        owner = next((i for i in range(cut) if recs[i].role == "assistant" and any(
+            tc.get("id") in kept_call_ids for tc in (recs[i].metadata.get("tool_calls") or []))),
+            None)
+        if owner is None:
+            return recs[:cut], recs[cut:]
+        cut = owner
+
+
+def _worth_collapsing(fold: list) -> bool:
+    """折区里除了**那一条最早的 user 回合**（原始请求 / 旧坍缩物）之外还有会被渲染的东西，才值得坍。
+
+    折区只剩原始请求时，「坍缩」= 把 USER_PROMPT 换成「USER_PROMPT + 摘要」，token 不降反升，
+    还白烧一次摘要 LLM。按回合切之后这种情况很常见：整个 task 只有一轮大并行调用时，对齐会把
+    切点一路挪到那一轮的 assistant，折区里就只剩原始请求。
+
+    只豁免**第一条** user 回合而不是所有 user 回合：连续多条用户消息（交互任务）合并成「第一条
+    原文 + 摘要」仍然可能省 token，不该被挡掉。
+    """
+    rendered = _rendered_only(fold)
+    first_user = next((r for r in rendered
+                       if r.role == "user" and r.kind is MemoryKind.CONVERSATION_TURN), None)
+    return any(r is not first_user for r in rendered)
+
+
 async def collapse_task_layer(
-    state, ctx, keep_last: int, summary_text: "str | ParsedDigest",
+    state, ctx, keep_last: int,
+    summary_text: "str | ParsedDigest | Callable[[], Awaitable[str | ParsedDigest]]",
 ) -> int:
-    """task compact（二级压缩）：把当前 task 层超过 keep_last 的早期回合（含原始 USER_PROMPT
-    与 observer 的 `## Progress So Far`）整体坍缩成一条新 USER_PROMPT，content = 原始消息 +
-    COLLAPSE_DELIM + 执行摘要；保留最近 keep_last 条 raw。返回 supersede 条数（≤keep_last → 0）。
+    """task compact（二级压缩）：把当前 task 层早期回合（含原始 USER_PROMPT 与 observer 的
+    `## Progress So Far`）整体坍缩成一条新 USER_PROMPT，content = 原始消息 + COLLAPSE_DELIM +
+    执行摘要；保留最近**至少** keep_last 条会被渲染的记录，切点对齐回合边界（见
+    `_split_for_collapse`）。返回 supersede 条数；无可折之物 → 0，且不求值摘要。
 
     坍缩物是 USER_PROMPT 而非 assistant 摘要：composer 据 mtype=="user_prompt"+task_id 定位当前
     task 贴 `## Current Task/## Current Message` 框，故当前运行 task 坍缩后框架不丢；已结束胶囊被
-    跨 task 召回时它就是一条背景 message。summary_text 兼容裸 str（旧测试桩）；degraded 标记
-    随 metadata 落库（spec: compact-fidelity）。
+    跨 task 召回时它就是一条背景 message。degraded 标记随 metadata 落库（spec: compact-fidelity）。
+
+    `summary_text` 可以是算好的文本（兼容裸 str 的旧测试桩），也可以是**取摘要的零参 async
+    函数**（`escalating_compact` 传的就是后者）：摘要在切分、no-op 判定、折区图片降级**之后**
+    才求值——无可折之物时不花那次 LLM，且摘要输入里不会有即将被降级的真图（同 L1 的顺序）。
     """
     memory = ctx.memory
     recs = await memory.load_view(
         state.scope, MemoryScope.TASK, ctx.provider_ctx, kinds=_TASK_VIEW_KINDS)
-    if len(recs) <= keep_last:
+    fold, kept = _split_for_collapse(recs, keep_last)
+    if not _worth_collapsing(fold):
         return 0
-
-    fold = recs if keep_last <= 0 else recs[:-keep_last]
 
     # §6.1：折叠范围内的残留真图**先无条件降级**（不受 keep_recent 保护）。L0.5 保住了
     # 最近 keep_recent 张，升级到这一级时它们恰好可能落进折区；不降的话下面取 `original`
@@ -284,10 +349,9 @@ async def collapse_task_layer(
         # 真图，照旧被拍扁，本段的目的完全落空。
         recs = await memory.load_view(
             state.scope, MemoryScope.TASK, ctx.provider_ctx, kinds=_TASK_VIEW_KINDS)
-        if len(recs) <= keep_last:
+        fold, kept = _split_for_collapse(recs, keep_last)
+        if not _worth_collapsing(fold):
             return 0
-        fold = recs if keep_last <= 0 else recs[:-keep_last]
-    kept = [] if keep_last <= 0 else recs[-keep_last:]
 
     # 「原始消息」节 = 折区最早一条 user 回合的原文（已坍缩过则取其原始节，保持有界）
     original = ""
@@ -628,8 +692,12 @@ async def demote_kept_capsules(state: LoopState, ctx: LoopContext, origin_ids: s
     return len(ids)
 
 
-async def _kept_origin_ids(state: LoopState, ctx: LoopContext, keep_last: int) -> set:
-    """L1 折后仍保留的最近 keep_last 个顶层单元的 origin_task_id（L2 的降级对象）。"""
+async def _kept_origin_ids(state: LoopState, ctx: LoopContext, keep_last: int) -> list:
+    """L1 折后仍保留的最近 keep_last 个顶层单元的 origin_task_id（L2 的降级对象）。
+
+    **从老到新排序**（曾返回无序 set）：L2 逐颗降级、达标即停，顺序决定了先牺牲谁——
+    必须是最老的先降，最近完成的胶囊最后才动。
+    """
     recs = await ctx.memory.load_view(
         _agent_half(state.scope), MemoryScope.AGENT, ctx.provider_ctx,
         kinds=[MemoryKind.CONVERSATION_TURN])
@@ -655,7 +723,7 @@ async def _kept_origin_ids(state: LoopState, ctx: LoopContext, keep_last: int) -
     top = [oid for oid, pid in parent_of.items()
            if oid != current and oid not in active and (pid is None or pid not in origins)]
     top.sort(key=lambda oid: first_ts[oid])
-    return set(top[-keep_last:]) if keep_last > 0 else set()
+    return top[-keep_last:] if keep_last > 0 else []
 
 
 async def escalating_compact(
@@ -763,25 +831,41 @@ async def escalating_compact(
     if est < target_tokens:
         return _finish(events)
 
-    # L2 · 保留的同 agent rich 胶囊降级 lean（无 LLM）
-    kept = await _kept_origin_ids(state, ctx, keep_last)
-    if kept:
-        n, freed = await _apply(demote_kept_capsules(state, ctx, kept))
+    # L2 · 保留的同 agent rich 胶囊降级 lean（无 LLM）——**从最老一颗开始逐颗降，每降一颗
+    # 就重新比一次 target，达标即停**。曾是整批一次降完：哪怕降一颗就够，L1 保下的全部胶囊也
+    # 一起被掏空（USER_PROMPT 原文、段摘要、act_recap 全删，只剩综合总结）。逐颗降级让最近
+    # 完成的胶囊尽量保持 rich——它们被后续回合引用的可能最大。
+    # 每颗各走一次 `_apply`：相邻两次之间没有别的写操作，「上一次 after 复用为本次 before」
+    # 的不变量成立；事件仍按级聚合成一条，`MemoryCompactFinished.levels` 不因颗数膨胀。
+    l2_n = l2_freed = l2_capsules = 0
+    for oid in await _kept_origin_ids(state, ctx, keep_last):
+        if est < target_tokens:
+            break
+        n, freed = await _apply(demote_kept_capsules(state, ctx, {oid}))
         if n:
-            events.append(make_event(state, EventType.MEMORY_COMPACTED, payload={
-                "superseded_count": n, "layer": "agent", "source": "demote_lean",
-                "trigger": trigger, "freed_tokens": freed}))
+            l2_n += n
+            l2_freed += freed
+            l2_capsules += 1
+    if l2_n:
+        events.append(make_event(state, EventType.MEMORY_COMPACTED, payload={
+            "superseded_count": l2_n, "layer": "agent", "source": "demote_lean",
+            "trigger": trigger, "freed_tokens": l2_freed, "demoted_capsules": l2_capsules}))
     if est < target_tokens:
         return _finish(events)
 
     # L3 · 坍缩当前 task（段摘要坍成更少，保 collapse_keep 条；仅当有 task 层材料可折）
-    # 计数用全量 TASK 视图（含 SUMMARY 段摘要）——与 collapse_task_layer 实际所折一致：
-    # retry 累积的是段摘要，只数 raw 会漏计、L3 永不触发。
-    task_n = len(await ctx.memory.load_view(
-        state.scope, MemoryScope.TASK, ctx.provider_ctx, kinds=_TASK_VIEW_KINDS))
+    # 计数用 TASK 视图里**会被渲染**的记录（对话回合 + SUMMARY 段摘要）——与
+    # collapse_task_layer 的保留名额同口径：retry 累积的是段摘要，只数 raw 会漏计、L3 永不
+    # 触发；而 TOOL_AUDIT 不进 prompt，算进来会让门槛虚高、提前开门。
+    task_n = len(_rendered_only(await ctx.memory.load_view(
+        state.scope, MemoryScope.TASK, ctx.provider_ctx, kinds=_TASK_VIEW_KINDS)))
     if task_n > collapse_keep:
-        summary_task = await summarize_for_compact(state, ctx, scope="task")
-        n, freed = await _apply(collapse_task_layer(state, ctx, collapse_keep, summary_task))
+        # 传「取摘要的函数」而非摘要文本（同 L1）：按回合切之后 L3 可能发现无可折之物而
+        # no-op，先算好就白烧一次 LLM；且折区图片降级发生在 collapse_task_layer 内部，
+        # 摘要必须在那之后生成，否则摘要输入里仍是真图。
+        n, freed = await _apply(collapse_task_layer(
+            state, ctx, collapse_keep,
+            lambda: summarize_for_compact(state, ctx, scope="task")))
         if n:
             events.append(make_event(state, EventType.MEMORY_COMPACTED, payload={
                 "superseded_count": n, "layer": "task", "source": "collapse",

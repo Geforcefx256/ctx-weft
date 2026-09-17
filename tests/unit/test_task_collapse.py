@@ -98,6 +98,9 @@ async def test_escalating_compact_l3_uses_collapse_keep_last(monkeypatch):
 
     async def _fake_collapse(state, ctx, keep_last, summary_text):
         kept_arg["keep_last"] = keep_last
+        # escalating_compact 交来的是「取摘要的函数」（惰性：真 collapse 在确定要折之后才求值）。
+        # 替身照真实实现去求值，本用例钉的「L3 产出一次 task 摘要」才有意义。
+        await cm._resolve_digest(summary_text)
         return 3
 
     monkeypatch.setattr(cm, "summarize_for_compact", _fake_summ)

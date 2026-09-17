@@ -55,9 +55,9 @@ _CTX_LIMIT, _INFLATED = 3000, 2800
 def _template(**loop_kwargs) -> AgentTemplate:
     """act-only（无 observe facet）→ 机械退出走规则 observe，不必脚本化 observe LLM。
 
-    `collapse_keep_last=1`：L3 的守卫是「task 层视图条数 > keep」，而越线那一轮只留下
-    USER_PROMPT + assistant + tool_result 三条，默认的 3 压不动（各级全 noop → 恢复被
-    `COMPACT_NOOP_KEY` 当场否决，测不到续跑）。调到 1 让 L3 在这个最小时间线上真的折。
+    `collapse_keep_last=1`：L3 按回合切，保留区至少要装下越线的那一整轮；时间线上只要越线
+    之前还有**一轮**历史，L3 就有东西可折。默认的 3 会把这个最小时间线整个保留下来（各级全
+    noop → 测不到续跑）。
     """
     lc = dict(collapse_keep_last=1, short_segment_token_threshold=0)
     lc.update(loop_kwargs)
@@ -70,25 +70,33 @@ def _template(**loop_kwargs) -> AgentTemplate:
 
 
 class _CrossThenSettleMock(MockLLMAdapter):
-    """前 `inflate_calls` 次调用把 usage 抬到越线值，之后回落真实值。
+    """第 `inflate_on` 里那几次调用（1 起算）把 usage 抬到越线值，其余回落真实值。
 
     一直抬着是测不出续跑的：act 每次续跑的第一轮都会立刻再越线，看到的只会是配额耗尽。
+    按序号而不是「前 N 次」：L3 按回合切，**越线之前得先有一轮不越线的历史**，L3 才有东西
+    可折——所以典型用法是「第 1 次正常、第 2 次越线」。
     另外留存**每次**请求的消息文本（`MockLLMAdapter.last_request` 只保最后一次），供
     「续跑那次请求里能看到压缩摘要」这条断言消费。
     """
 
-    def __init__(self, *args, inflate_calls: int = 1, **kwargs) -> None:
+    def __init__(self, *args, inflate_on=frozenset({2}), **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self._inflate_calls = inflate_calls
+        self._inflate_on = frozenset(inflate_on)
         self._calls = 0
         self.seen: list[str] = []
+        #: 每次请求的消息骨架 [(role, 发起的 tool_call id 集合, 回应的 tool_call_id)]——
+        #: 孤儿工具结果是被 gateway **静默**丢掉的，只看日志查不出来，得看实际发出去的形态。
+        self.shapes: list[list[tuple]] = []
 
     async def complete(self, request, stream: bool = True):
         self._calls += 1
-        inflate = self._calls <= self._inflate_calls
+        inflate = self._calls in self._inflate_on
         self.seen.append("\n".join(
             m.content if isinstance(m.content, str) else str(m.content)
             for m in request.messages))
+        self.shapes.append([
+            (m.role, frozenset(tc.get("id") for tc in (m.tool_calls or [])), m.tool_call_id)
+            for m in request.messages])
         async for chunk in super().complete(request, stream=stream):
             if inflate and chunk.kind == "usage" and chunk.usage is not None:
                 u = chunk.usage
@@ -107,11 +115,12 @@ def _working(i: int) -> MockResponse:
 
 
 def _working_then_done() -> list[MockResponse]:
-    """① 还在干活（撞停机线）；② 续跑后收尾。"""
-    return [_working(1), MockResponse(text="Here is the final answer.")]
+    """① 干活（不越线，留下一轮可折的历史）；② 干活（越线）；③ 续跑后收尾。"""
+    return [_working(1), _working(2), MockResponse(text="Here is the final answer.")]
 
 
-def _wire(monkeypatch, *, digest=_DIGEST, responses=None, inflate_calls=1, **loop_kwargs):
+def _wire(monkeypatch, *, digest=_DIGEST, responses=None, inflate_on=frozenset({2}),
+          **loop_kwargs):
     """装好一个 runtime：摘要打桩免真实 LLM、注册 noop 工具与 in-memory provider。"""
     if digest is not None:
         async def _fake_summ(state, ctx, *, scope="task"):
@@ -125,7 +134,7 @@ def _wire(monkeypatch, *, digest=_DIGEST, responses=None, inflate_calls=1, **loo
     resolver = InlineAgentTemplateProvider()
     resolver.register(_template(**loop_kwargs))
     llm = _CrossThenSettleMock(responses=responses or _working_then_done(),
-                               inflate_calls=inflate_calls,
+                               inflate_on=inflate_on,
                                context_limit=_CTX_LIMIT, output_reserve=0)
     runtime = make_runtime(llm=llm, agent_provider=resolver)
     runtime.providers.register_memory(InMemoryMemoryProvider())
@@ -172,10 +181,19 @@ async def test_recovers_in_place_without_spending_a_retry(monkeypatch, caplog):
     assert _types(seen, EventType.MEMORY_COMPACTED), "该有实际折叠"
 
     # ④ 进度不丢：续跑那次请求里，压缩摘要与原始消息**同时**在场
-    assert len(llm.seen) >= 2, "应有续跑那一次请求"
-    resumed = llm.seen[1]
+    assert len(llm.seen) >= 3, "应有续跑那一次请求"
+    resumed = llm.seen[2]   # 第 1、2 次是恢复前那一段 act（第 2 次越线），第 3 次是续跑
     assert _REMAINING_MARK in resumed, "压缩摘要的 Remaining 节没进续跑的 prompt = 进度丢了"
     assert _USER_PROMPT in resumed, "原始消息节没进续跑的 prompt"
+
+    # ⑤' 越线那一轮在续跑请求里**完整可见**：assistant 与它的工具结果一起被保留。
+    #     L3 曾按记录条数切，并把不渲染的 TOOL_AUDIT 算进名额，切点落在 assistant 与结果
+    #     之间 → 结果成孤儿 → 发送前被静默丢掉，模型看不到自己刚做完的那一轮。
+    shape = llm.shapes[2]
+    offered = set().union(*(ids for role, ids, _ in shape if role == "assistant"))
+    answered = [cid for role, _, cid in shape if role == "tool"]
+    assert answered, f"续跑请求里应能看到越线那一轮的工具结果，实际消息骨架 {shape}"
+    assert all(cid in offered for cid in answered), shape
 
     # ⑤ 无悬挂 tool_call：越线那轮的工具照执行完了，配对完整。
     #    （L3 折掉 assistant 却保住 tool_result 造成的**孤立 tool result** 是压缩的既有
@@ -223,7 +241,9 @@ async def test_turn_budget_is_not_reset_by_recovery(monkeypatch):
     上界了（恢复几次就是几倍）。这里把预算压到 1：第一段用掉唯一那一轮 → 恢复后 range 为空
     → 立刻 max_turns 退出，`MAX_TURNS_REACHED` 必须发出。
     """
-    runtime, llm, seen = _wire(monkeypatch, max_turns_per_act=1)
+    # 预算只有 1 轮 → 越线必须发生在第 1 次调用上。这一轮之前没有可折历史，L3 会 no-op，但
+    # 第一次恢复不采信「压不动」旗，照样回 prepare——本例要看的正是恢复之后轮数预算没被重置。
+    runtime, llm, seen = _wire(monkeypatch, max_turns_per_act=1, inflate_on={1})
     handle, state = await runtime.run_single_task(
         template_id="agent:tpl_recover", user_prompt=_USER_PROMPT)
 
@@ -245,7 +265,8 @@ async def test_gives_up_when_compaction_cannot_free_anything(monkeypatch):
     失效，配额会允许第二次恢复 → prepare 跑三次。usage 全程抬着，保证每段 act 都真越线。
     """
     runtime, llm, seen = _wire(monkeypatch, collapse_keep_last=99,
-                               responses=[_working(i) for i in range(4)], inflate_calls=4)
+                               responses=[_working(i) for i in range(4)],
+                               inflate_on={1, 2, 3, 4})
     handle, state = await runtime.run_single_task(
         template_id="agent:tpl_recover", user_prompt=_USER_PROMPT)
 
@@ -271,7 +292,7 @@ async def test_plain_text_finish_wins_over_the_stop_line(monkeypatch):
     """
     runtime, llm, seen = _wire(
         monkeypatch, responses=[MockResponse(text="Here is the final answer.")],
-        inflate_calls=1)   # 唯一这一轮就越线
+        inflate_on={1})   # 唯一这一轮就越线
     handle, state = await runtime.run_single_task(
         template_id="agent:tpl_recover", user_prompt=_USER_PROMPT)
 
@@ -287,7 +308,7 @@ async def test_actor_done_wins_over_the_stop_line(monkeypatch):
         MockResponse(text="all done",
                      tool_calls=[ToolCall(id="tc_f", name="control__finish_task",
                                           arguments={"deliverables_summary": ""})]),
-    ], inflate_calls=1)
+    ], inflate_on={1})
     handle, state = await runtime.run_single_task(
         template_id="agent:tpl_recover", user_prompt=_USER_PROMPT)
 
@@ -308,7 +329,7 @@ async def test_suspend_wins_over_the_stop_line(monkeypatch):
                      tool_calls=[ToolCall(id="tc_d", name="control__delegate_task",
                                           arguments={"title": "sub", "description": "do part",
                                                      "task_prompt": "do part"})]),
-    ], inflate_calls=1)
+    ], inflate_on={1})
     handle, state = await runtime.run_single_task(
         template_id="agent:tpl_recover", user_prompt=_USER_PROMPT)
 
@@ -325,8 +346,12 @@ async def test_quota_exhaustion_falls_back_to_the_retry_path(monkeypatch):
     否决（恢复一次就停），这条是压得动但救不住、一路用满 `max_context_recoveries=2`
     （恢复两次 → prepare 跑三次）。两条走的是 `_can_recover_context` 的不同否决分支。
     """
+    # 第 1 次调用不越线，给第一次恢复的 L3 留下一轮可折的历史；之后每次都越线。每次恢复
+    # L3 都折掉前一轮（压缩有效 → noop 旗不立），直到配额用满。observe 也会发 LLM 请求，
+    # 响应给足，免得 mock 耗尽。
     runtime, llm, seen = _wire(monkeypatch, max_context_recoveries=2,
-                               responses=[_working(i) for i in range(6)], inflate_calls=6)
+                               responses=[_working(i) for i in range(12)],
+                               inflate_on=set(range(2, 13)))
     handle, state = await runtime.run_single_task(
         template_id="agent:tpl_recover", user_prompt=_USER_PROMPT)
 
