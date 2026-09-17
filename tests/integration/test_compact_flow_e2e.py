@@ -3,6 +3,7 @@
 用真实 runtime（`run_single_task`）与真实 memory 驱动整条 prepare→act→observe→finalize。
 """
 
+from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from datetime import datetime, timedelta, UTC
 import pytest
@@ -11,8 +12,9 @@ from ctx_weft.core import CtxWeftRuntime
 from ctx_weft.providers.llm.mock import MockLLMAdapter, MockResponse
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from ctx_weft.protocols import (
-    AgentTemplate, IdentityFacet, LoopConfig, MemoryConfig,
-    MemoryEvent, MemoryEventType as T, MemoryAddress, ProviderContext,
+    AgentTemplate, CapabilityEvent, CapabilityProviderInfo, IdentityFacet, LoopConfig,
+    MemoryConfig, MemoryEvent, MemoryEventType as T, MemoryAddress, ProviderContext,
+    ToolCall, ToolCapability, ToolCapabilityProvider,
 )
 import dataclasses as _dc
 from ctx_weft.core.loop.steps import compact as cm
@@ -31,6 +33,56 @@ from tests.integration.test_minimal_loop import InlineAgentTemplateProvider, mak
 
 pytestmark = pytest.mark.asyncio
 _BASE = datetime(2026, 7, 1, tzinfo=UTC)
+
+
+_NOOP_ID = "probe:noop"
+_NOOP_NAME = "probe__noop"
+
+
+class _NoopToolProvider(ToolCapabilityProvider):
+    """一个什么都不做、只回一行文本的宿主工具。
+
+    存在的理由：**机械退出（max_turns / context_limit）只可能发生在带 tool call 的回合上。**
+    纯文本回合在 ActStep 里优先走 `_finish_plain_text_turn` 收尾（模型已经把答复交出来了，
+    此刻压缩没有收益，且让 context_limit 抢先会把一次正常收尾误报成机械退出、白吃一次重试），
+    所以本文件里凡要制造机械退出的用例，都得让模型真调一个工具。act 域的控制工具全都会终结
+    本段（delegate→suspend / finish_task→actor_done / ask_user→park），故这里自备一个中性的。
+    """
+
+    name = "probe"
+    description = "test-only no-op tool"
+
+    def capability(self) -> ToolCapability:
+        return ToolCapability(
+            id=_NOOP_ID, name="noop", description="Do nothing.",
+            input_schema={"type": "object", "properties": {}},
+            side_effects=False, spillable=False,
+        )
+
+    async def list(self, ctx: ProviderContext) -> list[ToolCapability]:
+        return [self.capability()]
+
+    async def describe(self, ctx: ProviderContext) -> CapabilityProviderInfo:
+        return CapabilityProviderInfo(
+            name=self.name, capability_count=1, supports_streaming=False,
+            supports_cancel=False, description=self.description,
+        )
+
+    async def cancel(self, invocation_id: str, ctx: ProviderContext) -> None:
+        return None
+
+    def invoke(self, capability_id, arguments, ctx) -> AsyncIterator[CapabilityEvent]:
+        return self._handle()
+
+    async def _handle(self) -> AsyncIterator[CapabilityEvent]:
+        yield CapabilityEvent(kind="result", payload={"content": "ok", "metadata": {}})
+
+
+def _working_turn(n: int) -> list[MockResponse]:
+    """n 个「还在干活」的回合：有 tool call，故不会走纯文本收尾那一支。"""
+    return [MockResponse(text="partial work, not done yet",
+                         tool_calls=[ToolCall(id=f"tc_{i}", name=_NOOP_NAME, arguments={})])
+            for i in range(n)]
 
 
 def _act_only_template() -> AgentTemplate:
@@ -90,18 +142,24 @@ async def test_context_limit_retry_without_recap_keeps_raw_and_defers_to_backgro
 
     resolver = InlineAgentTemplateProvider()
     # 关短段免折门，隔离出「空 recap 才是不折的原因」（短段免折是另一条已单测的路径）。
+    # max_context_recoveries=0 关掉上下文恢复：本例钉的是**恢复关闭/耗尽之后**那条老路
+    # （context_limit → observe → 强制 retry → 段折降级）。恢复本身开着时 ActStep 会把
+    # context_limit 路由回 PrepareStep 压缩续跑、根本不进 observe，那条路由由
+    # test_context_recovery_e2e.py 专测。
     tpl = _dc.replace(_act_only_template(),
-                      loop_config=LoopConfig(short_segment_token_threshold=0))
+                      loop_config=LoopConfig(short_segment_token_threshold=0,
+                                             max_context_recoveries=0))
     resolver.register(tpl)
     # spec: tool-schema-budget 后，窗口须容得下「地板 + 工具面预留」否则 prepare 期
     # assemble 直接溢出（20-token 极限窗口不再可行）。act 级 context_limit 命中改由
-    # usage 注入触发（0.8*3000=2400 阈值 < 注入的 2500）：tokenizer 不动，prepare 侧
+    # usage 注入触发（停机线 0.9*3000=2700 < 注入的 2800）：tokenizer 不动，prepare 侧
     # 估算仍走真实计数、不在压缩处提前分叉。
     llm = _UsageInflatingMock(
-        responses=[MockResponse(text="partial work, not done yet")],
-        context_limit=3000, output_reserve=0, prompt_tokens_override=2500)
+        responses=_working_turn(1),
+        context_limit=3000, output_reserve=0, prompt_tokens_override=2800)
     runtime = make_runtime(llm=llm, agent_provider=resolver)
     runtime.providers.register_memory(InMemoryMemoryProvider())
+    runtime.providers.register_capability(_NoopToolProvider())
 
     handle, state = await runtime.run_single_task(
         template_id="agent:tpl_actonly", user_prompt="do a long task")
@@ -151,13 +209,22 @@ async def test_multiround_retry_accumulates_then_l3_collapses_e2e(monkeypatch):
     tpl = _act_only_template()
     tpl = _dc.replace(tpl, id="tpl_mr", loop_config=LoopConfig(
         collapse_keep_last=2, compact_target_ratio=0.01,
+        # 关上下文恢复：本例要的是「每轮都退出→observe 折段」这个节奏，靠多个 run 把段摘要
+        # 攒到超过 collapse_keep_last。恢复开着时 act 会在**同一个 run 内**压缩续跑，攒不出多轮。
+        max_context_recoveries=0,
         short_segment_token_threshold=0))  # 关短段免折门：mock 段极小，留门则段摘要永不累积
     resolver.register(tpl)
-    llm = MockLLMAdapter(responses=[MockResponse(text="partial work, not done yet")] * 30,
-                         context_limit=20, output_reserve=0)
+    # 20-token 极限窗口在这里不再可行：机械退出现在必须走带 tool call 的回合（见
+    # `_NoopToolProvider`），而工具 schema 的预留放不进 20 token 的窗口（prepare 期
+    # assemble 直接 ContextOverflowError）。改用与本文件另一例同构的 usage 注入触发：
+    # 窗口 3000、停机线 0.9*3000=2700 < 注入的 2800 → 每个 run 的第一轮必命中 context_limit；
+    # 而 prepare 的 compact 门从第二个 run 起由真实基线（2800 ≥ 0.8*3000）打开。
+    llm = _UsageInflatingMock(responses=_working_turn(200), context_limit=3000,
+                              output_reserve=0, prompt_tokens_override=2800)
     runtime = make_runtime(llm=llm, agent_provider=resolver)
     mem = InMemoryMemoryProvider()
     runtime.providers.register_memory(mem)
+    runtime.providers.register_capability(_NoopToolProvider())
 
     # 复刻 run_single_task 脚手架，但在同一 task 上循环 _execute_task（同 scope → 段摘要累积）
     sid = "ses_mr"

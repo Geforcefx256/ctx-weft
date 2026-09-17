@@ -15,6 +15,7 @@ from typing import Any
 
 from ctx_weft.protocols import LLMMessage, LLMRequest, LLMUsage, ToolCall
 from ctx_weft.core.loop.driver import (
+    ACT_TURNS_USED_KEY, COMPACT_NOOP_KEY, CONTEXT_RECOVERY_COUNT_KEY,
     RECOGNIZE_INTENT_PENDING_KEY, ROUND_COMMITTED_KEY,
     LoopContext, LoopState, Step, StepOutcome, make_event,
 )
@@ -66,8 +67,16 @@ class ActStep(Step):
             raise RuntimeError("ActStep requires assembled_prompt — PrepareStep must run first")
 
         agent = state.agent
+        # 轮数预算**跨「上下文恢复」累计**：越过停机线后本步会经 PrepareStep 压缩再重入
+        # （见 `_can_recover_context`），若每次重入都从 1 重计，等于每恢复一次白送一整份
+        # `max_turns_per_act`——而这个配置的语义是「一次执行最多几轮」，不是「每段最多几轮」。
+        # `turn_num` 同样用累计值，使 ACT_TURN_STARTED 的轮号在一个 run 内单调递增。
         max_turns = agent.loop_config.max_turns_per_act
-        transcript: list[TurnRecord] = []
+        turns_used = state.extra.get(ACT_TURNS_USED_KEY, 0)
+        # transcript 同样累加而非覆盖：state_patch 是整字段覆盖，重入时本地变量若从空起头，
+        # 压缩前那些轮次就从 state.transcript 消失了（消费方：observe 的
+        # `_mechanical_verdict` 空 transcript → fail、background_observe 的 total_turns）。
+        transcript: list[TurnRecord] = list(state.transcript)
         exit_reason = "normal"
 
         # 运行时态势 guidance（任务树/已完成子任务/收尾提醒）已随装配管线注入
@@ -77,7 +86,8 @@ class ActStep(Step):
         # prompt 基线）。None=本轮无循环内真实基线（首轮）→ request_prompt_estimate 走整份估算。
         baseline_msg_count: int | None = None
 
-        for turn_num in range(1, max_turns + 1):
+        for turn_num in range(turns_used + 1, max_turns + 1):
+            state.extra[ACT_TURNS_USED_KEY] = turn_num
             await _interrupt_checkpoint(state, ctx)
             await ctx.event_bus.emit(make_event(
                 state, EventType.ACT_TURN_STARTED, payload={"turn": turn_num}))
@@ -106,33 +116,33 @@ class ActStep(Step):
                 turn=turn_num, messages_sent=list(current_messages),
                 assistant_text=turn.text, tool_calls=turn.tool_calls, usage=turn.usage)
 
-            # 4) context_limit 命中：记录本轮后停止
-            if context_limit_hit:
-                transcript.append(turn_record)
-                await ctx.event_bus.emit(make_event(state, EventType.ACT_TURN_COMPLETED, payload={
-                    "turn": turn_num, "reason": "context_limit"}))
-                exit_reason = "context_limit"
-                # 上下文爆了还留着运行期 pin 进来的额外工具描述，是朝根因加码——下一轮
-                # 重新装配时那些工具会原样再占一遍额度。**max_turns 那条退出不清**：它走
-                # 另一个事件、另一条路径，且语义相反——agent 接近轮数上限才找到对的工具，
-                # 清掉等于让它从零重来、再次耗尽轮数，是个会自我复现的活锁。
-                if ctx.capability_cache is not None:
-                    ctx.capability_cache.clear_pins(state.task.id)
-                logger.warning(
-                    "ActStep context_limit_hit: prompt_tokens=%d >= %d * 0.8 for agent %s",
-                    turn.usage.prompt_tokens, agent.loop_guard.context_limit, agent.id)
-                break
-
-            # 5) 纯文本（无 tool call）：interactive 让位用户 / 否则即任务产出 → observe
+            # 4) 纯文本（无 tool call）：interactive 让位用户 / 否则即任务产出 → observe
+            #
+            # **这一支刻意排在 context_limit 之前**（改造前相反）：纯文本就是本 run 的收尾，
+            # 模型已经把答复交出来了，此刻压缩没有任何收益——而让 context_limit 抢先的代价是
+            # 把一次正常收尾误报成机械退出，经 observe 强制改判 retry、白吃一次重试预算。
             if not turn.tool_calls:
                 transcript.append(turn_record)
                 await _finish_plain_text_turn(state, ctx, turn_num)
                 break
 
-            # 6) 派发前压缩（含派发调用且越阈值时；在 dispatch 执行 / 子 spawn-inherit 之前）
+            # 5) 派发前压缩（含派发调用且越阈值时；在 dispatch 执行 / 子 spawn-inherit 之前）
             await _maybe_predispatch_compact(state, ctx, turn.tool_calls, turn.usage)
 
-            # 7) 执行 tool calls（同批次延后退出信号，保证 tool_call ↔ result 一一对应）
+            # 6) 执行 tool calls（同批次延后退出信号，保证 tool_call ↔ result 一一对应）
+            #
+            # **越过停机线也照执行完**（改造前在 4) 就 break 了，工具一个都不跑）。三条理由：
+            # ① 工具调用已经发生过，结果是净收益，丢掉等于白烧一轮 LLM；
+            # ② 不执行就没有 TOOL_RESULT，memory 里留下一条**悬挂的** assistant tool_call。
+            #    改造前它被 observe 的 `_fold_retry_segment`（keep_last=0）连整段 raw 一起
+            #    supersede 掉，坑被掩埋；一旦改成压缩后原地续跑，`collapse_keep_last` 会把它
+            #    留在保留区，重装配出的 messages 就带一个无 result 的 tool_call，撞上
+            #    `llm_gateway.drop_dangling_tool_calls`——不 400（有兜底），但那条 assistant
+            #    会被剥成空消息再被 `remove_empty_messages` 整条删掉，模型看不到自己调过这些
+            #    工具，且每次恢复都打一条 ERROR（那个兜底的语义是「上游对账漏了」）。
+            # ③ 执行完可能进一步超出窗口，但这是安全的：装配预算层把 assistant(tool_calls)
+            #    与其 tool 结果聚成同生共死单元再整单元丢弃（`budget._coalesce_tool_pairs`），
+            #    永不产孤儿；且紧接着就是 compact，折的正是这批新料。
             tool_results = await _execute_tool_calls(state, ctx, turn.tool_calls)
             for tr in tool_results:
                 current_messages.append(LLMMessage(
@@ -140,13 +150,30 @@ class ActStep(Step):
             turn_record.tool_results = tool_results
             transcript.append(turn_record)
             await ctx.event_bus.emit(make_event(state, EventType.ACT_TURN_COMPLETED, payload={
-                "turn": turn_num, "reason": "tool_calls_processed"}))
+                "turn": turn_num,
+                "reason": "context_limit" if context_limit_hit else "tool_calls_processed"}))
 
             # finish_task 与 delegate 同批：finish 胜出（派发改投为独立后继）。
             _reconcile_finish_vs_dispatch(state, ctx, turn.tool_calls)
 
+            # 7) actor 收尾 —— 同样**优先于** context_limit：任务已经做完了，没有可续的跑。
             if state.task.actor_done:
                 exit_reason = "actor_done"
+                break
+
+            # 8) 越过上下文停机线：工具结果已全部落定、配对完整 → 结束本段。
+            #    去向由 `_can_recover_context` 决定（回 prepare 压缩续跑 / 退回 observe），
+            #    见下方路由。**不清 pin**：`_pinned` 按 task_id 分区（新 task 看不到旧 pin）、
+            #    有 max_pins 的 LRU 上界、且 task 落终态时由 `on_task_finished` 清——在这里
+            #    清等于让 agent 续跑后从零重新发现工具，正是 `CapabilityCache.evict` 的注释
+            #    明确拒绝在 run 边界做的那件事，而续跑连 run 边界都不跨。
+            if context_limit_hit:
+                exit_reason = "context_limit"
+                logger.warning(
+                    "ActStep context_limit_hit: prompt_tokens=%d >= %.2f * eff(limit=%d) "
+                    "for agent %s", turn.usage.prompt_tokens,
+                    getattr(agent.loop_config, "context_limit_stop_ratio", 0.8),
+                    agent.loop_guard.context_limit, agent.id)
                 break
 
         else:
@@ -155,9 +182,27 @@ class ActStep(Step):
             await ctx.event_bus.emit(make_event(state, EventType.MAX_TURNS_REACHED, payload={
                 "max_turns": max_turns}))
 
-        # suspend_requested 表示 actor 本轮派了活、本 run 要停在等子任务 → SuspendStep。
-        # （判据从 `task.status == "SUSPENDED"` 换成意图位：状态归 TaskManager，Task 4）
-        next_step = "suspend" if state.task.suspend_requested else "observe"
+        # 路由优先级：suspend > 上下文恢复 > observe。
+        #
+        # - suspend 最先：suspend_requested 表示 actor 本轮派了活、本 run 要停在等子任务 →
+        #   SuspendStep（判据从 `task.status == "SUSPENDED"` 换成意图位：状态归 TaskManager，
+        #   Task 4）。越线也不例外——父的上下文由 `_maybe_predispatch_compact` 那条路负责，
+        #   而这个 run 本来就要停了，没有「续跑」可言。
+        # - 恢复次之：越线但还救得回来 → 回 PrepareStep。为什么是 prepare 而不是已注册的
+        #   "compact" 步：① `CompactStep.execute` 返回 next_step=None，会直接终结 driver 的
+        #   循环（既无 observe 也无 finalize，run_outcome 是 None）；② `escalating_compact`
+        #   **从不回写** loop_guard.context_tokens（est 是局部量），所以 compact → prepare
+        #   会让 prepare 用压缩前的陈旧基线再开一次门、白跑第二次压缩；③ prepare 顺带做了
+        #   续跑必须做的两件事——resolve_and_bind 重解能力面 + `_assemble()` 重建
+        #   assembled_prompt（本步的 current_messages 正是从它来的）。
+        if state.task.suspend_requested:
+            next_step = "suspend"
+        elif exit_reason == "context_limit" and _can_recover_context(state):
+            state.extra[CONTEXT_RECOVERY_COUNT_KEY] = (
+                state.extra.get(CONTEXT_RECOVERY_COUNT_KEY, 0) + 1)
+            next_step = "prepare"
+        else:
+            next_step = "observe"
 
         # ── task.outputs：收尾时合成最终交付物（spec 2026-07-01 反转契约）──
         # 收尾路径 = 纯文本收尾(normal) 或 finish_task 收尾(actor_done 且未挂起)；答复即消息正文，
@@ -509,8 +554,41 @@ async def _run_llm_turn(
         anchor=anchor, minted=minted)
 
 
+def _can_recover_context(state: LoopState) -> bool:
+    """越过上下文停机线之后，该不该回 PrepareStep 压缩续跑（而非退回 observe 吃一次 retry）。
+
+    两个否决条件都必须有，各管一种失败模式：
+
+    - **配额**（`max_context_recoveries`，0 = 关闭恢复）：compact 压得动一点、但离 target
+      总是差一口气时，prepare↔act 会来回 ping-pong，每圈烧一次真实 act LLM 调用 + 一到两次
+      摘要调用。配额是这条的硬止损。
+    - **compact 已压不动**（`COMPACT_NOOP_KEY`）：`escalating_compact` 的每一级都有可折性
+      guard，全 noop 时它返回的事件里一条 `MEMORY_COMPACTED` 都没有——说明这个 scope 再压
+      也挤不出东西（例如 task 层只剩 ≤ collapse_keep_last 条、agent 层没有已完成胶囊、
+      单轮塞进来一条超大 tool result）。此时再恢复一次纯属白烧，立即放弃，不等配额耗尽。
+
+    ⚠️ 这个否决只在 `used > 0`（即已经恢复过至少一次）时生效。**本 run 开头那次 prepare 的
+    compact 也会写这个标志**，而那一次几乎必然是 noop——run 刚起，task 层往往只有一条
+    USER_PROMPT，各级 guard 全不满足。若不区分，那面「压不动」的旗会在 act 还没发出第一个
+    请求时就立起来，把整个 run 的恢复资格一笔勾销（实测：`prepare→act→observe`，恢复从不
+    发生）。所以第一次恢复只受配额约束——想知道压得动压不动，总得先真压一次。
+    """
+    limit = getattr(state.agent.loop_config, "max_context_recoveries", 0)
+    if limit <= 0:
+        return False
+    used = state.extra.get(CONTEXT_RECOVERY_COUNT_KEY, 0)
+    if used >= limit:
+        return False
+    return not (used > 0 and state.extra.get(COMPACT_NOOP_KEY))
+
+
 async def _account_tokens(state: LoopState, ctx: LoopContext, usage: LLMUsage) -> bool:
-    """更新 LoopGuard 基线 + session.token_used；返回是否命中 context_limit（80% 阈值）。
+    """更新 LoopGuard 基线 + session.token_used；返回是否越过上下文停机线。
+
+    阈值取 `loop_config.context_limit_stop_ratio`（默认 0.9），**曾硬编码 0.8**——那个值
+    与 `compact_token_ratio` 的默认值重合，于是 prepare 刚把估算压到「刚低于 0.8」，本步
+    第一轮就又越线，一次恢复配额当场蒸发。两条线现在分工：compact_token_ratio 管 run 开头
+    的常规压缩（估算口径），本比率管 mid-act 兜底（真实 usage 口径），故设得更高。
 
     对齐 miniAgents actor.py context_limit_hit 逻辑。
     """
@@ -537,10 +615,11 @@ async def _account_tokens(state: LoopState, ctx: LoopContext, usage: LLMUsage) -
     context_limit = agent.loop_guard.context_limit
     reserve = getattr(agent.loop_guard, "reserved_output_tokens", 0)
     eff = effective_limit(context_limit, reserve)
+    ratio = getattr(agent.loop_config, "context_limit_stop_ratio", 0.8)
     return (
         eff > 0
         and usage.prompt_tokens > 0
-        and usage.prompt_tokens >= int(eff * 0.8)
+        and usage.prompt_tokens >= int(eff * ratio)
     )
 
 

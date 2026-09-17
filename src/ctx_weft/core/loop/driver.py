@@ -167,6 +167,16 @@ ROUND_COMMITTED_KEY = "_round_committed"
 #: 判定留在 prepare 是因为只有那里手握 `bound_capabilities`；起飞在提交点是因为
 #: 旁路只该为**真的发生过**的那一轮花一次 LLM 调用（见 `act._commit_round`）。
 RECOGNIZE_INTENT_PENDING_KEY = "_recognize_intent_pending"
+#: `state.extra` 键：本 run 已用掉的「上下文恢复」次数（act 越过停机线 → 回 prepare
+#: 压缩续跑）。配额见 `LoopConfig.max_context_recoveries`；耗尽后退回 observe/retry。
+CONTEXT_RECOVERY_COUNT_KEY = "_context_recovery_count"
+#: `state.extra` 键：本 run 已用掉的 act 轮数（跨恢复累计）。`max_turns_per_act` 的语义是
+#: 「一次执行最多几轮」，恢复不该把它重置——否则每次恢复白送一整份轮数预算。
+ACT_TURNS_USED_KEY = "_act_turns_used"
+#: `state.extra` 键：上一次 compact「门开了但一条 MEMORY_COMPACTED 都没产」。各级都有
+#: 可折性 guard，全 noop 说明这个 scope 已经压不动了——再恢复一次只是白烧一轮 LLM，
+#: 故 act 据此立即放弃恢复，不等配额慢慢耗尽。
+COMPACT_NOOP_KEY = "_compact_noop"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

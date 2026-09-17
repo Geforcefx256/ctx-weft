@@ -7,6 +7,11 @@ token 估算对齐 miniAgents Reasoner._fetch_base：
 compact 触发（纯预算，spec 2026-07-01 §3.6）：
   - token_estimate / context_limit >= compact_token_ratio
   命中后调 escalating_compact 升级式压缩，再完整重装配一次 prompt（Q4=c 校正）。
+
+本步还是**上下文恢复**的落点：ActStep 越过 `context_limit_stop_ratio` 时不再直接退出吃一次
+retry，而是路由回本步（见 `act._can_recover_context`）——本步照常估算 → 压缩 → 重装配，act
+随后在压缩后的 prompt 上原地续跑。act 手里的真实 `context_tokens` 刚被写成越线值，所以这条
+路径上 compact 的门必然开。压缩若一无所获，本步把 `COMPACT_NOOP_KEY` 置起，act 据此放弃恢复。
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ from typing import Callable
 from ctx_weft.core.assembler import ContextRequest
 from ctx_weft.protocols.events import EventType
 from ctx_weft.core.loop.driver import (
+    COMPACT_NOOP_KEY,
     RECOGNIZE_INTENT_PENDING_KEY,
     LoopContext, LoopState, Step, StepOutcome, make_event,
 )
@@ -160,8 +166,20 @@ class PrepareStep(Step):
         # ── 5. compact 触发：命中则跑升级式 compact，再在压缩后 memory 上重装配一次（Q4=c 校正）──
         if await self._should_compact(state, ctx, token_estimate):
             from ctx_weft.core.loop.steps.compact import escalating_compact
-            for ev in await escalating_compact(state, ctx, token_estimate=token_estimate, trigger="compact"):
+            compact_events = await escalating_compact(
+                state, ctx, token_estimate=token_estimate, trigger="compact")
+            for ev in compact_events:
                 await ctx.event_bus.emit(ev)
+            # 「门开了但一条 MEMORY_COMPACTED 都没产」= 各级可折性 guard 全 noop = 这个 scope
+            # 已经压不动了。记进 state.extra 供 ActStep 的 `_can_recover_context` 读：它据此
+            # 立刻放弃上下文恢复，而不是把配额一次次耗在注定压不出东西的往返上。
+            # 每次开门都重写（含置 False）——压不动是**当时**的结论，不是永久标签：折区随
+            # 新回合增长，下一次可能就有可折对象了。
+            # 这里只作事实记录，**不判断它该不该否决恢复**：run 开头那次 prepare 的 compact
+            # 几乎必然 noop（task 层通常只有一条 USER_PROMPT），那面旗不该算在恢复头上。
+            # 解释权在 `_can_recover_context`（它只在已恢复过至少一次时才采信）。
+            state.extra[COMPACT_NOOP_KEY] = not any(
+                ev.type == EventType.MEMORY_COMPACTED for ev in compact_events)
             prompt = await _assemble()
 
         # ── 6. 会话意图识别：root task 首轮（无标题）判定在这里，**起飞在 act 的提交点** ──

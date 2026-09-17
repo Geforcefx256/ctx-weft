@@ -192,9 +192,12 @@ def _parse_loop_config(raw: dict) -> LoopConfig:
         failure_threshold=int(raw.get("failure_threshold", 3)),
         max_spawn_depth=int(raw.get("max_spawn_depth", 4)),
         compact_token_ratio=float(raw.get("compact_token_ratio", 0.8)),
+        compact_target_ratio=float(raw.get("compact_target_ratio", 0.4)),
         compact_message_delta=int(raw.get("compact_message_delta", 20)),
         compact_keep_last=int(raw.get("compact_keep_last", 6)),
         collapse_keep_last=int(raw.get("collapse_keep_last", 3)),
+        context_limit_stop_ratio=float(raw.get("context_limit_stop_ratio", 0.9)),
+        max_context_recoveries=int(raw.get("max_context_recoveries", 2)),
     )
 
 

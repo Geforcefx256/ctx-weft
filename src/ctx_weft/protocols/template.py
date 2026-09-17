@@ -77,7 +77,12 @@ class LoopConfig:
     compact_token_ratio: float = 0.8
     # 压缩「压到」目标比率（滞后区下沿）：触发后一路升级直到 token 估算 < 此比率 * context_limit。
     # 0 = 无滞后，回退等于 compact_token_ratio（压到刚低于触发比率即停）。应设得比 compact_token_ratio 低。
-    compact_target_ratio: float = 0.0
+    #
+    # 默认 0.4 而非 0：滞后区是 mid-act 恢复（见 context_limit_stop_ratio）能不能成立的前提。
+    # 无滞后时 compact 把估算压到「刚低于 0.8」就停，act 续跑第一轮加上本轮输出立刻又越线，
+    # 一次恢复配额当场蒸发；0.4 给出足够的续跑空间，代价是每次恢复折得更狠（单个长任务的
+    # 典型路径是 L0.5 → L1/L2 无可折对象跳过 → L3 坍缩当前 task 层，一次摘要 LLM 调用）。
+    compact_target_ratio: float = 0.4
     compact_message_delta: int = 20      # DEPRECATED（2026-07-01）：compact 改纯预算驱动，本字段不再被读
     compact_keep_last: int = 6           # 保留底线（非触发门）：agent 层折叠保留的胶囊数；更老的折成摘要
     collapse_keep_last: int = 3          # 保留底线（非触发门）：task 坍缩保留的最近段摘要条数
@@ -90,6 +95,15 @@ class LoopConfig:
     # 先对父自身 task 层对话压缩一次（fold_task），使父 resume 更精简、inherit 快照为
     # 压缩后版本。0 = 关闭（默认）。通常设得比 compact_token_ratio 更早触发。
     predispatch_compact_token_ratio: float = 0.0
+    # act 的上下文停机线：单轮**真实** prompt_tokens / effective_limit ≥ 此值 → 结束本段 act。
+    # 曾硬编码 0.8，与 compact_token_ratio 的默认值重合——于是 prepare 刚把估算压到「刚低于
+    # 0.8」，act 第一轮就又越线。两条线必须分工：compact_token_ratio 管 run 开头的常规压缩
+    # （估算口径），本值管 mid-act 兜底（真实口径），故设得更高。
+    context_limit_stop_ratio: float = 0.9
+    # 一次 run 内最多几次「上下文恢复」：act 越过 context_limit_stop_ratio 时不再直接退出吃
+    # 一次 retry，而是回 PrepareStep 压缩后原地续跑。配额耗尽（或 compact 已压不动，见
+    # `COMPACT_NOOP_KEY`）才退回 observe → retry 的老路。0 = 关闭恢复，行为回到改造前。
+    max_context_recoveries: int = 2
     # 短任务（叶子）保留阈值（spec 2026-06-23）：finish 时 task 层对话 token ≤ threshold
     # 且 LLM_RESPONSE 轮次 ≤ turn_cap → 不 close（保留完整对话）；否则 close 成残留。
     short_task_token_threshold: int = 1000

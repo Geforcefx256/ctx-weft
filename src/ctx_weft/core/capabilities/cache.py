@@ -158,10 +158,15 @@ class CapabilityCache:
             del slot[: len(slot) - self.max_pins]
 
     def clear_pins(self, task_id: str) -> None:
-        """清掉该 task 的 pin。幂等（task 终态与 context_limit 两条出口都可能重复调）。
+        """清掉该 task 的 pin。幂等（重复清、清不存在的 task 都安全）。
 
-        **已知边界：不是严格「每个 task 必清」。** 两条出口都挂在正常路径上（task 落终态的
-        `on_task_finished`、ActStep 的 context_limit 退出），绕开它们的异常终止路径
+        唯一出口是 task 落终态的 `on_task_finished`。**ActStep 的 context_limit 退出曾是
+        第二个出口，已移除**：`_pinned` 按 task_id 分区，新 task 天然看不到旧 task 的 pin，
+        所以「上下文爆了要清掉多占的工具描述」这个理由站不住——真正的膨胀上界由 `pin()` 的
+        max_pins LRU 提供（最多 8 条）。而在 act 中途清掉它，等于让 agent 压缩续跑后从零重新
+        发现工具，正是 `evict` 的注释明确拒绝在 run 边界做的那件事（续跑连 run 边界都不跨）。
+
+        **已知边界：不是严格「每个 task 必清」。** 出口挂在正常路径上，绕开它的异常终止路径
         （如 cancel_all 清掉从未 start 过的排队任务）会留下残余。残余上限是单 task 的
         max_pins 条，且随 CapabilityCache 本身（per-session）一起回收，故按已知边界接受。
         """
