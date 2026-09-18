@@ -87,8 +87,20 @@ class ReconcileStep(Step):
 
             # ── 双通道完成判定：事件流 finished / 确定性 memory id ──────────────
             res_id = tool_result_record_id(op_id) if op_id else None
-            if (f is not None and f.finished) or (res_id is not None and res_id in tool_record_ids):
-                if f is not None and f.finished and (res_id not in tool_record_ids):
+            # 事件流通道有一个例外：结果就是人的答复（`result_is_human_reply`，即 `ask_user`）。
+            # 它的 `CapabilityFinished` 与 `HitlResolved` 在同一次提交里先后落盘，崩在中间就是
+            # 「日志里有结果、问题还悬着」，人重答后拿事件那份补写会丢掉新答复；事件载荷还是
+            # 脱敏截断版。所以不用它——落到下面的 HITL 分支：还没人答就继续等，已有决定就交给
+            # gateway 重入，按决定重新生成。
+            # 第二个例外：事件里那份结果被截断过（`CapabilityFinished` 的 payload 有上限）。
+            # gateway 的重放短路认这一条，这里也必须认——否则 `spillable=False` 的工具
+            # （读文件、取工具输出这类）崩在结果事件与写 memory 之间时，截断版会被当成完整
+            # 结果写进对话。落到下面的分支，由 gateway 决定重跑还是作结。
+            event_done = f is not None and f.finished and not f.truncated and not (
+                getattr(ctx, "hitl", None) is not None
+                and ctx.hitl.registry.result_is_human_reply(state.scope.session_id, call_id))
+            if event_done or (res_id is not None and res_id in tool_record_ids):
+                if event_done and (res_id not in tool_record_ids):
                     # spec: tool-result-recovery——「已完成而 memory 缺失」（FINISHED 与
                     # TOOL_RESULT 写入之间崩溃）：用事件里那份补写。它**就是当初进对话
                     # 的收敛版**，不必也不该再收敛一遍。
@@ -207,6 +219,7 @@ class ReconcileStep(Step):
 
         引用身份沿用原执行 invocation_id（`attempts` 尾项），不是这次重入新生成的。
         """
+        from ctx_weft.core.media.fold import placeholder_refs
         from ctx_weft.core.loop.capability_gateway import ingest_tool_result
         content = str(result)
         ref_inv = attempts[-1] if attempts else tc.get("id", "")
@@ -219,7 +232,11 @@ class ReconcileStep(Step):
         await ingest_tool_result(
             ctx.memory, ctx.provider_ctx, state.scope,
             tool_call_id=tc.get("id", ""), content=content,
-            invocation_id=ref_inv, tool_name=tc.get("name", ""), via=via)
+            invocation_id=ref_inv, tool_name=tc.get("name", ""), via=via,
+            task_manager=getattr(ctx, "task_manager", None),
+            # 从事件补写时，内容里的图是**占位形态**（含完整 ref）。声明它们，否则
+            # 下一轮 blob GC 会把这些没人认领的字节回收掉，占位就此取不回东西。
+            blob_refs=placeholder_refs(content))
 
 async def _dangling_tool_calls(memory, scope, provider_ctx) -> tuple[list[dict], set[str]]:
     """最近一个 assistant turn 里未完成的 tool_call（按逻辑身份判定）。

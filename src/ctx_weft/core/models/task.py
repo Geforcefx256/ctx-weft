@@ -131,12 +131,9 @@ class Task:
     # reopen_task 据此发 TASK_REQUEUED，零 blob IO：reopen 只追加文本，不可能引入新图。
     user_prompt_event_jsonable: "str | list[dict] | None" = None
     original_user_prompt_event_jsonable: "str | list[dict] | None" = None
+    #: 这条 user_prompt 已经进了对话历史（memory，或这一轮未提交窗口的暂存区——装配时两者
+    #: 都看得见，见 `_persist_user_prompt`）。
     user_prompt_in_memory: bool = False
-    # 这条 user_prompt 落进 memory 时拿到的 record id（`_persist_user_prompt` 记下）。
-    # 用途只有一个：用户在 LLM 开口之前按了暂停，act 的丢弃路径据它 `memory.fold([id], [])`
-    # 把这一轮的用户消息纯遗忘掉（spec 2026-09-09）。**纯瞬态**，不进投影/快照——
-    # 跨重启之后这一轮要么早已提交、要么根本不在日志里，两种情形都用不到它。
-    user_prompt_memory_id: str | None = None
     settings: TaskSettings = field(default_factory=NormalTaskSettings)
     # 纯文本(无 tool call)turn 的处理方式：interactive=暂停等用户 / auto=自治需调 finish_task。
     # root task 由 session_registry 设为 interactive；委派子任务默认 auto（delegate_task/plan 可显式置 interactive）。

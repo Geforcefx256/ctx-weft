@@ -238,13 +238,12 @@ async def test_inject_resolved_user_turns_skips_replies_already_in_the_conversat
     writes: list[str] = []
     original = rt._write_hitl_reply_turn
 
-    async def _spy(req, sess, target):
+    async def _spy(req, sess, target, **kw):
         writes.append(req.id)
-        return await original(req, sess, target)
+        return await original(req, sess, target, **kw)
 
     rt._write_hitl_reply_turn = _spy  # type: ignore[method-assign]
-    await rt._inject_resolved_user_turns(
-        session, tm, parked_or_inflight_task_ids=set())
+    await rt._inject_resolved_user_turns(session, tm)
 
     assert writes == ["h_fresh"], "已注入过的那条不该再写一次；没注入过的那条必须补上"
     scope = MemoryAddress(session_id="s1", task_id="t1", agent_id="ag1")

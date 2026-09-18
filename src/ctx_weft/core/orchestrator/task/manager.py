@@ -322,10 +322,48 @@ class TaskManager:
             outputs=getattr(task, "outputs", None),
             process_report=getattr(task, "process_report", None),
             process_report_at=getattr(task, "process_report_at", None),
+            user_prompt_in_memory=getattr(task, "user_prompt_in_memory", False),
         )
         bus = self._event_bus
         if bus is not None:
             bus.begin_provisional(task_id)
+
+    def stage_memory(self, task_id: str, memory: Any, event: Any, provider_ctx: Any) -> bool:
+        """这一轮开着窗 → 把一次 memory 写入暂存进窗口，返回 True；没开窗 → False。
+
+        与事件缓冲同一个道理、同一个生命周期：窗口里发生的事在这一轮算数之前都不算发生。
+        暂存的写入由 `commit_round` 交给钩子按序落盘，丢弃时随快照一起扔掉——memory 里
+        从头到尾不出现一条「还没算数」的记录，撤销也就不需要任何补偿写（fold）。
+
+        TM 不碰 memory：这里只替它保管三件不透明的东西（写到哪、写什么、以谁的身份写），
+        真正的 `ingest` 在 runtime 的钩子里做。
+        """
+        snap = self._rounds.get(task_id) if task_id else None
+        if snap is None:
+            return False
+        if getattr(event, "id", None) is None:
+            # 叠加读取（装配）要给它一个稳定的记录 id；落盘时 provider 按给定 id 采用。
+            from ctx_weft.core.utils.ids import generate_id
+            event.id = generate_id("mem")
+        # 同 id 替换而不是并排：一轮提交失败停机后窗口保留，下一次 run 可能重入同一次
+        # 调用、再暂存同一条确定性 id 的结果（`res_...`）。memory 对同 id 是幂等的，
+        # 暂存区也得是，否则提交前的装配里同一个 tool_call 出现两份结果。
+        entry = (memory, event, provider_ctx)
+        for i, (_m, staged, _p) in enumerate(snap.staged_memory):
+            if staged.id == event.id:
+                snap.staged_memory[i] = entry
+                return True
+        snap.staged_memory.append(entry)
+        return True
+
+    def staged_memory(self, task_id: str) -> "list[Any]":
+        """这一轮暂存着、还没落盘的 memory 写入（`MemoryEvent` 列表，按写入顺序）。
+
+        读侧叠加用：装配 prompt 时必须看得见它们——那正是「LLM 开口之前」这一轮要用到的
+        内容（人刚给的答复、刚发的消息）。
+        """
+        snap = self._rounds.get(task_id) if task_id else None
+        return [ev for _mem, ev, _pctx in snap.staged_memory] if snap is not None else []
 
     def is_round_open(self, task_id: str) -> bool:
         return task_id in self._rounds
@@ -352,18 +390,101 @@ class TaskManager:
         触发点有两个，**都不在本类**：act 收到本轮第一个 chunk（正常路径），以及
         `_run_task` 的收尾兜底（见那里——失败、outage 耗尽、装配炸掉一律提交，
         只有用户主动中止才丢弃）。
+
+        补投之后调 `commit_round` 钩子：先把这一轮里待终局的 HITL 答复终局
+        （`HitlResolved`），再把暂存的 memory 写入按序落盘——**先有终局事实，答复才进
+        memory**。每一个提交点都经过这里，所以谁提交都不会漏掉那两步。
+        """
+        snap = self._rounds.get(task_id)
+        if snap is None:
+            return
+        # **快照在全部成功之后才弹出**。任何一步抛出（典型：存储不可用）都原样上抛、快照
+        # 留在原地，下一个提交点从断处重试——曾经一开头就 pop：补投失败时暂存的 memory
+        # 写入随快照丢失，待终局的 HITL 既没终局也没退回（进程内再也答不了），总线把窗口
+        # 放回去了、TM 却已不认这一轮，此后该 task 的事件全进一个没人关的缓冲。
+        #
+        # 重试的幂等性：事件补投用 `events_flushed` 标记跳过；钩子里的两步本身幂等——
+        # 已终局的 HITL 再 commit 是 no-op，暂存记录都带 id、重复 ingest 是 no-op。
+        if not snap.events_flushed:
+            # `ROUND_COMMITTED` **先于**补投，且**不带 task_id**（那道闸按 task_id 定，带上
+            # 就会被自己挡住）。顺序是给 host 看的：它据此把攒着的用户消息帧 flush 出去，
+            # 那一帧必须排在这一轮的 task/run 帧**之前**——用户先说话，agent 才开跑。
+            await self._emit(
+                EventType.ROUND_COMMITTED, task_id=None, payload={"task_id": task_id},
+            )
+            bus = self._event_bus
+            if bus is not None:
+                await bus.commit_provisional(task_id)
+            snap.events_flushed = True
+        # **排在补投之后**：`HitlResolved` 不能落在一个下游还没建键的 task 上（窗口里
+        # 攒着的 `TASK_*` / `RUN_STARTED` 得先出去）。**不吞异常**：钩子失败意味着终局
+        # 事实或 memory 没落定，这一轮不算提交完。
+        if self._hooks.commit_round is not None:
+            await self._hooks.commit_round(task_id, list(snap.staged_memory))
+        self._rounds.pop(task_id, None)
+
+    async def drop_round(self, task_id: str) -> None:
+        """撤掉一扇**什么都还没收下**的窗：调用方开了窗，随后那件事没成（应答校验失败 /
+        幂等 no-op）。
+
+        与 `abandon_round` / `discard_round` 的分界：那两个撤的是「收下过东西的一轮」，要经
+        `revert_round` 钩子退回答复、清暂停闩锁；这里窗里什么都没有，调钩子反而会误清别人
+        的闩锁。只做三件事：弹快照、丢缓冲、发 `ROUND_DISCARDED`（host 据此丢掉为这次应答
+        攒的消息帧；它若已自行回滚，那条帧是 no-op）。
         """
         if self._rounds.pop(task_id, None) is None:
             return
-        # `ROUND_COMMITTED` **先于**补投，且**不带 task_id**（那道闸按 task_id 定，带上
-        # 就会被自己挡住）。顺序是给 host 看的：它据此把攒着的用户消息帧 flush 出去，
-        # 那一帧必须排在这一轮的 task/run 帧**之前**——用户先说话，agent 才开跑。
-        await self._emit(
-            EventType.ROUND_COMMITTED, task_id=None, payload={"task_id": task_id},
-        )
         bus = self._event_bus
         if bus is not None:
-            await bus.commit_provisional(task_id)
+            bus.discard_provisional(task_id)
+        await self._emit(
+            EventType.ROUND_DISCARDED, task_id=None,
+            payload={"task_id": task_id, "reason": "nothing_accepted"},
+        )
+
+    def drop_round_buffer(self, task_id: str) -> None:
+        """**同步**丢掉一扇窗的两半（快照 + 总线缓冲），不发任何事件、不调任何钩子。
+
+        `drop_round` 的最小版本，只给逐出路径用（`Runtime._evict_session_memory`）：那里
+        这条会话的运行时内存正在被整体摘掉，发事件既没有意义也没有消费者。正常路径不该
+        走到这里——`cancel_session` 会先把窗收干净，`forget_session` 的准入判据也不放行。
+        """
+        if self._rounds.pop(task_id, None) is None:
+            return
+        bus = self._event_bus
+        if bus is not None:
+            bus.discard_provisional(task_id)
+
+    async def abandon_round(self, task_id: str) -> None:
+        """只撤「这一轮」本身，**不动 task 与 run**：热应答被暂停时用（spec 2026-09-09）。
+
+        与 `discard_round` 的分界：那个是整轮连 run 一起当没发生过（run 自己也在窗口里
+        出生）；这个的 run 早在窗口之前就开跑了，它还要照常 park、照常发结局事件——
+        所以这里不还原快照、不发 task 状态事件、不动队列与登记，只做三件事：
+
+        1. `revert_round` 钩子：答复退回 pending、清暂停闩锁。
+        2. 关窗，丢掉缓冲的事件（那条答复带出来的 `CapabilityFinished` 之类）与暂存的
+           memory 写入（回灌出来的工具结果）——memory 里本来就没有它们，无需补偿。
+        3. `ROUND_DISCARDED`（不带 task_id）：host 据此丢掉攒着的用户消息帧。
+
+        之后调用方抛 `HitlPark`，task 的状态由 `apply_run_outcome` 照常落盘。
+        """
+        if task_id not in self._rounds:
+            return
+        if self._hooks.revert_round is not None:
+            try:
+                await self._hooks.revert_round(task_id)
+            except Exception:
+                logger.exception(
+                    "abandon_round: revert_round hook failed for task %s", task_id)
+        self._rounds.pop(task_id, None)
+        bus = self._event_bus
+        if bus is not None:
+            bus.discard_provisional(task_id)
+        await self._emit(
+            EventType.ROUND_DISCARDED, task_id=None,
+            payload={"task_id": task_id, "reason": "discarded_before_first_chunk"},
+        )
 
     async def discard_round(self, task_id: str) -> None:
         """这一轮当作没发生过。**只用于用户主动中止**（首 chunk 之前按暂停 / 取消）。
@@ -371,10 +492,12 @@ class TaskManager:
         五步，顺序就是这段代码的全部要点——**每一步都必须发生在关窗之前**，窗口一关，
         此后发的任何事件都直接落盘：
 
-        1. `revert_round` 钩子：memory 里那条用户消息 `fold` 掉、被收口的旧气泡
-           `release` 回 pending（两样都在 orchestrator 之下，TM 够不到，见 hooks.py）。
+        1. `revert_round` 钩子：被收口的旧气泡 `release` 回 pending（HITL 在 orchestrator
+           之下，TM 够不到，见 hooks.py）。这一轮的用户消息 / 答复只在快照的暂存区里，
+           随第 5 步关窗一起扔掉，memory 从来没见过它们。
         2. 还原快照：`status` / `retry_count` / `outputs` / `process_report*`。后三样
-           是 `_inject_user_turn` 就地清掉的，没有别处存过旧值。
+           是 `_inject_user_turn` 就地清掉的，没有别处存过旧值。`user_prompt_in_memory`
+           同理：暂存的提问被扔掉了，标志要回到开窗之前。
 
            **`title` / `description` 不在其列**：唯一会就地改它们的是
            `update_task_metadata`（`recognize_intent` 调），而旁路的起飞点在
@@ -409,6 +532,9 @@ class TaskManager:
             task.outputs = snap.outputs
             task.process_report = snap.process_report
             task.process_report_at = snap.process_report_at
+            # 这一轮暂存的若是 task 自己的提问（`_persist_user_prompt`），它随快照一起被扔掉了，
+            # 落库标志得跟着回落，否则下一轮以为写过了、不再写。
+            task.user_prompt_in_memory = snap.user_prompt_in_memory
 
         # ③ 把 agent 拨回原位（事件在窗口里，只到 ALM，不落盘）。
         #
@@ -586,7 +712,8 @@ class TaskManager:
         except Exception as e:
             logger.exception("Task %s assembly failed: %s", task_id, e)
             # 装配就炸了也算数（同下方收尾兜底的理由）：先提交，再发失败事件。
-            await self.commit_round(task_id)
+            if not await self._commit_round_or_halt(task_id):
+                return
             await self._handle_task_failure(
                 task_id, error=str(e), exc=e, reason=InterruptReason.ASSEMBLY_FAILURE,
             )
@@ -653,11 +780,16 @@ class TaskManager:
             #
             # 位置要在 `apply_run_outcome` **之前**：那一句会发 task 状态事件，得先让
             # 窗口里攒的 `TASK_CREATED` 出去，不然状态事件会先于创建事件落盘。
-            await self.commit_round(task_id)
+            if not await self._commit_round_or_halt(task_id):
+                return
             status = await self.apply_run_outcome(task_id, outcome)
             # runner 正常跑完才把本轮 spawn 的子任务入队（“一轮跑完之后 push”）
             await self._flush_staged(task_id)
             await self._settle(task_id, status)
+            # **收尾的最后一步**：这次停下来等的问题若已经有答复，说明那条应答落在了本段
+            # 收尾里、它的重排被「还在跑」挡掉了。槽位此刻已经释放，补做即可。
+            if outcome.kind is RunOutcomeKind.AWAITING_HUMAN:
+                await self._wake_if_already_answered(task_id, outcome.hitl_id)
         except PersistenceUnavailableError:
             # spec: event-commit——同 assemble 分支：不提交、不处置、不重排。
             # 会话隔离已由 CommitGate 标记；drain 的健康检查挡住后续派发。
@@ -669,11 +801,71 @@ class TaskManager:
             else:
                 logger.exception("Task %s failed: %s", task_id, e)
             # 同上：崩溃也算数，先提交再发终态事件。
-            await self.commit_round(task_id)
+            if not await self._commit_round_or_halt(task_id):
+                return
             # 崩溃入口：结局的构造在 `crash_run_outcome` 一处（retriable 的取法是崩溃
             # 专用的，与 outage 支硬编码的 False 不同源——契约见那个工厂的 docstring）。
             status = await self.apply_run_outcome(task_id, crash_run_outcome(e))
             await self._settle(task_id, status)
+
+    async def _wake_if_already_answered(self, task_id: str, hitl_id: str) -> None:
+        """run 停在「等人」并收尾完毕 → 自检：它等的那个问题是不是已经有答复了。
+
+        有 → 补一次重排。那条应答一定是落在本次收尾里的：它到达时 `resume_task` 看见
+        task 还在 `_running_tasks`（槽位要到 `_settle` 才释放，早放会让同一个 task 被派发
+        两次），于是早退、既不入队也不 drain，而这次唤醒没有任何地方记得。应答侧照旧推
+        一把（快路径），本方法是那条推送落空时的兜底——它不看「有没有人推过」，只看状态。
+
+        判据只认**这次 park 所等的那个 hitl_id**（`RunOutcome.hitl_id`，也就是
+        `TaskAwaitingHuman` 那条事件的 payload），所以不会变成无条件重排：重排后的 run
+        若再停下来，等的是另一个问题，那个问题还没答复。
+
+        配对事件不会重复：工具类应答那条路的 `resume_task` 是在发 `TaskHumanResolved`
+        **之前**早退的，这里补发正好一次；wait 气泡那条路已经由 `mark_human_resolved`
+        发过并把状态置成 PENDING，`resume_task` 的 `was_blocked` 判据因此不成立，只入队。
+
+        best-effort：判据读不到（钩子未注入 / 抛异常）就当作没答复——退回本方法存在之前
+        的行为，`/resume` 仍然救得回来。
+        """
+        ready = self._hooks.human_answer_ready
+        if not hitl_id or ready is None:
+            return
+        try:
+            answered = ready(task_id, hitl_id)
+        except Exception:
+            logger.exception(
+                "_wake_if_already_answered: predicate failed for task %s hitl %s",
+                task_id, hitl_id)
+            return
+        if not answered:
+            return
+        logger.info(
+            "Task %s parked on %s, but the answer had already arrived during the run's "
+            "settle window — re-queuing it here (the reply's own wake was dropped)",
+            task_id, hitl_id)
+        await self.resume_task(task_id, hitl_id=hitl_id)
+        await self.drain()
+
+    async def _commit_round_or_halt(self, task_id: str) -> bool:
+        """`_run_task` 的收尾兜底提交。失败 → 记日志、返回 False，调用方就地停住。
+
+        与 `PersistenceUnavailableError` 两个既有分支同一处置：不处置 task（状态事件
+        同样要过提交门）、不重排。窗口与暂存留在快照里（`commit_round` 失败不弹快照），
+        下一个提交点重试；进程重启则按日志与 memory 各自的真相恢复——没补投成功的这一轮
+        在两边都不存在。
+
+        曾经直接 `await self.commit_round(...)`：它抛出的异常若在 `except Exception` 块
+        里发生，同级的 `except PersistenceUnavailableError` 接不住，异常逃出 `_run_task`，
+        `_running_tasks` 不清理，agent 在进程内一直显示忙。
+        """
+        try:
+            await self.commit_round(task_id)
+        except Exception:
+            logger.exception(
+                "Task %s halted: committing its round failed (window and staged memory "
+                "are kept for a retry)", task_id)
+            return False
+        return True
 
     async def apply_run_outcome(self, task_id: str, outcome: RunOutcome) -> str:
         """run 的结局 → task 的处置：写状态 + 发那一条 task 状态事件。**唯一入口**。
@@ -1698,8 +1890,8 @@ class TaskManager:
 class RoundSnapshot:
     """开窗那一刻的可回滚状态（spec 2026-09-09）。
 
-    只装 **TaskManager 自己拥有** 的东西。memory 记录 id 挂在 `Task.user_prompt_memory_id`
-    上（落库那一刻记下的），HITL 与 ALM 归 runtime —— 那两样经 `revert_round` 钩子回退。
+    只装 **TaskManager 自己拥有** 的东西，外加这一轮暂存的 memory 写入（不透明地保管，
+    落盘归 `commit_round` 钩子）。HITL 与 ALM 归 runtime —— 那两样经 `revert_round` 钩子回退。
 
     后三个字段是这份快照存在的主要理由：`_inject_user_turn` 会就地把 `outputs` /
     `process_report` / `process_report_at` 清空（"新消息意味着有新工作要做"），而旧值
@@ -1713,6 +1905,13 @@ class RoundSnapshot:
     outputs: Any | None = None
     process_report: str | None = None
     process_report_at: "datetime | None" = None
+    user_prompt_in_memory: bool = False
+    #: `commit_round` 已把缓冲的事件补投出去（`RoundCommitted` + `commit_provisional`）。
+    #: 提交在钩子那一步失败、快照保留时，重试据此跳过补投。
+    events_flushed: bool = False
+    #: 这一轮暂存的 memory 写入：`(memory provider, MemoryEvent, ProviderContext)`，按写入
+    #: 顺序。见 `stage_memory`。
+    staged_memory: "list[tuple[Any, Any, Any]]" = field(default_factory=list)
 
 
 def task_payload(task: Task, *, user_prompt_jsonable: "str | list[dict] | None") -> dict:

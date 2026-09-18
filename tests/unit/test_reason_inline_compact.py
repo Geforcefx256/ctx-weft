@@ -14,6 +14,7 @@ class _SpyEscalatingCompact:
         self.kwargs = None
 
     async def __call__(self, state, ctx, **kwargs):
+        self.order = list(getattr(ctx.task_manager, "committed", []))
         self.called = True
         self.kwargs = kwargs
         return []
@@ -63,8 +64,14 @@ async def test_reason_runs_compact_inline_and_routes_to_act(monkeypatch):
             return SimpleNamespace(token_count=10, system="", messages=[], tools=[])
 
     class _TM:
+        def __init__(self):
+            self.committed = []
+
         async def push_task(self, *a, **k):
             pushed.append(a)
+
+        async def commit_round(self, task_id):
+            self.committed.append(task_id)
 
     class _Bus:
         async def emit(self, ev):
@@ -81,6 +88,8 @@ async def test_reason_runs_compact_inline_and_routes_to_act(monkeypatch):
     assert pushed == []                # no compact Task pushed
     assert outcome.next_step == "act"  # still proceeds to act
     assert asm.calls == 2              # assembled once, then re-assembled after compaction
+    # 压缩只折 memory，够不着未提交窗口里暂存的记录 → 压缩之前必须先提交这一轮。
+    assert spy.order == ["t1"]
 
 
 async def test_reason_stashes_bound_capabilities(monkeypatch):

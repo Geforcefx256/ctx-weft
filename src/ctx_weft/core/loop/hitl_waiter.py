@@ -79,7 +79,9 @@ class HitlWaiter:
         req = self._registry.get(hitl_id)
         if req is None:
             raise KeyError(f"No HITL request found: {hitl_id}")
-        if req.resolved:
+        # `claim_pending` 与 `resolved` 同一处理：两阶段之下冷应答先落成待终局，
+        # 只看 `resolved` 会让还在等的协程挂上一个永远不会被投递的槽，同时冷续跑已经开跑。
+        if req.resolved or req.claim_pending:
             logger.info(
                 "HITL resolved before wait() attached a slot (open()/wait() race "
                 "window, or cancel) → treating as evicted so the cold path (which "
@@ -101,8 +103,10 @@ class HitlWaiter:
             # 「热投递赢了这次终局」的唯一权威，它由 `HitlService._commit` 在取槽的同一
             # 原子段里写入。claimed=False 一律按驱逐处理，返回 None 让 gateway 走 park。
             current = self._registry.get(hitl_id)
-            if current is not None and current.resolved and current.claimed:
-                return current.decision  # 应答先到且被本槽热消费：走热已解决
+            if (current is not None and current.claimed
+                    and current.effective_decision is not None):
+                # 应答先到且被本槽热消费（可能仍待终局，两阶段）：走热已解决
+                return current.effective_decision
             self._registry.detach_slot(hitl_id)
             slot.abandon()
             logger.info("HITL hot window evicted → cold (hitl=%s)", hitl_id)

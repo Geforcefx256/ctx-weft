@@ -450,29 +450,45 @@ _REDACT_DATA_PREVIEW = 12
 
 
 def redact_content_for_event(content: "str | list[ContentPart] | None") -> str:
-    """把内容渲染成适合进事件 payload 的字符串。
+    """把内容渲染成适合进事件 payload 的字符串。**字节绝不上事件流**（spec §6.8）：
+    一张图几万字符，直接进事件库会把它撑爆。
 
-    图片渲染成短标记而非原始 base64——一张图几万字符，直接进 LLM_PROMPT_SENT
-    会把事件库撑爆（spec §6.8）。
+    **已经外部化成 ref 的图渲染成 L0.5 占位**（`media.refs.encode_image_placeholder`，
+    全仓唯一真源）——那是一段**含完整 ref** 的文本，模型读到它可以
+    `media:get_image(...)` 把图取回来。这一点是崩溃恢复的承重件：`CapabilityFinished`
+    的 `result` 是「结果事件已落盘、memory 记录还没写」那个窗口里唯一幸存的一份，
+    补写只能照它重建。本函数从前在这里自制了一个短标记（只留 ref 前 12 个字符），
+    取不回来——同一个仓库里两套图片标记，而事件这边用的是残缺的那套。
 
-    Phase 1 尚无调用方——留给 Phase 2 的 LLM_PROMPT_SENT 脱敏用。不是死代码，
-    删除前请先确认 Phase 2 的脱敏需求已挪到别处。
+    仍留短标记的只有**内联 base64**（宿主没接 memory blob store，压根没有 ref 可写）：
+    没有可取回的东西，占位也编不出来。
+
+    纯文本（`str`）**原样返回同一对象**，零开销、对无图会话逐字节无影响。
     """
     if not content:
         return ""
     if isinstance(content, str):
         return content
+    from ctx_weft.core.media.refs import encode_image_placeholder
+
     parts: list[str] = []
     for part in content:
         if _is_text_part(part):
             parts.append(part.text)
-        else:
-            data = getattr(part, "data", "") or ""
-            src = getattr(part, "source_type", "base64")
-            parts.append(
-                f"[image {getattr(part, 'media_type', '?')} "
-                f"{src}:{data[:_REDACT_DATA_PREVIEW]}…]"
-            )
+            continue
+        media_type = getattr(part, "media_type", "?")
+        refs = extract_blob_refs([part])
+        if refs:
+            try:
+                parts.append(encode_image_placeholder(refs[0], media_type))
+                continue
+            except ValueError:      # ref 不是可解析 token：退回短标记，别产出坏占位
+                logger.warning("redact_content_for_event: unusable blob ref %r", refs[0])
+        data = getattr(part, "data", "") or ""
+        src = getattr(part, "source_type", "base64")
+        parts.append(
+            f"[image {media_type} {src}:{data[:_REDACT_DATA_PREVIEW]}…]"
+        )
     return "".join(parts)
 
 

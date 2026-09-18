@@ -164,8 +164,8 @@ class HitlService:
         不算发生。真终局由 `commit(hitl_id)` 在 act 的提交点完成，`release(hitl_id)` 则
         把它退回 pending（用户在 TTFT 窗口里按了暂停）。
 
-        **热投递不受 `defer` 影响**：有活等待槽意味着一个协程正就地醒来继续跑，没有
-        「新一轮」可言，也就没有可撤销的东西——那条路照旧一步终局，与改造前逐字节同义。
+        **热投递同样推迟**：有活等待槽时决定照常就地递给那个协程（`claimed=True`），但
+        终局一样留到提交点——人答完到 LLM 开口之间按暂停，这条答复要能撤回。
         """
         req = self.registry.get(reply.hitl_id)
         if req is None:
@@ -203,8 +203,16 @@ class HitlService:
         resolved = self.registry.commit_claim(hitl_id, self._now())
         if resolved is None:
             return None
+        try:
+            await self._emit_resolved(resolved, resolved.decision, event_payload,
+                                      claimed=resolved.claimed)
+        except BaseException:
+            # 事实没落盘 → 内存里也不能算终局。退回待终局（答复与载荷原样保留），让
+            # 调用方的提交整体失败、稍后重试；不退回的话，内存说「答完了」、日志说「还悬着」，
+            # 而提交钩子若照常把答复写进 memory，重启后人重答会被 id 幂等静默吞掉。
+            self.registry.uncommit_claim(hitl_id)
+            raise
         resolved.pending_event_payload = None
-        await self._emit_resolved(resolved, resolved.decision, event_payload, claimed=False)
         self.registry.gc()
         return resolved
 
@@ -256,9 +264,9 @@ class HitlService:
         （无 await ⟹ 原子），因此「热投递」与「冷续跑」互斥、不双投。投递与发事实
         在其后，不占原子段。
 
-        ``defer=True`` 时走 `claim()`：**只在没有热等待槽**的情形下真的推迟——有槽
-        意味着一个协程正就地醒来，那条路上没有「新一轮」可撤销，推迟只会让它拿着一份
-        永远不终局的答复继续跑。故取槽之后按结果分流，而不是在入口按 `defer` 分流。
+        ``defer=True`` 时走 `claim()`：冷热都只登记待终局。热投递的协程拿到的是
+        `pending_decision`，提交点由 gateway 在它醒来时重新武装，所以不会「拿着一份
+        永远不终局的答复继续跑」。
         """
         transferred = (
             self.registry.claim(req.id, decision, message_event_payload) if defer
@@ -280,17 +288,15 @@ class HitlService:
                     "HitlService._commit: slot.deliver raised for hitl_id=%s; "
                     "treating as unclaimed and still emitting HitlResolved", resolved.id)
                 claimed = False
-        if defer:
-            if not claimed:
-                # 冷路径：待终局，事件留到 act 的提交点再发（`commit`）。
-                return resolved
-            # 热投递抢到了：没有「新一轮」，就地终局，与 defer=False 逐字节同义。
-            promoted = self.registry.commit_claim(req.id, self._now())
-            if promoted is None:                      # 不该发生；防御性保持幂等
-                return resolved
-            resolved = promoted
-            resolved.pending_event_payload = None
         resolved.claimed = claimed
+        if defer:
+            # 冷热同一口径：待终局，事件留到 act 的提交点再发（`commit`）。
+            #
+            # 热投递曾经在这里就地终局，理由是「协程就地醒来，没有新一轮可撤销」。那不对：
+            # 人答完之后到 LLM 真的开口之前，用户同样可能按暂停，而那时整轮（这条答复、
+            # 它回灌出来的工具结果）都还没发生。被叫醒的协程由 gateway 重新武装提交点
+            # （`_resolve_human`），暂停则由 act 走热撤销（`_discard_round_if_uncommitted`）。
+            return resolved
         await self._emit_resolved(resolved, decision, message_event_payload, claimed=claimed)
         self.registry.gc()
         return resolved

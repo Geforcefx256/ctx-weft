@@ -40,9 +40,12 @@ def session_from_projection(proj: SessionView) -> Session:
 
 def task_from_projection(proj: TaskView) -> Task:
     """Rebuild a Task dataclass from its event-sourced projection."""
-    # Tasks that were already executing (ACTIVE or SUSPENDED) had their user
-    # prompt ingested into memory before the crash; mark it so the driver
-    # doesn't ingest it a second time on recovery.
+    # Tasks that were already executing (ACTIVE or SUSPENDED) normally had their user
+    # prompt ingested into memory before the crash; mark it so the driver doesn't
+    # ingest it a second time on recovery. This is only an inference — the recovery
+    # path verifies it against memory (`Runtime._verify_task_prompts_in_memory`),
+    # because a crash between a round's commit and its staged-memory flush leaves a
+    # started task whose prompt never reached memory.
     prompt_in_memory = bool(proj.user_prompt) and proj.status in ("ACTIVE", "SUSPENDED")
     return Task(
         id=proj.id,

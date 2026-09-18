@@ -245,6 +245,15 @@ async def converge_tool_output(
     return "\n".join(parts) + "\n" + "\n".join(body)
 
 
+def tool_audit_record_id(tool_call_id: str) -> str | None:
+    """TOOL_AUDIT 的 memory 记录 id —— 与 `tool_result_record_id` 同一套派生，前缀换 `aud_`。
+
+    确定性的理由与结果那条相同：同一次调用可能被重入（冷续跑、停机后窗口复用），随机 id
+    会让审计记录一次次叠加。裸 wire id 不存在确定性派生 → `None` → provider 发自动 id。
+    """
+    return f"aud_{tool_call_id[3:]}" if is_internal_call_id(tool_call_id) else None
+
+
 def tool_result_record_id(tool_call_id: str) -> str | None:
     """TOOL_RESULT 的 memory 记录 id —— **只对内部标识有定义**，裸 wire id 返回 None。
 
@@ -276,6 +285,8 @@ async def ingest_tool_result(
     tool_name: str = "",
     via: str = "",
     extra_metadata: dict[str, Any] | None = None,
+    task_manager: Any = None,
+    blob_refs: "list[str] | None" = None,
 ) -> str | None:
     """把一条 TOOL_RESULT 写进 task 层对话，返回它的记录 id（自动 id 时为 None）。
 
@@ -327,7 +338,11 @@ async def ingest_tool_result(
         metadata["recovered_via"] = via
     if extra_metadata:
         metadata.update(extra_metadata)
-    await memory.ingest(
+    # ``task_manager``：给了就经 `ingest_or_stage` 分流——这一轮还没算数时（典型：人刚给的
+    # 答复回灌成的结果、拒绝授权写下的补位）暂存进窗口，提交时在 `HitlResolved` 之后落盘。
+    from ctx_weft.core.loop.driver import ingest_or_stage
+    await ingest_or_stage(
+        memory,
         MemoryEvent(
             id=record_id,
             kind=MemoryKind.CONVERSATION_TURN,
@@ -337,8 +352,14 @@ async def ingest_tool_result(
             timestamp=now_utc(),
             role="tool",
             metadata=metadata,
+            # ``blob_refs``：内容里若有**占位形态**的图（从事件补写时就是这一形态），
+            # 它携带的 ref 必须显式声明——GC 的 mark 判据只看结构化字段、刻意绝不解析
+            # 占位文案。不声明的话占位活着、字节却会在下一轮回收里被当孤儿删掉，模型
+            # `media:get_image` 取回来的是「图片不可用」。同 `compact.collapse_task_layer`。
+            blob_refs=list(blob_refs or []),
         ),
         provider_ctx,
+        task_manager=task_manager, task_id=scope.task_id or "",
     )
     return record_id
 
@@ -471,7 +492,12 @@ class CapabilityGateway:
         # 不收敛，超过事件 payload 的上限就会被截断——而它们全是只读、可重新派生的
         # （`fs__read_file` / `results__read_tool_output` / skill 的 `list_files`，清一色
         # `side_effects=False`），正确动作是**重跑而非重放**，所以这里放它落下去。
-        if facts is not None and facts.finished and facts.result is not None                 and not facts.truncated:
+        # 例外：结果就是人的答复（`HitlRegistry.result_is_human_reply`，即 `ask_user`）——恒按
+        # HITL 决定重新生成，不重放事件里那份（可能是人重答之前的旧答复，且是脱敏截断版）。
+        if facts is not None and facts.finished and facts.result is not None \
+                and not facts.truncated and not (
+                    ctx.hitl is not None and ctx.hitl.registry.result_is_human_reply(
+                        ctx.provider_ctx.session_id, tool_call_id)):
             logger.info(
                 "CapabilityGateway: %s already finished — replaying recorded result, "
                 "provider not re-invoked", ledger_key)
@@ -626,8 +652,15 @@ class CapabilityGateway:
         #
         # 代价是「窗口里跑过工具的那一轮不再可撤销」，那正是正确的语义。幂等（act 的
         # 每个 chunk 都调同一个函数），无 task_manager 时是 no-op。
+        #
+        # **唯一的例外是 `ask_user`**：它的 provider 只声明「要问人」，什么都不做。重入它
+        # 是在回放一条已经在案、尚未终局的答复（reconcile 冷续跑），而那条答复在 LLM 开口
+        # 之前必须能撤回——在这里关窗就把撤回的机会提前掐掉了（答复连同回灌出来的工具结果
+        # 此刻还在窗口的暂存区里）。真要**新开**一个问题时，`_resolve_human` 会在登记之前
+        # 关窗（问题必须看得见）。
         from ctx_weft.core.loop.steps.act import _commit_round
-        await _commit_round(state, ctx)
+        if tool_name != ASK_USER_NAME:
+            await _commit_round(state, ctx)
 
         # 6. 记录 invocation（事件 + TOOL_INVOCATION / delegate conversation turn 入 memory）——审计通道
         await self._record_invocation(state, ctx, tool_name, cap, invocation_id, audit_args, is_dispatch, is_silent, tool_call_id)
@@ -770,7 +803,8 @@ class CapabilityGateway:
             await ingest_tool_result(
                 self._memory, ctx.provider_ctx, _tool_scope(state),
                 tool_call_id=tool_call_id, content=content, is_error=True,
-                invocation_id=invocation_id, tool_name=tool_name)
+                invocation_id=invocation_id, tool_name=tool_name,
+                task_manager=getattr(ctx, "task_manager", None))
         return self._error_result(invocation_id, tool_name, content)
 
     async def _record_invocation(
@@ -811,8 +845,13 @@ class CapabilityGateway:
                 # 分支。此刻工具还没执行、子任务尚不存在，能写的只有一句不含任何 id 的
                 # 常量；而那条才是被持久化、被此后每一次对话重建重放的版本。
         elif not is_silent:
-            await self._memory.ingest(
+            # 走 `ingest_or_stage`：`ask_user` 重入时这一轮还没提交（step 5 对它不关窗），
+            # 审计记录与它配对的结果同进同退。
+            from ctx_weft.core.loop.driver import ingest_or_stage
+            await ingest_or_stage(
+                self._memory,
                 MemoryEvent(
+                    id=tool_audit_record_id(tool_call_id),
                     kind=MemoryKind.TOOL_AUDIT, scope=MemoryScope.TASK,
                     address=_tool_scope(state),
                     content=f"{tool_name}({sanitized})",
@@ -822,6 +861,7 @@ class CapabilityGateway:
                               "tool_call_id": tool_call_id},
                 ),
                 ctx.provider_ctx,
+                task_manager=getattr(ctx, "task_manager", None), task_id=state.task.id,
             )
 
     async def _stream_tool(
@@ -965,7 +1005,8 @@ class CapabilityGateway:
             await ingest_tool_result(
                 self._memory, ctx.provider_ctx, _tool_scope(state),
                 tool_call_id=tool_call_id, content=content, is_error=is_error,
-                invocation_id=invocation_id, tool_name=tool_name)
+                invocation_id=invocation_id, tool_name=tool_name,
+                task_manager=getattr(ctx, "task_manager", None))
 
     def _find_provider(self, capability_id: str) -> ToolCapabilityProvider | None:
         prefix = capability_id.rsplit(":", 1)[0]
@@ -1124,6 +1165,10 @@ class CapabilityGateway:
         # 那一条（两阶段，spec 2026-09-09）。
         if cached is not None and cached.effective_decision is not None:
             return cached.id, cached.effective_decision
+        # 要**新开**一个问题：它必须立刻看得见。开着的未提交窗口会把 `HitlOpened` 挡在
+        # 缓冲里，人就永远看不到这个问题（step 5 对 `ask_user` 不关窗，见那里）。
+        from ctx_weft.core.loop.steps.act import _commit_round
+        await _commit_round(state, ctx)
         req = await ctx.hitl.open(
             ask,
             session_id=ctx.provider_ctx.session_id,
@@ -1143,6 +1188,7 @@ class CapabilityGateway:
             # 热窗口被驱逐 → 不放行也不拒绝。守住安全不变式：绝不调 provider.invoke。
             from ctx_weft.core.loop.park import HitlPark
             raise HitlPark(hitl_id=req.id, tool_call_id=tool_call_id)
+        _rearm_commit_point_after_hot_reply(state, ctx, req.id)
         return req.id, human
 
     @staticmethod
@@ -1189,6 +1235,34 @@ class CapabilityGateway:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _rearm_commit_point_after_hot_reply(
+    state: "LoopState", ctx: "LoopContext", hitl_id: str,
+) -> None:
+    """热应答把协程叫醒之后，给「这一轮」重新武装提交点（spec 2026-09-09）。
+
+    `reply_to_hitl` 为这条答复开了未提交窗口，决定也只是待终局。被叫醒的 run 早就过过
+    一次提交点（`ROUND_COMMITTED_KEY` 是 run 级幂等标志），不清掉它，`_commit_round`
+    永远是 no-op：窗口要到 run 结束才关，期间该 task 的事件全挡在缓冲里，host 看不见
+    下一个问题——连续提问时「第二个问题答了没用、一直让人重答」就是这么来的。
+
+    只在**这条答复自己开的窗**上做（`round_hitl_id` 对得上）。窗若是别的应答开的
+    （例如冷续跑的一轮里，reconcile 重放的工具又热等了一次授权），那一轮本来就没提交，
+    标志本就是 False，也轮不到这里决定怎么撤。
+
+    同时记下 `HOT_REPLY_ROUND_KEY`：这一轮若在 LLM 开口前被暂停，act 要走**热撤销**
+    （撤回答复后 park），而不是整轮 `RoundDiscarded`——这个 run 的 `RUN_STARTED` 早已
+    落盘，把它的结尾连同缓冲一起丢掉，日志里就留下一个永不结束的 run。
+    """
+    tm = ctx.task_manager
+    if tm is None or not tm.is_round_open(state.task.id):
+        return
+    if tm.round_hitl_id(state.task.id) != hitl_id:
+        return
+    from ctx_weft.core.loop.driver import HOT_REPLY_ROUND_KEY, ROUND_COMMITTED_KEY
+    state.extra[ROUND_COMMITTED_KEY] = False
+    state.extra[HOT_REPLY_ROUND_KEY] = hitl_id
 
 
 def _human_reply_as_result(

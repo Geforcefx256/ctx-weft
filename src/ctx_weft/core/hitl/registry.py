@@ -171,14 +171,15 @@ class PendingHitl:
 def reply_memory_id(req: "PendingHitl") -> str:
     """这条应答落 memory 时的幂等键。**唯一派生点**（写入侧与恢复期补写侧共用）。
 
-    第一次应答恒是 `hitlreply:{hitl_id}` —— 与改造前逐字节相同，存量记录不受影响。
-    被撤销过再重答的才带上 `:{n}`：上一次那条记录已被 `fold` 成 superseded，而 memory
-    的 record-id 契约是「已存在的 id（**含已 superseded**）= no-op，不比对内容、不重复
-    写入」——它**仍然占着旧键**，不换键的话用户重打的那句话会被静默吞掉。
+    第一次应答恒是 `hitlreply:{hitl_id}`；被撤销过再重答的带上 `:{n}`，`n` 取自
+    `reply_attempt`（从事件日志里 `HitlReplyRetracted` 的条数折出来，跨重启成立）。
 
-    `n` 来自 `reply_attempt`，而那个数是**从事件日志折出来的**（`HitlReplyRetracted`
-    的条数，见 `fold_hitl_snapshot`），不是内存计数器。这一点是本函数正确性的全部：
-    撤销之后重启，内存里什么都没有，只有日志能告诉你这是第几次。
+    ⚠ **这一维如今是历史包袱，不再承重**。它当初的理由是：撤销一轮要把已经写进 memory 的
+    那条答复 `fold` 成 superseded，而 memory 的 id 契约是「已存在的 id（含已 superseded）
+    = no-op」，换句话说旧键还占着，重答不换键就会被静默吞掉。改成**暂存**之后
+    （`TaskManager.stage_memory`），被撤销的答复根本没进过 memory，也就没有占着的旧键。
+    留着只是不动存量数据与既有日志协议；要清理的话，`reply_attempt` 与
+    `HitlReplyRetracted` 的折叠会一起失去唯一的用途。
     """
     base = f"hitlreply:{req.id}"
     return base if req.reply_attempt == 0 else f"{base}:{req.reply_attempt}"
@@ -287,6 +288,20 @@ class HitlRegistry:
         req.resolved_at = resolved_at
         return req
 
+    def uncommit_claim(self, hitl_id: str) -> "PendingHitl | None":
+        """`commit_claim` 的逆：终局 → 回待终局。只用于「终局事实没发出去」的回滚。
+
+        答复（`decision` → `pending_decision`）与事件载荷（`pending_event_payload`，
+        提交成功前没有清）原样保留，重试的 `commit` 拿到的仍是同一份。
+        """
+        req = self._requests.get(hitl_id)
+        if req is None or not req.resolved or req.claim_pending:
+            return None
+        req.pending_decision = req.decision
+        req.decision = None
+        req.resolved_at = None
+        return req
+
     def release_claim(self, hitl_id: str) -> "PendingHitl | None":
         """待终局 → 回 pending：这一轮被丢弃了，那条答复当作没说过。
 
@@ -299,6 +314,9 @@ class HitlRegistry:
             return None
         req.pending_decision = None
         req.pending_event_payload = None
+        # 撤回之后没有任何协程在等它了（热投递的那个 run 已经 park 掉），下一次应答
+        # 必须按冷路径分流。
+        req.claimed = False
         # 与 `HitlReplyRetracted` 折出来的口径保持一致：内存里也 +1，好让**同一进程内**
         # 紧接着的重答不必等重启折叠就拿到对的键。日志是真相源，这里只是同步。
         req.reply_attempt += 1
@@ -429,6 +447,22 @@ class HitlRegistry:
                         or r.invocation_key == invocation_key)]
         return max(matches, key=lambda r: r.created_at) if matches else None
 
+    def result_is_human_reply(self, session_id: str, tool_call_id: str) -> bool:
+        """这次调用的结果**就是人的答复**：工具阶段有一个 `reply_as_result` 的请求（`ask_user`）。
+
+        用途：判「事件流里记着的那份工具结果能不能拿来补写 / 重放」。答案是不能——
+        它的 `CapabilityFinished` 与 `HitlResolved` 在同一轮提交里先后落盘，崩在两者之间就是
+        「日志里有结果、问题还悬着」；重启后人再答一次，拿事件里那份补写，新答复就被静默
+        丢弃（又一次「答了没用」）。而且事件载荷是脱敏 + 截断版，答复里的图只剩文本标记。
+
+        这类结果是答复的纯函数、不碰任何副作用，所以正确做法恒为「按 HITL 决定重新生成」：
+        问题还悬着 → 继续等人；已有决定（待终局或已终局）→ 交给 gateway 重入，命中决定缓存。
+        `HumanResumable` 的工具阶段请求（`reply_as_result=False`）**不在此列**——那条路会
+        重新调 `provider.resume`，可能重放副作用。
+        """
+        req = self.find_for_tool_call(session_id, tool_call_id, HITL_STAGE_TOOL)
+        return req is not None and req.reply_as_result
+
     def decision_for(
         self, session_id: str, tool_call_id: str, stage: str,
         invocation_key: str | None = None,
@@ -463,6 +497,16 @@ class HitlRegistry:
             and (session_id is None or r.session_id == session_id)
             and (agent_id is None or r.agent_id == agent_id)
         ]
+
+    def claim_pending_for_session(self, session_id: str) -> list[PendingHitl]:
+        """该 session 上**已收到答复、尚未终局**的请求（不分 task）。
+
+        两个消费方都在收尾路径上：`cancel_session` 要把它们退回待答再收口（它们不在
+        `list_pending` 里，直接遍历那份列表会把它们漏掉、永远卡在待终局）；
+        `session_is_quiescent` 要据此判「这条会话还不能被逐出」。
+        """
+        return [r for r in self._requests.values()
+                if r.claim_pending and r.session_id == session_id]
 
     def claim_pending_for_task(self, session_id: str, task_id: str) -> list[PendingHitl]:
         """该 task 上**已收到答复但尚未终局**的请求（两阶段，见 `PendingHitl.pending_decision`）。

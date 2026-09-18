@@ -471,8 +471,16 @@ async def test_requeue_of_a_resolved_user_turn_does_not_duplicate_the_injection(
     assert len(await _hitl_reply_prompts(rt)) == 1
 
 
-async def test_a_task_still_parked_on_another_hitl_gets_no_injection():
-    """该 task 还挂着别的**未决** HITL：它此刻是 parked、没入队，不该被改状态。"""
+async def test_a_task_parked_on_another_hitl_still_gets_the_reply_injected():
+    """该 task 还挂着别的**未决** HITL：状态一动不动，但那条已终局的答复照样要补进对话。
+
+    「有未决 HITL 就整个跳过」曾经是这里的判据（从 `restore` 的重排判据借来的）。它错在
+    把两件事混成一件：**要不要重排**看未决问题，**这条答复进没进过对话**不看。代价实测
+    过——同一个 task 上前一条已终局的答复被跳过，而人答掉那个未决问题时走的是活 TM 那条
+    路（它当时不做补写），那条答复就此永久缺失（审查文档 M8）。
+
+    补写本身仍然是**只写记忆**：下面第一条断言钉住 task 状态不被碰。
+    """
     events = [
         *_resolved_user_turn_never_injected(),
         _ev(8, EventType.HITL_OPENED, task_id=TID, hitl_id="hit_2", form="approval",
@@ -482,8 +490,9 @@ async def test_a_task_still_parked_on_another_hitl_gets_no_injection():
     rt = await _runtime_with_events(events)
     await rt.recover_agent(AID)
     tm = _tm(rt)
-    assert tm.get_task(TID).status == "SUSPENDED"
-    assert await _hitl_reply_prompts(rt) == []
+    assert tm.get_task(TID).status == "SUSPENDED"      # 只写记忆，绝不碰状态
+    injected = await _hitl_reply_prompts(rt)
+    assert [str(r.content) for r in injected] == ["use postgres"]
 
 
 async def test_restore_leaves_a_parent_with_live_children_suspended():

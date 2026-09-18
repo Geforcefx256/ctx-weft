@@ -8,7 +8,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from ctx_weft.core.loop.driver import LoopContext, LoopState, Step, StepOutcome
+from ctx_weft.core.loop.driver import (
+    LoopContext, LoopState, Step, StepOutcome, _persist_user_prompt,
+)
 from ctx_weft.core.orchestrator.task.disposition import RunOutcome, RunOutcomeKind
 from ctx_weft.core.utils.clock import now_utc
 from ctx_weft.protocols import MemoryEvent, MemoryKind, MemoryScope
@@ -25,20 +27,8 @@ class SuspendStep(Step):
         task = state.task
         events: list[Any] = []
 
-        # 1) Ingest user prompt if not already
-        if task.user_prompt and not task.user_prompt_in_memory:
-            await ctx.memory.ingest(
-                MemoryEvent(
-                    kind=MemoryKind.CONVERSATION_TURN, scope=MemoryScope.TASK,
-                    address=state.scope,
-                    content=task.user_prompt,
-                    timestamp=now_utc(),
-                    role="user",
-                    metadata={"task_id": task.id},
-                ),
-                ctx.provider_ctx,
-            )
-            task.user_prompt_in_memory = True
+        # 1) 提问还没进对话就补上（走落库的唯一入口：确定性 id + 窗口暂存分流）
+        await _persist_user_prompt(state, ctx)
 
         # 2) Build suspension summary from spawn titles written by control tool
         from ctx_weft.core.models.task import NormalTaskSettings

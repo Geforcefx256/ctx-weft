@@ -293,6 +293,7 @@ SM 的输入只有四类，全部来自 TaskManager，每一类都是一个独�
 | `TaskFailed` | | `error_code` `error_message` `retry_count` | → `FAILED`，`failure_counter += 1`。`error_code=TASK_FAILED_BY_THRESHOLD` 是熔断的聚合结果，**不计数** |
 | `TaskCanceled` | | `reason` | → `CANCELED` |
 | `TaskRequeued` | | 两种形状：<br>· observer 判重试：`outcome="retry"` `summary` `retry_count`<br>· reopen：`reason` `user_prompt` `original_user_prompt` | → `PENDING`，清空 `outputs`；reopen 还会覆写 `user_prompt` |
+| `TaskMessageAppended` | | `memory_id` `agent_id` `content` `source` `timestamp` | **只记事实、不改状态**。一条用户消息被并进这个 task 的对话（`send_message` 的注入分支）；`content` 是 event 侧形态（图走 event blob ref）。消息进 memory 要等这一轮提交，而暂存区在事件补投**之后**才落盘——崩在两者之间时，恢复期据此把消息补回 memory |
 | `TaskOutcomeRecorded` | `TaskFinalized` | `task_id` `outcome` `outputs: {output, summary}` `error` | **只记结果，不改状态**：状态转移是 `TaskFinished` / `TaskFailed` 的事。交付物两段分开送（2026-09-05）：`output` = **答复正文本身**（收尾回合的 assistant 正文），`summary` = agent 调 `finish_task` 时给的 `deliverables_summary`，即写给 reviewer 的交付物自评清单。host 打印「最终答复」只该取 `output`——两段混成一串正是自评清单被当答案打出来的成因。判据以 `task.outputs` 为准绳：retry 驳回把它置空时两段一起归空，不送已被驳回的废稿。`output` 恒为**纯文本**（多模态交付物走 blob store，不进事件载荷）。reducer 侧仍不折这两个字段，投影的 `outputs`/`error` 只认 `TaskFinished`/`TaskFailed` 一个来源；本字段的消费者是 host 的 `tasks` 表与 CLI |
 
 > **`TaskSuspended` 从三义收窄到一义。** 它从前靠 `reason` 字面量区分「等子任务」/

@@ -125,6 +125,12 @@ class EventType(StrEnum):
     TASK_CANCELED = "TaskCanceled"
     TASK_FINALIZED = "TaskFinalized"
     TASK_REQUEUED = "TaskRequeued"
+    # task 域：一条用户消息被并进了这个 task 的对话（`send_message` 的注入分支）。**只记
+    # 事实、不改状态**——它存在的唯一理由是让这条消息的正文在事件日志里有一份：消息写进
+    # memory 要等这一轮提交（暂存区在事件补投**之后**才落盘），崩在两者之间时，恢复期据此
+    # 把消息补回 memory（`Runtime._restore_appended_messages`）。
+    # payload: {memory_id, agent_id, content（event 侧形态，图走 event blob ref）, source, timestamp}
+    TASK_MESSAGE_APPENDED = "TaskMessageAppended"
     BLACKBOARD_PUBLISHED = "BlackboardPublished"
     # ── Agent 域 ──
     AGENT_INSTANTIATED = "AgentInstantiated"

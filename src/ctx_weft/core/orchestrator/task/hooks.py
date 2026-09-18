@@ -62,13 +62,35 @@ class TaskManagerHooks:
     cancel_inflight: "Callable[[str], bool] | None" = None
 
     #: 「撤销这一轮里**不属于 TM** 的那部分」（两阶段提交的丢弃路径，spec 2026-09-09）。
-    #: 由 `discard_round` 在关窗**之前**调用，做两件 TM 结构上碰不到的事：
-    #:   · `memory.fold([user_prompt_memory_id], [])` —— 把这一轮的用户消息纯遗忘掉；
-    #:   · `hitl.release(hitl_id)` —— 把被这条消息收口的旧气泡退回 pending。
-    #: 与本 dataclass 里其余几条同一理由：memory 与 hitl 都在 orchestrator **之下**，
-    #: TM 向上够不到；而「什么时候撤」只有 TM 知道。best-effort，抛异常只记日志——
-    #: 一次撤销失败不该把「用户按了暂停」变成一次 run 崩溃。
+    #: 由 `discard_round` / `abandon_round` 在关窗**之前**调用：`hitl.release` 把这一轮
+    #: 收下的答复退回 pending，并清暂停闩锁。memory 不在其列——这一轮的写入只在快照的
+    #: 暂存区里（`TaskManager.stage_memory`），关窗时随快照扔掉。
+    #: 与本 dataclass 里其余几条同一理由：hitl 在 orchestrator **之下**，TM 向上够不到；
+    #: 而「什么时候撤」只有 TM 知道。best-effort，抛异常只记日志——一次撤销失败不该把
+    #: 「用户按了暂停」变成一次 run 崩溃。
     revert_round: "Callable[[str], Coroutine[Any, Any, None]] | None" = None
+
+    #: 「这一轮算数了，把**不属于 TM** 的那部分也落定」——`revert_round` 的对偶。
+    #: 参数：(task_id, 暂存的 memory 写入)。由 `commit_round` 在补投缓冲**之后**调用，
+    #: 顺序固定：① 把该 task 上待终局的 HITL 答复终局（发 `HitlResolved`）；② 把暂存的
+    #: memory 写入按序落盘——**终局事实先于答复进 memory**。
+    #: 收在这里而不是散在各提交点，是因为提交点不止一个——act 的首 chunk、gateway 调工具前、
+    #: act 离开循环前、prepare 压缩前、`_run_task` 的收尾兜底、消息并进在跑 task 的就地
+    #: 提交。best-effort，抛异常只记日志。
+    commit_round: "Callable[[str, list[Any]], Coroutine[Any, Any, None]] | None" = None
+
+    #: 「这个 task 停下来等的那个问题，此刻是不是已经有答复了」——run 收尾时的自检判据。
+    #: 参数 (task_id, hitl_id)，同步只读。
+    #:
+    #: 存在的理由是一道结构性的时序缝：park 信号要一路上抛到 `_run_task` 才被 TM 看见，
+    #: 而运行槽位要到 `_settle` 才释放（提前释放会让同一个 task 被派发两次）。落在这段
+    #: 收尾里的冷应答，其 `resume_task` 会被「它还在跑」挡掉，而那次唤醒没有任何地方
+    #: 记得——答复还在，会话却停摆到下一次 `/resume`。
+    #:
+    #: 修法是把唤醒从「一次性推送」改成「可从状态推导」：收尾末尾自己问一句，答案由
+    #: HITL 的内存态给（runtime 侧实现，TM 够不到 hitl）。判据只认**这次 park 所等的
+    #: 那个问题**，所以不会退化成无条件重排：下一次 park 等的是另一个 hitl_id。
+    human_answer_ready: "Callable[[str, str], bool] | None" = None
 
     #: 熔断收尾：(root_we_failed_and_started|None, ack_tasks, failures) -> None。
     #: trip 序列第 7 步内联 await（不是后台甩），保证 memory 落盘先于 SESSION_FINISHED

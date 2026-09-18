@@ -16,7 +16,7 @@ from typing import Any
 from ctx_weft.protocols import LLMMessage, LLMRequest, LLMUsage, ToolCall
 from ctx_weft.core.loop.driver import (
     ACT_TURNS_USED_KEY, COMPACT_NOOP_KEY, CONTEXT_RECOVERY_COUNT_KEY,
-    RECOGNIZE_INTENT_PENDING_KEY, ROUND_COMMITTED_KEY,
+    HOT_REPLY_ROUND_KEY, RECOGNIZE_INTENT_PENDING_KEY, ROUND_COMMITTED_KEY,
     LoopContext, LoopState, Step, StepOutcome, make_event,
 )
 from ctx_weft.core.loop.llm_gateway import (
@@ -182,6 +182,11 @@ class ActStep(Step):
             await ctx.event_bus.emit(make_event(state, EventType.MAX_TURNS_REACHED, payload={
                 "max_turns": max_turns}))
 
+        # 离开 act 的循环 = 这一轮已经推进到别的步骤（suspend / prepare 压缩续跑 / observe），
+        # 那些步骤直接读 memory、不认暂存区，所以先提交：暂存的答复与消息此刻落盘。
+        # 热应答醒来后一个 chunk 都没等到就走到这里（例如同批的 finish_task），也算数。
+        await _commit_round(state, ctx)
+
         # 路由优先级：suspend > 上下文恢复 > observe。
         #
         # - suspend 最先：suspend_requested 表示 actor 本轮派了活、本 run 要停在等子任务 →
@@ -324,15 +329,17 @@ async def _commit_round(state: LoopState, ctx: LoopContext) -> None:
        未提交窗口里（只到达了进程内状态机，见 `EventBus` 类 docstring）；
     2. 把这一轮唤醒的那条 HITL 答复还停在**待终局**（`pending_decision`），
        `HitlResolved` 一直没发——日志里那个气泡仍是 pending。
-
-    3. `recognize_intent` 还没起飞（判定在 `PrepareStep`，起飞在这里）——旁路只该为
+    3. 这一轮的 memory 写入（用户消息、HITL 答复、由答复回灌的工具结果）暂存在窗口里
+       （`ingest_or_stage`），memory 里还没有它们。提交时钩子先发 `HitlResolved`、再按序
+       落盘——**终局事实先于答复进 memory**。
+    4. `recognize_intent` 还没起飞（判定在 `PrepareStep`，起飞在这里）——旁路只该为
        **真的发生过**的那一轮花一次 LLM 调用。它跑在 root task 上，而 root task 从第二句
        起每一轮都开窗，放在 prepare 起飞就会在窗口里跑、被撤销时整串事件白丢。
 
-    **用户消息的落库不在此列**：它照旧在 run 启动时就写进 memory（`_persist_user_prompt`）。
-    推迟它的代价是 PrepareStep 的预算折叠（L0.5 图片降级 / L1 / L3）在每一轮的首次装配
-    都看不见这条记录，带图的第一条消息一张也降不了——`test_media_fold_replay_e2e` 实测钉住。
-    它的撤销走 `_discard_round_if_uncommitted` 里的 `memory.fold`，那是纯遗忘原语，不是补偿写。
+    暂存的记录压缩够不着（L0.5 图片降级 / L1 / L3 只折 memory）。所以 PrepareStep 判定要
+    压缩时**先提交**再压缩——代价是那一轮不再可撤，换来带图的第一条消息照样能被降级
+    （`test_media_fold_replay_e2e` 钉住）。act 离开循环去别的步骤之前同样先提交：那些步骤
+    直接读 memory，而这一轮已经推进到了别处，算数。
 
     顺序不可换：`TASK_CREATED` 必须最先出闸，它是下游 reducer 与 host 建 task 键的那一条；
     `recognize_intent` 必须在它之后起飞，它会发自己的一串事件，且要写 `task.title/description`
@@ -340,26 +347,22 @@ async def _commit_round(state: LoopState, ctx: LoopContext) -> None:
     """
     if state.extra.get(ROUND_COMMITTED_KEY):
         return
-    state.extra[ROUND_COMMITTED_KEY] = True
 
+    # 两阶段终局的第二阶段（那条把这一轮唤醒的答复——HITL 应答 / `send_message` 对旧
+    # 气泡的收口——现在才算数、`HitlResolved` 在此刻才发）由 `commit_round` 的钩子完成，
+    # 见 `TaskManagerHooks.commit_round`。
     tm = ctx.task_manager
     if tm is not None:
         await tm.commit_round(state.task.id)
+    # **成功之后才置位**：提交失败（存储不可用）时异常上抛、标志保持 False，下一个提交点
+    # （或 `_run_task` 的收尾兜底）会重试，而不是以为已经提交过了。
+    state.extra[ROUND_COMMITTED_KEY] = True
+    # 这一轮算数了，它就不再是「可热撤销的一轮」。
+    state.extra.pop(HOT_REPLY_ROUND_KEY, None)
 
-    # 两阶段终局的第二阶段：这一轮真的开跑了，那条把它唤醒的答复（HITL 冷续跑 /
-    # `send_message` 对旧气泡的收口）现在才算数，`HitlResolved` 在此刻才发。
-    # **必须排在 `commit_round` 之后**：那一句先把窗口里攒的 `TASK_*` / `RUN_STARTED`
-    # 放出去，`HitlResolved` 才不会落在一个下游还没建键的 task 上。
     if state.extra.pop(RECOGNIZE_INTENT_PENDING_KEY, False):
         from ctx_weft.core.loop.steps.recognize_intent import launch_recognize_intent
         launch_recognize_intent(state, ctx)
-
-    if ctx.hitl is not None:
-        # 按 task 查，而不是把一串 hitl_id 顺着 LoopState 穿三层管道下来——与丢弃侧的
-        # `_revert_round` 同一口径（它也按 task 全量 release），两边判据只有一份。
-        for req in ctx.hitl.registry.claim_pending_for_task(
-                state.session.id, state.task.id):
-            await ctx.hitl.commit(req.id)
 
 
 
@@ -372,14 +375,9 @@ async def _discard_round_if_uncommitted(state: LoopState, ctx: LoopContext) -> N
     对话，丢不得；它们照常 park 出续跑气泡，只是那条刚注入的用户消息同样还没落 memory，
     所以照样零残留。
 
-    本函数做两件事，然后抛信号：
-
-    1. **把这一轮的用户消息从 memory 里纯遗忘掉**——`fold([id], [])`，标 superseded，
-       `load_view` 自然滤掉。这是 provider 早就有的原语（compact / finalize /
-       background_observe 都在用），不是补偿写。id 来自 `task.user_prompt_memory_id`，
-       在落库那一刻记下的；**不能**改用「读视图取最后一条 user」那种事后推断——用户连发
-       两条、或上一条是 HITL 应答时会撤错人。
-    2. 抛 `RoundDiscarded`，一路 unwind 到 `_run_task`。
+    本函数只抛信号：`RoundDiscarded` 一路 unwind 到 `_run_task`，由 `discard_round` 收尾。
+    memory 这边无事可做——这一轮的用户消息 / 答复只在窗口的暂存区里（`ingest_or_stage`），
+    随窗口一起扔掉。
 
     **一条事件都不发**：task 状态事件的发射点只有 TaskManager 一处（Task 4 的不变式，
     `test_task_manager_owns_status` 有静态守卫盯着）。把 agent 送回 `idle` 的那条
@@ -391,22 +389,19 @@ async def _discard_round_if_uncommitted(state: LoopState, ctx: LoopContext) -> N
     if tm is None or not tm.is_round_open(state.task.id):
         return
 
-    record_id = getattr(state.task, "user_prompt_memory_id", None)
-    if record_id and ctx.memory is not None:
-        try:
-            await ctx.memory.fold([record_id], [], ctx.provider_ctx)
-        except Exception:
-            # 遗忘失败不该把「用户按了暂停」变成一次 run 崩溃：那会把一个干净的丢弃
-            # 变成一条 TASK_FAILED + 满屏栈。记一行，照常丢弃——最坏结果是 memory 里
-            # 多留一条没人应答的 user 回合，比会话炸掉轻得多。
-            logger.exception(
-                "discard_round: failed to fold user prompt %s of task %s",
-                record_id, state.task.id)
-        else:
-            state.task.user_prompt_memory_id = None
-            # 记录没了，落库标志也要跟着回落：这个 task 若被重排（本路径下不会，但
-            # 语义上必须自洽），`_persist_user_prompt` 应当重新写一条，而不是以为写过了。
-            state.task.user_prompt_in_memory = False
+    hot_hitl_id = state.extra.pop(HOT_REPLY_ROUND_KEY, "")
+    if hot_hitl_id:
+        # **热撤销**：这一轮是一条热应答开出来的——同一个 run 醒来接着跑，还没等到 LLM
+        # 开口就被暂停了。不能整轮 `RoundDiscarded`：这个 run 的 `RUN_STARTED` 早已落盘，
+        # 连它的结尾一起丢掉，日志里就是一个永不结束的 run。
+        #
+        # 于是分两半：答复这一半撤掉（答复退回待答；缓冲的事件与暂存的工具结果随窗口丢弃，
+        # memory 里本来就没有），run 这一半照常 park 在那个问题上——正是「人还没答」的世界，
+        # `RUN_FINISHED` / `TaskAwaitingHuman` 如实落盘，重答走冷路径。
+        await tm.abandon_round(state.task.id)
+        req = ctx.hitl.registry.get(hot_hitl_id) if ctx.hitl is not None else None
+        raise HitlPark(hitl_id=hot_hitl_id,
+                       tool_call_id=req.tool_call_id if req is not None else "")
 
     raise RoundDiscarded(state.task.id)
 
@@ -663,9 +658,18 @@ async def _ingest_assistant_turn(
         asst_tool_dicts.append(d)
     _excluded = DISPATCH_TOOLS | SILENT_TOOLS
     non_dispatch_tool_dicts = [d for d in asst_tool_dicts if d["name"] not in _excluded]
-    record_id = await ctx.memory.ingest(
+    # 经 `ingest_or_stage`：正常路径上这一轮早已提交（首 chunk 就是提交点），分流直写；
+    # 唯一走暂存的是「LLM 流一个 chunk 都没吐就正常结束」——那时窗口还开着，直写会让
+    # memory 里出现一条属于「还没算数的一轮」的 assistant 回合（崩溃后它甚至可能属于一个
+    # 日志里不存在的 task）。id 是预铸的锚，暂存安全。
+    from ctx_weft.core.loop.driver import ingest_or_stage
+    # 锚缺省（旧测试直调）时自己铸一个：暂存需要一个稳定 id，而落库返回值这条路上
+    # 已经没人再给了。生产路径恒有锚（`_run_llm_turn` 预铸）。
+    record_id = anchor or generate_id("asst")
+    await ingest_or_stage(
+        ctx.memory,
         MemoryEvent(
-            id=anchor or None,
+            id=record_id,
             kind=MemoryKind.CONVERSATION_TURN, scope=MemoryScope.TASK,
             address=state.scope,
             content=text,
@@ -679,6 +683,9 @@ async def _ingest_assistant_turn(
             },
         ),
         ctx.provider_ctx,
+        task_manager=getattr(ctx, "task_manager", None),
+        # 鸭子类型的 state 替身（单测直调本函数）可能没有 task。
+        task_id=getattr(getattr(state, "task", None), "id", ""),
     )
     return PersistedAssistantTurn(record_id=record_id or "", tool_calls=asst_tool_dicts)
 
@@ -730,6 +737,10 @@ async def _execute_tool_calls(
         # 调用侧不再铸第二条身份、也不再经共享 provider_ctx 转移所有权。
         # 工具间命中：软打断 → 本 tc 及之后全部「未开始」→ 补「已取消」+ park；硬取消 → CancelledError。
         if _interrupt_pending(ctx):
+            # 这一轮若还没提交（热应答醒来、到下一个提交点之前），暂停就是撤回那条答复：
+            # 走 `_discard_round_if_uncommitted`（热撤销 → park 在原问题上，抛出）。剩下的
+            # 工具调用**不补**结果——人重答之后 reconcile 会把它们当作从未开始的调用执行。
+            await _discard_round_if_uncommitted(state, ctx)
             for rest in tool_calls[i:]:
                 await _ingest_synthetic_tool_result(state, ctx, rest, CANCELLED_MARK, cancelled=True)
             ctx.run_phase.in_tool_loop = False
@@ -745,6 +756,9 @@ async def _execute_tool_calls(
         completed = await _await_tool_or_stop(invoke_task, ctx)
         if not completed:
             if _interrupt_pending(ctx):
+                # 同上。被打断的这个工具若已过 gateway step 5，这一轮已提交，下面这句 no-op；
+                # 没过 step 5 就意味着 provider 从未被调用，当作没开始即可。
+                await _discard_round_if_uncommitted(state, ctx)
                 await _ingest_synthetic_tool_result(state, ctx, tc, INTERRUPTED_MARK, interrupted=True)
                 for rest in tool_calls[i + 1:]:
                     await _ingest_synthetic_tool_result(state, ctx, rest, CANCELLED_MARK, cancelled=True)
@@ -867,7 +881,8 @@ async def _ingest_synthetic_tool_result(
     await ingest_tool_result(
         ctx.memory, ctx.provider_ctx, state.scope,
         tool_call_id=tc.id, content=content, is_error=True, tool_name=tc.name,
-        extra_metadata={"interrupted": interrupted, "cancelled": cancelled})
+        extra_metadata={"interrupted": interrupted, "cancelled": cancelled},
+        task_manager=getattr(ctx, "task_manager", None))
 
 
 async def _await_tool_or_stop(invoke_task: "asyncio.Future", ctx: LoopContext) -> bool:

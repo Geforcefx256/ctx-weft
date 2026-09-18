@@ -163,6 +163,10 @@ class LoopContext:
 
 #: `state.extra` 键：本轮是否已过提交点（`act._commit_round` 的幂等标志）。
 ROUND_COMMITTED_KEY = "_round_committed"
+#: `state.extra` 键：本轮是由一条**热应答**开出来的（值 = 那个 hitl_id）。由 gateway 在
+#: 协程被叫醒时写（`_rearm_commit_point_after_hot_reply`）。act 据此把「LLM 开口前的
+#: 暂停」走成热撤销而不是整轮丢弃，见 `act._discard_round_if_uncommitted`。
+HOT_REPLY_ROUND_KEY = "_hot_reply_round"
 #: `state.extra` 键：`PrepareStep` 判定该跑 recognize_intent，但要等提交点才起飞。
 #: 判定留在 prepare 是因为只有那里手握 `bound_capabilities`；起飞在提交点是因为
 #: 旁路只该为**真的发生过**的那一轮花一次 LLM 调用（见 `act._commit_round`）。
@@ -220,20 +224,63 @@ def make_event(
     return ev
 
 
+async def ingest_or_stage(
+    memory: Any, event: "MemoryEvent", provider_ctx: Any, *,
+    task_manager: Any, task_id: str,
+) -> None:
+    """task 层 memory 写入的唯一分流点：这个 task 开着未提交窗口 → 暂存进窗口；否则直接写。
+
+    窗口开着 = 这一轮还没算数（LLM 还没开口）。这期间写进来的东西——用户刚发的消息、
+    人刚给的答复、由答复回灌出来的工具结果——在这一轮算数之前都不该出现在 memory 里：
+    否则它会跑在 `HitlResolved` 之前，撤销这一轮也只能靠补偿写（fold）去抹。暂存的写入
+    由 `TaskManager.commit_round` 的钩子在终局事实之后按序落盘，丢弃时随窗口一起扔掉。
+    同一轮里要读到它们的地方（prepare 装配）走 `TaskManager.staged_memory` 叠加。
+    """
+    stage = getattr(task_manager, "stage_memory", None)   # 宿主/测试的 TM 替身可能没有
+    if stage is not None and task_id and stage(task_id, memory, event, provider_ctx):
+        return
+    await memory.ingest(event, provider_ctx)
+
+
+def task_prompt_record_id(task_id: str, content: "str | list[Any]") -> str:
+    """task 提问的**确定性** memory 记录 id。全仓唯一派生点（落库侧与恢复核对侧共用）。
+
+    确定性的用处是让「这条提问写过没有」不必再靠猜：同一条提问重复写命中同一个 id，
+    memory 的 id 契约（已存在的 id——含已 superseded——= no-op）直接兜住；`reopen_task`
+    改写过提问则哈希不同，照常写进去。被 L3 坍缩掉的旧提问仍占着它的旧 id，不会被复活。
+
+    指纹取自**拍平的文本 + 各 part 的种类计数**：跨重启时提问从事件还原，文本形态稳定，
+    而图片的引用形态在 event / memory 两个命名空间下并不相同，不能进指纹。纯图片提问
+    因此靠 part 计数区分（文本为空时仅剩它）。
+    """
+    import hashlib
+    from collections import Counter
+
+    from ctx_weft.core.utils.content import content_to_text
+
+    text = content if isinstance(content, str) else content_to_text(content)
+    kinds = Counter(getattr(p, "type", "?") for p in content) if isinstance(content, list) else {}
+    blob = f"{text}\u0000{sorted(kinds.items())}"
+    digest = hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()[:16]
+    return f"uprompt:{task_id}:{digest}"
+
+
 async def _persist_user_prompt(state, ctx) -> None:
     """task 启动时持久化 raw user_prompt（呈现态框架由 composer 渲染期生成，不落库）。
 
-    记下这条记录的 id（`task.user_prompt_memory_id`）：用户在 LLM 开口之前按暂停时，
-    act 的丢弃路径要靠它把这一轮的用户消息 `fold` 掉（spec 2026-09-09）。**必须记 id
-    而不是事后「取视图里最后一条 user」**——用户连发两条、或上一条是 HITL 应答时，
-    那种取法会撤错人。
+    新开的 task 在第一轮算数之前开着未提交窗口（spec 2026-09-09），所以这条提问是**暂存**
+    的（`ingest_or_stage`）：LLM 开口时随提交落盘，开口前被暂停就随窗口一起扔掉。
+    `user_prompt_in_memory` 在暂存时就置真——它回答的是「装配时能不能从历史里找到这条
+    提问」，而暂存的记录装配时看得见；窗口被丢弃时由 `TaskManager.discard_round` 还原。
     """
     task = state.task
     if not task.user_prompt or task.user_prompt_in_memory:
         return
     from ctx_weft.core.utils.clock import now_utc
-    record_id = await ctx.memory.ingest(
+    await ingest_or_stage(
+        ctx.memory,
         MemoryEvent(
+            id=task_prompt_record_id(task.id, task.user_prompt),
             kind=MemoryKind.CONVERSATION_TURN, scope=MemoryScope.TASK,
             address=state.scope,
             # 原样落库（含多模态）：这是图片在改造前第一次消失的地方。
@@ -244,8 +291,9 @@ async def _persist_user_prompt(state, ctx) -> None:
             metadata={"task_id": task.id},
         ),
         ctx.provider_ctx,
+        task_manager=getattr(ctx, "task_manager", None),
+        task_id=task.id,
     )
-    task.user_prompt_memory_id = record_id
     task.user_prompt_in_memory = True
 
 
@@ -300,15 +348,13 @@ class StepDriver:
         # 任务启动时立即持久化 raw user_prompt，保证 resume 时对话上下文完整可重建
         # （呈现态框架 ## Current Task/Message 由 composer 渲染期生成，不落库）。
         #
-        # ⚠ spec 2026-09-09 推迟的是**事件**，不是这一次 memory 写入——两者的推迟代价
-        # 完全不同。落库若推迟到 act 的提交点，PrepareStep 的预算折叠（L0.5 图片降级、
-        # L1/L3 折叠）在**每一轮的首次装配**时都看不见这条记录：带图的第一条消息因此
-        # 一张都降不了，直接顶着满额图片去撞窗口。这条已由
-        # `tests/integration/test_media_fold_replay_e2e.py` 实测钉住。
+        # 窗口开着时它进**暂存区**（`ingest_or_stage`），这一轮算数才落盘、被撤销就随
+        # 窗口扔掉——memory 里不出现「还没算数」的记录，撤销因此不需要任何补偿写。
+        # 装配看得见暂存区（PrepareStep 叠加），所以模型不会看不到这条提问。
         #
-        # 所以这一份照旧立刻落库；它的「撤销」由 act 的丢弃路径用 `memory.fold([id], [])`
-        # 完成（纯遗忘，标 superseded，`load_view` 自然滤掉）——那是 provider 早就有的
-        # 原语，compact / finalize / background_observe 都在用，不是为此新造的东西。
+        # 压缩（L0.5 图片降级 / L1 / L3）只折 memory、够不着暂存区，所以 PrepareStep
+        # 判定要压缩时会**先提交再压缩**——带图的第一条消息照样降得了
+        # （`tests/integration/test_media_fold_replay_e2e.py` 钉住这条）。
         await _persist_user_prompt(state, ctx)
 
         # Blackboard 订阅：本 task 订阅相关任务的结果 topic，下一次 reason 即可感知。

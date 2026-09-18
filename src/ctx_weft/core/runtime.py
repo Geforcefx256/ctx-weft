@@ -11,6 +11,7 @@ import contextlib
 import logging
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -37,6 +38,7 @@ from ctx_weft.protocols.capability import Authorizer
 from ctx_weft.core.control.tokens import CancelToken, PauseToken, RunTokens
 from ctx_weft.core.models.discriminators import CancelReason, InterruptReason
 from ctx_weft.protocols.events import Event, EventOrigin, EventType
+from ctx_weft.core.utils.event import emit_event
 from ctx_weft.core.hitl.registry import HitlRegistry, PendingHitl
 from ctx_weft.core.hitl.reply_intake import ReplyIntake
 from ctx_weft.core.hitl.service import HitlService
@@ -115,6 +117,7 @@ from ctx_weft.protocols.hitl import (
     PREFACE_AFTER_INTERRUPT_EDIT,
     HitlReply,
     HitlRequestView,
+    NoResumeDelivery,
     ToolResultDelivery,
     UserTurnDelivery,
 )
@@ -220,6 +223,10 @@ async def _copy_memory_for_inherit(
             md["tool_call_id"] = r.metadata["tool_call_id"]
         await memory.ingest(
             MemoryEvent(
+                # 确定性 id：同一份源记录复制给同一个子 scope 恒是同一条。丢弃一轮会把
+                # `user_prompt_in_memory` 还原（`discard_round`），而这份复制的门就挂在
+                # 那个标志上——随机 id 的话，撤销之后重跑会把整段继承记忆再抄一遍。
+                id=f"inherit:{child_task.id}:{r.id}" if r.id else None,
                 kind=MemoryKind.CONVERSATION_TURN, scope=MemoryScope.AGENT,
                 address=child_scope,
                 content=r.content,
@@ -1058,6 +1065,21 @@ class CtxWeftRuntime:
         # 与熔断 trip 序列同一条纪律（HITL 终局须先于会话终态）。不终局的代价在重启后：
         # rebuild_hitl 按「有 HitlOpened 无终局事件」折 pending，会把已取消会话的
         # 提问当未决恢复出来（总账 A10）。
+        # **先把开着的未提交窗口收掉**：窗口靠「那一轮的提交点」来关，而这条会话就此不再
+        # 有下一轮。不收的代价有三：那一轮里发出的 `TASK_CANCELED` 等事实随缓冲一起消失、
+        # 总线的缓冲没人清（逐出 TM 之后仍留在那里）、被这一轮收下的答复停在待终局——
+        # 它不在 `list_pending` 里，下面那一句收口遍历不到它，重启后又成了「有 HitlOpened
+        # 无终局事件」的未决提问（总账 A10）。
+        #
+        # 用丢弃而不是提交：用户取消了会话，这一轮本就不该算数。丢弃会把待终局的答复退回
+        # 待答，于是下面那一句正好把它们以 `cancelled` 收口、事实落盘。
+        # `getattr`：宿主 / 单测的 TM 替身可能没有窗口这套（与本文件其余几处同姿态）。
+        for _tid in list(getattr(task_manager, "open_round_task_ids", None) or ()):
+            try:
+                await task_manager.discard_round(_tid)
+            except Exception:
+                logger.exception(
+                    "cancel_session: discard_round failed for task %s", _tid)
         await self._cancel_session_hitl(session_id, message=CancelReason.USER_CANCEL)
         # ② 清队列。
         if task_manager is not None:
@@ -1143,6 +1165,7 @@ class CtxWeftRuntime:
 
     async def _cancel_pending_hitl_of(
         self, agent_id: str, *, session_id: str, defer: bool = False,
+        defer_only_task_id: str | None = None,
     ) -> None:
         """终局**该 agent 名下**全部未决 HITL（`cancel_agent` 专用）。
 
@@ -1158,52 +1181,76 @@ class CtxWeftRuntime:
         for v in self.list_pending_hitl(session_id=session_id):
             if v.agent_id != agent_id or v.resolved:
                 continue
+            # `defer_only_task_id`：只有这个 task 的气泡跟着这一轮走，其余立即收口
+            # （提交 / 撤销钩子都按 task 查待终局请求，别的 task 的会卡住，见调用点）。
+            this_defer = defer and (
+                defer_only_task_id is None or v.task_id == defer_only_task_id)
             try:
                 await self.hitl.cancel(
-                    v.id, message=CancelReason.USER_CANCEL, defer=defer)
+                    v.id, message=CancelReason.USER_CANCEL, defer=this_defer)
             except Exception:
                 logger.exception(
                     "_cancel_pending_hitl_of: cancel failed for agent=%s hitl=%s", agent_id, v.id,
                 )
 
+    def _hitl_answer_ready(self, session_id: str, task_id: str, hitl_id: str) -> bool:
+        """`human_answer_ready` 钩子：这条请求属于该 task，且人已经给出了决定。
+
+        「给出了决定」含**待终局**那一份（`effective_decision`）：冷应答先登记待终局、
+        `HitlResolved` 要等这一轮的提交点才发，而这里判的正是「答复到过没有」，不是
+        「事实落盘没有」。取消也算——那同样是一个决定，重排后由 reconcile 把它变成
+        一条工具结果继续跑。
+        """
+        req = self.hitl_registry.get(hitl_id)
+        return (
+            req is not None
+            and req.session_id == session_id
+            and req.task_id == task_id
+            and req.effective_decision is not None
+        )
+
+    async def _commit_round_writes(
+        self, session_id: str, task_id: str, staged: "list[tuple[Any, Any, Any]]",
+    ) -> None:
+        """`commit_round` 钩子：这一轮算数了——先终局答复，再让答复进 memory。
+
+        1. 该 task 上待终局的 HITL 答复逐条终局（发 `HitlResolved`）。判据与 `_revert_round`
+           同一份（按 task 全量查）。
+        2. 这一轮暂存的 memory 写入按写入顺序落盘（`TaskManager.stage_memory`）。
+
+        **顺序就是这个钩子的全部要点**：终局事实先落盘，答复才进 memory。反过来，崩在
+        两步之间就会出现「memory 里有答复、日志里问题还悬着」——人再答一次，模型却
+        早已拿着旧答复往下跑。按现在的顺序，崩在中间只会是「已终局、memory 里还没有」，
+        那正是既有恢复路径会补的形状（`UserTurn` 由 `_inject_resolved_user_turns` 补写，
+        工具结果由 reconcile 按事件里的 `CapabilityFinished` 补写）。
+
+        **失败即上抛，不吞**：任何一条终局失败就不再写 memory（否则 memory 跑到日志前面，
+        正是这个顺序要防的形状）；写 memory 失败同样上抛。`TaskManager.commit_round` 据此
+        保留快照，下一个提交点重试——两步都幂等（已终局的 HITL 再 commit 是 no-op，暂存
+        记录带 id、重复 ingest 是 no-op）。
+        """
+        for req in self.hitl_registry.claim_pending_for_task(session_id, task_id):
+            await self.hitl.commit(req.id)
+        for memory, event, pctx in staged:
+            await memory.ingest(event, pctx)
+
     async def _revert_round(self, session_id: str, task_id: str) -> None:
         """撤销一轮里**不属于 TaskManager** 的那两样（`revert_round` 钩子，spec 2026-09-09）。
 
-        1. **memory**：把这一轮的用户消息 `fold([id], [])` 掉——纯遗忘，标 superseded，
-           `load_view` 自然滤掉。id 是落库那一刻记在 `Task.user_prompt_memory_id` 上的；
-           **绝不**改用「读视图取最后一条 user」那种事后推断——用户连发两条、或上一条
-           是 HITL 应答时会撤错人。
-        2. **HITL**：把被这条消息收口的旧气泡 `release` 回 pending。它从来没发过
+        1. **HITL**：把这一轮收下的答复（HITL 应答 / 被新消息收口的旧气泡）`release` 回
+           pending。它从来没发过
            `HitlResolved`，`HitlOpened` 还在原地，于是日志描述的正是撤销之前的世界，
            会话状态折叠自然回到 `PAUSED`。
 
-        两步各自 best-effort：一次撤销失败不该把「用户按了暂停」变成 run 崩溃。最坏
-        结果是 memory 里多留一条没人应答的 user 回合、或一个气泡停在待终局——都比会话
-        炸掉轻得多，且都会记一条 exception 日志。
+        2. **暂停闩锁**：见下方第 3 步注释。
+
+        memory 不在其列：这一轮的用户消息、答复、由答复回灌的工具结果都只在窗口的暂存区
+        里（`TaskManager.stage_memory`），关窗时随快照扔掉，memory 从来没见过它们。
+
+        best-effort：一次撤销失败不该把「用户按了暂停」变成 run 崩溃。最坏结果是一个气泡
+        停在待终局，且会记一条 exception 日志。
         """
         tm = self._task_managers.get(session_id)
-        task = tm.get_task(task_id) if tm is not None else None
-
-        record_id = getattr(task, "user_prompt_memory_id", None) if task else None
-        if record_id:
-            try:
-                memory = self.providers.get_memory()
-                pctx = ProviderContext(
-                    session_id=session_id,
-                    tenant_id=getattr(task, "tenant_id", "default"),
-                    task_id=task_id,
-                    agent_id=(task.assigned_agent_id or task.creator_agent_id or ""),
-                )
-                await memory.fold([record_id], [], pctx)
-            except Exception:
-                logger.exception(
-                    "_revert_round: fold user prompt %s of task %s failed",
-                    record_id, task_id)
-            else:
-                task.user_prompt_memory_id = None
-                # 记录没了，落库标志也要跟着回落，否则这个 task 若被重排，
-                # `_persist_user_prompt` 会以为写过了、不再补写。
-                task.user_prompt_in_memory = False
 
         # 按 task 全量退回，而不是记一个 id：`_cancel_pending_hitl_of` 收口的是该 agent
         # 名下**全部**未决请求，可能不止一条。
@@ -1811,6 +1858,12 @@ class CtxWeftRuntime:
             # 丢弃一轮时把 TM 够不到的两样东西撤回来：memory 里那条用户消息、
             # 被这条消息收口的旧 HITL 气泡。见 `_revert_round`。
             revert_round=lambda tid, sid=session.id: self._revert_round(sid, tid),
+            # run 收尾时的自检：它等的那个问题是不是已经有答复了（见钩子定义处）。
+            human_answer_ready=lambda tid, hid, sid=session.id: self._hitl_answer_ready(
+                sid, tid, hid),
+            # 提交一轮：待终局的 HITL 答复终局，再落盘暂存的 memory 写入。见 `_commit_round_writes`。
+            commit_round=lambda tid, staged, sid=session.id: self._commit_round_writes(
+                sid, tid, staged),
             threshold_finalizer=lambda root, ack_tasks, failures, sess=session: (
                 self._finalize_threshold_memory(sess, root, ack_tasks, failures)),
             # 统一取消胶囊闭合：cancel_all / 熔断清场（已启动挂起排队）/ 在途协作取消
@@ -1895,6 +1948,9 @@ class CtxWeftRuntime:
           会把 TM 连同那个排着队的 task 一起丢掉，它永远不会跑。TM 不在内存里视为满足
           （压根没有队列可言）。
         - **没有未决 HITL**：有人正等着回答，`hitl_registry` 里那条记录还要用。
+        - **没有待终局的答复、没有开着的未提交窗口**：这两样都表示「有一轮正开着」——答复
+          刚收下还没落定、事件还攒在缓冲里。此刻逐出 TM 会把那一轮连同它的暂存一起丢掉，
+          而它们在 `list_pending` 里是看不见的（待终局的请求刻意不出现在那份列表）。
         - **每个 agent 都处于 `idle` / `terminated`**：`running` 在跑；`waiting_human`
           在等人；`interrupted` 在等 `/resume`，而续跑要用那份内存状态。
 
@@ -1905,6 +1961,10 @@ class CtxWeftRuntime:
         if tm is not None and not tm.is_done():
             return False
         if self.hitl_registry.list_pending(session_id=session_id):
+            return False
+        if self.hitl_registry.claim_pending_for_session(session_id):
+            return False
+        if tm is not None and tm.open_round_task_ids:
             return False
         reg = self._agent_lifecycle_manager
         for aid in reg.agent_ids_of_session(session_id):
@@ -2019,6 +2079,15 @@ class CtxWeftRuntime:
         `cancel_session` 已经把它们逐个终局。要真按 session 清，得先给 registry 加那个
         口，不该在这里伸手进它的内部结构。
         """
+        # 逐出之前先把残留的未提交窗口丢掉：窗口的两半分别住在 TM（快照 + 暂存）与总线
+        # （事件缓冲）里，只摘 TM 会让总线那半留在原地——此后该 task 的事件会一直往一个
+        # 没人关的缓冲里堆。正常路径上到这里已经没有开着的窗（`cancel_session` 先收过，
+        # `forget_session` 的判据也不放行），这一步是兜底。
+        tm = self._task_managers.get(session_id)
+        for _tid in list(getattr(tm, "open_round_task_ids", None) or ()):
+            logger.warning(
+                "_evict_session_memory: dropping the still-open round of task %s", _tid)
+            tm.drop_round_buffer(_tid)
         self._release_round(session_id)
         self._task_managers.pop(session_id, None)
         self._agent_lifecycle_manager.forget_session(session_id)
@@ -2405,6 +2474,9 @@ class CtxWeftRuntime:
         # driver ingest 进 memory。两个 ref 命名空间互不相通，故必须在此过桥：
         # event_blob 取字节 → memory 侧重新归一化。每一步只碰一个 store。
         await self._restore_task_prompts(all_tasks, session_id, sess_proj.tenant_id)
+        # 「开始过的 task 提问一定在 memory 里」只是 `task_from_projection` 的推断，恢复前对着
+        # memory 核一遍；缺了就让 driver 按刚还原出来的 prompt 补写。
+        await self._verify_task_prompts_in_memory(all_tasks, session_id, sess_proj.tenant_id)
 
         # 装填 HitlRegistry：**park / 重排的判据从此只读内存**（spec §3.1）。必须在算下面
         # 两个集合之前——registry 空着算出来的 parked 是空集，等于「人还没答，任务却自己
@@ -2480,14 +2552,14 @@ class CtxWeftRuntime:
             memory=self.providers.get_memory(),
             task_manager=task_manager,
         ))
+        # 崩溃窗口兜底：注入消息已随事件落盘、却没来得及进 memory 的，按事件补回。
+        await self._restore_appended_messages(session)
         # act 纯文本暂停（wait_for_user）冷应答：把用户回复注入 task 层并重排（reconcile 覆盖不到,见上）。
         if user_reply is not None:
             await self._inject_user_reply(user_reply, session, task_manager)
         # 崩溃窗口兜底：已终局的 UserTurn 请求，其答复若还没进过对话，在这里补上。
         await self._inject_resolved_user_turns(
             session, task_manager,
-            # 与 `restore` 用**同一个**集合（复审 Important）。
-            parked_or_inflight_task_ids=parked_task_ids,
             skip_hitl_id=getattr(user_reply, "id", "") if user_reply is not None else "",
         )
 
@@ -2520,6 +2592,76 @@ class CtxWeftRuntime:
         if not resumable and not keep_alive:
             final_status = "FAILED" if session.failure_counter > 0 else "SUCCEEDED"
             await task_manager.finalize_idle_session(final_status)
+
+    async def _verify_task_prompts_in_memory(
+        self, tasks: "list[Task]", session_id: str, tenant_id: str,
+    ) -> None:
+        """恢复期核对：投影判定「提问已在 memory」的 task，memory 里是否真有那条提问。
+
+        `task_from_projection` 只能按状态**猜**：ACTIVE / SUSPENDED 猜「已写进 memory」，
+        其余猜「没写」。两个方向都会错，所以这里对着 memory 核实，两边都修正：
+
+        - 猜「已写」却没有：新 task 的提问在第一轮算数前只在暂存区里，提交时事件**先**落盘、
+          暂存**后**落盘，崩在中间就是这一形状。信了猜测，driver 不再写它，这个 task 从此
+          缺了原始提问。
+        - 猜「没写」其实有（`AWAITING_HUMAN` / `INTERRUPTED` / 恢复后的 `PENDING`）：driver
+          会**再写一条**，时间戳是恢复时刻、排在对话末尾。实测复现过。
+
+        提问本身不会丢：它在 `TaskCreated`（reopen 后是 `TaskRequeued`）的 payload 里，
+        `_restore_task_prompts` 刚把它还原到 `task.user_prompt` 上。
+
+        「这条提问在不在」的判据有两道，命中一道即算在：
+        1. 确定性 id（`task_prompt_record_id`）已在视图里——新数据走这条，reopen 改写过提问
+           时哈希不同，于是如实判「不在」，修订版照常写入；
+        2. 存量数据（自动 id）：该 task 的 TASK 层 user 回合、不带 `metadata["source"]`
+           （那是 HITL 应答 / 注入消息）、且拍平文本与当前提问一致。L3 坍缩物以原文开头，
+           因此用前缀匹配。
+
+        best-effort：读 memory 失败就保留猜测（与改造前同义），记一条 exception。
+        """
+        from ctx_weft.core.loop.driver import task_prompt_record_id
+        from ctx_weft.core.utils.content import content_to_text
+        from ctx_weft.protocols import MemoryKind as _MK
+        memory = self.providers.get_memory()
+        ctx = ProviderContext(session_id=session_id, tenant_id=tenant_id)
+        for task in tasks:
+            if not task.user_prompt:
+                continue
+            try:
+                view = await memory.load_view(
+                    MemoryAddress(session_id=session_id, task_id=task.id),
+                    MemoryScope.TASK, ctx, kinds=[_MK.CONVERSATION_TURN],
+                )
+            except Exception:
+                logger.exception(
+                    "_verify_task_prompts_in_memory: load_view failed for task %s — "
+                    "keeping the projection's assumption", task.id)
+                continue
+            want_id = task_prompt_record_id(task.id, task.user_prompt)
+            want_text = (task.user_prompt if isinstance(task.user_prompt, str)
+                         else content_to_text(task.user_prompt)).strip()
+            present = any(
+                r.id == want_id or (
+                    r.role == "user" and "source" not in (r.metadata or {})
+                    and (r.metadata or {}).get("task_id", task.id) == task.id
+                    and want_text
+                    and (r.content if isinstance(r.content, str)
+                         else content_to_text(r.content)).strip().startswith(want_text)
+                )
+                for r in view
+            )
+            if present == task.user_prompt_in_memory:
+                continue
+            if present:
+                logger.info(
+                    "_verify_task_prompts_in_memory: task %s (%s) already has its prompt in "
+                    "memory — not writing it a second time", task.id, task.status)
+            else:
+                logger.warning(
+                    "_verify_task_prompts_in_memory: task %s is %s but its prompt is not in "
+                    "memory (crashed between commit and flush) — re-ingesting from the event log",
+                    task.id, task.status)
+            task.user_prompt_in_memory = present
 
     async def _restore_task_prompts(
         self, tasks: "list[Task]", session_id: str, tenant_id: str,
@@ -2732,6 +2874,9 @@ class CtxWeftRuntime:
             raise RuntimeError("live TaskManager has no session — cannot resume in place")
         if user_reply is not None:
             await self._inject_user_reply(user_reply, session, tm)
+        # 崩溃窗口兜底也放一份在这条路上：重建路径跑过一次之后，若那时某个 task 正在跑而
+        # 被跳过，它的那条已终局答复只能等下一次续跑来补——就是这里（审查文档 M8）。
+        await self._inject_resolved_user_turns(session, tm, skip_hitl_id=hitl_id)
         await tm.resume_task(resumed_task_id, hitl_id=hitl_id)
         self._register_and_drain(session, tm)
 
@@ -2785,7 +2930,14 @@ class CtxWeftRuntime:
         transient = not task_id
 
         # ── idle-guard: claim the slot synchronously (no await before the claim) ──
-        if session_id in self._busy_sessions or self._run_tokens.get(session_id):
+        #
+        # 「忙」不止看在跑的 run：开着的未提交窗口、已收下还没终局的答复，都表示有一轮
+        # 正在进行，而它的暂存 memory 压缩根本看不见（压缩只折 memory）。此刻压缩等于对着
+        # 一份缺了这一轮的视图折叠。判据与 `session_is_quiescent` 同源，只是这里不看 agent 态。
+        _tm = self._task_managers.get(session_id)
+        if (session_id in self._busy_sessions or self._run_tokens.get(session_id)
+                or self.hitl_registry.claim_pending_for_session(session_id)
+                or (_tm is not None and _tm.open_round_task_ids)):
             raise SessionBusyError(session_id)
         self._busy_sessions.add(session_id)
         token = CancelToken()
@@ -3199,14 +3351,15 @@ class CtxWeftRuntime:
             content, session.id, tenant_id=session.tenant_id,
         )
         mem_id = generate_id("mem")
-        await self._ingest_user_turn(
-            scope, pctx, normalized, event_id=mem_id,
-            task_id=target.id, source="send_message",
-        )
-        # 撤销这一轮时要靠它把这条消息 fold 掉（`_revert_round`）。记在落库那一刻，
-        # 不做事后推断——连发两条时「取视图最后一条 user」会撤错人。
-        target.user_prompt_memory_id = mem_id
+        msg_ts = now_utc()
         if _suspended_on_live_children(tm, target):
+            # 没有「这一轮」（不开窗，见下方开窗处注释）→ `_ingest_user_turn` 直接落盘。
+            await self._ingest_user_turn(
+                scope, pctx, normalized, event_id=mem_id,
+                task_id=target.id, source="send_message", timestamp=msg_ts,
+            )
+            await self._emit_message_appended(
+                session, target.id, agent_id, mem_id, _event_jsonable, msg_ts)
             logger.info(
                 "_inject_user_turn: task %s is SUSPENDED on live children — message "
                 "written, state left alone so _try_resume_parent still wakes it",
@@ -3236,9 +3389,26 @@ class CtxWeftRuntime:
              if v.agent_id == agent_id and not v.resolved),
             "",
         )
+        # 记下窗是不是本次开的：下面「重排没排上 → 就地提交」只该提交自己开的窗。
+        opened_here = not tm.is_round_open(target.id)
         tm.begin_round(target.id, owns_task=False, hitl_id=stale_hitl)
+        # 窗口开着 → 这条消息暂存进窗口（`_ingest_user_turn` 经 `ingest_or_stage` 分流），
+        # 这一轮算数时才落盘，撤销时随窗口扔掉。
+        await self._ingest_user_turn(
+            scope, pctx, normalized, event_id=mem_id,
+            task_id=target.id, source="send_message", timestamp=msg_ts,
+        )
+        # 消息正文的事件侧一份（带 task_id → 在窗口里缓冲、随这一轮提交**先于** memory 落盘）。
+        await self._emit_message_appended(
+            session, target.id, agent_id, mem_id, _event_jsonable, msg_ts)
         # `defer=True`：旧气泡的收口跟着这一轮走——撤销时它要回到 pending。
-        await self._cancel_pending_hitl_of(agent_id, session_id=session_id, defer=True)
+        #
+        # **只有同一个 task 的气泡才跟着这一轮**：提交与撤销两个钩子都按 task 查待终局
+        # 请求，而这里是按 **agent** 找旧气泡。该 agent 名下别的 task 上的气泡若也以
+        # `defer` 收下，就没有任何一轮会去终局或退回它——永远卡在待终局，且从待答列表里
+        # 消失。那些立即收口。
+        await self._cancel_pending_hitl_of(
+            agent_id, session_id=session_id, defer=True, defer_only_task_id=target.id)
         # 清旧进展，同 `_inject_user_reply`：新消息意味着有新工作要做，陈旧的
         # outputs/process_report 留着会让 success-guardrail 误判"已经产出过"。
         target.outputs = None
@@ -3254,9 +3424,13 @@ class CtxWeftRuntime:
             #
             # 这是 spec 2026-09-09 §6 说的那个例外：消息被并进一个已经在跑/将跑的
             # task，没有「这一轮」可言，撤销也就无从谈起。
-            await tm.commit_round(task_id)
-            for req in self.hitl_registry.claim_pending_for_task(session_id, task_id):
-                await self.hitl.commit(req.id)
+            #
+            # **窗若不是本次开的就不提交**：该 task 已有一轮开着（热应答醒来还没等到 LLM
+            # 开口、冷续跑还在 reconcile、新 task 首 chunk 前）。那一轮有自己的提交点与撤销
+            # 路径，这条消息并进去、跟着它一起算数或一起撤回；在这里提交就替它提前关了窗——
+            # 它的答复在 LLM 开口前被终局、暂存提前落盘，撤销从此无从谈起。
+            if opened_here:
+                await tm.commit_round(task_id)      # 钩子会一并终局被收口的旧气泡
         return target.id
 
     async def _start_task_for_agent(
@@ -3609,16 +3783,54 @@ class CtxWeftRuntime:
         # **开不出窗就不推迟**：没有 TaskManager（冷启动、会话已被逐出内存）时这条应答
         # 不会经由本进程的某个 run 走到提交点，推迟等于让它永远停在待终局——那正是
         # `reply_to_hitl` 一向要避免的「人答了但会话不动」。开不出窗就照旧一步终局。
+        #
+        # **已终局的不开窗**：`resolve` 对它是幂等 no-op，这里开出去的窗没有任何一轮来关，
+        # 该 task 此后的事件就全被挡在缓冲里（双击 / 陈旧页签重放就能触发）。
+        #
+        # **已收下过答复（`claim_pending`）→ 直接幂等返回 None**，什么都不碰：它的那一轮
+        # 正开着（或正在提交），这次是并发的重复应答。不能落到下面去——不开窗就会以
+        # `defer=False` 走一步终局，而 `registry.resolve` 只拒「已终局」，会把待终局的那条
+        # 答复原地盖成终局、绕过它自己那一轮的提交与撤销。
+        if pending is not None and pending.claim_pending:
+            return None
+        #
+        # 窗若是**本次调用开的**（此前该 task 没有开着的窗），这件事没成时要自己撤掉：
+        # `resolve` 抛异常（应答校验失败）或返回 None（并发的重复应答）。不撤，这扇窗没有
+        # 任何一轮来关，该 task 此后的事件全被挡在缓冲里。别人开的窗不碰——它有自己的主人。
         round_task_id = ""
-        if pending is not None and pending.task_id:
+        opened_here = False
+        _tm = None
+        if (pending is not None and pending.task_id
+                and not pending.resolved and not pending.claim_pending):
             _tm = self._task_managers.get(pending.session_id)
-            if _tm is not None:
+            # **只有真会续跑的应答才开窗**：窗口靠「那一轮的提交点」来关，没有那一轮就没人
+            # 关它，该 task 此后的事件全被挡在缓冲里。两类没有下一轮：
+            #   · `NoResumeDelivery`（纯通知 / 取消）——`_resume_after_hitl` 对它什么都不做；
+            #   · 目标 task 已终态 / 已不在这个 TM 名下——重排必然 no-op。
+            # 不开窗就走一步终局（`defer=False`），`HitlResolved` 当场发出，与「这条应答
+            # 没有可撤销的一轮」这个事实一致。
+            _target = _tm.get_task(pending.task_id) if _tm is not None else None
+            _resumable = (
+                not isinstance(pending.delivery, NoResumeDelivery)
+                and _target is not None
+                and _target.status not in TERMINAL_TASK_STATUSES
+            )
+            if _tm is not None and _resumable:
+                opened_here = not _tm.is_round_open(pending.task_id)
                 _tm.begin_round(pending.task_id, owns_task=False, hitl_id=pending.id)
                 round_task_id = pending.task_id
-        # `defer`：冷应答只登记待终局，`HitlResolved` 留到 act 的提交点才发。
-        # 热投递（有活等待槽）不受影响，`HitlService` 会就地终局——那条路上没有新一轮。
-        resolved = await self.hitl.resolve(reply, defer=bool(round_task_id))
+        # `defer`：冷热都只登记待终局，`HitlResolved` 留到 act 的提交点才发。热投递的
+        # 协程醒来后由 gateway 重新武装提交点（`_rearm_commit_point_after_hot_reply`）；
+        # LLM 开口前被暂停则走热撤销（`act._discard_round_if_uncommitted`）。
+        try:
+            resolved = await self.hitl.resolve(reply, defer=bool(round_task_id))
+        except BaseException:
+            if opened_here and _tm is not None:
+                await _tm.drop_round(round_task_id)
+            raise
         if resolved is None:
+            if opened_here and _tm is not None:
+                await _tm.drop_round(round_task_id)
             return None                       # 幂等：已终局，不重复续跑
         if resolved.claimed:
             return resolved.to_view()         # 热投递已就地续跑，不得双投
@@ -3779,6 +3991,7 @@ class CtxWeftRuntime:
 
     async def _write_hitl_reply_turn(
         self, req: "PendingHitl", session: Session, target: "Task",
+        *, timestamp: "datetime | None" = None,
     ) -> None:
         """**只把人的答复写进对话，绝不碰 task 状态。**
 
@@ -3845,25 +4058,113 @@ class CtxWeftRuntime:
         # 应答可能被重试（host 超时重发 / 用户连点）：`resolve()` 对已终局请求已幂等
         # no-op（不会二次调用本方法），但这里再加一道幂等键——`id` 是 memory 层的幂等键
         # （provider 已实现），确定性地由 hitl_id 派生（spec §7.3/§12.2）。
-        # 幂等键带上「这是第几次应答」（`reply_memory_id`）。一轮被撤销时（spec
-        # 2026-09-09）这条记录会被 `fold` 成 superseded，而 memory 的 record-id 契约是
-        # 「已存在的 id（**含已 superseded**）= no-op」——它仍然占着旧键。不换键的话，
-        # 用户重答同一个气泡时重打的那句话会被**静默吞掉**：界面上消息在、模型永远看不见。
         #
-        # 那个「第几次」是从事件日志折出来的（`HitlReplyRetracted` 的条数），不是内存
-        # 计数器——撤销之后重启，内存里什么都没有，只有日志说得清。
+        # 键上那一维「第几次应答」（`reply_memory_id`）已是历史包袱：被撤销的答复现在只在
+        # 未提交窗口的暂存区里、从没进过 memory，也就没有占着的旧键要躲。见那个函数的说明。
+        # ``timestamp``：恢复期补写传那条答复**真正终局的时刻**（`resolved_at`），而不是
+        # 「补写的此刻」——它发生得更早，用当前时刻会把它排到本次应答之后，对话顺序颠倒。
         reply_mem_id = reply_memory_id(req)
         await self._ingest_user_turn(
             scope, pctx, content, event_id=reply_mem_id,
-            task_id=target.id, source="hitl_reply",
+            task_id=target.id, source="hitl_reply", timestamp=timestamp,
         )
-        # 撤销这一轮时要靠它把这条答复 fold 掉（`_revert_round`）。与 `_inject_user_turn`
-        # 那条同一口径：记在落库那一刻，不做事后推断。
-        target.user_prompt_memory_id = reply_mem_id
+
+    async def _emit_message_appended(
+        self, session: "Session", task_id: str, agent_id: str, memory_id: str,
+        content_jsonable: "str | list[dict] | None", timestamp: "datetime",
+    ) -> None:
+        """发 `TaskMessageAppended`：注入消息的正文在事件日志里的那一份。见事件定义处的注释。"""
+        await emit_event(
+            self._event_bus, EventType.TASK_MESSAGE_APPENDED,
+            session_id=session.id, tenant_id=session.tenant_id,
+            origin=EventOrigin.RUNTIME, task_id=task_id, agent_id=agent_id or None,
+            payload={
+                "memory_id": memory_id,
+                "agent_id": agent_id,
+                "content": content_jsonable,
+                "source": "send_message",
+                "timestamp": timestamp.isoformat(),
+            },
+        )
+
+    async def _restore_appended_messages(self, session: "Session") -> None:
+        """恢复期补写：`TaskMessageAppended` 记着、memory 里却没有的注入消息，按原 id / 原时间戳写回。
+
+        补的是暂存机制留下的崩溃窗口：注入消息在这一轮提交时**先**随事件补投落盘
+        （`TaskMessageAppended`、`TaskRequeued`……），**后**才从暂存区写进 memory。崩在两者
+        之间，日志说这条消息来过、host 也已经把它显示出来，memory 里却没有——模型永远看不见。
+
+        幂等：按记录 id 判重（视图里已有即跳过）；已被压缩 supersede 的记录不在视图里，但
+        memory 的 id 契约是「已存在的 id（含 superseded）= no-op」，再写一次也不会复活它。
+        best-effort：单条失败只记日志，不拖垮整场恢复。
+        """
+        from ctx_weft.core.control.reducers import load_events_of_types
+        from ctx_weft.core.utils.content import (
+            content_from_jsonable, downgrade_images_to_text, hydrate_event_content,
+            normalize_content,
+        )
+        from ctx_weft.protocols import MemoryEvent
+
+        events = await load_events_of_types(
+            self.event_store, session.id, (EventType.TASK_MESSAGE_APPENDED,))
+        if not events:
+            return
+        memory = self.providers.get_memory()
+        event_blob_store = self.providers.get_event_blob_store()
+        blob_store = self.providers.get_memory_blob_store()
+        seen: "dict[str, set[str]]" = {}
+        for ev in events:
+            p = ev.payload or {}
+            task_id, memory_id = ev.task_id or "", p.get("memory_id") or ""
+            if not task_id or not memory_id:
+                continue
+            agent_id = p.get("agent_id") or ev.agent_id or ""
+            pctx = ProviderContext(session_id=session.id, tenant_id=session.tenant_id,
+                                   task_id=task_id, agent_id=agent_id)
+            try:
+                if task_id not in seen:
+                    view = await memory.load_view(
+                        MemoryAddress(session_id=session.id, task_id=task_id),
+                        MemoryScope.TASK, pctx, kinds=[MemoryKind.CONVERSATION_TURN])
+                    seen[task_id] = {r.id for r in view}
+                if memory_id in seen[task_id]:
+                    continue
+                content = content_from_jsonable(p.get("content") or "")
+                if not isinstance(content, str):
+                    try:
+                        content = await hydrate_event_content(
+                            content, event_blob_store=event_blob_store, ctx=pctx)
+                        if blob_store.can_externalize:
+                            content = await normalize_content(
+                                content, blob_store=blob_store, ctx=pctx)
+                    except Exception:
+                        logger.error(
+                            "_restore_appended_messages: content of %s could not be restored, "
+                            "downgrading images to text", memory_id, exc_info=True)
+                        content = downgrade_images_to_text(content)
+                raw_ts = p.get("timestamp")
+                ts = datetime.fromisoformat(raw_ts) if raw_ts else ev.timestamp
+                await memory.ingest(MemoryEvent(
+                    id=memory_id,
+                    kind=MemoryKind.CONVERSATION_TURN, scope=MemoryScope.TASK,
+                    address=MemoryAddress(session_id=session.id, task_id=task_id,
+                                          agent_id=agent_id),
+                    content=content, timestamp=ts, role="user",
+                    metadata={"task_id": task_id, "source": p.get("source") or "send_message"},
+                ), pctx)
+                seen[task_id].add(memory_id)
+                logger.warning(
+                    "_restore_appended_messages: re-ingested injected message %s of task %s "
+                    "(crashed between round commit and staged-memory flush)", memory_id, task_id)
+            except Exception:
+                logger.exception(
+                    "_restore_appended_messages: failed to restore %s of task %s",
+                    memory_id, task_id)
 
     async def _ingest_user_turn(
         self, scope: "MemoryAddress", pctx: ProviderContext,
         content: "str | list[ContentPart]", *, event_id: str, task_id: str, source: str,
+        timestamp: "datetime | None" = None,
     ) -> None:
         """把一条**已经算好**的用户侧内容，作为一轮 `CONVERSATION_TURN`（role=user）
         写进 `scope`（TASK 视图）——纯落盘这一步，不判断内容该怎么来、也不碰 task 状态。
@@ -3873,24 +4174,31 @@ class CtxWeftRuntime:
         content 怎么派生（HITL 要拒绝措辞/打断续接前缀，`send_message` 就是调用方给的
         原样消息）与幂等键怎么起（`hitlreply:{hitl_id}` vs. 一个新生成的 id）——那部分
         差异留在各自调用方，这里不重复实现第二套 ingest。
+
+        经 `ingest_or_stage` 分流：该 task 开着未提交窗口（HITL 冷应答 / 消息注入开的那一轮）
+        → 暂存，这一轮算数时在 `HitlResolved` 之后落盘；没开窗（恢复期补写、挂起等子任务
+        的注入）→ 直接写。
         """
+        from ctx_weft.core.loop.driver import ingest_or_stage
         from ctx_weft.protocols import MemoryEvent
-        await self.providers.get_memory().ingest(
+        await ingest_or_stage(
+            self.providers.get_memory(),
             MemoryEvent(
                 id=event_id,
                 kind=MemoryKind.CONVERSATION_TURN, scope=MemoryScope.TASK,
                 address=scope,
                 content=content,
-                timestamp=now_utc(),
+                timestamp=timestamp or now_utc(),
                 role="user",
                 metadata={"task_id": task_id, "source": source},
             ),
             pctx,
+            task_manager=self._task_managers.get(scope.session_id), task_id=task_id,
         )
 
     async def _inject_resolved_user_turns(
         self, session: Session, task_manager: TaskManager, *,
-        parked_or_inflight_task_ids: "set[str]", skip_hitl_id: str = "",
+        skip_hitl_id: str = "",
     ) -> None:
         """恢复期补注入：把该 session 里**已终局的 `UserTurn` 请求**的答复写进对话。
 
@@ -3937,14 +4245,24 @@ class CtxWeftRuntime:
         于是每次冷应答的代价从 O(N) 次写降到 O(该 session 里有已终局 UserTurn 的 task 数)
         次读。**仍未被界住**的是 `rebuild_hitl` 的整流折叠，见那里的说明。
         """
+        # 鸭子类型的 TM 替身可能没有这个方法（单测）——取不到就当作「没有在跑的 task」。
+        _running = getattr(task_manager, "running_task_ids", None)
+        running: "set[str]" = set(_running()) if callable(_running) else set()
         candidates: list[tuple[PendingHitl, Any]] = []
         for req in self.hitl_registry.resolved_for_session(session.id):
+            # **不看「这个 task 还挂着别的未决问题」**：那是重排要不要放行的判据，与
+            # 「这条答复进没进过对话」无关。曾经借用它，代价是同一个 task 上前一条已终局的
+            # 答复被跳过，而人答掉那个未决问题时走的是活 TM 那条路（它不做补写）——那条
+            # 答复就此永久缺失（审查文档 M8）。
+            #
+            # 只避开**正在跑**的 task：往一个正在装配 prompt 的 task 的对话里插写是并发风险，
+            # 而它正跑着就说明有人在驱动它，这条答复自会在它自己的路径上被消费。
             if (req.id == skip_hitl_id
                     or req.legacy_origin
                     or not isinstance(req.delivery, UserTurnDelivery)
                     or req.effective_decision is None
                     or not req.task_id
-                    or req.task_id in parked_or_inflight_task_ids):
+                    or req.task_id in running):
                 continue
             target = task_manager.get_task(req.task_id)
             if target is None or target.status in TERMINAL_TASK_STATUSES:
@@ -3961,7 +4279,8 @@ class CtxWeftRuntime:
             if reply_memory_id(req) in already:
                 continue                      # 已经注入过（见上「界」）
             try:
-                await self._write_hitl_reply_turn(req, session, target)
+                await self._write_hitl_reply_turn(
+                    req, session, target, timestamp=req.resolved_at)
             except Exception:
                 logger.exception(
                     "_inject_resolved_user_turns: 注入失败 session=%s hitl=%s",

@@ -82,6 +82,12 @@ def _estimate_record_tokens(r, count: Callable[[str], int] | None = None) -> int
     return total
 
 
+def _staged_memory(state, ctx) -> list:
+    """当前 task 这一轮暂存、还没落盘的 memory 写入（没开窗 / 无 TaskManager → 空）。"""
+    staged = getattr(getattr(ctx, "task_manager", None), "staged_memory", None)
+    return staged(state.task.id) if staged is not None else []
+
+
 def _estimate_assembled_tokens(prompt, count: Callable[[str], int] | None = None) -> int:
     """无真实基线（首轮/一次性）时对整份装配 prompt 的估算：system + 每条消息（含 tool_calls
     参数/图片/framing）+ tools schema。
@@ -142,6 +148,10 @@ class PrepareStep(Step):
             act_resume_cue = ""
 
         def _assemble():
+            # 这一轮暂存、还没落盘的对话记录（用户消息 / HITL 答复 / 答复回灌的工具结果，
+            # 见 `ingest_or_stage`）。LLM 开口之前这一轮要用的恰恰是它们，所以装配时叠加进
+            # 历史。**每次装配现取**：压缩前会先提交，那之后它们已经在 memory 里了。
+            staged = _staged_memory(state, ctx)
             return ctx.assembler.assemble(ContextRequest(
                 purpose=purpose,
                 scope=state.scope,
@@ -156,6 +166,7 @@ class PrepareStep(Step):
                     "skill_name": skill_name,
                     "act_guidance": act_guidance,
                     "act_resume_cue": act_resume_cue,
+                    "staged_memory": staged,
                 },
             ))
 
@@ -165,6 +176,11 @@ class PrepareStep(Step):
 
         # ── 5. compact 触发：命中则跑升级式 compact，再在压缩后 memory 上重装配一次（Q4=c 校正）──
         if await self._should_compact(state, ctx, token_estimate):
+            # **先提交再压缩**：压缩（L0.5 图片降级 / L1 / L3）只折 memory，够不着这一轮暂存
+            # 的记录——带图的第一条消息、带图的答复就一张也降不了。提交让它们落盘、进入
+            # 压缩的视野；代价是这一轮从此不可撤（LLM 开口前按暂停也不再丢弃）。
+            from ctx_weft.core.loop.steps.act import _commit_round
+            await _commit_round(state, ctx)
             from ctx_weft.core.loop.steps.compact import escalating_compact
             compact_events = await escalating_compact(
                 state, ctx, token_estimate=token_estimate, trigger="compact")
@@ -284,6 +300,11 @@ class PrepareStep(Step):
                     if r.kind is MemoryKind.CONVERSATION_TURN and r.role in ("user", "assistant")
                 ]
                 new_records = convo[guard.context_message_count:]
+                # 暂存区里的回合同样会被装配进 prompt（见 `_assemble`），一并计入。
+                new_records += [
+                    ev for ev in _staged_memory(state, ctx)
+                    if ev.kind is MemoryKind.CONVERSATION_TURN and ev.role in ("user", "assistant")
+                ]
                 count = ctx.llm.tokenizer.count
                 delta = sum(_estimate_record_tokens(r, count) for r in new_records)
                 return guard.context_tokens + delta, True

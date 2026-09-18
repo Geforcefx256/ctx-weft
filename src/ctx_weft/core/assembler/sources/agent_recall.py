@@ -28,7 +28,7 @@ from ctx_weft.core.assembler.priority import slot_priority
 from ctx_weft.core.assembler.sources._history import record_to_history_block, wrap_compact_summary
 from ctx_weft.core.utils.content import content_to_text
 from ctx_weft.core.utils.ids import generate_id
-from ctx_weft.protocols import MemoryAddress, MemoryKind, MemoryScope
+from ctx_weft.protocols import MemoryAddress, MemoryKind, MemoryRecord, MemoryScope
 from ctx_weft.protocols.memory_compat import legacy_type_of as _legacy_type_of
 
 if TYPE_CHECKING:
@@ -38,6 +38,19 @@ if TYPE_CHECKING:
 # 与旧 _TASK_TYPES 四类型等价）；agent 层 = AGENT 视图默认 kinds（覆盖旧 _AGENT_TYPES，legacy
 # dispatch 配对已在 normalize_view 内完成）。全量幸存、升序——体量边界由 close/compact 的
 # fold + BudgetStrategy 负责，不在召回处截断。
+
+
+#: TASK 视图默认召回的 kinds（与 `load_view` 默认口径一致：TOOL_AUDIT 不进装配）。
+_VIEW_TASK_KINDS = (MemoryKind.CONVERSATION_TURN, MemoryKind.SUMMARY)
+
+
+def _staged_record(ev) -> MemoryRecord:
+    """暂存的 `MemoryEvent` → 与 `load_view` 同形的 `MemoryRecord`（v2 行：type=None）。"""
+    return MemoryRecord(
+        id=ev.id or "", type=None, content=ev.content, timestamp=ev.timestamp,
+        role=ev.role, topic=ev.topic, kind=ev.kind, scope=ev.scope, address=ev.address,
+        metadata=dict(ev.metadata or {}), blob_refs=list(ev.blob_refs or []),
+    )
 
 
 class AgentRecallSource:
@@ -69,6 +82,26 @@ class AgentRecallSource:
         for idx, record in enumerate(task_records):  # load_view 已升序（旧→新）
             yield record_to_history_block(
                 record, source="agent_recall", idx=idx, request=request, current_task_id=current_task_id
+            )
+        # 叠加这一轮暂存、还没落盘的 task 层记录（PrepareStep 经 extra 递进来，见
+        # `TaskManager.stage_memory`）。渲染与 memory 里的记录完全同一条路；排序由 composer
+        # 按 (timestamp, seq_no) 归并，暂存的恒是最新的。
+        staged = [
+            ev for ev in ((getattr(request, "extra", None) or {}).get("staged_memory") or [])
+            if ev.scope is MemoryScope.TASK and ev.kind in _VIEW_TASK_KINDS
+            and getattr(ev.address, "agent_id", None) == request.scope.agent_id
+        ]
+        # 排序键要和落盘之后可比：composer 按 (timestamp, seq_no) 归并，而 provider 给的
+        # seq_no 是 per-scope 递增。暂存的恒是最新的，所以取「视图里见过的最大 seq_no」往后排；
+        # 时间戳撞上时（Windows 时钟 15.6ms 分辨率下并不罕见）提交前后的顺序因此一致。
+        base = max(
+            (r.metadata.get("seq_no", 0) for r in task_records if r.metadata), default=0) + 1
+        # 序号只经 `idx` 传给渲染（`record_to_history_block` 的 seq_no 兜底），**不写进
+        # 暂存事件的 metadata**——那份 metadata 稍后要原样落库，不该掺进装配期算出来的值。
+        for i, ev in enumerate(staged):
+            yield record_to_history_block(
+                _staged_record(ev), source="agent_recall", idx=base + i, request=request,
+                current_task_id=current_task_id,
             )
 
         # ── 2) agent 层残留 / 经验 ──
