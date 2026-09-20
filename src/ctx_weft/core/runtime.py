@@ -39,7 +39,12 @@ from ctx_weft.core.control.tokens import CancelToken, PauseToken, RunTokens
 from ctx_weft.core.models.discriminators import CancelReason, InterruptReason
 from ctx_weft.protocols.events import Event, EventOrigin, EventType
 from ctx_weft.core.utils.event import emit_event
-from ctx_weft.core.hitl.registry import HitlRegistry, PendingHitl
+from ctx_weft.core.hitl.registry import (
+    HITL_STAGE_AUTHZ,
+    HITL_STAGE_RERUN,
+    HitlRegistry,
+    PendingHitl,
+)
 from ctx_weft.core.hitl.reply_intake import ReplyIntake
 from ctx_weft.core.hitl.service import HitlService
 from ctx_weft.core.loop.capability_gateway import CapabilityGateway
@@ -3842,11 +3847,37 @@ class CtxWeftRuntime:
             # 不开窗就走一步终局（`defer=False`），`HitlResolved` 当场发出，与「这条应答
             # 没有可撤销的一轮」这个事实一致。
             _target = _tm.get_task(pending.task_id) if _tm is not None else None
+            # 第三类不开窗：**授权类应答（`authz` / `rerun`）不可撤销**。
+            #
+            # 批准一个危险工具之后再「撤回」语义上就不成立——工具可能已经跑了，撤掉的只是
+            # 记录，不是世界。今天那条路更糟：`abandon_round` 明文丢掉「那条答复带出来的
+            # `CapabilityFinished` 之类」与暂存的工具结果，连 `CapabilityInvoked` 一起丢，于是
+            # 重入时 `facts` 为空、gateway 以为它没跑过，**连「准不准重跑」都不问就再跑一遍**。
+            #
+            # 不开窗 → `defer=False` → `HitlResolved` 当场落盘，工具是拿着一份**已终局**的
+            # 批准在跑，于是那枚「已了结」的章能盖在 `CapabilityInvoked` 之后（见
+            # `_record_invocation`）——门一过就花掉，这才是审批该有的生命周期。
+            #
+            # 判据用 **stage 而非 form**：stage 是 gateway 开气泡时显式传的授权语境，form 只是
+            # 展示形态（host 完全可以用 approval form 问一个非授权问题）。`ask_user`
+            # （`stage=tool`）**保持可撤销**——那是人打的字，2026-09-09 那个撤销窗口正是为它引入的。
+            _is_authz = pending.stage in (HITL_STAGE_AUTHZ, HITL_STAGE_RERUN)
             _resumable = (
                 not isinstance(pending.delivery, NoResumeDelivery)
+                and not _is_authz
                 and _target is not None
                 and _target.status not in TERMINAL_TASK_STATUSES
             )
+            if _is_authz and _tm is not None and _tm.is_round_open(pending.task_id):
+                # 不该发生：一个 task 只有一个 run，而开窗的那几条路（消息注入）都会先收口
+                # 既有气泡，加上本方法开头 `claim_pending` 那道早返回，未被 claim 的授权气泡
+                # 不可能和一扇开着的窗共存。真撞上了要知道——那道缓冲闸按 task_id 定，不按
+                # 窗口主人，于是这条 `HitlResolved` 会进别人那扇窗的缓冲；那一轮被丢弃时
+                # 内存已终局、日志却丢了终局事实，正是两阶段当初要消灭的那种分歧。
+                logger.warning(
+                    "reply_to_hitl: 授权类应答 %s 撞上 task %s 上开着的未提交窗口——"
+                    "终局事实可能被那一轮的缓冲吞掉，这条不变式要查",
+                    pending.id, pending.task_id)
             if _tm is not None and _resumable:
                 opened_here = not _tm.is_round_open(pending.task_id)
                 _tm.begin_round(pending.task_id, owns_task=False, hitl_id=pending.id)

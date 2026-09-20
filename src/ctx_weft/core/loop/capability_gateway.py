@@ -825,6 +825,21 @@ class CapabilityGateway:
             "arguments": sanitized,
             "tool_call_id": tool_call_id,
         }, origin=EventOrigin.LOOP_CAPABILITY_GATEWAY))
+        # 授权类决定到此花掉：审批的作用是放行**这一次**调用，`CapabilityInvoked` 落库就是
+        # 「门已经过了」。留着它等结果，等于让一份用过的批准在冷重入时还能开门（`:507` 的重跑
+        # 分支之后紧接着就是 `:524` 的授权步，而决定缓存第四维 `invocation_key` 跨重启逐字节
+        # 相同、**会**命中）。重入本该重新问：那时情况变了（可能已经跑过一半），「准不准重跑」
+        # 与「准不准跑」是两个问题，各答各的。
+        #
+        # 能盖在这里，前提是审批**不进两阶段**（`reply_to_hitl` 对 authz/rerun 不开窗、
+        # `defer=False`），所以此刻它已经终局。否则 `close()` 会因待终局跳过，而强行盖会让这枚
+        # 章排在 `HitlResolved` 之前，折叠先摘 `opened` 再撞上终局找不到请求 → 终局丢掉。
+        #
+        # 只盖 authz/rerun：`tool` 那一类（`ask_user`）的答复要等它变成工具结果才算被消费。
+        if ctx.hitl is not None:
+            await ctx.hitl.close_for_tool_call(
+                ctx.provider_ctx.session_id, tool_call_id,
+                stages=(HITL_STAGE_AUTHZ, HITL_STAGE_RERUN))
         if is_dispatch:
             # 派发（spec 2026-06-28 §2.3；2026-07-03 修订）：**只有 delegate_plan 的 envelope 框**
             # 在此 eager 写（plan 框 + 配对 ack，避免 plan 框悬挂被 legalize 剥掉）。

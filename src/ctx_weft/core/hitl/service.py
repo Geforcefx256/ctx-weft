@@ -391,20 +391,29 @@ class HitlService:
                 n += 1
         return n
 
-    async def close_for_tool_call(self, session_id: str, tool_call_id: str) -> int:
-        """把该 tool_call 的全部已终局请求一并了结，返回盖上几条。
+    async def close_for_tool_call(
+        self, session_id: str, tool_call_id: str, *,
+        stages: "tuple[str, ...] | None" = None,
+    ) -> int:
+        """把该 tool_call 的已终局请求了结，返回盖上几条。`stages=None` = 不分 stage。
 
-        **不分 stage**：一次工具调用最多牵三条请求（`authz` 事前审核、`tool` provider 自问、
-        `rerun` 准重跑），它们在这次调用结束时**同时**失效。逐个 stage 去盖要调用方记住
-        有哪几个 stage，那种知识迟早漏掉一个（漏掉的那条就永不销账）。
+        **默认不分 stage**：结果落库那一刻，这次调用牵到的三类请求（`authz` 事前审核、
+        `tool` provider 自问、`rerun` 准重跑）同时失效；逐个 stage 去盖要调用方记住有哪几个，
+        那种知识迟早漏掉一个。
 
-        调用点在 gateway 的两个落库出口之后（结果已进 memory / 未授权的错误结果已进 memory）
-        ——见 `close` 的顺序纪律。
+        `stages` 只在一个地方收窄：**授权类决定在调用开始时就了结**（`_record_invocation`
+        发完 `CapabilityInvoked` 之后，只盖 `authz` / `rerun`）。审批的作用是放行这一次调用,
+        门一过它就花掉了；留着它等结果，等于让一份花掉的批准在重入时还能开门。`tool` 那一类
+        不能这么早盖——`ask_user` 的答复要等它变成工具结果才算被消费。
+
+        调用点一律在持久效果之后（事件已发 / 结果已进 memory），见 `close` 的顺序纪律。
         """
         if not tool_call_id:
             return 0
         n = 0
         for req in self.registry.resolved_for_tool_call(session_id, tool_call_id):
+            if stages is not None and req.stage not in stages:
+                continue
             if await self.close(req):
                 n += 1
         return n

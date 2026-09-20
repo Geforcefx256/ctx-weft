@@ -376,3 +376,89 @@ def test_reply_turn_writer_does_not_stamp_by_itself():
     assert "ingest_or_stage" not in src   # 形态：它自己不判暂存
     assert src.count("self.hitl.close(") <= 1, (
         "这里最多只该有那一次（对已终局请求的补注入路径）")
+
+
+# ── 审批不可撤销：门一过就花掉 ─────────────────────────────────────────────────
+
+
+def test_authz_stages_do_not_open_an_uncommitted_round():
+    """授权类应答（`authz` / `rerun`）不开未提交窗口 → `defer=False` → 当场终局。
+
+    批准一个危险工具之后再「撤回」语义上不成立：工具可能已经跑了，撤掉的只是记录、不是世界。
+    而今天那条路更糟——`abandon_round` 明文丢掉「那条答复带出来的 `CapabilityFinished` 之类」
+    与暂存的工具结果，连 `CapabilityInvoked` 一起丢，于是重入时 `facts` 为空、gateway 以为它
+    没跑过，连「准不准重跑」都不问就再跑一遍。
+
+    判据是 **stage 而非 form**：stage 是 gateway 开气泡时显式传的授权语境，form 只是展示形态。
+    """
+    import inspect
+
+    from ctx_weft.core.runtime import CtxWeftRuntime
+
+    src = inspect.getsource(CtxWeftRuntime.reply_to_hitl)
+    assert "HITL_STAGE_AUTHZ" in src and "HITL_STAGE_RERUN" in src
+    assert "and not _is_authz" in src, "授权类必须被排除在 _resumable 之外"
+    # 判据不能退回 form：那会把 host 用 approval form 问的非授权问题一起变成不可撤销
+    assert 'form == "approval"' not in src
+
+
+def test_tool_stage_stays_retractable():
+    """`ask_user`（`stage=tool`）**保持**可撤销——那是人打的字。
+
+    2026-09-09 那个撤销窗口正是为它引入的：用户在 LLM 开口之前反悔，那句话当作没说过。
+    这条和上一条一起，才说明这次改的是「授权」而不是「所有 HITL」。
+    """
+    import inspect
+
+    from ctx_weft.core.runtime import CtxWeftRuntime
+
+    src = inspect.getsource(CtxWeftRuntime.reply_to_hitl)
+    stages = src[src.index("_is_authz = pending.stage in"):]
+    stages = stages[:stages.index(")")]
+    assert "HITL_STAGE_TOOL" not in stages, "工具阶段不该被一起变成不可撤销"
+
+
+def test_invocation_closes_only_the_authorization_stages():
+    """`CapabilityInvoked` 之后只盖 `authz` / `rerun` 的章,不盖 `tool`。
+
+    盖 `tool` 是错的：`ask_user` 的答复要等它变成工具结果才算被消费,在调用开始时盖等于宣布
+    一件还没发生的事。
+    """
+    import inspect
+
+    from ctx_weft.core.loop.capability_gateway import CapabilityGateway
+
+    src = inspect.getsource(CapabilityGateway._record_invocation)
+    assert "close_for_tool_call" in src, "门一过就该盖章"
+    i_emit = src.index("CAPABILITY_INVOKED")
+    i_close = src.index("close_for_tool_call")
+    assert i_emit < i_close, "章要在事件之后"
+    scope = src[i_close:i_close + 300]
+    assert "HITL_STAGE_AUTHZ" in scope and "HITL_STAGE_RERUN" in scope
+    assert "HITL_STAGE_TOOL" not in scope
+
+
+async def test_close_for_tool_call_honours_the_stage_filter():
+    """`stages` 过滤真的生效：只盖授权那两类,`tool` 那条留着等结果。"""
+    svc, bus = _service(HITL_STAGE_AUTHZ, HITL_STAGE_TOOL, HITL_STAGE_RERUN)
+
+    n = await svc.close_for_tool_call(
+        _SID, _TCID, stages=(HITL_STAGE_AUTHZ, HITL_STAGE_RERUN))
+
+    assert n == 2
+    assert _closed_ids(bus) == {f"hit_{HITL_STAGE_AUTHZ}", f"hit_{HITL_STAGE_RERUN}"}
+    # 结果落库那一步（不带 stages）再把剩下那条收掉
+    assert await svc.close_for_tool_call(_SID, _TCID) == 1
+    assert f"hit_{HITL_STAGE_TOOL}" in _closed_ids(bus)
+
+
+async def test_result_exit_does_not_re_stamp_the_authorization_ones():
+    """结果落库那一步不分 stage,但已盖过的按内存幂等跳过——不会发重复的章。"""
+    svc, bus = _service(HITL_STAGE_AUTHZ, HITL_STAGE_TOOL)
+
+    await svc.close_for_tool_call(_SID, _TCID, stages=(HITL_STAGE_AUTHZ,))
+    await svc.close_for_tool_call(_SID, _TCID)                    # 兜底那次
+
+    ids = [e.payload["hitl_id"] for e in bus.events
+           if e.type == EventType.HITL_CLOSED]
+    assert sorted(ids) == [f"hit_{HITL_STAGE_AUTHZ}", f"hit_{HITL_STAGE_TOOL}"], ids
