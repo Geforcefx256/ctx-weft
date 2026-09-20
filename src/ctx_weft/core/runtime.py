@@ -686,7 +686,8 @@ class CtxWeftRuntime:
             if snapshot_every_n > 0:
                 from ctx_weft.providers.events.snapshot import SnapshotWriter
                 writer = SnapshotWriter(self.event_store, self._event_bus,
-                                        every_n_events=snapshot_every_n)
+                                        every_n_events=snapshot_every_n,
+                                        memory_settled=self._memory_settled)
             # handle 统一暴露：required 模式 persister=None（提交走 gate）、writer 可 detach。
             self.persistence = PersistenceHandle(None, writer)
         else:
@@ -696,7 +697,8 @@ class CtxWeftRuntime:
             # 旧路径（spec 2026-08-29 §6.4 + final review R15）：persister 必须先于
             # snapshot writer 订阅；handle 存公开属性 persistence 供宿主 detach。
             self.persistence = attach_persistence(
-                self._event_bus, self.event_store, snapshot_every_n=snapshot_every_n)
+                self._event_bus, self.event_store, snapshot_every_n=snapshot_every_n,
+                memory_settled=self._memory_settled)
 
         # Auto-register 内置 providers（与用户注册的 providers 无关）
         control_provider = ControlCapabilityProvider()
@@ -1911,6 +1913,37 @@ class CtxWeftRuntime:
         """
         self._capability_cache.clear_pins(task_id)
         await self.hitl.close_resolved(session_id, task_id=task_id)
+
+    def _memory_settled(self, session_id: str) -> bool:
+        """这一刻该 session 的 memory 效果是否都已落地——**快照写入的前置条件**。
+
+        不变式：**有快照 ⟹ 到它的 `committed_head` 为止，memory 效果都已落地。** 恢复路径
+        「以快照为准」全靠它；一张领先的快照是静默的数据丢失（它说某件事做完了，所以
+        `pending_recap` / HITL `resolved` 里没有它，而 memory 里其实没有）。
+
+        判据只有一条：**该 session 有没有开着的未提交窗口**。开着就意味着这一轮的 memory
+        写入还在暂存区（`ingest_or_stage`），而缓冲里的事件已经先于它们被补投——
+        `TaskManager.commit_round` 的顺序是「补投 → 钩子（落盘暂存）→ 关窗」，而
+        `SnapshotWriter` 是 rest 订阅者，在补投那一步就被叫醒了。实测见
+        `tests/unit/test_snapshot_not_ahead_of_memory.py`。
+
+        窗口之外 memory 是同步直落的（`ingest_or_stage` 的另一支），而 `RunFinished` 在 run
+        体末尾的 `finally` 里发——那时这条 run 自己的写入已经落定。所以「没有开着的窗」就是
+        这个不变式的充分条件。
+
+        **这个判断为什么必须在 core**：它读的是 `TaskManager` 的窗口状态，而 provider 只看得
+        见 EventBus。把它留在 provider 手里，provider 只能拿「收到某个事件」当代理，而那个
+        代理恰好是错的——缓冲里的每一条事件都排在它自己的 memory 效果之前。
+
+        没有 TM（会话还没起 / 已逐出）→ True：没有在跑的轮次，也就没有暂存的写入。
+        """
+        tm = self._task_managers.get(session_id)
+        if tm is None:
+            return True
+        checker = getattr(tm, "any_round_open", None)
+        if not callable(checker):
+            return True          # 鸭子类型的 TM 替身（单测）——不因此挡住快照
+        return not checker()
 
     def _bind_task_manager(self, session_id: str, task_manager: "TaskManager") -> None:
         """把 TM 登记为该 session 的 owner——**唯一写 `_task_managers` 的地方**（逐出除外）。

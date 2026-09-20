@@ -366,6 +366,15 @@ class TaskManager:
     def is_round_open(self, task_id: str) -> bool:
         return task_id in self._rounds
 
+    def any_round_open(self) -> bool:
+        """本 TM 名下还有没有开着的未提交窗口。
+
+        供快照写入的前置条件用（`SnapshotWriter._is_safe_to_write`）：窗口开着就意味着有
+        暂存的 memory 写入还没落盘，而缓冲里的事件已经**先于**它们被补投给 rest 订阅者。
+        那一刻写快照会写出一张领先于 memory 的——恢复「以快照为准」之后那是静默的数据丢失。
+        """
+        return bool(self._rounds)
+
     def round_hitl_id(self, task_id: str) -> str:
         """这一轮收口了哪个旧气泡（没有则空串）。供 `revert_round` 钩子 release 用。"""
         snap = self._rounds.get(task_id)

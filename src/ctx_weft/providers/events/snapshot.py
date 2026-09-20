@@ -43,6 +43,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from collections.abc import Callable
+
 from ctx_weft.core.control.reducers import _PROJECTION_VERSION
 from ctx_weft.protocols.events import TRANSIENT_EVENT_TYPES
 
@@ -70,9 +72,14 @@ class SnapshotWriter:
         event_bus: "EventBus | None" = None,
         *,
         every_n_events: int = DEFAULT_SNAPSHOT_EVERY_N_EVENTS,
+        memory_settled: "Callable[[str], bool] | None" = None,
     ) -> None:
         self._store = event_store
         self._every_n = max(1, every_n_events)
+        #: 「这一刻该 session 的 memory 效果是否都已落地」。由 core 注入——只有它知道
+        #: （那是它自己的 ingest 路径）。见 `_is_safe_to_write` 的说明。None = 一律放行
+        #: （无 TaskManager 的极简接线 / 单测）。
+        self._memory_settled = memory_settled
         self._since_snapshot: dict[str, int] = {}
         # 本进程内已写过快照的 session（spec: snapshot-recovery）：空集意味着「服务刚
         # 起来」，第一张快照走全量重锚，纠正上一个进程可能留下的偏差。
@@ -84,9 +91,50 @@ class SnapshotWriter:
             await self._subscription.unsubscribe()
             self._subscription = None
 
+    def _is_safe_to_write(self, session_id: str) -> bool:
+        """现在写一张快照，会不会写出一张**领先于 memory** 的？
+
+        不变式：**有快照 ⟹ 到它的 `committed_head` 为止，memory 效果都已落地。** 恢复路径
+        「以快照为准」全靠它——一张领先的快照就是静默的数据丢失（它说某件事做完了，所以
+        `pending_recap` / HITL `resolved` 里没有它，而 memory 里其实没有）。
+
+        为什么需要这道门：未提交窗口下的顺序是
+
+            TaskManager.commit_round:
+              1. ROUND_COMMITTED
+              2. bus.commit_provisional(task_id)   ← 缓冲里的事件在这里补投给 rest 订阅者
+              3. commit_round 钩子：HitlResolved → **暂存的 memory 写入落盘**
+              4. _rounds.pop
+
+        本类是 rest 订阅者，所以第 2 步就会被叫醒，而那一刻 `committed_head` 已经涵盖整批
+        缓冲事件、第 3 步还没跑。实测确认，见
+        `tests/unit/test_snapshot_not_ahead_of_memory.py`。
+
+        这也是「从事件里找一个『已落 memory』的信号」那条路走不通的原因：缓冲里的**每一条**
+        事件都排在它自己的 memory 效果之前，`ActTurnCompleted` / `CapabilityFinished` 都是。
+        判断只能来自 core 的 ingest 路径，所以这里收一个注入的谓词，不自己猜。
+
+        跳过的代价是**安全的那一侧**：这一刻不写，下一个 `RunFinished` 再写；快照偏旧只意味着
+        恢复多重放一段、多做一次幂等写。而快照偏新是不可挽回的。
+        """
+        if self._memory_settled is None:
+            return True
+        try:
+            return bool(self._memory_settled(session_id))
+        except Exception:
+            # 谓词自己炸了 → 当作「不安全」。宁可少写一张快照，不可写一张领先的。
+            logger.exception(
+                "SnapshotWriter: memory_settled 判定失败，跳过本次写入 (%s)", session_id)
+            return False
+
     async def on_event(self, event: "Event") -> None:
         session_id = event.session_id
         if not session_id:
+            return
+        if not self._is_safe_to_write(session_id):
+            # 这一刻该 session 还有没落盘的 memory 写入（见 `_is_safe_to_write`）。**计数照旧
+            # 累加**，所以下一个安全的边界会立刻补上这一张，不会因为跳过而拖长重放窗口。
+            self._since_snapshot[session_id] = self._since_snapshot.get(session_id, 0) + 1
             return
         # 瞬态 delta 不计入阈值，使「每 N 事件」按有意义的持久化事件计数。
         if event.type in TRANSIENT_EVENT_TYPES:

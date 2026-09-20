@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from ctx_weft.protocols.events import TRANSIENT_EVENT_TYPES
@@ -77,6 +78,7 @@ def attach_persistence(
     event_store: "EventStore",
     *,
     snapshot_every_n: int = 0,
+    memory_settled: "Callable[[str], bool] | None" = None,
 ) -> PersistenceHandle:
     """按**正确顺序**接线 EventPersister（+ `snapshot_every_n > 0` 时的 SnapshotWriter）。
 
@@ -91,5 +93,7 @@ def attach_persistence(
     writer = None
     if snapshot_every_n > 0:
         from ctx_weft.providers.events.snapshot import SnapshotWriter
-        writer = SnapshotWriter(event_store, event_bus, every_n_events=snapshot_every_n)
+        writer = SnapshotWriter(event_store, event_bus,
+                                every_n_events=snapshot_every_n,
+                                memory_settled=memory_settled)
     return PersistenceHandle(persister, writer)
