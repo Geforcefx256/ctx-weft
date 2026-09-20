@@ -982,8 +982,26 @@ def _as_resolved(req: PendingHitl, decision: HitlDecision, resolved_at: datetime
     return req
 
 
-def fold_hitl_snapshot(events: list[Event]) -> HitlSnapshot:
+def apply_hitl_event(ev: Event, snap: HitlSnapshot) -> HitlSnapshot:
+    """把**一条** HITL 事件折进已有的 `snap`（增量 apply 的那一步）。
+
+    它和 `fold_hitl_snapshot` 是**同一份实现**——后者就是在空 `snap` 上把事件逐条喂进来。
+    并存两份口径不同的 HITL 折叠正是旧实现里「重建了 pending 却没重建已解决」那类漂移的
+    来源，也是本分支当初把 HITL 移出投影的理由，所以这里绝不另写一遍。
+
+    能这样复用，前提是 `snap` 是**唯一**的累加器：连折叠期的工作账（`opened` /
+    `decision_owner`）都在它里面。放在外面，一次性折叠与增量折叠各带一份，两份迟早分叉。
+    """
+    return fold_hitl_snapshot([ev], snap)
+
+
+def fold_hitl_snapshot(
+    events: list[Event], snap: "HitlSnapshot | None" = None,
+) -> HitlSnapshot:
     """双读折叠：新旧两套 HITL 事件 → `HitlSnapshot`。
+
+    `snap` 非 None 时**在它上面继续折**（增量 apply，见 `apply_hitl_event`）；折叠是左折叠，
+    所以「一次喂 n 条」与「分 n 次各喂 1 条」逐字段等价。
 
     同 tool_call 有多条请求（重问副本）时，**最后一条可用决定胜出**。
 
@@ -994,11 +1012,10 @@ def fold_hitl_snapshot(events: list[Event]) -> HitlSnapshot:
     `normalize_content` 写入**记忆** blob store，并对失败做 `downgrade_images_to_text`
     兜底（该兜底绝不可再抛）。本函数本身保持同步、不做这一步（spec §12.3.3）。
     """
-    snap = HitlSnapshot()
-    opened: dict[str, PendingHitl] = {}
-    #: `decisions_for` 的键 → 当前那条决定是谁的。`HitlClosed` 据此只销自己那一条
-    #: （同键会被重问副本覆盖，见那个分支的说明）。折叠本地账，不出这个函数。
-    _decision_owner: dict[tuple[str, str, str], str] = {}
+    if snap is None:
+        snap = HitlSnapshot()
+    opened = snap.opened
+    _decision_owner = snap.decision_owner
     for ev in events:
         p = ev.payload or {}
         rid = p.get("hitl_id", "")

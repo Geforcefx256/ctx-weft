@@ -447,3 +447,55 @@ def test_closed_only_retires_its_own_decision_not_a_resupplied_one():
     assert decision.message == "新"
     assert "hit_old" not in snap.resolved
     assert "hit_new" in snap.resolved, "新那条还没了结"
+
+
+# ── 单一实现：增量折与一次性折逐字段等价 ─────────────────────────────────────
+
+
+def test_incremental_fold_equals_one_shot_fold():
+    """分 n 次各喂 1 条 == 一次喂 n 条。
+
+    折叠是左折叠，所以这必须成立——不成立的话，恢复出来的 HITL 态会依赖「这次走了哪条路」
+    （投影增量 vs 无快照全量折），那种 bug 极难归因。这也是 `apply_hitl_event` 能和
+    `fold_hitl_snapshot` 共用同一份实现的全部理由：它就是后者在已有累加器上的一次调用。
+    """
+    from ctx_weft.core.control.reducers import apply_hitl_event
+    from ctx_weft.core.hitl.snapshot import HitlSnapshot
+
+    events = [
+        _opened(hitl_id="hit_a"),
+        _ev(EventType.HITL_RESOLVED, {
+            "hitl_id": "hit_a", "outcome": "accepted", "claimed": False,
+            "message": "go"}, seq=1),
+        _closed(hitl_id="hit_a", seq=2),
+        *_user_turn_pair(hitl_id="hit_b"),
+        _opened(hitl_id="hit_c", seq=5),
+    ]
+
+    one_shot = fold_hitl_snapshot(events)
+
+    incremental = HitlSnapshot()
+    for ev in events:
+        apply_hitl_event(ev, incremental)
+
+    assert sorted(incremental.pending) == sorted(one_shot.pending)
+    assert sorted(incremental.resolved) == sorted(one_shot.resolved)
+    assert sorted(incremental.decisions_for) == sorted(one_shot.decisions_for)
+    # 工作账也要一致——它是增量能接着折下去的前提
+    assert sorted(incremental.opened) == sorted(one_shot.opened)
+    assert incremental.decision_owner == one_shot.decision_owner
+
+
+def test_the_working_ledgers_live_on_the_accumulator():
+    """工作账必须挂在 `snap` 上，不能是折叠的本地变量。
+
+    放在外面，一次性折叠与增量折叠就各带一份，两份迟早分叉——而 `opened` 决定了
+    `HitlResolved` / `HitlReplyRetracted` 能不能找回请求，分叉的后果是整条终局丢掉。
+    """
+    from ctx_weft.core.hitl.snapshot import HitlSnapshot
+
+    snap = HitlSnapshot()
+    assert hasattr(snap, "opened") and hasattr(snap, "decision_owner")
+
+    snap = fold_hitl_snapshot([_opened(hitl_id="hit_x")])
+    assert "hit_x" in snap.opened, "折过之后工作账要留在累加器上"

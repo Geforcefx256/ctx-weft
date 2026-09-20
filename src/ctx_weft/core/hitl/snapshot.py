@@ -33,6 +33,39 @@ class HitlSnapshot:
     结构上做不了这一步；这是调用方（下一阶段接 `load_snapshot` 到恢复路径时）的责任。
     """
 
+    #: 折叠期的工作账：**开过的请求**（按 hitl_id）。`HitlClosed` 与 `outcome=cancelled`
+    #: 会把条目摘掉，所以它的大小 = 「开了还没了结的」≈ 活跃数，不随会话长度增长。
+    #:
+    #: 为什么在这里而不是折叠的本地变量：`apply_hitl_event` 要能被**增量** apply，那就要求
+    #: 累加器是**唯一**的状态。放在外面，一次性折叠和增量折叠各带一份，两份迟早分叉。
+    opened: dict[str, PendingHitl] = field(default_factory=dict)
+    #: 折叠期的工作账：`decisions_for` 的键 → 当前那条决定是谁的。`HitlClosed` 据此只销
+    #: 自己那一条——同键会被「重问副本」的后一条决定覆盖，不记主人就直接 pop，一条**旧**
+    #: 请求的了结会把**新**请求的决定连带删掉 → 同一个工具重新求批。
+    decision_owner: dict[tuple[str, str, str], str] = field(default_factory=dict)
+
+    #: 折叠期的工作账：**开过的请求**（按 hitl_id）。`HitlClosed` 与 `outcome=cancelled`
+    #: 会把条目摘掉，所以它的大小 = 「开了还没了结的」≈ 活跃数，不随会话长度增长。
+    #:
+    #: 为什么在这里而不是折叠的本地变量：`apply_hitl_event` 要能被**增量** apply，那就要求
+    #: 累加器是**唯一**的状态。放在外面，一次性折叠和增量折叠各带一份，两份迟早分叉。
+    opened: dict[str, PendingHitl] = field(default_factory=dict)
+    #: 折叠期的工作账：`decisions_for` 的键 → 当前那条决定是谁的。`HitlClosed` 据此只销
+    #: 自己那一条——同键会被「重问副本」的后一条决定覆盖，不记主人就直接 pop，一条**旧**
+    #: 请求的了结会把**新**请求的决定连带删掉 → 同一个工具重新求批。
+    decision_owner: dict[tuple[str, str, str], str] = field(default_factory=dict)
+
+    #: 折叠期的工作账：**开过的请求**（按 hitl_id）。`HitlClosed` 与 `outcome=cancelled`
+    #: 会把条目摘掉，所以它的大小 = 「开了还没了结的」≈ 活跃数，不随会话长度增长。
+    #:
+    #: 为什么在这里而不是折叠的本地变量：`apply_hitl_event` 要能被**增量** apply，那就要求
+    #: 累加器是**唯一**的状态。放在外面，一次性折叠和增量折叠各带一份，两份迟早分叉。
+    opened: dict[str, PendingHitl] = field(default_factory=dict)
+    #: 折叠期的工作账：`decisions_for` 的键 → 当前那条决定是谁的。`HitlClosed` 据此只销
+    #: 自己那一条——同键会被「重问副本」的后一条决定覆盖，不记主人就直接 pop，一条**旧**
+    #: 请求的了结会把**新**请求的决定连带删掉 → 同一个工具重新求批。
+    decision_owner: dict[tuple[str, str, str], str] = field(default_factory=dict)
+
     pending: dict[str, PendingHitl] = field(default_factory=dict)
     decisions_for: dict[tuple[str, str, str], tuple[HitlDecision, dict[str, Any] | None]] = field(
         default_factory=dict)
