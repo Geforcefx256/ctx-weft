@@ -86,7 +86,7 @@ async def test_load_no_longer_rewinds_current_task_id(monkeypatch):
     assert reg.record_of(aid).current_task_id == first.task_id
 
     # 热重装（/resume、冷 HITL 应答、并发 send_message 的自愈都会走到这里）
-    await rt._load_agents_of(sid, tenant_id="default")
+    await rt._load_agents_of(sid, tenant_id="default")  # 返回 (条数, tenant)
     assert reg.record_of(aid).current_task_id == first.task_id, "路由判据被热重装倒回了"
 
     # 判据没倒回 → 下一条消息并进同一个 task，不再凭空多开一个

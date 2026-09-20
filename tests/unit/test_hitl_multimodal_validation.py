@@ -466,100 +466,13 @@ async def test_hitl_image_reaches_memory():
     assert content[0].source_type == "ref"
 
 
-# ── A2-5：blob 落在正确的 tenant 锚点（缺口 3）────────────────────────────────
-
-
-def _install_live_owner(rt, session_id: str, tenant_id: str):
-    """给 session 装一个活 owner TaskManager（热应答的主路径就是从它读 tenant）。"""
-    from ctx_weft.core.orchestrator.task.manager import TaskManager
-    from ctx_weft.core.models.session import Session
-
-    tm = TaskManager(session_id=session_id, event_bus=rt.event_bus)
-    tm.set_session(Session(
-        id=session_id, user_prompt="", status="RUNNING", tenant_id=tenant_id,
-    ))
-    rt._task_managers[session_id] = tm
-    return tm
-
-
-@pytest.mark.asyncio
-async def test_blob_anchors_to_the_session_tenant_via_live_owner():
-    """热路径：活 owner TM 持有 Session，tenant 必须从它身上来，而非写死 default。"""
-    store = _CountingStore()
-    rt = _make_runtime(_VisionClient(), store)
-    _install_live_owner(rt, "ses-tenant-hot", "tenant-alpha")
-    hid = await _pending(rt, session_id="ses-tenant-hot")
-
-    await _reply(rt, hid, [ImagePart(data=_PNG, media_type="image/png")])
-
-    assert store.put_calls == 1
-    assert store.ctx_tenant_ids == ["tenant-alpha"], (
-        "blob 必须落在该 session 所属 tenant 的锚点上"
-    )
-    assert store.ctx_session_ids == ["ses-tenant-hot"]
-
-
-@pytest.mark.asyncio
-async def test_blob_anchors_to_the_session_tenant_via_event_log_on_cold_reply():
-    """冷路径：进程重启后无活 TM，tenant 由事件日志解出（每条 Event 都带 tenant_id）。"""
-    from ctx_weft.protocols.events import Event
-    from ctx_weft.core.utils.clock import now_utc
-    from ctx_weft.core.utils.ids import generate_id
-
-    store = _CountingStore()
-    rt = _make_runtime(_VisionClient(), store)
-    await rt.event_store.append(Event(
-        id=generate_id("evt"), run_id=None, sequence=0, session_id="ses-tenant-cold",
-        type="SessionCreated", timestamp=now_utc(), tenant_id="tenant-beta",
-    ))
-    hid = await _pending(rt, session_id="ses-tenant-cold")
-
-    await _reply(rt, hid, [ImagePart(data=_PNG, media_type="image/png")])
-
-    assert store.put_calls == 1
-    assert store.ctx_tenant_ids == ["tenant-beta"]
-
-
-# ── A2-6：解不出 session 时回落 default 且不抛 ───────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_unknown_session_falls_back_to_default_tenant_without_raising():
-    """既无活 TM 也无事件（陌生 session）→ 回落 default，**不得抛**。
-
-    HITL 应答路径上抛错会卡住人类应答，故这里刻意保持现状而不是报错。
-    """
-    store = _CountingStore()
-    rt = _make_runtime(_VisionClient(), store)
-    hid = await _pending(rt, session_id="ses-nowhere")
-
-    view = await _reply(rt, hid, [ImagePart(data=_PNG, media_type="image/png")])
-
-    assert view is not None and view.outcome == "accepted"
-    assert store.ctx_tenant_ids == ["default"]
-
-
-@pytest.mark.asyncio
-async def test_event_store_failure_falls_back_to_default_tenant_without_raising():
-    """事件存储不可用（宿主 DB 抖动）时同样只能回落，不得把异常甩给应答方。"""
-    store = _CountingStore()
-    rt = _make_runtime(_VisionClient(), store)
-
-    async def _boom(session_id):
-        raise RuntimeError("event store down")
-
-    rt.event_store.read_by_session = _boom  # type: ignore[method-assign]
-    hid = await _pending(rt, session_id="ses-broken-store")
-
-    view = await _reply(rt, hid, [ImagePart(data=_PNG, media_type="image/png")])
-
-    assert view is not None and view.outcome == "accepted"
-    assert store.ctx_tenant_ids == ["default"]
-
-
 @pytest.mark.asyncio
 async def test_plain_text_reply_never_touches_the_event_store():
-    """纯文本应答不写 blob，就不该为解 tenant 去读事件日志（读了也白读）。"""
+    """纯文本应答不碰事件库。
+
+    2026-09-19 之前这里防的是「为解 tenant 去读事件日志」；那套反查已经删掉（tenant 随请求
+    带着走），所以现在它守的是更一般的一条：应答内容管线不该为了任何理由回头读事件流。
+    """
     store = _CountingStore()
     rt = _make_runtime(_VisionClient(), store)
     reads: list[str] = []
@@ -584,7 +497,7 @@ async def test_plain_text_reply_never_touches_the_event_store():
 @pytest.mark.asyncio
 async def test_hitl_event_put_receives_the_real_session_tenant_not_default():
     """应答提交路径给 event 侧 `content_to_event_jsonable` 传的 ctx.tenant_id
-    必须是 `_normalize_hitl_content` 解出的真实 tenant，而不是写死的 "default"。
+    必须是**请求带来的**真实 tenant，而不是写死的 "default"。
 
     刻意只注册 EventBlobStore、**不注册 MemoryBlobStore**：这是「memory 不可外部化、
     event 可外部化」组合（spec §6：`normalize_content` 短路不碰 event 侧，ref 化改由
@@ -596,8 +509,8 @@ async def test_hitl_event_put_receives_the_real_session_tenant_not_default():
     event_store = _CountingEventStore()
     rt = _make_runtime(_VisionClient())
     rt.providers.register_event_blob_store(event_store)
-    _install_live_owner(rt, "ses-tenant-event", "tenant-gamma")
-    hid = await _pending(rt, session_id="ses-tenant-event")
+    hid = await _pending_with_tenant(
+        rt, session_id="ses-tenant-event", tenant_id="tenant-gamma")
 
     view = await _reply(rt, hid, [ImagePart(data=_PNG, media_type="image/png")])
 
@@ -690,7 +603,11 @@ async def _pending_with_tenant(rt, *, session_id: str, tenant_id: str) -> str:
 
 
 def _count_event_reads(rt) -> list[str]:
-    """给两条读事件库的路都装计数——`_tenant_for_session` 先走类型收窄、再兜底全量。"""
+    """给两条读事件库的路都装计数。
+
+    应答内容管线**不该**为任何理由回头读事件流（tenant 随请求带着走，2026-09-19 起 core
+    里连解析入口都没有了）。两条都装上，免得将来有人换一条路读、断言还以为是绿的。
+    """
     hits: list[str] = []
     orig_typed = rt._read_session_events_of_types
     orig_full = rt.event_store.read_by_session
@@ -706,44 +623,3 @@ def _count_event_reads(rt) -> list[str]:
     rt._read_session_events_of_types = typed          # type: ignore[method-assign]
     rt.event_store.read_by_session = full            # type: ignore[method-assign]
     return hits
-
-
-@pytest.mark.asyncio
-async def test_tenant_on_the_request_anchors_the_blob_without_any_lookup():
-    """请求自带真 tenant → blob 落在它上面，且**一次事件库都不读**。
-
-    改造前这里是拿 session_id 去事件日志反查 tenant 的，而那个值从请求被开出来的那一刻
-    就一直在手里（`HitlService.open` 的契约：「本类自己不持有、也不去解」）。
-    """
-    store = _CountingStore()
-    rt = _make_runtime(_VisionClient(), store)
-    hid = await _pending_with_tenant(rt, session_id="ses-carried", tenant_id="tenant-carried")
-    reads = _count_event_reads(rt)
-
-    await _reply(rt, hid, [ImagePart(data=_PNG, media_type="image/png")])
-
-    assert store.ctx_tenant_ids == ["tenant-carried"], "blob 该落在请求带来的 tenant 上"
-    assert reads == [], f"不该为解 tenant 读事件库，实际读了：{reads}"
-
-
-@pytest.mark.asyncio
-async def test_default_tenant_on_the_request_still_gets_resolved():
-    """请求上是 `"default"` → **仍要解一次**。
-
-    `"default"` 既是合法的真租户名、又是这条链上每一环的缺省值，两者在值上不可区分。
-    保守地再解一次：解出来仍是 default 则行为不变，解出真 tenant 则救回了一个本该带上却
-    没带的值——多租户宿主下那正是「图落错锚点」与「落对」的差别。
-    """
-    store = _CountingStore()
-    rt = _make_runtime(_VisionClient(), store)
-    _install_live_owner(rt, "ses-default-carried", "tenant-real")
-    hid = await _pending_with_tenant(
-        rt, session_id="ses-default-carried", tenant_id="default")
-    reads = _count_event_reads(rt)
-
-    await _reply(rt, hid, [ImagePart(data=_PNG, media_type="image/png")])
-
-    assert store.ctx_tenant_ids == ["tenant-real"], (
-        "请求上的 default 该被当成「可能没填」，由解析救回真 tenant")
-    # 活 owner TM 命中在读事件库之前，所以这一路仍是零 IO
-    assert reads == [], f"热路径该在内存里命中，实际读了：{reads}"

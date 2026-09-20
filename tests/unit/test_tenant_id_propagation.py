@@ -12,7 +12,7 @@
    这里测的是 `runtime._announce_queue_state_as_tm_proxy` 代 TaskManager 发的两条
    队列信号（`TaskQueueBlocked`/`TaskQueueInterrupted`）；该方法与它代发的信号均已
    停发，恢复期的租户传播现在改钉 `AgentLifecycleManager.load()` 装填完发的
-   AGENT_* 现状广播——同一个 `_tenant_for_session` 解出的值，只是搬了发射点。
+   AGENT_* 现状广播——同一条会话的 tenant，只是搬了发射点。
 """
 
 from __future__ import annotations
@@ -85,7 +85,9 @@ async def test_recovery_queue_signal_carries_the_recovered_sessions_tenant() -> 
     2026-09-04（Task 12，events-v2 §5）前这里钉的是 `TaskQueueBlocked`/
     `TaskQueueInterrupted`（`_announce_queue_state_as_tm_proxy` 代发）；两者均已
     停发，租户传播的验证点改到 `AgentLifecycleManager.load()` 装填完发的现状广播——
-    同一个 `_tenant_for_session` 解出的值只是换了个发射点，被验证的行为没变。
+    同一条会话的 tenant 只是换了个发射点，被验证的行为没变：恢复期广播必须带真 tenant，
+    而不是新 runtime 实例的默认值。2026-09-19 起它由 `_load_agents_of` 从自己折出的
+    session 投影里照搬（每条 Event 都带 tenant_id），不再有「解析」这一步。
 
     用 `hitl_timeout_sec=0` 逼一次冷 park（零热窗），拿到一个持有未决 HITL、已落盘的
     会话；随后另起一个**空白**的新 runtime、只共享同一个 `event_store`（模拟「进程

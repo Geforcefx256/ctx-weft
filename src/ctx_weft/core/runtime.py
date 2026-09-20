@@ -843,85 +843,8 @@ class CtxWeftRuntime:
         normalized = await normalize_content(content, blob_store=blob_store, ctx=ctx)
         return normalized, event_jsonable
 
-    #: tenant 的缺省值。`PendingHitl.tenant_id` 与 host 侧可选参数都缺省成它，于是
-    #: 「真的是 default 租户」与「根本没填」在值上**不可区分**——`_tenant_or_resolve`
-    #: 因此把它当作后者处理。
+    #: tenant 的缺省值——**core 不推断 tenant**（见 `_load_agents_of` 的说明）。
     _DEFAULT_TENANT = "default"
-
-    async def _tenant_or_resolve(self, tenant_id: str | None, session_id: str) -> str:
-        """随调用/请求带来的 tenant 优先；**`"default"` 视为「可能没填」，再解一次。**
-
-        tenant 本该一路带着走（`ProviderContext` → `HitlService.open` →
-        `PendingHitl.tenant_id` → 应答管线），`_tenant_for_session` 只是兜底。但那条链的
-        缺省值是 `"default"`，而它同时也是一个**合法的真租户名**——所以「带来的是 default」
-        既可能是如实的，也可能是某处忘了传。保守起见后者也走一次解析：
-
-        - 解出来仍是 `"default"` → 行为与直接用它一致；
-        - 解出真 tenant → 救回了一个本该带上却没带的值（多租户宿主下这是「图落错 tenant
-          锚点」与「落对」的差别）。
-
-        代价是单租户部署（tenant 恒 default）在冷路径上多一次 `SessionCreated` 的类型
-        查询——`_tenant_for_session` 已收窄到那一条事件，很便宜。
-        """
-        if tenant_id and tenant_id != self._DEFAULT_TENANT:
-            return tenant_id
-        return await self._tenant_for_session(session_id)
-
-    async def _tenant_for_session(self, session_id: str) -> str:
-        """由 session_id 解出 tenant_id；解不出一律回落 ``"default"``，**绝不抛**。
-
-        ⚠️ **这是兜底，不是常态路径。** tenant 是 host 侧的概念（宿主那边是
-        ``"{surrogate_id}:{cowork_id}"``，由它的 API 层拼出来、写进它自己的 session 记录），
-        core 只负责搬运——`Event.tenant_id` / `ProviderContext.tenant_id` /
-        `PendingHitl.tenant_id` 一路带着走。所以正确的做法是**让它随调用传进来**，而不是
-        拿 session_id 回来反查一个本该在手里的字段。2026-09-19 把几处反查接回了那条链：
-
-        - HITL 应答内容归一化 ← `PendingHitl.tenant_id`（经 `ReplyIntake`）；
-        - registry-miss 时的 agent 装填 ← `PendingHitl.tenant_id`；
-        - HITL 快照的 blob hydrate ← 快照里请求本体的 tenant；
-        - `rebuild_session` / `dispatch_task` ← host 传入的可选 `tenant_id`。
-
-        剩下真正需要本方法的只有两种：host 没传（旧 host / 其它 host 实现）、以及
-        `rebuild_all_agents` 那种「自己从 `list_active_session_ids` 扫出 sid、没有上游可
-        问」的场合。
-
-        三条途径，先热后冷：
-        1. 活 owner TaskManager 的 `session`（`_task_managers`）——热应答的主路径，纯内存查表；
-        2. `SessionCreated` 事件：会话的 tenant 就记在它身上，而**每条 `Event` 都带
-           `tenant_id`**（`protocols/events.py`）。按类型收窄取这一条（每会话恰一条），
-           走 `(session_id, type)` 索引，不必读整条流、也不必 `rebuild_view` 折投影；
-        3. 兜底全量读：`SessionCreated` 缺失（日志损坏 / 导入残缺）时才退到这条，取第一条
-           带 tenant 的事件——保住改造前「任何一条事件的 tenant 都算」那个语义，代价只
-           落在异常数据上。
-
-        **为什么不一开始就全量读**：这条在 HITL 冷应答路径上，而它原本是 O(会话全部事件)
-        ——只为拿一个字段。长会话里每次冷应答都要把整条流读出来再丢掉。
-
-        本方法在 HITL 应答路径上——**抛错会卡住人类应答**，故整段 best-effort：
-        存储不可用 / session 无事件 / 事件不带 tenant，一律回落 `"default"`（= 现状）。
-        """
-        tm = self._task_managers.get(session_id)
-        sess = tm.session if tm is not None else None
-        if sess is not None and sess.tenant_id:
-            return sess.tenant_id
-        try:
-            created = await self._read_session_events_of_types(
-                session_id, (EventType.SESSION_CREATED,))
-            for ev in created:
-                tenant = getattr(ev, "tenant_id", "")
-                if tenant:
-                    return tenant
-            # SessionCreated 没有 / 不带 tenant —— 罕见（损坏或残缺的日志），此时才付全量
-            for ev in await self.event_store.read_by_session(session_id):
-                tenant = getattr(ev, "tenant_id", "")
-                if tenant:
-                    return tenant
-        except Exception:
-            logger.warning(
-                "HITL tenant resolve: cannot read events for session %s; using 'default'",
-                session_id, exc_info=True,
-            )
-        return "default"
 
     async def _normalize_hitl_content(
         self, content: "str | list[ContentPart]", session_id: str, tenant_id: str,
@@ -939,21 +862,9 @@ class CtxWeftRuntime:
 
         event 侧与 memory 侧同用这一个 tenant：两边的 blob 落在同一个锚点上。
 
-        **纯文本（或两个 blob store 都不能外部化）时连兜底解析也不付**：那种情形下根本不写
-        blob，tenant 用不上，读了也白读。判据是 memory **或** event 任一可外部化就算要用
-        ——event 侧的外部化独立于 memory 侧（两个 store 各写各的），只看 memory 侧会漏掉
-        「memory 不可外部化、event 可外部化」这一组合。
         """
-        needs_blob = not isinstance(content, str) and (
-            self.providers.get_memory_blob_store().can_externalize
-            or self.providers.get_event_blob_store().can_externalize
-        )
-        effective_tenant = (
-            await self._tenant_or_resolve(tenant_id, session_id) if needs_blob
-            else (tenant_id or self._DEFAULT_TENANT)
-        )
         return await self._validate_and_normalize_content(
-            content, session_id, tenant_id=effective_tenant,
+            content, session_id, tenant_id=tenant_id or self._DEFAULT_TENANT,
         )
 
     def _register_run_tokens(
@@ -2169,17 +2080,17 @@ class CtxWeftRuntime:
         **绝不抛**：`_load_agents_of` 自己就是绝不抛的，`rebuild_hitl` 的失败也只记日志。
         装不出来（session 在事件日志里压根不存在）返回 0，由调用方决定这算不算错。
 
-        ``tenant_id``：**host 知道就传**。tenant 是 host 侧的概念（宿主那边是
-        ``"{surrogate_id}:{cowork_id}"``，由 API 层拼出来、写进它自己的 session 记录），
-        core 只是搬运它。传了就直接用；不传才回落 `_tenant_for_session` 去事件日志里反查
-        ——那是给「手上只有 session_id」的调用方留的兜底，不该是常态路径。
+        ``tenant_id``：**host 给什么就是什么**（不给 → ``"default"``）。tenant 是 host 侧的
+        概念（宿主那边是 ``"{surrogate_id}:{cowork_id}"``，由 API 层拼出来、写进它自己的
+        session 记录），core 只负责搬运——不推断、不反查、不「猜它是不是忘了传」。
         """
-        tenant_id = await self._tenant_or_resolve(tenant_id, session_id)
         try:
             await self.rebuild_hitl(session_id)
         except Exception:
             logger.exception("rebuild_session: rebuild_hitl failed for %s", session_id)
-        n = await self._load_agents_of(session_id, tenant_id=tenant_id)
+        # host 没给 tenant 时由 `_load_agents_of` 从它折出的投影里照搬，并把用掉的那个
+        # 值交回来——`register_session` 用同一个，两处不会记成不同的 tenant。
+        n, tenant_id = await self._load_agents_of(session_id, tenant_id=tenant_id)
         self._session_registry.register_session(session_id, tenant_id=tenant_id)
         await self._settle_crashed_agents(session_id)
         return n
@@ -3608,8 +3519,7 @@ class CtxWeftRuntime:
         """在已有 session 上派发一条**全新的顶层 task**（spec/09）——`delegate_task` 的
         host 侧对等物。
 
-        ``tenant_id``：同 `rebuild_session`——host 知道就传，不传才回落
-        `_tenant_for_session` 反查。
+        ``tenant_id``：同 `rebuild_session`——host 给什么就是什么，不给则 ``"default"``。
 
         与 `send_message` 的分工：那个是**对话**（有活 task 就并进去，路由归 core），
         这个是**派发**（永不注入既有 task，开不开新 agent、挂谁、继承谁全由调用方声明）。
@@ -3663,7 +3573,7 @@ class CtxWeftRuntime:
         from ctx_weft.core.utils.content import content_to_text
 
         # ── 1/2. tenant + 参数校验（零副作用、零 IO）──────────────────────────
-        tenant_id = await self._tenant_or_resolve(tenant_id, session_id)
+        tenant_id = tenant_id or self._DEFAULT_TENANT
         s = settings if isinstance(settings, NormalTaskSettings) else (
             deserialize_settings(settings) if settings is not None else NormalTaskSettings()
         )
@@ -4009,9 +3919,7 @@ class CtxWeftRuntime:
             # （`HitlService.open` 的契约：「本类自己不持有、也不去解」），冷折出来的那些
             # 则由 `fold_hitl_snapshot` 从 `Event.tenant_id` 填。所以这里不必再去日志反查
             # 一个已经随请求带过来的字段。
-            await self._load_agents_of(
-                req.session_id,
-                tenant_id=await self._tenant_or_resolve(req.tenant_id, req.session_id))
+            await self._load_agents_of(req.session_id, tenant_id=req.tenant_id)
 
     async def _inject_user_reply(
         self, req: "PendingHitl", session: Session, task_manager: TaskManager,
@@ -4395,8 +4303,19 @@ class CtxWeftRuntime:
         ups = [r for r in view if r.role == "user"]
         return content_to_text(ups[-1].content) if ups else ""
 
-    async def _load_agents_of(self, session_id: str, *, tenant_id: str) -> int:
-        """据事件折出该 session 的 `AgentView` 并喂进 ALM，返回装填条数。
+    async def _load_agents_of(
+        self, session_id: str, *, tenant_id: str | None = None,
+    ) -> "tuple[int, str]":
+        """据事件折出该 session 的 `AgentView` 并喂进 ALM，返回 `(装填条数, 实际用的 tenant)`。
+
+        ``tenant_id``：**调用方给什么就用什么**。不给则从本方法已经折出的 session 投影里
+        照搬（`SessionView.tenant_id` —— 每条 `Event` 都带 `tenant_id`，那就是事件流里记
+        下的真值）。这不是「core 去解 tenant」：投影本来就要折，取一个字段零成本，且它是
+        搬运而非推断。
+
+        **把用掉的 tenant 一并返回**，是为了让 `rebuild_session` 的另一个消费者
+        （`register_session`）与这里同源：否则它得自己再折一次投影，或者退回写死
+        ``"default"``——那就又出现「同一条会话在两处记着不同 tenant」的漂移。
 
         `rebuild_session` 与（Task 13 起的）单 agent 恢复共用的唯一装填路径——「恢复是
         喂进来、不是查回去」（spec §3.1），折叠逻辑只此一份，避免两边各写一套
@@ -4414,6 +4333,10 @@ class CtxWeftRuntime:
 
         view = await rebuild_view(self.event_store, session_id)
         sess_proj = view.sessions.get(session_id)
+        if tenant_id is None:
+            tenant_id = (
+                sess_proj.tenant_id if sess_proj is not None else self._DEFAULT_TENANT
+            ) or self._DEFAULT_TENANT
         if sess_proj is None or not sess_proj.template_id:
             logger.warning(
                 "_load_agents_of: session %s has no projection or no template_id; "
@@ -4428,11 +4351,12 @@ class CtxWeftRuntime:
         # 还没落盘。把它们的 id 交给 `load()`，让它别拿日志折出来的旧值把路由判据倒回去。
         tm = self._task_managers.get(session_id)
         protected = set(tm.open_round_task_ids) if tm is not None else set()
-        return await self._agent_lifecycle_manager.load(
+        loaded = await self._agent_lifecycle_manager.load(
             view.agents, session_id=session_id,
             tenant_id=tenant_id, fallback_template_id=fallback_template_id,
             protected_current_tasks=protected,
         )
+        return loaded, tenant_id
 
     async def rebuild_hitl(self, session_id: str) -> int:
         """从事件**装填**该 session 的 HITL 内存态，返回 pending 条数。
@@ -4510,11 +4434,11 @@ class CtxWeftRuntime:
         # 同属一个 tenant，故取到的第一个即可。
         # `decisions_for` 刻意不作来源：`load_snapshot` 给「只有决定、没有请求本体」的快照
         # 造的是 `tenant_id` 缺省为 "default" 的占位项（registry.py 的 ② 分支），拿它当
-        # 锚点会把多租户宿主的图落错地方。都取不到才回落 `_tenant_for_session`。
+        # 锚点会把多租户宿主的图落错地方。一条都取不到（空快照不会走到这里）→ default。
         tenant_id = next(
             (r.tenant_id for r in (*snapshot.pending.values(), *snapshot.resolved.values())
              if r.tenant_id),
-            "",
+            self._DEFAULT_TENANT,
         )
         ctx: ProviderContext | None = None
         for key, decision in targets.values():
@@ -4525,7 +4449,7 @@ class CtxWeftRuntime:
                 if ctx is None:
                     ctx = ProviderContext(
                         session_id=session_id,
-                        tenant_id=await self._tenant_or_resolve(tenant_id, session_id))
+                        tenant_id=tenant_id)
                 hydrated = await hydrate_event_content(
                     message, event_blob_store=self.providers.get_event_blob_store(), ctx=ctx)
                 blob_store = self.providers.get_memory_blob_store()
@@ -4591,8 +4515,10 @@ class CtxWeftRuntime:
         total = 0
         for sid in session_ids:
             try:
-                tenant_id = await self._tenant_for_session(sid)
-                total += await self._load_agents_of(sid, tenant_id=tenant_id)
+                # 不传 tenant：这条路没有上游可问，由 `_load_agents_of` 从它自己折出的
+                # session 投影里照搬（每条 Event 都带 tenant_id）。
+                loaded, _ = await self._load_agents_of(sid)
+                total += loaded
             except Exception:
                 logger.exception("rebuild_all_agents: failed for session %s", sid)
         return total
