@@ -447,6 +447,20 @@ class HitlRegistry:
                         or r.invocation_key == invocation_key)]
         return max(matches, key=lambda r: r.created_at) if matches else None
 
+    def resolved_for_tool_call(self, session_id: str, tool_call_id: str) -> list[PendingHitl]:
+        """该 tool_call 的全部**已终局**请求，三个 stage 都算。空 tool_call_id → 空表。
+
+        `HitlService.close_for_tool_call` 的取数口——一次调用结束时那几条一起失效，所以这里
+        **不按 stage 过滤**，也**不带 `invocation_key`**：同 id 另一次调用的记录也该跟着了结，
+        它同样不会再被问（决定缓存按 `invocation_key` 认人，对不上就不会命中）。
+        """
+        if not tool_call_id:
+            return []
+        return [r for r in self._requests.values()
+                if r.tool_call_id == tool_call_id
+                and r.session_id == session_id
+                and r.resolved]
+
     def result_is_human_reply(self, session_id: str, tool_call_id: str) -> bool:
         """这次调用的结果**就是人的答复**：工具阶段有一个 `reply_as_result` 的请求（`ask_user`）。
 

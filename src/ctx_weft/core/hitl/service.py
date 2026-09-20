@@ -323,6 +323,55 @@ class HitlService:
             payload["modified_arguments"] = decision.modified_arguments
         await self._emit(EventType.HITL_RESOLVED, resolved, payload)
 
+    async def close(self, req: PendingHitl) -> bool:
+        """给一条**已终局**的请求盖「已了结」章：发 `HitlClosed`。返回有没有真盖上。
+
+        语义见 `EventType.HITL_CLOSED`：它说的是「这条决定已经被消费掉，再也不会被问」。
+        **调用点必须在持久效果落地之后**——答复已进对话、工具结果已进 memory。提前盖章会让
+        折叠不再把它列进补注入清单，而那份效果其实还没落，那句话就永久消失了。
+
+        只给已终局的盖：未决请求人还没答，盖章等于宣布一件没发生的事（会记 WARNING——
+        那说明调用点的顺序错了，是要查的，不是要忍的）。
+
+        **收请求对象而不是 id**：调用方手上本来就有它，而按 id 回查 registry 会凭空多一个
+        失败模式——`gc()` 会按 `_max_resolved` 逐出最旧的已终局项，被逐出的那条就永远盖不上
+        章、永远留在折叠的清单里。盖章不该依赖内存里还留着它。
+
+        **不抛**：这是一枚事后的章，它失败不该回滚已经成功的消费。发不出去的后果只是退回
+        本事件引入之前的行为（那条记录继续留在清单里、下次恢复幂等补一遍），不是数据损坏。
+        """
+        if not req.resolved:
+            logger.warning(
+                "HitlService.close(%s): 这条请求还没终局——盖章会宣布一件没发生的事，"
+                "调用点的顺序要查", req.id)
+            return False
+        try:
+            await self._emit(EventType.HITL_CLOSED, req, {"hitl_id": req.id})
+        except Exception:
+            logger.exception(
+                "HitlService.close(%s): HitlClosed 发射失败（消费已经成功，"
+                "下次恢复会幂等补一遍）", req.id)
+            return False
+        return True
+
+    async def close_for_tool_call(self, session_id: str, tool_call_id: str) -> int:
+        """把该 tool_call 的全部已终局请求一并了结，返回盖上几条。
+
+        **不分 stage**：一次工具调用最多牵三条请求（`authz` 事前审核、`tool` provider 自问、
+        `rerun` 准重跑），它们在这次调用结束时**同时**失效。逐个 stage 去盖要调用方记住
+        有哪几个 stage，那种知识迟早漏掉一个（漏掉的那条就永不销账）。
+
+        调用点在 gateway 的两个落库出口之后（结果已进 memory / 未授权的错误结果已进 memory）
+        ——见 `close` 的顺序纪律。
+        """
+        if not tool_call_id:
+            return 0
+        n = 0
+        for req in self.registry.resolved_for_tool_call(session_id, tool_call_id):
+            if await self.close(req):
+                n += 1
+        return n
+
     async def _emit(self, event_type: EventType, req: PendingHitl, payload: dict) -> None:
         await emit_event(
             self._bus,

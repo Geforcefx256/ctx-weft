@@ -880,7 +880,7 @@ HITL_FOLD_EVENT_TYPES: tuple[EventType, ...] = (
     EventType.HITL_OPENED,
     EventType.HITL_RESOLVED,
     EventType.HITL_REPLY_RETRACTED,
-    EventType.HITL_REPLY_INJECTED,
+    EventType.HITL_CLOSED,
     EventType.HITL_REQUIRED,
     *_HITL_RESOLVE_TYPES,
 )
@@ -996,6 +996,9 @@ def fold_hitl_snapshot(events: list[Event]) -> HitlSnapshot:
     """
     snap = HitlSnapshot()
     opened: dict[str, PendingHitl] = {}
+    #: `decisions_for` 的键 → 当前那条决定是谁的。`HitlClosed` 据此只销自己那一条
+    #: （同键会被重问副本覆盖，见那个分支的说明）。折叠本地账，不出这个函数。
+    _decision_owner: dict[tuple[str, str, str], str] = {}
     for ev in events:
         p = ev.payload or {}
         rid = p.get("hitl_id", "")
@@ -1070,18 +1073,28 @@ def fold_hitl_snapshot(events: list[Event]) -> HitlSnapshot:
                 if req.tool_call_id:
                     key = (req.session_id, req.tool_call_id, req.stage)
                     snap.decisions_for[key] = (decision, req.resume_state)
+                    _decision_owner[key] = rid
 
-        elif ev.type == EventType.HITL_REPLY_INJECTED:
-            # 那条答复已经落进对话 → 不再需要恢复期补注入，从 `resolved` 销账。
+        elif ev.type == EventType.HITL_CLOSED:
+            # 已了结 → 从**两份**账上销掉：补注入清单（`resolved`）与决定缓存
+            # （`decisions_for`）。这枚章的语义是「这条决定再也不会被问」，所以两份一起销
+            # ——前身设计里它只销前者、后者另靠 capability 事件推，那正是「两套机制」。
             #
-            # **不动 `decisions_for`**：那一半的消费信号是该 tool_call 的
-            # `CapabilityFinished`，不是「注入进对话」。在这里顺手 pop 会让一条仍需短路的
-            # 冷决定消失 → 同一个工具重新求批。
+            # **只销自己那一条**：`decisions_for` 的键是 `(session, tool_call, stage)` 三维，
+            # 同一个键会被「重问副本」的后一条决定覆盖（最后一条可用决定胜出）。不记主人就
+            # 直接 pop，一条**旧**请求的了结会把**新**请求的决定连带删掉 → 同一个工具重新
+            # 求批。`_decision_owner` 是这一步的本地账。
             #
-            # **不动 `opened`**：`HitlReplyRetracted` 还要能按 rid 把这条请求找回来（它的
-            # 分支 `req is None` 就 `continue`，找不回来气泡就回不到 pending）。`opened`
-            # 是折叠的本地工作集，不入快照，留着不花钱。
+            # **不动 `opened`**：`HitlReplyRetracted` 还要能按 rid 把请求找回来（它的分支
+            # `req is None` 就 `continue`，找不回来气泡就永远回不到 pending）。正常流程下
+            # 了结之后不会再撤回，但存量/外部流会，而 `opened` 是折叠的本地工作集、不入快照。
             snap.resolved.pop(rid, None)
+            req = opened.get(rid)
+            if req is not None and req.tool_call_id:
+                key = (req.session_id, req.tool_call_id, req.stage)
+                if _decision_owner.get(key) == rid:
+                    snap.decisions_for.pop(key, None)
+                    _decision_owner.pop(key, None)
 
         elif ev.type == EventType.HITL_REPLY_RETRACTED:
             # 一次已收下的答复被收回（spec 2026-09-09）：气泡回到未决，并记一笔
@@ -1110,6 +1123,7 @@ def fold_hitl_snapshot(events: list[Event]) -> HitlSnapshot:
             if req.tool_call_id:              # 决定缓存只对得上 tool_call 的请求有意义
                 key = (req.session_id, req.tool_call_id, req.stage)
                 snap.decisions_for[key] = (decision, req.resume_state)
+                _decision_owner[key] = rid
 
     return snap
 

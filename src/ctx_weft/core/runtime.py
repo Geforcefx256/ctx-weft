@@ -4060,28 +4060,10 @@ class CtxWeftRuntime:
             scope, pctx, content, event_id=reply_mem_id,
             task_id=target.id, source="hitl_reply", timestamp=timestamp,
         )
-        # 记一笔「这条答复已经落进对话」——**必须在 ingest 之后**。它把「已终局」与「已了结」
-        # 分开：`HitlResolved` 只说人答了，折叠据此留下的 `HitlSnapshot.resolved` 是**全部**
-        # 已终局请求，随对话轮数线性增长；有了这条，那个集合自己销账、变成有界的。
-        #
-        # 两个方向都安全：崩在 ingest 之前 → 没有本事件 → 下次补注入；崩在 ingest 之后、
-        # 本事件之前 → 同样没有本事件 → 下次重跑注入，而 ingest 按 `hitlreply:{hitl_id}`
-        # 幂等，不会写重。失败方向朝「多做一次幂等写」，不朝「少救一条答复」。
-        #
-        # 发失败**不抛**：注入已经成功了，回滚不了；抛出去会把一条本来救回来的答复变成
-        # 一次恢复失败。代价是退回本事件引入之前的行为（那条请求继续留在 `resolved` 里、
-        # 下次恢复再幂等补一遍），不是数据损坏。
-        try:
-            await emit_event(
-                self._event_bus, EventType.HITL_REPLY_INJECTED,
-                session_id=session.id, tenant_id=session.tenant_id,
-                origin=EventOrigin.RUNTIME, task_id=target.id, agent_id=agent_id or None,
-                payload={"hitl_id": req.id},
-            )
-        except Exception:
-            logger.exception(
-                "_write_hitl_reply_turn: HitlReplyInjected 发射失败 hitl_id=%s"
-                "（答复已注入，下次恢复会幂等补一遍）", req.id)
+        # 盖「已了结」章——**必须在 ingest 之后**，顺序纪律见 `EventType.HITL_CLOSED`。
+        # 这条请求的持久效果就是上面那次 ingest：答复已经落进对话，它再也不会被补注入。
+        # `close()` 自己不抛（一枚事后的章不该回滚已经成功的消费）。
+        await self.hitl.close(req)
 
     async def _emit_message_appended(
         self, session: "Session", task_id: str, agent_id: str, memory_id: str,

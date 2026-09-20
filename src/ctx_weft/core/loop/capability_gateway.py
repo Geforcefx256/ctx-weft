@@ -805,6 +805,11 @@ class CapabilityGateway:
                 tool_call_id=tool_call_id, content=content, is_error=True,
                 invocation_id=invocation_id, tool_name=tool_name,
                 task_manager=getattr(ctx, "task_manager", None))
+        # 未授权出口同样要盖章。这条路**一条 capability 事件都不发**（「没有 INVOKED 就是没
+        # 跑过」），所以从 capability 事件推退役的做法在这里是个真空：一条「人拒绝了」的决定
+        # 永远等不到销账。由消费方盖章就没有这个洞——拒绝也是一次消费。
+        if ctx.hitl is not None:
+            await ctx.hitl.close_for_tool_call(ctx.provider_ctx.session_id, tool_call_id)
         return self._error_result(invocation_id, tool_name, content)
 
     async def _record_invocation(
@@ -1007,6 +1012,15 @@ class CapabilityGateway:
                 tool_call_id=tool_call_id, content=content, is_error=is_error,
                 invocation_id=invocation_id, tool_name=tool_name,
                 task_manager=getattr(ctx, "task_manager", None))
+        # 这次调用牵到的 HITL 决定（事前审核 / provider 自问 / 准重跑）到此全部失效——结果已
+        # 经落进 memory，谁也不会再问它们。**盖在 ingest 之后**，顺序纪律见
+        # `EventType.HITL_CLOSED`：提前盖会让折叠不再补，而效果其实还没落。
+        #
+        # 派发 / SILENT 工具不入对话，但它们同样可能被门控过，所以盖章不跟着上面的
+        # `is_dispatch/is_silent` 分支——那两个分支管的是「写不写对话」，与「这条决定还
+        # 要不要留着」无关。
+        if ctx.hitl is not None:
+            await ctx.hitl.close_for_tool_call(ctx.provider_ctx.session_id, tool_call_id)
 
     def _find_provider(self, capability_id: str) -> ToolCapabilityProvider | None:
         prefix = capability_id.rsplit(":", 1)[0]

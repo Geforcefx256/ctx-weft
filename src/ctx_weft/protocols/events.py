@@ -193,23 +193,40 @@ class EventType(StrEnum):
     # 那个计数**必须从日志折出来**，不能是内存计数器：撤销之后重启，内存里什么都没有，
     # 键必然撞回去。这条事件的存在就是为了让它可还原。
     HITL_REPLY_RETRACTED = "HitlReplyRetracted"   # payload: {hitl_id}
-    # 那条答复**已经落进对话**（`hitlreply:{hitl_id}` 记忆记录写成了）。
+    # 这条请求**已了结**：它的决定已经被消费掉，再也不会被问。
     #
-    # **为什么需要它。** `HitlResolved` 只说「人答了」，不说「系统用掉了」。两者之间有个
-    # 真实的崩溃窗口：决定已落盘，进程却在「把答复注入进对话」之前死了——任务重排本身
-    # 不带这一步，不补，人说的那句话就静默消失。`HitlRegistry.resolved_for_session()` 的
-    # 补注入就是补它，而要知道「哪些还没补」，折叠就只能留下**全部**已终局请求：那个集合
-    # 随对话轮数线性增长（交互式会话里每条用户消息都是一次 UserTurn HITL）。这条事件把
-    # 「已终局」和「已了结」分开，于是那个集合变成自己会销账的有界集。
+    # **「已终局」不等于「已了结」。** `HitlResolved` 只说人答了；系统把那个答复/批准用掉
+    # 是**之后**的一步，而两者之间有个真实的崩溃窗口。留着那些已终局记录就是为了补它：
+    # UserTurn 要补「把答复注入进对话」（不补，人说的那句话静默消失），工具审核要补「这次
+    # 被门控的调用还没跑完」（不补，冷重入会把同一个工具重新求批一遍）。代价是折叠只能留下
+    # 该会话**全部**已终局请求——交互式会话里每条用户消息都是一次 UserTurn HITL、每次受管
+    # 工具调用又是一次审核，那个集合随会话线性增长，而 `rebuild_hitl` 每次冷应答重折一遍。
+    # 这条事件把两者分开，于是集合只剩「答了但还没用掉」的那几条：自己销账、有界。
     #
-    # **为什么发在 ingest 之后。** 两个方向都安全：崩在 ingest 之前 → 没有本事件 → 记录
-    # 留着，下次补注入；崩在 ingest 之后、本事件发出之前 → 同样没有本事件 → 记录留着 →
-    # 下次重跑注入，而 ingest 按 `hitlreply:{hitl_id}` 幂等，不会写重。发在 ingest 之前
-    # 就没有这个性质——那正是 `CapabilityFinished` 现在的处境。同一手法见
-    # `TaskRecapStarted/Done`（段 recap 的 memory 写没落完）与 `TaskMessageAppended`。
+    # **一条规则贯穿所有形态：谁消费了这条决定，谁在持久效果落地之后盖章。**
+    # 四个发射点（UserTurn 的答复注入、工具跑完、`ask_user` 出结果、未授权出口）都遵循它。
+    # 这不是风格，是那两个崩溃方向的正确性来源：
     #
-    # **不含正文**：那句话已经在对话里，事件日志侧那一份由 `TaskMessageAppended` 承担。
-    HITL_REPLY_INJECTED = "HitlReplyInjected"     # payload: {hitl_id}
+    #   崩在持久效果之前   → 没有本事件 → 记录留着 → 下次补 ✓
+    #   崩在持久效果之后、本事件之前 → 同样没有本事件 → 下次重做，而那些写入都按确定性 id
+    #                       幂等（`hitlreply:{hitl_id}` / `tool_result_record_id`），不会写重 ✓
+    #
+    # 失败方向恒朝「多留一条、多做一次幂等写」，不朝「少救一条答复」。
+    #
+    # **为什么不从 capability 事件推。** 那是这条事件的前身设计，两种形态各推一套：工具那半
+    # 从 `CapabilityFinished` + `truncated` + 「结果是不是人的答复」三个条件推。三处都不成立——
+    # ① `CapabilityInvoked` 不行：冷重入时 `facts.invoked` 已为真却**还会**再走一次授权
+    #    （gateway :507 的重跑分支之后就是 :524 的授权步），而决定缓存第四维
+    #    `invocation_key = tool_name + sha256(原始参数)` 跨重启逐字节相同、**会**命中；
+    # ② `truncated` 只影响事件载荷那份拷贝，memory 里是完整的——按事件推才需要关心它；
+    # ③ `ask_user` 的 `CapabilityFinished` 与 `HitlResolved` 同一轮提交里先后落盘，崩在中间
+    #    就是「日志里有结果、问题还悬着」，所以 reconcile 刻意不信那个通道。
+    # 而且未授权出口（`_error_and_record`）根本不发任何 capability 事件，那条拒绝的决定永远
+    # 等不到销账。统一由消费方盖章之后，①②③ 与那个真空一起消失，也不必再维护「退役条件必须
+    # 和 gateway 的重放短路同源」这种没人会记得的不变式。
+    #
+    # **不含正文**：该落的都落了，本事件只是一枚章。
+    HITL_CLOSED = "HitlClosed"                    # payload: {hitl_id}
     HITL_OPENED = "HitlOpened"
     HITL_RESOLVED = "HitlResolved"
     # ── Guard 域 ──

@@ -1,13 +1,13 @@
-"""`HitlReplyInjected`：把「人答了」与「系统用掉了」分开。
+"""`HitlClosed`：把「人答了」与「系统用掉了」分开。
 
 `HitlResolved` 只说人答了。决定落盘之后、答复注入进对话之前，进程可能死掉——任务重排本身
 不带注入这一步，不补，人说的那句话就静默消失。补注入的清单是 `HitlSnapshot.resolved`，而它
 从前留的是该会话**全部**已终局请求：交互式会话里每条用户消息都是一次 UserTurn HITL，那个
 清单随对话轮数线性增长。这条事件让它自己销账。
 
-**发射时机是承重的**：必须在 memory ingest **之后**。见 `EventType.HITL_REPLY_INJECTED`
-的注释里那两个方向的论证。本文件钉的就是那个时机、以及它失败时不许把一条已经救回来的答复
-变成一次恢复失败。
+**一条规则贯穿所有形态：谁消费了这条决定，谁在持久效果落地之后盖章。** 本文件钉 UserTurn
+那个发射点的时机，以及 `HitlService.close` 的顺序纪律；gateway 那两个出口在
+`tests/unit/test_hitl_closed_by_gateway.py`。
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ def _req(hitl_id="hit_u", message="我的答复"):
     req = PendingHitl(
         id=hitl_id, form=HITL_FORM_WAIT, session_id="s1", task_id="t1", agent_id="ag_root",
         delivery=UserTurnDelivery(task_id="t1", preface=PREFACE_NORMAL), created_at=_T0,
+        tenant_id="acme",
     )
     req.decision = HitlDecision(outcome="accepted", message=message)
     req.resolved_at = _T0
@@ -67,7 +68,7 @@ async def _harness(monkeypatch):
     orig_emit = rt._event_bus.emit
 
     async def _traced_emit(ev):
-        if ev.type == EventType.HITL_REPLY_INJECTED:
+        if ev.type == EventType.HITL_CLOSED:
             trace.append("emit")
             emitted.append(ev)
         return await orig_emit(ev)
@@ -81,7 +82,7 @@ async def _harness(monkeypatch):
 
 
 async def test_emitted_after_the_ingest_not_before(monkeypatch):
-    """顺序就是正确性：先 ingest 再发事件。
+    """顺序就是正确性：先 ingest 再盖章。
 
     反过来的话，崩在两者之间就留下「日志说已注入、对话里却没有」——而这条事件的全部作用
     正是让折叠据此**不再**补注入，于是那句话永久消失。`CapabilityFinished` 现在就是发在
@@ -95,6 +96,8 @@ async def test_emitted_after_the_ingest_not_before(monkeypatch):
     assert len(emitted) == 1
     ev = emitted[0]
     assert ev.payload == {"hitl_id": "hit_u"}, "只带 hitl_id——正文已经在对话里"
+    # tenant 取自**请求**，与 HitlOpened / HitlResolved / HitlReplyRetracted 同口径
+    # （`HitlService._emit` 统一用 `req.tenant_id`）——不是从 session 另取一份。
     assert (ev.session_id, ev.task_id, ev.tenant_id) == ("s1", "t1", "acme")
 
 
@@ -123,7 +126,7 @@ async def test_emit_failure_does_not_undo_a_successful_injection(monkeypatch):
     rt, session, task, trace, _ = await _harness(monkeypatch)
 
     async def _emit_boom(ev):
-        if ev.type == EventType.HITL_REPLY_INJECTED:
+        if ev.type == EventType.HITL_CLOSED:
             raise RuntimeError("bus down")
 
     monkeypatch.setattr(rt._event_bus, "emit", _emit_boom)
@@ -171,5 +174,5 @@ async def test_registry_no_longer_lists_it_for_re_injection(monkeypatch):
 
     reg2 = HitlRegistry()
     reg2.load_snapshot(fold_hitl_snapshot(
-        [*base, _ev(EventType.HITL_REPLY_INJECTED, {"hitl_id": "hit_u"}, 2)]))
+        [*base, _ev(EventType.HITL_CLOSED, {"hitl_id": "hit_u"}, 2)]))
     assert reg2.resolved_for_session("s1") == [], "注入过了就不该再出现在补注入清单里"

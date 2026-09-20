@@ -292,11 +292,11 @@ def test_malformed_hitl_resolved_with_empty_outcome_leaves_request_pending():
     assert _key("call_9", HITL_STAGE_TOOL) not in snap.decisions_for
 
 
-# ── HitlReplyInjected：把「已终局」与「已了结」分开 ─────────────────────────────
+# ── HitlClosed：把「已终局」与「已了结」分开 ───────────────────────────────────
 
 
-def _injected(hitl_id="hit_u", seq=2) -> Event:
-    return _ev(EventType.HITL_REPLY_INJECTED, {"hitl_id": hitl_id}, seq=seq)
+def _closed(hitl_id="hit_u", seq=2) -> Event:
+    return _ev(EventType.HITL_CLOSED, {"hitl_id": hitl_id}, seq=seq)
 
 
 def _user_turn_pair(hitl_id="hit_u", message="我的答复"):
@@ -316,50 +316,52 @@ def _user_turn_pair(hitl_id="hit_u", message="我的答复"):
     ]
 
 
-def test_resolved_user_turn_stays_in_resolved_until_it_is_injected():
-    """没有 injected 事件 → 留在 `resolved`，等恢复期补注入。这是旧行为，不能变。"""
+def test_resolved_user_turn_stays_in_resolved_until_it_is_closed():
+    """没有 `HitlClosed` → 留在 `resolved`，等恢复期补注入。这是旧行为，不能变。"""
     snap = fold_hitl_snapshot(_user_turn_pair())
     assert "hit_u" in snap.resolved
     assert "hit_u" not in snap.pending
 
 
-def test_injected_retires_it_from_resolved():
-    """有了 injected → 从 `resolved` 销账。
+def test_closed_retires_it_from_resolved():
+    """有了 `HitlClosed` → 从 `resolved` 销账。
 
     这是这条事件存在的全部理由：`resolved` 是恢复期补注入的清单，而它从前留的是**全部**
     已终局请求——交互式会话里每条用户消息都是一次 UserTurn HITL，所以那个清单随对话轮数
     线性增长。销账之后它只剩「答了但还没落进对话」的那几条。
     """
-    snap = fold_hitl_snapshot([*_user_turn_pair(), _injected()])
+    snap = fold_hitl_snapshot([*_user_turn_pair(), _closed()])
     assert "hit_u" not in snap.resolved
     assert "hit_u" not in snap.pending, "销账不等于回到未决——人已经答过了"
 
 
-def test_injected_does_not_touch_the_decision_cache():
-    """**不动 `decisions_for`**：那一半的消费信号是 `CapabilityFinished`，不是「进对话」。
+def test_closed_also_retires_the_decision_cache():
+    """两份账一起销：补注入清单（`resolved`）**和**决定缓存（`decisions_for`）。
 
-    在这里顺手 pop，会让一条仍需短路的冷决定消失 → 同一个工具重新求批一遍。
+    这枚章的语义是「这条决定再也不会被问」，所以两份一起销。前身设计里它只销前者、后者另靠
+    capability 事件推——那正是「两套机制」，而且工具那半推不对（见 `EventType.HITL_CLOSED`
+    里列的三处）。
     """
     snap = fold_hitl_snapshot([
         _opened(),                                        # 带 tool_call_id="call_9"
         _ev(EventType.HITL_RESOLVED, {
             "hitl_id": "hit_9", "outcome": "accepted", "claimed": False,
             "message": "go"}, seq=1),
-        _injected(hitl_id="hit_9", seq=2),
+        _closed(hitl_id="hit_9", seq=2),
     ])
     assert "hit_9" not in snap.resolved
-    assert _key("call_9", HITL_STAGE_TOOL) in snap.decisions_for
+    assert _key("call_9", HITL_STAGE_TOOL) not in snap.decisions_for
 
 
-def test_retract_after_injected_still_puts_the_bubble_back_to_pending():
-    """injected **不得**把请求从折叠的 `opened` 工作集里摘掉。
+def test_retract_after_closed_still_puts_the_bubble_back_to_pending():
+    """`HitlClosed` **不得**把请求从折叠的 `opened` 工作集里摘掉。
 
     摘了，`HitlReplyRetracted` 的 `req is None` 分支就 `continue`，气泡永远回不到未决——
     撤销之后那条请求既不在 pending、也没有决定，凭空消失。
     """
     snap = fold_hitl_snapshot([
         *_user_turn_pair(),
-        _injected(),
+        _closed(),
         _ev(EventType.HITL_REPLY_RETRACTED, {"hitl_id": "hit_u"}, seq=3),
     ])
     assert "hit_u" in snap.pending
@@ -367,14 +369,41 @@ def test_retract_after_injected_still_puts_the_bubble_back_to_pending():
     assert snap.pending["hit_u"].reply_attempt == 1, "撤销次数仍要数出来（memory 幂等键第二维）"
 
 
-def test_injected_for_an_unknown_hitl_id_is_a_no_op():
-    """存量/外部流里孤立的一条 injected：不炸、不凭空造记录。"""
-    snap = fold_hitl_snapshot([_injected(hitl_id="hit_never_seen")])
+def test_closed_for_an_unknown_hitl_id_is_a_no_op():
+    """存量/外部流里孤立的一条 `HitlClosed`：不炸、不凭空造记录。"""
+    snap = fold_hitl_snapshot([_closed(hitl_id="hit_never_seen")])
     assert snap.pending == {} and snap.resolved == {}
 
 
-def test_injected_is_in_the_fold_type_set():
+def test_closed_is_in_the_fold_type_set():
     """折叠读的类型集必须含它——漏了就等于这条事件不存在，清单继续线性增长。"""
     from ctx_weft.core.control.reducers import HITL_FOLD_EVENT_TYPES
 
-    assert EventType.HITL_REPLY_INJECTED in HITL_FOLD_EVENT_TYPES
+    assert EventType.HITL_CLOSED in HITL_FOLD_EVENT_TYPES
+
+
+def test_closed_only_retires_its_own_decision_not_a_resupplied_one():
+    """同键被「重问副本」覆盖之后，**旧**请求的了结不得把**新**请求的决定连带删掉。
+
+    `decisions_for` 的键是 `(session, tool_call, stage)` 三维，同一次调用重问一遍就会复用
+    这个键（最后一条可用决定胜出）。不记主人就直接 pop，冷重入会因为查不到决定而把同一个
+    工具重新求批一遍——而人明明刚答过。
+    """
+    snap = fold_hitl_snapshot([
+        _opened(hitl_id="hit_old"),
+        _ev(EventType.HITL_RESOLVED, {
+            "hitl_id": "hit_old", "outcome": "accepted", "claimed": False,
+            "message": "旧"}, seq=1),
+        _opened(hitl_id="hit_new", seq=2),                    # 同 tool_call / 同 stage
+        _ev(EventType.HITL_RESOLVED, {
+            "hitl_id": "hit_new", "outcome": "accepted", "claimed": False,
+            "message": "新"}, seq=3),
+        _closed(hitl_id="hit_old", seq=4),                    # 了结的是**旧**那条
+    ])
+
+    key = _key("call_9", HITL_STAGE_TOOL)
+    assert key in snap.decisions_for, "旧请求的了结不该带走新请求的决定"
+    decision, _ = snap.decisions_for[key]
+    assert decision.message == "新"
+    assert "hit_old" not in snap.resolved
+    assert "hit_new" in snap.resolved, "新那条还没了结"
