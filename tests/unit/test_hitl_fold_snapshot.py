@@ -353,20 +353,60 @@ def test_closed_also_retires_the_decision_cache():
     assert _key("call_9", HITL_STAGE_TOOL) not in snap.decisions_for
 
 
-def test_retract_after_closed_still_puts_the_bubble_back_to_pending():
-    """`HitlClosed` **不得**把请求从折叠的 `opened` 工作集里摘掉。
+def test_retract_after_closed_is_a_no_op():
+    """了结之后再撤回 → no-op，气泡**不**回 pending。
 
-    摘了，`HitlReplyRetracted` 的 `req is None` 分支就 `continue`，气泡永远回不到未决——
-    撤销之后那条请求既不在 pending、也没有决定，凭空消失。
+    这条同时钉住 `opened` 的退役：`HitlClosed` 会把请求从折叠的工作集里摘掉，而「回不到
+    pending」正是那一步唯一可观察的后果。不摘它，把这个折叠搬进投影的那一步就还是无界的
+    ——`opened` 保留每一条开过的请求、不看结局。
+
+    摘得掉，是因为活路径上撤回与了结互斥：撤回在这一轮提交**之前**，了结在持久效果落地
+    **之后**。而且这比从前留着它更安全——一条被撤回复活的已了结请求没有任何人在等，却会经
+    `parked_task_ids` 永久挡住那个 task 的重排。
     """
     snap = fold_hitl_snapshot([
         *_user_turn_pair(),
         _closed(),
         _ev(EventType.HITL_REPLY_RETRACTED, {"hitl_id": "hit_u"}, seq=3),
     ])
-    assert "hit_u" in snap.pending
+    assert "hit_u" not in snap.pending, "已了结的请求不该被撤回复活"
     assert "hit_u" not in snap.resolved
-    assert snap.pending["hit_u"].reply_attempt == 1, "撤销次数仍要数出来（memory 幂等键第二维）"
+
+
+def test_retract_before_closed_still_puts_the_bubble_back():
+    """没了结就撤回 → 照旧回到 pending，并数出撤过几次。
+
+    这是撤回机制本来的语义，上一条不能把它一起改掉：`reply_attempt` 是 memory 幂等键的
+    第二维（`reply_memory_id`），撤销后重答只有这个数能让它不撞上上一次的 superseded 记录。
+    """
+    snap = fold_hitl_snapshot([
+        *_user_turn_pair(),
+        _ev(EventType.HITL_REPLY_RETRACTED, {"hitl_id": "hit_u"}, seq=2),
+    ])
+    assert "hit_u" in snap.pending
+    assert snap.pending["hit_u"].reply_attempt == 1
+
+
+def test_cancelled_is_closed_without_a_stamp():
+    """取消即了结：不进 `resolved`，也不再占着 `opened`——不必等一枚 `HitlClosed`。
+
+    cancelled 压根不是决定（`fold_cold_hitl_decision` 同一口径），没有后续消费可言。会话
+    关闭 / 熔断 / 逐出都会批量取消，不摘它就是一条按「被取消过多少次」增长的账。
+
+    同上，可观察后果是撤回变 no-op。这条口径天然覆盖 `defer=True` 的延迟收口——它最终也
+    走到同一条 `HitlResolved`，另发一枚章反而容易漏掉那条分支。
+    """
+    events = [
+        _opened(hitl_id="hit_c"),
+        _ev(EventType.HITL_RESOLVED, {
+            "hitl_id": "hit_c", "outcome": "cancelled", "claimed": False}, seq=1),
+    ]
+    snap = fold_hitl_snapshot(events)
+    assert snap.pending == {} and snap.resolved == {}
+
+    after_retract = fold_hitl_snapshot(
+        [*events, _ev(EventType.HITL_REPLY_RETRACTED, {"hitl_id": "hit_c"}, seq=2)])
+    assert after_retract.pending == {}, "取消之后已经了结，撤回不该把它复活"
 
 
 def test_closed_for_an_unknown_hitl_id_is_a_no_op():

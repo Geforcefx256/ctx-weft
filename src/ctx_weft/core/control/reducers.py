@@ -1066,7 +1066,20 @@ def fold_hitl_snapshot(events: list[Event]) -> HitlSnapshot:
                 outcome=outcome, message=content_from_jsonable(p.get("message") or ""),
                 modified_arguments=p.get("modified_arguments"),
             )
-            if outcome != HITL_OUTCOME_CANCELLED:
+            if outcome == HITL_OUTCOME_CANCELLED:
+                # **取消即了结**，不必等一枚 `HitlClosed`：cancelled 压根不是决定
+                # （`fold_cold_hitl_decision` 同一口径），没有后续消费可言——取消本身就是
+                # 终点。所以这条既不进 `resolved`/`decisions_for`（下面那个分支管），也不该
+                # 继续占着 `opened`：会话关闭 / 熔断 / 逐出都会批量取消，不摘就是一条按
+                # 「被取消过多少次」增长的账。
+                #
+                # 这不是「第二套机制」：它不跨引另一份折叠、不看别的条件，就是本事件自己
+                # 载荷里的 `outcome`。而且它天然覆盖 `defer=True` 那条路——延迟收口最终
+                # 也走到这条 `HitlResolved`，另发一枚章反而容易漏掉那条分支。
+                #
+                # 代价同上：取消之后再撤回变成 no-op，方向同样是安全的那边。
+                opened.pop(rid, None)
+            else:
                 # `resolved` **不看 tool_call_id**：`UserTurn` 的 park 本就没有 tool_call，
                 # 按它过滤会把整整一类已终局请求丢掉（复审 Finding 2）。
                 snap.resolved[rid] = _as_resolved(req, decision, ev.timestamp)
@@ -1085,16 +1098,24 @@ def fold_hitl_snapshot(events: list[Event]) -> HitlSnapshot:
             # 直接 pop，一条**旧**请求的了结会把**新**请求的决定连带删掉 → 同一个工具重新
             # 求批。`_decision_owner` 是这一步的本地账。
             #
-            # **不动 `opened`**：`HitlReplyRetracted` 还要能按 rid 把请求找回来（它的分支
-            # `req is None` 就 `continue`，找不回来气泡就永远回不到 pending）。正常流程下
-            # 了结之后不会再撤回，但存量/外部流会，而 `opened` 是折叠的本地工作集、不入快照。
             snap.resolved.pop(rid, None)
-            req = opened.get(rid)
+            req = opened.pop(rid, None)
             if req is not None and req.tool_call_id:
                 key = (req.session_id, req.tool_call_id, req.stage)
                 if _decision_owner.get(key) == rid:
                     snap.decisions_for.pop(key, None)
                     _decision_owner.pop(key, None)
+            # **连 `opened` 一起摘**。这是「有界」的最后一环：`opened` 保留每一条开过的
+            # 请求、不看结局，所以不摘它，把这个折叠搬进投影的那一步就还是无界的（今天它
+            # 只是本地变量，代价藏在 O(n) 的瞬时分配里）。
+            #
+            # 摘得掉，是因为了结之后没有任何事件还会合法引用它：`HitlResolved` 早过去了，
+            # 而撤回（`HitlReplyRetracted`）与了结在活路径上互斥——撤回发生在这一轮提交
+            # **之前**，了结发生在持久效果落地**之后**。
+            #
+            # 于是「了结之后再撤回」变成 no-op（气泡不回 pending）。这比从前留着它更安全：
+            # 一条被撤回复活的已了结请求没有任何人在等，而它会经 `parked_task_ids` 永久挡住
+            # 那个 task 的重排。失败方向朝「少一条没人等的未决」，不朝「多一条永挡」。
 
         elif ev.type == EventType.HITL_REPLY_RETRACTED:
             # 一次已收下的答复被收回（spec 2026-09-09）：气泡回到未决，并记一笔
@@ -1117,8 +1138,12 @@ def fold_hitl_snapshot(events: list[Event]) -> HitlSnapshot:
             snap.pending.pop(rid, None)
             req = opened.get(rid)
             decision = _legacy_decision(ev.type, p)
+            if ev.type == EventType.HITL_CANCELLED:
+                opened.pop(rid, None)         # 取消即了结，与新模型同口径（见上）
+                continue
             if req is None or decision is None:
-                continue                      # HITL_CANCELLED / 不可用决定：按未决重问
+                continue                      # 不可用决定：按未决重问（那会开一条新请求，
+                                              # 所以这条留在 opened 里也不会再长）
             snap.resolved[rid] = _as_resolved(req, decision, ev.timestamp, legacy=True)
             if req.tool_call_id:              # 决定缓存只对得上 tool_call 的请求有意义
                 key = (req.session_id, req.tool_call_id, req.stage)
