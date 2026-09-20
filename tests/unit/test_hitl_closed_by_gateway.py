@@ -266,3 +266,113 @@ def test_close_resolved_is_not_wired_into_the_shared_cancel_helper():
     src = inspect.getsource(CtxWeftRuntime._cancel_pending_hitl_of)
     assert "close_resolved" not in src, (
         "这个 helper 被活路径共用，盖章会把还要用的决定销掉")
+
+
+# ── 两阶段：章只能在提交点落下 ─────────────────────────────────────────────────
+#
+# 这一段是为一个真实缺陷补的。它一度被「替身比真实对象更终局」掩盖：早先的用例直接给
+# `req.decision` 赋值造出一个已终局的请求，于是盖章顺利——而活路径上冷应答先落成
+# `pending_decision`（`claim`），`req.resolved` 为 False，章根本没盖上。
+
+
+def _two_phase_service():
+    """registry + service，里面一条 UserTurn 请求，**用真实的 claim 走两阶段**。"""
+    from ctx_weft.core.hitl.service import HitlService
+    from ctx_weft.protocols.hitl import UserTurnDelivery
+
+    reg = HitlRegistry()
+    req = PendingHitl(
+        id="hit_u", form="wait", session_id=_SID, task_id="t1", agent_id="ag1",
+        delivery=UserTurnDelivery(task_id="t1", preface="normal"),
+        created_at=_T0, tenant_id="acme", stage=HITL_STAGE_TOOL)
+    reg._requests[req.id] = req
+    bus = _Bus()
+    svc = HitlService(registry=reg, event_bus=bus, reply_intake=None)
+    reg.claim(req.id, HitlDecision(outcome="accepted", message="我的答复"), "我的答复")
+    return svc, bus, req
+
+
+async def test_claim_pending_is_never_stamped(caplog):
+    """待终局的请求**不许**盖章，而且这不是调用点错误、不该报 WARNING。
+
+    不许盖，是因为这一轮还能被撤销（`release`），而且它的 memory 写入此刻只在暂存区。
+    不报 WARNING，是因为这正是两阶段的常态——把常态写成告警等于让告警失去意义。
+    """
+    import logging
+
+    svc, bus, req = _two_phase_service()
+    assert req.claim_pending and not req.resolved, "前提：处在待终局"
+
+    with caplog.at_level(logging.WARNING):
+        ok = await svc.close(req)
+
+    assert ok is False
+    assert _closed_ids(bus) == set(), "待终局就盖章 = 宣布一件还能被撤销的事"
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+async def test_commit_point_is_what_stamps_it():
+    """章由提交点补，而且必须排在 `HitlResolved` **之后**。
+
+    顺序是承重的：折叠遇到 `HitlClosed` 会摘掉 `opened`，若它排在前面，紧随其后的
+    `HitlResolved` 就找不到请求（那个分支 `req is None` 直接 `continue`）——整条终局丢掉。
+    """
+    svc, bus, req = _two_phase_service()
+
+    done = await svc.commit(req.id)                  # 第一阶段 → 第二阶段
+    assert done is not None and done.resolved
+    assert await svc.close(done) is True
+
+    kinds = [e.type for e in bus.events
+             if e.type in (EventType.HITL_RESOLVED, EventType.HITL_CLOSED)]
+    assert kinds == [EventType.HITL_RESOLVED, EventType.HITL_CLOSED], kinds
+
+
+async def test_release_before_commit_leaves_no_stamp():
+    """这一轮被撤销 → 只发 `HitlReplyRetracted`，绝不发章。
+
+    章发了就等于宣布「用掉了」，而那条答复恰恰是被收回的；配合折叠摘 `opened`，气泡再也
+    回不到 pending。
+    """
+    svc, bus, req = _two_phase_service()
+
+    released = await svc.release(req.id)
+
+    assert released is not None
+    assert _closed_ids(bus) == set()
+    assert any(e.type == EventType.HITL_REPLY_RETRACTED for e in bus.events)
+
+
+def test_commit_round_hook_stamps_after_both_steps():
+    """`Runtime._commit_round_writes` 的三步顺序：终局 → 落盘暂存 → 盖章。
+
+    源码顺序检查。前两步的相对顺序是既有纪律（先有终局事实，答复才进 memory）；第三步
+    必须在两者之后，那是「决定已终局」与「效果已持久」同时成立的唯一位置。
+    """
+    import inspect
+
+    from ctx_weft.core.runtime import CtxWeftRuntime
+
+    src = inspect.getsource(CtxWeftRuntime._commit_round_writes)
+    i_commit = src.index("await self.hitl.commit(")
+    i_ingest = src.index("await memory.ingest(")
+    i_close = src.index("await self.hitl.close(")
+    assert i_commit < i_ingest < i_close, (
+        f"三步顺序错了：commit={i_commit} ingest={i_ingest} close={i_close}")
+
+
+def test_reply_turn_writer_does_not_stamp_by_itself():
+    """写对话那一步**不自己盖章**——它不知道自己这次写是暂存还是直落。
+
+    `_ingest_user_turn` 走 `ingest_or_stage`：task 开着未提交窗口就进暂存区。所以「效果已
+    持久」只有调用方知道，章归调用方。恢复期补注入那条路上请求本就已终局、也没有开窗，
+    所以它那次 `close()` 照旧盖得上。
+    """
+    import inspect
+
+    from ctx_weft.core.runtime import CtxWeftRuntime
+
+    src = inspect.getsource(CtxWeftRuntime._write_hitl_reply_turn)
+    assert "ingest_or_stage" not in src   # 形态：它自己不判暂存
+    assert src.count("self.hitl.close(") <= 1, (
+        "这里最多只该有那一次（对已终局请求的补注入路径）")

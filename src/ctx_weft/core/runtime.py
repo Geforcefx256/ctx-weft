@@ -1197,6 +1197,8 @@ class CtxWeftRuntime:
         1. 该 task 上待终局的 HITL 答复逐条终局（发 `HitlResolved`）。判据与 `_revert_round`
            同一份（按 task 全量查）。
         2. 这一轮暂存的 memory 写入按写入顺序落盘（`TaskManager.stage_memory`）。
+        3. 给刚终局的那些答复盖 `HitlClosed`——见那一步的注释：这是「决定已终局」与「效果
+           已持久」同时成立的唯一位置。
 
         **顺序就是这个钩子的全部要点**：终局事实先落盘，答复才进 memory。反过来，崩在
         两步之间就会出现「memory 里有答复、日志里问题还悬着」——人再答一次，模型却
@@ -1209,10 +1211,34 @@ class CtxWeftRuntime:
         保留快照，下一个提交点重试——两步都幂等（已终局的 HITL 再 commit 是 no-op，暂存
         记录带 id、重复 ingest 是 no-op）。
         """
+        committed: list[PendingHitl] = []
         for req in self.hitl_registry.claim_pending_for_task(session_id, task_id):
-            await self.hitl.commit(req.id)
+            done = await self.hitl.commit(req.id)
+            if done is not None:
+                committed.append(done)
         for memory, event, pctx in staged:
             await memory.ingest(event, pctx)
+        # 3. 给这一轮终局掉的答复盖「已了结」章（`HitlClosed`）。
+        #
+        # **这里是那枚章唯一正确的位置**，因为两个条件到这一行才同时成立：决定已终局
+        # （第 1 步刚发 `HitlResolved`）、效果已持久（第 2 步刚把暂存的写入落盘）。放在
+        # 更早的任何地方都不行：
+        #
+        # - 放在写对话那一步（`_write_hitl_reply_turn`）—— 那时请求还是待终局，而且写入
+        #   还在暂存区；`close()` 因此会安静跳过，章落不下来（那正是它的用意）。
+        # - 放在窗口里任何位置 —— 事件会进这一轮的缓冲，而缓冲在**钩子之前**就补投完了
+        #   （`TaskManager.commit_round` 先 `commit_provisional` 再调本钩子），于是这枚章
+        #   会排在 `HitlResolved` **之前**。折叠会先摘掉 `opened`、再撞上 `HitlResolved`
+        #   找不到请求 → 那条终局整个丢掉。
+        #
+        # 这一轮被丢弃时走的是 `_revert_round`：答复 `release` 回 pending，本方法压根不跑,
+        # 章自然也不会发——正是要的那个形状。
+        #
+        # 盖章失败不上抛（`close()` 自己不抛）：前两步才是这个钩子的承重步骤，一枚事后的
+        # 章不该把一次已经落定的提交变成失败。漏掉的后果只是那条记录多留一轮，下次恢复
+        # 幂等补一遍。
+        for done in committed:
+            await self.hitl.close(done)
 
     async def _revert_round(self, session_id: str, task_id: str) -> None:
         """撤销一轮里**不属于 TaskManager** 的那两样（`revert_round` 钩子，spec 2026-09-09）。

@@ -330,8 +330,15 @@ class HitlService:
         **调用点必须在持久效果落地之后**——答复已进对话、工具结果已进 memory。提前盖章会让
         折叠不再把它列进补注入清单，而那份效果其实还没落，那句话就永久消失了。
 
-        只给已终局的盖：未决请求人还没答，盖章等于宣布一件没发生的事（会记 WARNING——
-        那说明调用点的顺序错了，是要查的，不是要忍的）。
+        只给**已终局**的盖。未决 / 待终局一律安静跳过：
+
+        - 未决：人还没答，没有决定可谈。
+        - **待终局**（两阶段的常态）：答复收下了但这一轮还能被撤销（`release`），而且它的
+          memory 写入此刻还在暂存区（`ingest_or_stage`）。这种请求的章由提交点补
+          （`Runtime._commit_round_writes` 的尾巴）——那里 `HitlResolved` 刚发完、暂存的写入刚落盘，
+          是两个条件同时成立的唯一位置。**这道跳过因此是承重的**：在它之前盖章，事件会进
+          这一轮的缓冲、补投时排在 `HitlResolved` **之前**，折叠会先摘掉 `opened` 再撞上
+          `HitlResolved` 找不到请求，那条终局就整个丢了。
 
         **收请求对象而不是 id**：调用方手上本来就有它，而按 id 回查 registry 会凭空多一个
         失败模式——`gc()` 会按 `_max_resolved` 逐出最旧的已终局项，被逐出的那条就永远盖不上
@@ -343,9 +350,13 @@ class HitlService:
         if req.closed:
             return False                     # 已经盖过——取消 + 销毁这类相继路径不重复发
         if not req.resolved:
-            logger.warning(
-                "HitlService.close(%s): 这条请求还没终局——盖章会宣布一件没发生的事，"
-                "调用点的顺序要查", req.id)
+            # **待终局不是错误，是两阶段的常态。** 冷应答先落成 `pending_decision`，而把它
+            # 注入对话、被 gateway 重放的那些代码都跑在提交点**之前**（见
+            # `PendingHitl.effective_decision`）。此刻盖章会宣布一件还能被撤销的事，所以
+            # 这里安静跳过——那一枚章由提交点补（`Runtime._commit_round_writes` 的尾巴），它是
+            # 「决定已终局」与「效果已持久」同时成立的唯一位置。
+            logger.debug(
+                "HitlService.close(%s): 待终局，章交给提交点补", req.id)
             return False
         try:
             await self._emit(EventType.HITL_CLOSED, req, {"hitl_id": req.id})
