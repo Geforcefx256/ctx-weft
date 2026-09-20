@@ -19,7 +19,7 @@
 一次工具调用的执行记录**就是它在事件流里留下的痕迹**：`CapabilityInvoked` 在 provider
 之前、经提交门确认才返回，`CapabilityFinished` 带的正是进对话的那份结果。核心不为此
 另设存储，protocols 也不为此暴露存储协议——折法住在 `core/control/reducers.py`，与
-`fold_hitl_snapshot` / `fold_pending_task_recap` 并列。
+`fold_hitl_snapshot` 并列。
 
 曾经这里有一整套 `OperationStore` / `OperationRecord` / CAS revision（更早还是独立的
 `protocols/operations.py`）。它的核心承诺「调 provider 之前先把『我要动手了』持久确认

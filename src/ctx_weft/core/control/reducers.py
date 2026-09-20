@@ -93,33 +93,6 @@ _AGENT_STATUS_BY_EVENT: dict[str, str] = {
 }
 
 
-#: `fold_pending_task_recap` 需要的事件类型全集。供调用方按类型收窄读取——那个折叠只关心
-#: 这两种，不该为它全量回放整条事件流（实测一条 3 万事件的会话读一次 ≈ 3.5s / 130MB）。
-TASK_RECAP_EVENT_TYPES: tuple[EventType, ...] = (
-    EventType.TASK_RECAP_STARTED,
-    EventType.TASK_RECAP_DONE,
-)
-
-
-def fold_pending_task_recap(events: list[Event]) -> dict[str, dict]:
-    """折叠 TaskRecap 事件 → 仍未完成的 {task_id: {"boundary", "agent_id"}}（started 减去 done）。
-
-    某 task 有 TASK_RECAP_STARTED 而无其后的 TASK_RECAP_DONE，说明该段 background observe 的
-    memory 写未持久完成（崩溃在中途）——恢复据此重跑。同 task_id last-write-wins。
-    """
-    pending: dict[str, dict] = {}
-    for ev in events:
-        p = ev.payload or {}
-        tid = p.get("task_id", "")
-        if not tid:
-            continue
-        if ev.type == EventType.TASK_RECAP_STARTED:
-            pending[tid] = {"boundary": p.get("boundary", ""), "agent_id": p.get("agent_id", "")}
-        elif ev.type == EventType.TASK_RECAP_DONE:
-            pending.pop(tid, None)
-    return pending
-
-
 def apply_events(events: list[Event], view: RunStateView) -> RunStateView:
     """在已有 RunStateView 上增量应用事件列表（快照恢复后的 delta replay）。"""
     for ev in events:
@@ -214,6 +187,11 @@ def serialize_view(view: RunStateView) -> dict[str, Any]:
         "transcript_turns": view.transcript_turns,
         "events_total": view.events_total,
         "tasks_total": view.tasks_total,
+        # 不裁：它由自己的 DONE 销账，不随会话长度增长（见字段 docstring）。
+        "pending_recap": {
+            tid: {"boundary": info.get("boundary", ""), "agent_id": info.get("agent_id", "")}
+            for tid, info in view.pending_recap.items()
+        },
         "sessions": {
             sid: {
                 "id": s.id,
@@ -377,6 +355,13 @@ def deserialize_view(data: dict[str, Any]) -> RunStateView:
         # `not all_tasks` 那一半仍然对；且 v1 blob 已因 projection_version 不匹配
         # 被判不可用、走全量回放，这里的回落只是形态完整性。
         tasks_total=data.get("tasks_total", 0),
+        # v2 及更早的 blob 无此键 → 空。那些 blob 已因 projection_version 不匹配被判不可用、
+        # 走全量回放（全量回放会正确折出它），所以这里的回落只是形态完整性——**这正是
+        # bump 版本号换来的东西**：不必为「老快照里没有这个字段」另留一条兜底查询。
+        pending_recap={
+            tid: {"boundary": v.get("boundary", ""), "agent_id": v.get("agent_id", "")}
+            for tid, v in (data.get("pending_recap") or {}).items()
+        },
         sessions=sessions,
         tasks=tasks,
         agents=agents,
@@ -396,7 +381,11 @@ def deserialize_view(data: dict[str, Any]) -> RunStateView:
 #: **回滚安全**——v1 的代码读到 v2 blob 会因版本不匹配走全量回放，而不是把一份裁过的
 #: tasks 当全量用（那会让 `restore` 静默少掉 task）。代价是存量快照集体失效一次、
 #: 各会话首次写快照时全量重锚一次。
-_PROJECTION_VERSION = 2
+#: v3（2026-09-20）：blob 新增 `pending_recap`（段 recap 的待重跑账，从前是恢复路径上
+#: 一次独立的按类型收窄查询）。必须 bump：v2 的 blob 没有这个键，拿它当增量基底会让
+#: 「崩溃打断的 recap」静默变成「没有待重跑的」，那段 memory 写就永远补不上了。bump 之后
+#: v2 blob 判不可用 → 全量回放 → 正确折出该字段，无需任何迁移分支。
+_PROJECTION_VERSION = 3
 
 
 def snapshot_is_usable(
@@ -831,6 +820,26 @@ def _apply(view: RunStateView, ev: Event) -> None:
             # 先到的 TaskFinalized 覆盖或清空后到的成果，正是 A1 当初要治的那个漂移。
             task.finished_at = ev.timestamp
 
+    # ── 段 recap（被崩溃打断的 background observe）──────────────────────────────
+    # started 记账、done 销账，剩下的就是要重跑的。**这里是唯一的折叠实现**——从前它是
+    # 独立函数 `fold_pending_task_recap` + 恢复路径上一次按类型收窄的查询，那条查询随会话
+    # 长度线性增长（见 `RunStateView.pending_recap`）。搬进来而不是并存：feat 把 HITL 移出
+    # 投影的理由正是「两份口径不同的折叠会漂移」，同一条原则在这里就是「只留一份」。
+    #
+    # 键取 payload 的 `task_id` 而不是 `ev.task_id`：这两个事件把它写在 payload 里，
+    # 事件头上的 task_id 在段边界上可能是父任务。
+    elif t in (EventType.TASK_RECAP_STARTED, EventType.TASK_RECAP_DONE):
+        rtid = p.get("task_id", "")
+        if rtid:
+            if t == EventType.TASK_RECAP_STARTED:
+                # 同 task_id last-write-wins：重跑失败会再发一条 started。
+                view.pending_recap[rtid] = {
+                    "boundary": p.get("boundary", ""),
+                    "agent_id": p.get("agent_id", ""),
+                }
+            else:
+                view.pending_recap.pop(rtid, None)
+
     # ── LLM / Context ─────────────────────────────────────────────────────────
     elif t == EventType.PREPARE_COMPLETED:
         view.assembled_prompt_tokens = p.get("assembled_token_count", 0)
@@ -1110,9 +1119,13 @@ def fold_hitl_snapshot(events: list[Event]) -> HitlSnapshot:
 #   revision CAS  → 唯一消费者（宿主并发处置 API）已删，无并发写者
 #
 # 与 `reduce_events` 的分工：那个折的是常驻状态（每步都读、进快照）；这个只在恢复
-# 与重入时问一次，所以和 `fold_hitl_snapshot` / `fold_pending_task_recap` 同类——
-# 折出来就用，不存。比 HITL 折叠还省一层：未决 HITL 的年龄没有上界所以不能截尾，
-# 而 dangling tool_call 必定在最后一个 assistant 回合之后，读最近一段即可。
+# 与重入时问一次，所以和 `fold_hitl_snapshot` 同类——折出来就用，不存。比 HITL 折叠
+# 还省一层：未决 HITL 的年龄没有上界所以不能截尾，而 dangling tool_call 必定在最后一个
+# assistant 回合之后，读最近一段即可。
+#
+# 段 recap 曾经也在这一档，后来进了投影（`RunStateView.pending_recap`）：它和 HITL 一样
+# 没有年龄上界，但它的账**自己会销**（每条由它的 DONE 删掉），所以进得起快照；HITL 的
+# 未决集则由 `HitlRegistry` 持有，投影里不另存一份。
 
 async def load_events_of_types(
     store, session_id: str, types: "tuple[EventType, ...]",

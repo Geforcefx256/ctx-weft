@@ -3,9 +3,16 @@
 一次性把整条流变成 `list[Event]` 的代价是实测过的：一条 3 万事件 / 45MB `events` 表的
 会话约 **130MB 常驻、读一次 3.5 秒**（SQLite 本地文件；Postgres 走网更慢）。所以
 
-1. 只关心几种事件类型的折叠，必须按类型收窄——段 recap 折叠曾经是全量读，而它每次
-   `/resume` 都走一遍（`_recover_session_locked`），与快照有没有无关；
+1. 只关心几种事件类型的折叠，必须按类型收窄（HITL 折叠、dangling tool_call 折叠都在这
+   一档）——段 recap 折叠曾经是全量读，而它每次 `/resume` 都走一遍
+   （`_recover_session_locked`），与快照有没有无关；
 2. 快照不可用时那趟**正当的**全量重放也要分批，不把整条流驻留内存。
+
+段 recap 后来**连收窄查询都不发了**：收窄只把斜率降了 15 倍，它仍随会话长度线性增长
+（recap 事件只增不减），所以那个账进了投影（`RunStateView.pending_recap`）。这条路的护栏
+在 `tests/unit/test_fold_pending_task_recap.py`（折叠 + 快照往返）与
+`tests/integration/test_task_recap_recovery.py::test_resume_does_not_read_the_whole_event_stream`
+（真实 `/resume` 上一次 recap 查询都不发）。
 
 第 2 条的分批**由 store 产出**（`EventStore.replay`，基类默认实现即真分批——`read_range`
 与 `committed_head` 都是必需方法，按 position 区间切就行）。core 只管
@@ -20,7 +27,7 @@ from datetime import UTC, datetime
 import pytest
 
 from ctx_weft.core.control.reducers import (
-    TASK_RECAP_EVENT_TYPES,
+    HITL_FOLD_EVENT_TYPES,
     rebuild_view,
     reduce_events,
 )
@@ -83,40 +90,44 @@ async def _seed(store: InMemoryEventStore, n_noise: int) -> None:
 # ── 1. 段 recap 折叠：按类型收窄，不碰全量 ──────────────────────────────────
 
 
-async def test_recap_fold_reads_only_the_two_recap_types() -> None:
-    """收窄入口本身：给它那个类型集，它只发一次类型查询、不碰全量。
+async def test_typed_read_does_not_touch_the_full_stream() -> None:
+    """收窄入口本身：给它一个类型集，它只发一次类型查询、不碰全量。
 
-    ⚠️ 这条**只测入口**，护不住「调用点用错工具」——那条在
-    `tests/integration/test_task_recap_recovery.py::test_resume_does_not_read_the_whole_event_stream`，
-    它走真实的 `/resume` → `restore_session` 路径。两条都要有：这条钉工具本身的行为，
-    那条钉真实调用点确实用了它。
+    ⚠️ 这条**只测入口**，护不住「调用点用错工具」——那种要在真实恢复路径上钉，见
+    `tests/integration/test_task_recap_recovery.py::test_resume_does_not_read_the_whole_event_stream`。
+    两档都要有：这条钉工具本身的行为，那条钉调用点确实用了它。
     """
     from ctx_weft.core.control.reducers import load_events_of_types
 
     store = _CountingStore()
     await _seed(store, n_noise=500)
 
-    got = await load_events_of_types(store, _SID, TASK_RECAP_EVENT_TYPES)
+    got = await load_events_of_types(store, _SID, HITL_FOLD_EVENT_TYPES)
 
-    assert store.full_reads == 0, "不该为段 recap 折叠读整条事件流"
-    assert store.typed_reads == [tuple(str(t) for t in TASK_RECAP_EVENT_TYPES)]
-    assert len(got) == 3, f"503 条噪音里只该取回那两类共 3 条，实际 {len(got)}"
+    assert store.full_reads == 0, "收窄入口不该读整条事件流"
+    assert store.typed_reads == [tuple(str(t) for t in HITL_FOLD_EVENT_TYPES)]
+    assert got == [], "503 条噪音里没有 HITL 事件，收窄就该一条都不取回"
 
 
-async def test_recap_type_set_matches_what_the_fold_actually_reads() -> None:
-    """类型集与折叠实现必须同步——漏一个类型就会静默少折出一个待重跑的段。"""
-    import inspect
+async def test_recap_fold_lives_in_the_projection_not_in_a_query() -> None:
+    """段 recap 的账只有一处折叠实现，且在 `_apply` 里（进投影）。
 
-    from ctx_weft.core.control.reducers import fold_pending_task_recap
+    从前它是独立函数 `fold_pending_task_recap` + 恢复路径上一次收窄查询。并存两份折叠正是
+    feat 把 HITL 移出投影要治的那类漂移，所以这里钉「旧的那份真的没了」——留着它，下一个人
+    就会照旧用法再写一次那条线性增长的查询。
+    """
+    import ctx_weft.core.control.reducers as mod
 
-    src = inspect.getsource(fold_pending_task_recap)
-    for t in TASK_RECAP_EVENT_TYPES:
-        assert t.name in src, f"{t.name} 在类型集里但折叠实现没读它"
-    declared = {t.name for t in TASK_RECAP_EVENT_TYPES}
-    for line in src.splitlines():
-        if "EventType.TASK_" in line:
-            name = line.split("EventType.")[1].split(":")[0].split()[0].strip(" :")
-            assert name in declared, f"折叠读了 {name}，但它不在 TASK_RECAP_EVENT_TYPES 里"
+    assert not hasattr(mod, "fold_pending_task_recap")
+    assert not hasattr(mod, "TASK_RECAP_EVENT_TYPES")
+
+    store = _CountingStore()
+    await _seed(store, n_noise=3)
+    view = await rebuild_view(store, _SID)
+
+    assert store.typed_reads == [], "重放折出这个账，不发类型查询"
+    # _seed 的最后一条是 t_stuck 的 started（无 done），t_done 那对已销账
+    assert set(view.pending_recap) == {"t_stuck"}
 
 
 # ── 2. 快照不可用时的全量重放：按 position 区间分批 ─────────────────────────
