@@ -93,6 +93,14 @@ _AGENT_STATUS_BY_EVENT: dict[str, str] = {
 }
 
 
+#: `fold_pending_task_recap` 需要的事件类型全集。供调用方按类型收窄读取——那个折叠只关心
+#: 这两种，不该为它全量回放整条事件流（实测一条 3 万事件的会话读一次 ≈ 3.5s / 130MB）。
+TASK_RECAP_EVENT_TYPES: tuple[EventType, ...] = (
+    EventType.TASK_RECAP_STARTED,
+    EventType.TASK_RECAP_DONE,
+)
+
+
 def fold_pending_task_recap(events: list[Event]) -> dict[str, dict]:
     """折叠 TaskRecap 事件 → 仍未完成的 {task_id: {"boundary", "agent_id"}}（started 减去 done）。
 
@@ -424,6 +432,25 @@ def snapshot_is_usable(
     return True
 
 
+#: 全量回放的分批大小。回放是左折叠、可分批，所以内存峰值由它而不是会话长度决定。
+#:
+#: 取 2000 是实测的权衡点（3 万条事件 / 45MB 的 events 表，SQLite 本地）：
+#:
+#:     批大小    查询次数    耗时      内存峰值
+#:     一次性        1      3.75s    121.5 MB
+#:      1000       30      6.10s      6.3 MB
+#:      2000       15      5.09s     12.3 MB     ← 取这档
+#:      5000        6      4.58s     30.2 MB
+#:     10000        3      4.47s     60.1 MB
+#:
+#: 判据是「内存是硬约束、耗时是软约束」：121MB 单会话在并发恢复下会叠成几百 MB ~ GB，
+#: 那是会崩的；而这条路只在**快照不可用**时走（罕见），多花一秒用户等得起。
+#:
+#: ⚠️ 数字来自 SQLite 本地文件。Postgres 走网络时每次查询多一个 RTT，分批的耗时劣势会
+#: 放大（但单次大查询传 45MB 也更慢）；真要调，照上面的方法在目标库上重测。
+_REPLAY_BATCH = 2000
+
+
 async def rebuild_view(event_store: Any, session_id: str) -> RunStateView:
     """按快照+增量或全量回放重建 RunStateView（spec: snapshot-recovery，wp4 改造）。
 
@@ -456,10 +483,26 @@ async def rebuild_view(event_store: Any, session_id: str) -> RunStateView:
             through_position=head,
         )
         return apply_events([se.event for se in delta], view)
-    # 全量：忽略快照（存量/损坏/超前），按 position 序重放；重造快照由 writer 负责
-    stored = await event_store.read_range(
-        session_id, after_position=0, through_position=head)
-    return reduce_events([se.event for se in stored], run_id=session_id)
+    # 全量：忽略快照（存量/损坏/超前），按 position 序重放；重造快照由 writer 负责。
+    #
+    # **分批读，不把整条流一次性驻留内存**：`read_range(0..head)` 一次性返回会让内存峰值
+    # 随会话长度走——实测一条 3 万事件的会话约 120MB 常驻。而重放是左折叠
+    # （`reduce_events(evts)` 就是 `apply_events(evts, 空 view)`，本文件里两段循环体逐字
+    # 相同；apply 是 for 循环、可结合），所以按 position 区间切开逐批 apply 与整批
+    # **逐字段等价**，内存峰值降到 O(batch)。
+    #
+    # position 是连续整数、`head` 是这一刻的提交位点，所以区间切分是精确的——既不重也
+    # 不漏，且整趟重放锚在同一个 `head` 上（一致切面，不受期间新提交影响）。
+    view = RunStateView(run_id=session_id, session_id="", task_id="", agent_id="")
+    cursor = 0
+    while cursor < head:
+        upper = min(cursor + _REPLAY_BATCH, head)
+        stored = await event_store.read_range(
+            session_id, after_position=cursor, through_position=upper)
+        if stored:
+            apply_events([se.event for se in stored], view)
+        cursor = upper
+    return view
 
 
 def reduce_events(events: list[Event], run_id: str) -> RunStateView:

@@ -490,3 +490,43 @@ async def test_all_tasks_terminal_with_a_pruned_snapshot_does_not_raise() -> Non
     assert view.tasks == {} and view.tasks_total == 1
 
     await runtime.recover_agent(aid)   # 不抛即通过（没有活可重排，但会话是好的）
+
+
+async def test_resume_does_not_read_the_whole_event_stream() -> None:
+    """恢复时折段 recap **不得**全量读事件流——按类型收窄。
+
+    走的是真实恢复路径（`/resume` → `recover_agent` → `restore_session`），而不是直接调
+    那个收窄入口：护住的正是「调用点用错工具」这件事。从前这里是
+    `read_by_session(session_id)`，每次用户点「继续」都把整条流读一遍——实测一条 3 万事件
+    的会话约 3.5 秒 / 130MB，而 `fold_pending_task_recap` 只需要 TaskRecapStarted /
+    TaskRecapDone 那几十条。与快照有没有无关：同一个方法里 `rebuild_view` 已经用过快照了，
+    这是额外的一次独立全量读。
+    """
+    runtime, _mem, _seen = _make_runtime()
+    store = runtime.event_store
+    full_reads = [0]
+    orig = store.read_by_session
+
+    async def _counting(session_id):
+        full_reads[0] += 1
+        return await orig(session_id)
+
+    store.read_by_session = _counting          # type: ignore[method-assign]
+
+    sid, tid, aid = "ses_recap", "tsk_recap", "agt_root"
+    for e in [
+        _ev(1, EventType.SESSION_CREATED, user_prompt="do it",
+            template_id="agent:tpl_echo", root_agent_id=aid),
+        _ev(2, EventType.TASK_CREATED, task={
+            "id": tid, "status": "ACTIVE", "title": "T", "kind": "reasoning",
+            "assigned_agent_id": aid, "creator_agent_id": aid}),
+        _ev(3, EventType.TASK_STARTED, task_id=tid, assigned_agent_id=aid),
+        _ev(4, EventType.TASK_FINISHED, task_id=tid, outcome="success", summary="done"),
+        _ev(5, EventType.TASK_RECAP_STARTED, task_id=tid, boundary="finish", agent_id=aid),
+    ]:
+        await store.append(e)
+
+    await runtime.recover_agent(aid)
+
+    assert full_reads[0] == 0, (
+        f"恢复路径不该读整条事件流，实际读了 {full_reads[0]} 次")

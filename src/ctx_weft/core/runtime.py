@@ -2476,9 +2476,15 @@ class CtxWeftRuntime:
         terminal_ids = {t.id for t in all_tasks if t.status in TERMINAL_TASK_STATUSES}
 
         # 折出被崩溃打断的段 recap（started 无 done）——覆盖全部 observe 段边界。
-        from ctx_weft.core.control.reducers import fold_pending_task_recap
-        events_all = await self.event_store.read_by_session(session_id)
-        pending_recap = fold_pending_task_recap(events_all)
+        #
+        # **只取那两种事件**：`fold_pending_task_recap` 只读 TaskRecapStarted /
+        # TaskRecapDone，从前这里却全量读整条事件流（每次 `/resume` 都付一次——实测 3 万
+        # 事件 ≈ 3.5s / 130MB）。长会话里这两类只有几十条（每个 observe 段一对）。
+        from ctx_weft.core.control.reducers import (
+            TASK_RECAP_EVENT_TYPES, fold_pending_task_recap,
+        )
+        pending_recap = fold_pending_task_recap(
+            await self._read_session_events_of_types(session_id, TASK_RECAP_EVENT_TYPES))
 
         # 既无可恢复 task、且这个会话**从来没有过** task（空/损坏投影）→ 确无事可做，
         # 保留原抛错。判据是 `view.tasks_total`（创建过几个）而**不是** `all_tasks` 是否为空：
