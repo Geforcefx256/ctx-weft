@@ -849,10 +849,17 @@ class CtxWeftRuntime:
         HITL 请求不带 tenant_id，而 blob 的 ProviderContext 需要它——多租户宿主下
         写死 `"default"` 会让 HITL 递进来的图落到错误的 tenant 锚点。
 
-        两条途径，先热后冷：
+        三条途径，先热后冷：
         1. 活 owner TaskManager 的 `session`（`_task_managers`）——热应答的主路径，纯内存查表；
-        2. 事件日志：**每条 `Event` 都带 `tenant_id`**（`protocols/events.py`），取该 session
-           第一条即可，不必 `rebuild_view` 折叠整个投影（冷应答/重启后走这条）。
+        2. `SessionCreated` 事件：会话的 tenant 就记在它身上，而**每条 `Event` 都带
+           `tenant_id`**（`protocols/events.py`）。按类型收窄取这一条（每会话恰一条），
+           走 `(session_id, type)` 索引，不必读整条流、也不必 `rebuild_view` 折投影；
+        3. 兜底全量读：`SessionCreated` 缺失（日志损坏 / 导入残缺）时才退到这条，取第一条
+           带 tenant 的事件——保住改造前「任何一条事件的 tenant 都算」那个语义，代价只
+           落在异常数据上。
+
+        **为什么不一开始就全量读**：这条在 HITL 冷应答路径上，而它原本是 O(会话全部事件)
+        ——只为拿一个字段。长会话里每次冷应答都要把整条流读出来再丢掉。
 
         本方法在 HITL 应答路径上——**抛错会卡住人类应答**，故整段 best-effort：
         存储不可用 / session 无事件 / 事件不带 tenant，一律回落 `"default"`（= 现状）。
@@ -862,17 +869,22 @@ class CtxWeftRuntime:
         if sess is not None and sess.tenant_id:
             return sess.tenant_id
         try:
-            events = await self.event_store.read_by_session(session_id)
+            created = await self._read_session_events_of_types(
+                session_id, (EventType.SESSION_CREATED,))
+            for ev in created:
+                tenant = getattr(ev, "tenant_id", "")
+                if tenant:
+                    return tenant
+            # SessionCreated 没有 / 不带 tenant —— 罕见（损坏或残缺的日志），此时才付全量
+            for ev in await self.event_store.read_by_session(session_id):
+                tenant = getattr(ev, "tenant_id", "")
+                if tenant:
+                    return tenant
         except Exception:
             logger.warning(
                 "HITL tenant resolve: cannot read events for session %s; using 'default'",
                 session_id, exc_info=True,
             )
-            return "default"
-        for ev in events:
-            tenant = getattr(ev, "tenant_id", "")
-            if tenant:
-                return tenant
         return "default"
 
     async def _normalize_hitl_content(

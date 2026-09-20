@@ -87,6 +87,38 @@ class MemoryEventModel(Base):
         Index("ix_memory_tenant_task", "tenant", "session_id", "layer", "task_id"),
         Index("ix_memory_tenant_agent", "tenant", "session_id", "layer", "agent_id"),
         Index("ix_memory_tenant_topic", "tenant", "topic", "topic_seq_no"),
+        # ── load_view / recall_topic 的工作索引（2026-09-19）───────────────────
+        #
+        # 起因：`load_view` 在长会话上实测走**全表扫**（上面那两条 `ix_memory_*` 帮不上
+        # ——`type IN (...)` 是多值，且排序列不在索引里），而它一个回合要被调十几次。
+        # 同一个 (session, layer, task) 分区里死行（is_superseded）会累积到活行的百倍，
+        # 于是每次都把死行读出来再丢掉。
+        #
+        # 三处刻意的选择：
+        #
+        # 1. **`is_superseded` 做等值列，而不是部分索引的谓词。** 部分索引（`WHERE
+        #    is_superseded = 0`）在 SQLite 上要求索引谓词与查询谓词**逐字一致**才命中
+        #    ——实测 `= 0` 的索引配 `IS 0` 的查询直接不命中、退回全表扫，且不报错。而本
+        #    仓两个 provider 的写法本就不同（core 用 `.is_(False)`、宿主用 `== False`），
+        #    那样任何一处改写法都会静默失效。做成等值列则两种写法都命中，代价是索引里
+        #    含死行（体积大些，查询效率一样——等值定位后只扫活行段）。
+        # 2. **`type` 不进索引。** 它是 `IN (...)` 多值，放进去会打断有序性、迫使
+        #    `ORDER BY timestamp, seq_no` 走临时 B-tree；挪出去让排序列紧跟等值前缀，
+        #    排序就完全由索引提供（实测：临时 B-tree 消失）。type 退为回表过滤，作用在
+        #    已经很小的活行集上。
+        # 3. **tenant 不进索引。** core 侧的 tenant 过滤是 `COALESCE(tenant,'default')=?`
+        #    （表达式，裸列索引本来就匹配不上——上面那三条 `ix_memory_tenant_*` 对它同样
+        #    没用），而 `session_id` 已经把范围收到一个会话，tenant 再滤几乎不减行。
+        #
+        # `agent` 那条同时服务 AGENT scope 与 TASK scope 的跨 task 聚合（半址
+        # `task_id=None` → 按 agent_id 过滤，layer 仍是 'task'，故 layer 留在索引里）。
+        Index("ix_memory_task_view", "session_id", "layer", "task_id",
+              "is_superseded", "timestamp", "seq_no"),
+        Index("ix_memory_agent_view", "session_id", "layer", "agent_id",
+              "is_superseded", "timestamp", "seq_no"),
+        # `recall_topic`（topic + topic_seq_no > cursor，按 topic_seq_no 升序）与写路径的
+        # `max(topic_seq_no) WHERE topic=?`。后者实测从回表变成 COVERING INDEX。
+        Index("ix_memory_topic_seq", "topic", "topic_seq_no"),
     )
 
 
