@@ -193,6 +193,23 @@ class EventType(StrEnum):
     # 那个计数**必须从日志折出来**，不能是内存计数器：撤销之后重启，内存里什么都没有，
     # 键必然撞回去。这条事件的存在就是为了让它可还原。
     HITL_REPLY_RETRACTED = "HitlReplyRetracted"   # payload: {hitl_id}
+    # 那条答复**已经落进对话**（`hitlreply:{hitl_id}` 记忆记录写成了）。
+    #
+    # **为什么需要它。** `HitlResolved` 只说「人答了」，不说「系统用掉了」。两者之间有个
+    # 真实的崩溃窗口：决定已落盘，进程却在「把答复注入进对话」之前死了——任务重排本身
+    # 不带这一步，不补，人说的那句话就静默消失。`HitlRegistry.resolved_for_session()` 的
+    # 补注入就是补它，而要知道「哪些还没补」，折叠就只能留下**全部**已终局请求：那个集合
+    # 随对话轮数线性增长（交互式会话里每条用户消息都是一次 UserTurn HITL）。这条事件把
+    # 「已终局」和「已了结」分开，于是那个集合变成自己会销账的有界集。
+    #
+    # **为什么发在 ingest 之后。** 两个方向都安全：崩在 ingest 之前 → 没有本事件 → 记录
+    # 留着，下次补注入；崩在 ingest 之后、本事件发出之前 → 同样没有本事件 → 记录留着 →
+    # 下次重跑注入，而 ingest 按 `hitlreply:{hitl_id}` 幂等，不会写重。发在 ingest 之前
+    # 就没有这个性质——那正是 `CapabilityFinished` 现在的处境。同一手法见
+    # `TaskRecapStarted/Done`（段 recap 的 memory 写没落完）与 `TaskMessageAppended`。
+    #
+    # **不含正文**：那句话已经在对话里，事件日志侧那一份由 `TaskMessageAppended` 承担。
+    HITL_REPLY_INJECTED = "HitlReplyInjected"     # payload: {hitl_id}
     HITL_OPENED = "HitlOpened"
     HITL_RESOLVED = "HitlResolved"
     # ── Guard 域 ──

@@ -880,6 +880,7 @@ HITL_FOLD_EVENT_TYPES: tuple[EventType, ...] = (
     EventType.HITL_OPENED,
     EventType.HITL_RESOLVED,
     EventType.HITL_REPLY_RETRACTED,
+    EventType.HITL_REPLY_INJECTED,
     EventType.HITL_REQUIRED,
     *_HITL_RESOLVE_TYPES,
 )
@@ -1069,6 +1070,18 @@ def fold_hitl_snapshot(events: list[Event]) -> HitlSnapshot:
                 if req.tool_call_id:
                     key = (req.session_id, req.tool_call_id, req.stage)
                     snap.decisions_for[key] = (decision, req.resume_state)
+
+        elif ev.type == EventType.HITL_REPLY_INJECTED:
+            # 那条答复已经落进对话 → 不再需要恢复期补注入，从 `resolved` 销账。
+            #
+            # **不动 `decisions_for`**：那一半的消费信号是该 tool_call 的
+            # `CapabilityFinished`，不是「注入进对话」。在这里顺手 pop 会让一条仍需短路的
+            # 冷决定消失 → 同一个工具重新求批。
+            #
+            # **不动 `opened`**：`HitlReplyRetracted` 还要能按 rid 把这条请求找回来（它的
+            # 分支 `req is None` 就 `continue`，找不回来气泡就回不到 pending）。`opened`
+            # 是折叠的本地工作集，不入快照，留着不花钱。
+            snap.resolved.pop(rid, None)
 
         elif ev.type == EventType.HITL_REPLY_RETRACTED:
             # 一次已收下的答复被收回（spec 2026-09-09）：气泡回到未决，并记一笔
