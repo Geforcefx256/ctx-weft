@@ -125,6 +125,14 @@ class PendingHitl:
     #: `hitlreply:{hitl_id}` 幂等键、去重不了，补一次就凭空多一轮用户发言。
     #: 活路径开出来的请求恒为 False。**core 内部字段，不出 `to_view()`。**
     legacy_origin: bool = False
+    #: 这条决定**已了结**：消费完成了，`HitlClosed` 已经发出（见那个事件类型的说明）。
+    #:
+    #: 纯内存、不入事件也不入快照：折叠遇到 `HitlClosed` 直接把这条从 `resolved` /
+    #: `decisions_for` 摘掉，所以装填回来的记录里根本不会有 closed=True 的。它在内存里
+    #: 存在只为两件事——① 让 `resolved_for_session()` 与「折叠装填出来的集合」保持一致
+    #: （那条不变式写在那个方法的 docstring 里，是恢复期兜底的承重点）；② 让盖章幂等，
+    #: 取消 + 销毁这类前后相继的路径不会给同一条请求发两遍章。
+    closed: bool = False
 
     @property
     def resolved(self) -> bool:
@@ -447,6 +455,18 @@ class HitlRegistry:
                         or r.invocation_key == invocation_key)]
         return max(matches, key=lambda r: r.created_at) if matches else None
 
+    def mark_closed(self, hitl_id: str) -> bool:
+        """把一条记录标成**已了结**。返回这次是否真标上（已标过 / 找不到 → False）。
+
+        纯机制：不发事件、不判顺序。盖章那一步在 `HitlService.close`，它先发事件再来标——
+        标了却没发出去，这条就永远不在清单里了，那才是真丢。
+        """
+        req = self._requests.get(hitl_id)
+        if req is None or req.closed:
+            return False
+        req.closed = True
+        return True
+
     def resolved_for_tool_call(self, session_id: str, tool_call_id: str) -> list[PendingHitl]:
         """该 tool_call 的全部**已终局**请求，三个 stage 都算。空 tool_call_id → 空表。
 
@@ -459,7 +479,7 @@ class HitlRegistry:
         return [r for r in self._requests.values()
                 if r.tool_call_id == tool_call_id
                 and r.session_id == session_id
-                and r.resolved]
+                and r.resolved and not r.closed]
 
     def result_is_human_reply(self, session_id: str, tool_call_id: str) -> bool:
         """这次调用的结果**就是人的答复**：工具阶段有一个 `reply_as_result` 的请求（`ask_user`）。
@@ -547,5 +567,5 @@ class HitlRegistry:
         """
         return [
             r for r in self._requests.values()
-            if r.resolved and r.session_id == session_id
+            if r.resolved and not r.closed and r.session_id == session_id
         ]

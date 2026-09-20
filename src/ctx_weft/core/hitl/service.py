@@ -340,6 +340,8 @@ class HitlService:
         **不抛**：这是一枚事后的章，它失败不该回滚已经成功的消费。发不出去的后果只是退回
         本事件引入之前的行为（那条记录继续留在清单里、下次恢复幂等补一遍），不是数据损坏。
         """
+        if req.closed:
+            return False                     # 已经盖过——取消 + 销毁这类相继路径不重复发
         if not req.resolved:
             logger.warning(
                 "HitlService.close(%s): 这条请求还没终局——盖章会宣布一件没发生的事，"
@@ -352,7 +354,31 @@ class HitlService:
                 "HitlService.close(%s): HitlClosed 发射失败（消费已经成功，"
                 "下次恢复会幂等补一遍）", req.id)
             return False
+        # **先发事件、后标内存**：反了的话「标了但没发出去」会让这条在内存里消失、日志里
+        # 又没有章，恢复期的清单两头都看不见它——那是真丢，比多发一次章严重得多。
+        self.registry.mark_closed(req.id)
         return True
+
+    async def close_resolved(self, session_id: str, *, agent_id: str | None = None) -> int:
+        """把该 session（可按 agent 收窄）全部**已终局**请求一并了结，返回盖上几条。
+
+        用在**取消 / 销毁**路径上：那些决定的消费者已经不存在了——任务不会再跑，
+        `_inject_resolved_user_turns` 对终态 task 本就直接跳过，gateway 也不会再为它求批。
+        不盖章它们就永远留在折叠的清单里，而那条会话的事件日志还在（`purge_session` 明确
+        **不删日志**，删不删是 host 的步骤）。
+
+        ⚠️ **只该由真终结的路径调**。它不区分「这条决定马上就要被消费」——活路径上那些
+        请求正等着被注入/被 gateway 重放，盖章会让它们从清单里消失，此后崩一次就永久丢。
+        所以不要把它挂进 `_cancel_pending_hitl_of` 那类共享 helper（它有一个 `defer=True`
+        的活路径调用方 `_inject_user_turn`）。
+        """
+        n = 0
+        for req in self.registry.resolved_for_session(session_id):
+            if agent_id is not None and req.agent_id != agent_id:
+                continue
+            if await self.close(req):
+                n += 1
+        return n
 
     async def close_for_tool_call(self, session_id: str, tool_call_id: str) -> int:
         """把该 tool_call 的全部已终局请求一并了结，返回盖上几条。

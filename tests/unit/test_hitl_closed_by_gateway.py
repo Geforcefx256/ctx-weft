@@ -148,3 +148,121 @@ def test_closing_is_not_gated_on_dispatch_or_silent():
     assert "is_dispatch" not in guard and "is_silent" not in guard, \
         f"盖章被 dispatch/silent 分支挡住了：if {guard}"
     assert tail  # 形态完整
+
+
+# ── 取消 / 销毁路径 ───────────────────────────────────────────────────────────
+
+
+async def test_close_resolved_stamps_the_whole_session():
+    """取消之后没人会再消费那些决定——任务不会再跑，补注入对终态 task 本就跳过。
+
+    不盖章它们就永远留在折叠的清单里，而这条会话的事件日志还在（`purge_session` 明确不删
+    日志）。这是这条路存在的全部理由。
+    """
+    svc, bus = _service(HITL_STAGE_AUTHZ, HITL_STAGE_TOOL)
+
+    n = await svc.close_resolved(_SID)
+
+    assert n == 2
+    assert _closed_ids(bus) == {f"hit_{HITL_STAGE_AUTHZ}", f"hit_{HITL_STAGE_TOOL}"}
+
+
+async def test_close_resolved_is_idempotent():
+    """取消 → 销毁是前后相继的两条路，同一条请求不得发两遍章。
+
+    幂等靠内存 `PendingHitl.closed`；`purge_session` 里那次正常路径下就是 no-op。
+    """
+    svc, bus = _service(HITL_STAGE_AUTHZ)
+
+    first = await svc.close_resolved(_SID)
+    second = await svc.close_resolved(_SID)
+
+    assert (first, second) == (1, 0)
+    assert len([e for e in bus.events if e.type == EventType.HITL_CLOSED]) == 1
+
+
+async def test_close_resolved_can_narrow_to_one_agent():
+    """agent 粒度：不得误伤同一 session 里别的 agent 仍然有用的决定。"""
+    svc, bus = _service(HITL_STAGE_AUTHZ)
+    other = PendingHitl(
+        id="hit_other", form="approval", session_id=_SID, task_id="t2",
+        agent_id="ag_other", delivery=ToolResultDelivery(tool_call_id="call_x"),
+        created_at=_T0, tenant_id="acme", tool_call_id="call_x", stage=HITL_STAGE_AUTHZ)
+    other.decision = HitlDecision(outcome="accepted", message="ok")
+    other.resolved_at = _T0
+    svc.registry._requests[other.id] = other
+
+    n = await svc.close_resolved(_SID, agent_id="ag1")
+
+    assert n == 1
+    assert _closed_ids(bus) == {f"hit_{HITL_STAGE_AUTHZ}"}
+
+
+async def test_closed_records_leave_the_re_injection_list():
+    """盖过章的记录不再出现在 `resolved_for_session()`。
+
+    这条不变式写在那个方法的 docstring 里：它返回的集合必须与「折叠装填出来的集合」一致，
+    而折叠遇到 `HitlClosed` 会把那条整个摘掉。两边不一致，恢复期兜底就会对着一份幻影清单
+    反复做无用功。
+    """
+    svc, bus = _service(HITL_STAGE_AUTHZ)
+    assert len(svc.registry.resolved_for_session(_SID)) == 1
+
+    await svc.close_resolved(_SID)
+
+    assert svc.registry.resolved_for_session(_SID) == []
+
+
+async def test_stamp_is_emitted_before_the_memory_mark():
+    """**先发事件、后标内存**。
+
+    反了的话「标了但没发出去」会让这条在内存里消失、日志里又没有章——恢复期的清单两头都
+    看不见它，那是真丢，比多发一次章严重得多。
+    """
+    svc, bus = _service(HITL_STAGE_AUTHZ)
+    req = svc.registry.get(f"hit_{HITL_STAGE_AUTHZ}")
+
+    async def _boom(ev):
+        raise RuntimeError("bus down")
+
+    svc._bus.emit = _boom
+
+    assert await svc.close(req) is False
+    assert req.closed is False, "发不出去就不该标——否则它从两边同时消失"
+
+
+def test_cancel_and_purge_both_close():
+    """两条真终结路径都要盖章，而且 purge 必须在 `forget_session` **之前**盖。
+
+    摘掉之后就没有请求对象可盖了。源码顺序检查——真跑通这两条要搭整个 runtime，而要钉的
+    只是「哪句在哪句之前」。
+    """
+    import inspect
+
+    from ctx_weft.core.runtime import CtxWeftRuntime
+
+    cancel_src = inspect.getsource(CtxWeftRuntime.cancel_session)
+    assert "close_resolved" in cancel_src, "取消之后那些决定没人消费了，要盖章"
+
+    purge_src = inspect.getsource(CtxWeftRuntime.purge_session)
+    # 按**实际调用串**比，不按裸名字——docstring 里也提到了 forget_session。
+    stamp = "await self.hitl.close_resolved("
+    forget = "self.hitl_registry.forget_session("
+    assert stamp in purge_src and forget in purge_src
+    assert purge_src.index(stamp) < purge_src.index(forget), (
+        "摘掉记录之后就盖不了章了")
+
+
+def test_close_resolved_is_not_wired_into_the_shared_cancel_helper():
+    """**不得**挂进 `_cancel_pending_hitl_of`。
+
+    那个 helper 有一个活路径调用方（`_inject_user_turn` 传 `defer=True`），那条路上的请求
+    正等着被注入/被 gateway 重放。在那里盖章会让它们从清单里消失，此后崩一次就永久丢。
+    """
+    import inspect
+
+    from ctx_weft.core.runtime import CtxWeftRuntime
+
+    src = inspect.getsource(CtxWeftRuntime._cancel_pending_hitl_of)
+    assert "close_resolved" not in src, (
+        "这个 helper 被活路径共用，盖章会把还要用的决定销掉")

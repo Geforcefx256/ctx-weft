@@ -1053,6 +1053,14 @@ class CtxWeftRuntime:
                 logger.exception(
                     "cancel_session: discard_round failed for task %s", _tid)
         await self._cancel_session_hitl(session_id, message=CancelReason.USER_CANCEL)
+        # 已终局但还没被消费的决定：会话取消之后没人会再消费它们了（任务不会再跑，
+        # `_inject_resolved_user_turns` 对终态 task 本就跳过），所以一并盖 `HitlClosed`。
+        # 不盖就永远留在折叠的补注入清单里——而这条会话的事件日志还在（core 不删日志）。
+        # 上面那步收口的是**未决**的，它们终局成 cancelled，折叠本就不收录，两件事不重叠。
+        try:
+            await self.hitl.close_resolved(session_id)
+        except Exception:
+            logger.exception("cancel_session: close_resolved failed for %s", session_id)
         # ② 清队列。
         if task_manager is not None:
             await task_manager.cancel_all(reason=CancelReason.USER_CANCEL)
@@ -2038,6 +2046,15 @@ class CtxWeftRuntime:
         # `max_resolved` 裁剪最旧的，要等它被后来的挤出去才消失。
         # 放在 `cancel_session` **之后**：那一步刚把未决的逐个终局掉，此刻摘的应当全是
         # 已终局项（真摘到未决的，registry 会记一条 WARNING）。
+        #
+        # **摘之前先盖章**：摘掉之后就没有请求对象可盖了，而事件日志还在（core 不删日志），
+        # 那些已终局未消费的决定会永远留在折叠的清单里。上面的 `cancel_session` 正常路径
+        # 已经盖过一轮，这里是它抛异常时的兜底——`close()` 按内存 `closed` 标记幂等，正常
+        # 路径下这一次是 no-op，不会发重复的章。
+        try:
+            await self.hitl.close_resolved(session_id)
+        except Exception:
+            logger.exception("purge_session: close_resolved failed for %s", session_id)
         self.hitl_registry.forget_session(session_id)
         self._evict_session_memory(session_id)
 
