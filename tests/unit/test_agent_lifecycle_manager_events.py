@@ -105,5 +105,5 @@ async def test_materialize_emits_nothing():
     agent, _ = await lm.instantiate(
         template_id=TPL, session_id="s1", tenant_id="default")
     bus.events.clear()
-    lm.materialize(agent.id)
+    lm.materialize(agent.id, session_id=agent.session_id, tenant_id=agent.tenant_id)
     assert bus.events == []

@@ -299,13 +299,18 @@ async def test_load_reloading_the_same_session_is_still_idempotent():
     assert reg.record_of("a1").session_id == "s1"
 
 
-async def test_load_replaces_a_fallback_placeholder_from_a_guessed_session():
-    """`materialize` 撞上还没装填的 id 会就地补一条占位（session 是猜的）；真记录随后
-    装填时要能覆盖它——占位不代表已确认的归属，不参与唯一性判定。"""
+async def test_load_replaces_a_fallback_placeholder_from_another_session():
+    """`materialize` 撞上还没装填的 id 会就地补一条占位；真记录随后装填时要能覆盖它
+    ——占位不代表已确认的归属，不参与唯一性判定。
+
+    占位记录的 session 按**调用方给的**归属（2026-09-19 起 `_register_fallback` 必传，不
+    再猜「最近一次 register_session 的会话」）。这里刻意让占位落在 `s_placeholder`、真记录
+    来自 `s_real`：两者不同，才测得到「覆盖」而非「恰好同名」。若占位参与唯一性判定，
+    下面那次 `load` 会抛 `DuplicateAgentId` 而不是修正它。"""
     reg = _alm()
-    reg.register_session("s_guess", tenant_id="default", fallback_template_id="tpl")
-    reg._register_fallback("a1")
-    assert reg.record_of("a1").session_id == "s_guess"
+    reg.register_session("s_placeholder", tenant_id="default", fallback_template_id="tpl")
+    reg._register_fallback("a1", session_id="s_placeholder", tenant_id="default")
+    assert reg.record_of("a1").session_id == "s_placeholder"
 
     await reg.load({"a1": AgentView(id="a1")}, session_id="s_real", tenant_id="default",
                    fallback_template_id="tpl")

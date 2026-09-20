@@ -89,7 +89,7 @@ async def _idle_agent():
     rt._agent_lifecycle_manager.register_session(
         SID, tenant_id="default", fallback_template_id=f"agent:{tmpl.id}",
     )
-    rt._agent_lifecycle_manager.materialize(AID)
+    rt._agent_lifecycle_manager.materialize(AID, session_id=SID, tenant_id="default")
     return rt
 
 

@@ -2731,7 +2731,8 @@ class CtxWeftRuntime:
             lm.register_session(
                 session.id, tenant_id=session.tenant_id, fallback_template_id=template_id,
             )
-            agent, rm = lm.materialize(agent_id)
+            agent, rm = lm.materialize(
+                agent_id, session_id=session.id, tenant_id=session.tenant_id)
             # 窗口以 session.context_limit/reserved_output_tokens 为准（host 配置的预算
             # 天花板，独立于 ModelChoice）——同 _SessionTaskRunner.assemble 的口径。
             agent = _dc.replace(agent, loop_guard=LoopGuard(
@@ -2927,7 +2928,8 @@ class CtxWeftRuntime:
             lm.register_session(
                 session.id, tenant_id=session.tenant_id, fallback_template_id=proj.template_id,
             )
-            agent, rm = lm.materialize(target_agent_id)
+            agent, rm = lm.materialize(
+                target_agent_id, session_id=session.id, tenant_id=session.tenant_id)
             # materialize 不返回 template（它只读 record，不碰 TemplateLookup）——
             # state.extra 仍需要它（CompactStep 经 extra["template"] 读），单独取一次。
             template = await self._template_lookup.get_template(
@@ -4997,7 +4999,8 @@ class _SessionTaskRunner:
                     # （LLMClientResolver 才是那层缓存）。
                     rm = self._registry.resolve_model(agent.id)
                 else:
-                    agent, rm = self._registry.materialize(t.assigned_agent_id)
+                    agent, rm = self._registry.materialize(
+                        t.assigned_agent_id, session_id=sess_id, tenant_id=tenant_id)
                     # materialize 不返回 template；沿用原行为按 sub_tmpl_id 重新解析
                     # （与 create 分支同一个来源，agent 出身早已由 AgentInstantiated
                     # 事件钉住，这里只是要一份可用的 AgentTemplate 对象）。
@@ -5047,6 +5050,7 @@ class _SessionTaskRunner:
                 # 创建者上下文并污染 root。scope 键与调度串行判定共用 effective_agent_id 单一真相。
                 agent, rm = self._registry.materialize(
                     effective_agent_id(t, self._session.root_agent_id or ""),
+                    session_id=sess_id, tenant_id=tenant_id,
                 )
                 # 见上面 subagent 分支同一条注释：窗口以 session 配置为准，rm 只贡献
                 # client/身份。

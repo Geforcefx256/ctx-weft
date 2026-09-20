@@ -72,7 +72,7 @@ async def test_load_resolves_template_config_not_dataclass_defaults():
     views = {"agt_a": AgentView(id="agt_a", template_id=TPL)}
     await lm.load(views, session_id="s1", tenant_id="default",
                   fallback_template_id=TPL)
-    got, _rm = lm.materialize("agt_a")
+    got, _rm = lm.materialize("agt_a", session_id="s1", tenant_id="default")
     assert got.memory_config == tmpl.memory_config
     assert got.loop_config == tmpl.loop_config
 

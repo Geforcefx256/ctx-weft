@@ -214,7 +214,8 @@ async def test_compact_agent_run_has_start_and_finish():
     runtime._agent_lifecycle_manager.register_session(
         sid, tenant_id="default", fallback_template_id="agent:tpl_echo",
     )
-    runtime._agent_lifecycle_manager.materialize(aid)
+    runtime._agent_lifecycle_manager.materialize(
+        aid, session_id=sid, tenant_id="default")
 
     await runtime.compact_agent(aid)
 

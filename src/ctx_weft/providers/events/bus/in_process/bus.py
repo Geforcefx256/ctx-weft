@@ -185,13 +185,17 @@ class InProcessEventBus(EventBus):
                 if position is not None:
                     # 元事件比队列里最旧的一条真事件更值钱（它承载补读锚点）——塞不下时
                     # 再丢一条最旧的给它腾位；连这也失败只剩 warning 日志兜底。
+                    #
+                    # 封套字段逐个照抄触发它的那条事件，**`tenant_id` 也在内**：
+                    # `Event.tenant_id` 有缺省值 `"default"`，漏抄一个就把这条元事件归到
+                    # 了别的租户。它是瞬态、不落库，但按 tenant 分流的订阅者照样会分错。
                     try:
                         sub.queue.put_nowait(Event(
                             id=f"evt_dropped_{sub.id}_{position}",
                             run_id=event.run_id, sequence=0,
                             session_id=event.session_id, type=EventType.EVENTS_DROPPED,
                             timestamp=event.timestamp, task_id=event.task_id,
-                            agent_id=event.agent_id,
+                            agent_id=event.agent_id, tenant_id=event.tenant_id,
                             payload={"subscriber_id": sub.id, "position": position,
                                      "dropped": sub.dropped},
                         ))
@@ -206,7 +210,7 @@ class InProcessEventBus(EventBus):
                                 run_id=event.run_id, sequence=0,
                                 session_id=event.session_id, type=EventType.EVENTS_DROPPED,
                                 timestamp=event.timestamp, task_id=event.task_id,
-                                agent_id=event.agent_id,
+                                agent_id=event.agent_id, tenant_id=event.tenant_id,
                                 payload={"subscriber_id": sub.id, "position": position,
                                          "dropped": sub.dropped},
                             ))

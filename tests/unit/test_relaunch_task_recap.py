@@ -93,7 +93,7 @@ async def test_relaunch_registers_close_synth_for_finish(minimal_runtime_with_se
     tcid = await _seed_finish_pair(memory, session, task, agent_id)
     task.status = "FINISHED"
 
-    def _fake_materialize(self, agent_id):
+    def _fake_materialize(self, agent_id, *, session_id=None, tenant_id=None):
         return (Agent(id=agent_id, session_id=session.id, template_id="tpl_echo",
                        tenant_id=session.tenant_id), _fake_resolved_model())
 
@@ -170,7 +170,7 @@ async def test_relaunch_dispatch_boundary_no_close_synth(minimal_runtime_with_se
     runtime, session, template, task_manager, task, agent_id, memory = minimal_runtime_with_session
     task.status = "SUSPENDED"  # 委派挂起中崩溃的形态
 
-    def _fake_materialize(self, agent_id):
+    def _fake_materialize(self, agent_id, *, session_id=None, tenant_id=None):
         return (Agent(id=agent_id, session_id=session.id, template_id="tpl_echo",
                        tenant_id=session.tenant_id), _fake_resolved_model())
 

@@ -48,7 +48,7 @@ async def test_compact_agent_rejects_busy_session() -> None:
     rt._agent_lifecycle_manager.register_session(
         sid, tenant_id="default", fallback_template_id="agent:tpl_echo",
     )
-    rt._agent_lifecycle_manager.materialize(aid)
+    rt._agent_lifecycle_manager.materialize(aid, session_id=sid, tenant_id="default")
     rt._busy_sessions.add(sid)  # simulate an active drain
     with pytest.raises(SessionBusyError):
         await rt.compact_agent(aid)
@@ -121,7 +121,7 @@ async def test_compact_agent_uses_agent_lifecycle_managers_current_model_not_sta
     rt._agent_lifecycle_manager.register_session(
         sid, tenant_id="default", fallback_template_id=f"agent:{tmpl.id}",
     )
-    rt._agent_lifecycle_manager.materialize(aid)
+    rt._agent_lifecycle_manager.materialize(aid, session_id=sid, tenant_id="default")
 
     # host 先经 registry 的真相源换模型……
     changed = await rt.set_agent_llm(aid, llm_model="model-new")
@@ -188,7 +188,7 @@ async def test_compact_agent_folds_agent_layer() -> None:
     rt._agent_lifecycle_manager.register_session(
         sid, tenant_id="default", fallback_template_id=f"agent:{tmpl.id}",
     )
-    rt._agent_lifecycle_manager.materialize(aid)
+    rt._agent_lifecycle_manager.materialize(aid, session_id=sid, tenant_id="default")
 
     result = await rt.compact_agent(aid)
 

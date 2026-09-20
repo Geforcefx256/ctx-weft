@@ -843,11 +843,22 @@ class AgentLifecycleManager:
             reserved_output_tokens=client.output_reserve,
         )
 
-    def materialize(self, agent_id: str) -> tuple[Agent, ResolvedModel]:
+    def materialize(
+        self, agent_id: str, *, session_id: str, tenant_id: str,
+    ) -> tuple[Agent, ResolvedModel]:
         """水合：按 id 从 record 造一个新的 Agent 对象，顺带解出这次要用的模型。零事件，永不抛。
 
-        未登记的 id（恢复期缺口——比如跨重启后本进程的 registry 是空的）走「按
-        session 的 fallback_template_id 就地补登记 + WARNING」而不是 KeyError：
+        `session_id` / `tenant_id`：**必传，调用方给什么就是什么。** 它们只在这个 id 还没
+        登记时才被用到（下面那条补登记），但做成必需参数而不是可选：四个调用点手上本来
+        就都有这份语境（`assemble` 开头的 `sess_id`/`tenant_id`、另两处 `register_session`
+        前一行的 `session` 对象），而**省略它的代价是 registry 只能猜**——2026-09-19 之前
+        `_register_fallback` 在无语境时回落「最近一次 `register_session` 的会话」，那在同
+        一进程处理过多个会话时会把 agent 连同它的 tenant 归到**别的 session** 上（而
+        `register_session` 用 `setdefault`，已登记的会话不会被移到末尾，所以「最近一次」
+        跟「当前这次」并不是一回事）。签名里带上，那条猜的分支就不必存在。
+
+        未登记的 id（恢复期缺口——比如事件流里缺这个 agent 的 `AgentInstantiated`）走
+        「按 session 的 fallback_template_id 就地补登记 + WARNING」而不是 KeyError：
         回落而非报错是刻意的，与 `load()` 装填时模板解析失败的口径一致——
         授权按模板做策略，重启后把未知模板判成「无权限」会让老会话直接跑不动，
         把恢复期的一个缺口变成崩溃是净损失。
@@ -861,7 +872,8 @@ class AgentLifecycleManager:
         """
         rec = self._agents.get(agent_id)
         if rec is None:
-            rec = self._register_fallback(agent_id)
+            rec = self._register_fallback(
+                agent_id, session_id=session_id, tenant_id=tenant_id)
         rm = self.resolve_model(agent_id)
         agent = Agent(
             id=agent_id,
@@ -881,7 +893,7 @@ class AgentLifecycleManager:
         return agent, rm
 
     def _register_fallback(
-        self, agent_id: str, *, session_id: str | None = None, tenant_id: str | None = None,
+        self, agent_id: str, *, session_id: str, tenant_id: str,
     ) -> _AgentRecord:
         """未登记 id 的一次性补登记（materialize 的降级路径，instantiate 的父查找也借用它）。
 
@@ -889,34 +901,27 @@ class AgentLifecycleManager:
         record 从未存在过时创建一条，且创建后立刻幂等（第二次直接命中 `_agents.get`，
         不再触发警告），不会覆盖任何已登记的真实状态。
 
-        `session_id`/`tenant_id`：调用方若手上已经有确凿的 session 语境（比如
-        instantiate 的父查找——子 agent 的父几乎必然在同一次 instantiate 调用
-        的 session 里），传进来直接用，不猜。省略时才回落「最近一次
-        register_session 的会话」这个近似——materialize() 签名里没有 session_id
-        参数，是那条路径专属的容忍度（恢复期的一次缺口容忍度本就高于严格授权
-        路径），不是本方法本身必须用猜的。
+        `session_id` / `tenant_id`：**必传，调用方给什么就是什么，本方法不猜。**
+        2026-09-19 之前它们是可选的，省略时回落「最近一次 `register_session` 的会话」
+        （`next(reversed(self._sessions.items()))`）——那在同一进程处理过多个会话时会把
+        agent 连同 tenant 归到**别的** session 上，而且 `register_session` 用 `setdefault`，
+        已登记的会话不会被移到末尾，所以「最近一次」跟「当前这次」并不是一回事。两个
+        调用方手上本来都有确凿语境，那条猜的分支因此删除。
+
+        `template_id` 仍取自该 session 的登记项（`fallback_template_id`）——那是 registry
+        自己的账，不是调用方该操心的；session 没登记过则留空，与 `load()` 对无法解析的
+        模板同一口径（回落默认配置，不判成「无权限」）。
         """
         logger.warning(
-            "AgentLifecycleManager: unregistered agent %s; "
+            "AgentLifecycleManager: unregistered agent %s in session %s; "
             "falling back to a session default (recovery-time gap, degrading not crashing)",
-            agent_id,
+            agent_id, session_id,
         )
-        if session_id is not None and session_id in self._sessions:
-            _sid, defaults = session_id, self._sessions[session_id]
-        elif session_id is not None:
-            _sid = session_id
-            defaults = _SessionDefaults(
-                tenant_id=tenant_id or "default", fallback_template_id="",
-            )
-        elif self._sessions:
-            _sid, defaults = next(reversed(self._sessions.items()))
-        else:
-            defaults = _SessionDefaults(tenant_id="default", fallback_template_id="")
-            _sid = ""
+        defaults = self._sessions.get(session_id)
         rec = _AgentRecord(
-            session_id=_sid,
-            tenant_id=defaults.tenant_id,
-            template_id=defaults.fallback_template_id,
+            session_id=session_id,
+            tenant_id=tenant_id,
+            template_id=defaults.fallback_template_id if defaults is not None else "",
             parent_agent_id=None,
             spawn_depth=0,
             memory_config=MemoryConfig(),

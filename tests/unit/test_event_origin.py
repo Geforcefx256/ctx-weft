@@ -325,7 +325,7 @@ async def test_compact_agent_run_events_have_runtime_origin():
             metadata={"origin_task_id": f"root{i}", "parent_task_id": None}), pctx)
 
     rt._agent_lifecycle_manager.register_session(sid, tenant_id="default", fallback_template_id="agent:tpl_echo")
-    rt._agent_lifecycle_manager.materialize(aid)
+    rt._agent_lifecycle_manager.materialize(aid, session_id=sid, tenant_id="default")
 
     seen: list[Event] = []
 

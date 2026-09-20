@@ -19,9 +19,15 @@ from ctx_weft.providers.events import InMemoryEventStore, InProcessEventBus
 _T0 = datetime(2026, 9, 11, tzinfo=UTC)
 
 
+#: 刻意用非默认租户：`Event.tenant_id` 缺省就是 "default"，夹具若也用它，
+#: 「元事件有没有抄 tenant」这件事在断言上根本看不出来。
+_TENANT = "acme"
+
+
 def _ev(n: int) -> Event:
     return Event(id=f"evt_{n:04d}", run_id="r1", sequence=n, session_id="s1",
-                 type=EventType.RUN_STARTED, timestamp=_T0, payload={"n": n})
+                 type=EventType.RUN_STARTED, timestamp=_T0, tenant_id=_TENANT,
+                 payload={"n": n})
 
 
 async def test_slow_stream_observer_drops_visible_and_backfillable():
@@ -74,6 +80,11 @@ async def test_slow_stream_observer_drops_visible_and_backfillable():
 
     drop = next(e for e in slow_out if e.type == EventType.EVENTS_DROPPED)
     assert drop.payload["position"] >= 1
+    # 元事件的封套要照抄触发它那条事件的身份——`tenant_id` 曾被漏抄（`Event` 的缺省值
+    # 是 "default"），于是它悄悄归到了别的租户；瞬态不落库，但按 tenant 分流的订阅者
+    # 照样会分错。
+    assert drop.tenant_id == _TENANT
+    assert drop.session_id == "s1"
     # 补读可用：按 position 从持久日志取回被丢事件
     backfill = await store.read_range(
         "s1", after_position=drop.payload["position"] - 1,

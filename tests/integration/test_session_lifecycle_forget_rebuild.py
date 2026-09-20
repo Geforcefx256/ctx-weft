@@ -230,7 +230,8 @@ async def test_forget_agent_does_not_look_at_the_rest_of_the_session():
     rt = _make_runtime()
     sid, aid, _ = await _run_one_round(rt)
     # 同 session 塞一个还活着的 agent —— forget_session 会因它拒绝，forget_agent 不该。
-    rt._agent_lifecycle_manager._register_fallback("agt_busy", session_id=sid)
+    rt._agent_lifecycle_manager._register_fallback(
+        "agt_busy", session_id=sid, tenant_id="default")
     rt._agent_lifecycle_manager._agents["agt_busy"].status = "running"
 
     assert rt.forget_session(sid) is False
