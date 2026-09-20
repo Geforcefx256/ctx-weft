@@ -1883,13 +1883,34 @@ class CtxWeftRuntime:
                 self._finalize_cancel_memory(sess, tasks, reason)),
             on_session_done=_on_done,
             on_session_idle=_on_idle,
-            # task 落终态 → 清掉该 task 运行期 pin 进来的能力。挂在终态而非 run 收尾，
-            # 因为同一个 task 可以跑多个 run（retry/resume），pin 要跨得过重试
-            # （run 收尾的 evict 已明确不碰 pin 区，见 CapabilityCache.evict）。
-            on_task_terminal=lambda tid: self._capability_cache.clear_pins(tid),
+            # task 落终态 → 两件事，见 `_on_task_terminal`。挂在终态而非 run 收尾，因为同一个
+            # task 可以跑多个 run（retry/resume）：pin 要跨得过重试（run 收尾的 evict 已明确
+            # 不碰 pin 区，见 CapabilityCache.evict），HITL 决定同理——重试时它还要用。
+            on_task_terminal=lambda tid, sid=session.id: self._on_task_terminal(sid, tid),
         ))
 
         asyncio.create_task(task_manager.drain())
+
+    async def _on_task_terminal(self, session_id: str, task_id: str) -> None:
+        """`on_task_terminal` 钩子：task 落终态时回收挂在它身上的东西。
+
+        1. 清掉该 task 运行期 pin 进来的能力（`CapabilityCache`）。
+        2. 给它名下**已终局却再也不会被消费**的 HITL 决定盖 `HitlClosed`。
+
+        第 2 条是那套「了结」机制里最通用的退役判据：终态 task 不会再跑，
+        `_inject_resolved_user_turns` 对它本就直接跳过（`target.status in
+        TERMINAL_TASK_STATUSES`），gateway 也不会再为它求批。挂在这一个点上，一次覆盖
+        cancel / fail / finish 三种——比逐条去堵取消路径干净，也不会漏掉正常结束那一类
+        （那类同样可能留下已终局未消费的决定，只是比取消罕见）。
+
+        **不会误伤重试**：`_settle` 判 retry 时先 return，根本走不到这个钩子（与 pin 跨重试
+        保住是同一个理由），所以「还要再跑一轮」的 task 的决定不会被提前销掉。
+
+        best-effort：钩子在 `TaskManager.on_task_finished` 里已被 try/except 包住，这里不再
+        自己吞——盖章本身也不抛（见 `HitlService.close`）。
+        """
+        self._capability_cache.clear_pins(task_id)
+        await self.hitl.close_resolved(session_id, task_id=task_id)
 
     def _bind_task_manager(self, session_id: str, task_manager: "TaskManager") -> None:
         """把 TM 登记为该 session 的 owner——**唯一写 `_task_managers` 的地方**（逐出除外）。

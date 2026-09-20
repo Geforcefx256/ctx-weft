@@ -12,7 +12,8 @@
     threshold_finalizer   同上
     on_session_done       回收 run 令牌 / pause 闩 / scoped provider，全是 runtime 内存
     on_session_idle       同上
-    on_task_terminal      清 CapabilityCache 里该 task 的 pin——cache 归 core.capabilities，
+    on_task_terminal      清 CapabilityCache 里该 task 的 pin（cache 归 core.capabilities）、
+                          给该 task 已终局未消费的 HITL 决定盖章（hitl 在 orchestrator 之下），
                           TM 不认识它，也不该知道「工具面」这回事
 
 改造前它们是 8 个独立 setter（外加一个 `set_session_registry`，实测**从未被读过**，
@@ -113,7 +114,11 @@ class TaskManagerHooks:
     #: task 上、run 生命周期管不着的运行期状态（当前唯一使用者：清 CapabilityCache 里该
     #: task 的 pin）。**只在终态那条路上触发**：`_settle` 的 PENDING（retry）分支先 return，
     #: 故重试天然不触发——重试保住 pin 正是它该有的语义。同步回调、异常只记日志不阻断收尾。
-    on_task_terminal: "Callable[[str], None] | None" = None
+    #: task 落终态时调用（async）。当前两件事：清该 task 运行期 pin 进来的能力，以及给它
+    #: 名下**已终局却再也不会被消费**的 HITL 决定盖 `HitlClosed`——终态 task 不会再跑，
+    #: `_inject_resolved_user_turns` 对它本就直接跳过，gateway 也不会再为它求批。
+    #: best-effort：回调失败不该拦住任务收尾。
+    on_task_terminal: "Callable[[str], Coroutine[Any, Any, None]] | None" = None
 
     #: session 进入**空闲挂起**（park/suspend 且无其它在跑任务、非终结）时调用。
     #: 区别于 `on_session_done`：那是终结回调；这是「暂停待续接」的信号，供 runtime

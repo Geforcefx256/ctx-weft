@@ -370,8 +370,11 @@ class HitlService:
         self.registry.mark_closed(req.id)
         return True
 
-    async def close_resolved(self, session_id: str, *, agent_id: str | None = None) -> int:
-        """把该 session（可按 agent 收窄）全部**已终局**请求一并了结，返回盖上几条。
+    async def close_resolved(
+        self, session_id: str, *,
+        agent_id: str | None = None, task_id: str | None = None,
+    ) -> int:
+        """把该 session（可按 agent / task 收窄）全部**已终局**请求一并了结，返回盖上几条。
 
         用在**取消 / 销毁**路径上：那些决定的消费者已经不存在了——任务不会再跑，
         `_inject_resolved_user_turns` 对终态 task 本就直接跳过，gateway 也不会再为它求批。
@@ -382,10 +385,17 @@ class HitlService:
         请求正等着被注入/被 gateway 重放，盖章会让它们从清单里消失，此后崩一次就永久丢。
         所以不要把它挂进 `_cancel_pending_hitl_of` 那类共享 helper（它有一个 `defer=True`
         的活路径调用方 `_inject_user_turn`）。
+
+        `task_id` 收窄用在 **task 落终态**那条路上（`on_task_terminal`）。那是最通用的退役
+        判据：终态 task 不会再跑，`_inject_resolved_user_turns` 对它本就直接跳过
+        （`target.status in TERMINAL_TASK_STATUSES`），gateway 也不会再为它求批。一次覆盖
+        cancel / fail / finish 三种，不必逐条堵取消路径。
         """
         n = 0
         for req in self.registry.resolved_for_session(session_id):
             if agent_id is not None and req.agent_id != agent_id:
+                continue
+            if task_id is not None and req.task_id != task_id:
                 continue
             if await self.close(req):
                 n += 1

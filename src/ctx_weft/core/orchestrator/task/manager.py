@@ -1066,7 +1066,7 @@ class TaskManager:
         # 不该拦住任务收尾。
         if self._hooks.on_task_terminal is not None:
             try:
-                self._hooks.on_task_terminal(task_id)
+                await self._hooks.on_task_terminal(task_id)
             except Exception:
                 logger.exception("TaskManager: on_task_terminal callback failed for %s", task_id)
 

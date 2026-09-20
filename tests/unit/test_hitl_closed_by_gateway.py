@@ -462,3 +462,77 @@ async def test_result_exit_does_not_re_stamp_the_authorization_ones():
     ids = [e.payload["hitl_id"] for e in bus.events
            if e.type == EventType.HITL_CLOSED]
     assert sorted(ids) == [f"hit_{HITL_STAGE_AUTHZ}", f"hit_{HITL_STAGE_TOOL}"], ids
+
+
+# ── task 落终态：最通用的那条退役判据 ────────────────────────────────────────
+
+
+async def test_close_resolved_can_narrow_to_one_task():
+    """按 task 收窄——不得误伤同一 session 里别的 task 还有用的决定。"""
+    svc, bus = _service(HITL_STAGE_AUTHZ)
+    other = PendingHitl(
+        id="hit_other", form="approval", session_id=_SID, task_id="t_other",
+        agent_id="ag1", delivery=ToolResultDelivery(tool_call_id="call_x"),
+        created_at=_T0, tenant_id="acme", tool_call_id="call_x", stage=HITL_STAGE_AUTHZ)
+    other.decision = HitlDecision(outcome="accepted", message="ok")
+    other.resolved_at = _T0
+    svc.registry._requests[other.id] = other
+
+    n = await svc.close_resolved(_SID, task_id="t1")
+
+    assert n == 1
+    assert _closed_ids(bus) == {f"hit_{HITL_STAGE_AUTHZ}"}
+
+
+def test_task_terminal_hook_retires_that_tasks_decisions():
+    """task 落终态是**最通用**的退役判据，一次覆盖 cancel / fail / finish。
+
+    终态 task 不会再跑：`_inject_resolved_user_turns` 对它本就直接跳过
+    （`target.status in TERMINAL_TASK_STATUSES`），gateway 也不会再为它求批。所以挂在这一个
+    钩子上，比逐条去堵取消路径干净，也不会漏掉**正常结束**那一类——那类同样可能留下已终局
+    未消费的决定，只是比取消罕见。
+    """
+    import inspect
+
+    from ctx_weft.core.runtime import CtxWeftRuntime
+
+    src = inspect.getsource(CtxWeftRuntime._on_task_terminal)
+    assert "close_resolved" in src and "task_id=task_id" in src
+    assert "clear_pins" in src, "原有的 pin 回收不能丢"
+
+    # 钩子确实接上了这个方法（而不是仍然只接 clear_pins 的 lambda）
+    assert "self._on_task_terminal(" in inspect.getsource(CtxWeftRuntime)
+
+
+def test_task_terminal_hook_is_awaited():
+    """钩子必须被 `await`——盖章是 async，同步调用会留下一个从不执行的协程。
+
+    协程不 await 只会打一条 RuntimeWarning，测试照常绿，而那些决定一条都不会被销账。
+    """
+    import inspect
+
+    from ctx_weft.core.orchestrator.task.manager import TaskManager
+
+    src = inspect.getsource(TaskManager.on_task_finished)
+    assert "await self._hooks.on_task_terminal(" in src
+
+
+def test_retry_does_not_reach_the_terminal_hook():
+    """重试**不**走终态钩子，所以「还要再跑一轮」的 task 的决定不会被提前销掉。
+
+    与 CapabilityCache 的 pin 跨重试保住是同一个理由。这条把那个理由钉在测试里——它是新加的
+    盖章能不能挂在这个钩子上的前提：挂错了，一个只是本轮没做完的 task 的批准会被销账，下一轮
+    重跑时人要重新批一遍。
+    """
+    import inspect
+
+    from ctx_weft.core.orchestrator.task.manager import TaskManager
+
+    src = inspect.getsource(TaskManager._settle)
+    i_retry = src.index('if status == "PENDING":')
+    i_finished = src.index("await self.on_task_finished(")
+    assert i_retry < i_finished, "retry 判据必须在收尾之前"
+    # retry 分支里必须有 return，否则会穿下去落终态
+    retry_branch = src[i_retry:i_finished]
+    assert "return" in retry_branch, "retry 分支不 return 就会穿到终态收尾"
+    assert "on_task_finished" not in retry_branch
