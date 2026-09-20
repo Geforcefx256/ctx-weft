@@ -19,10 +19,14 @@ class ContentNormalizer(Protocol):
 
     两侧各写各的 blob store，两个 ref 不必相同——事件侧载荷必须由**原始**内容算出，
     不能拿 memory 侧的 ref 重算（那份 ref 事件库既无权解读也解不开）。
+
+    `tenant_id` 是 blob 的落点锚点，**由调用方给**——与 `HitlService.open` 同一条纪律
+    （「本类自己不持有、也不去解」）。它随请求一路带过来（`PendingHitl.tenant_id`），
+    实现方不该拿 `session_id` 去事件日志里反查一个已经在手里的字段。
     """
 
     async def __call__(
-        self, content: "str | list[ContentPart]", session_id: str,
+        self, content: "str | list[ContentPart]", session_id: str, tenant_id: str,
     ) -> "tuple[str | list[ContentPart], str | list[dict] | None]": ...
 
 
@@ -35,6 +39,6 @@ class ReplyIntake:
     async def normalize(
         self, content: "str | list[ContentPart]", req: "PendingHitl",
     ) -> "tuple[str | list[ContentPart], str | list[dict] | None]":
-        """收整个 `PendingHitl` 而非零散字段：blob 的 tenant 锚点要由 `session_id` 解出，
-        将来再要别的字段也不必改签名。"""
-        return await self._normalizer(content, req.session_id)
+        """收整个 `PendingHitl` 而非零散字段：blob 的 tenant 锚点就在它身上
+        （`PendingHitl.tenant_id`），将来再要别的字段也不必改签名。"""
+        return await self._normalizer(content, req.session_id, req.tenant_id)

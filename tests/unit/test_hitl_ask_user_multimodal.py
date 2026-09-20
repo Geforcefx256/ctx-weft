@@ -52,7 +52,7 @@ def _img() -> ImagePart:
 
 
 class _PassthroughNormalizer:
-    async def __call__(self, content, session_id):
+    async def __call__(self, content, session_id, tenant_id):
         return content, content
 
 

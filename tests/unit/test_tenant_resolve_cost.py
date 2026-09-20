@@ -57,6 +57,24 @@ def _count_full_reads(runtime) -> list[int]:
     return box
 
 
+def _count_tenant_lookups(runtime) -> list[int]:
+    """只数**解 tenant** 那一种类型收窄查询。
+
+    不能笼统地数 `_read_session_events_of_types`：`rebuild_session` 内部还会为 HITL 折叠
+    发一次（`HITL_FOLD_EVENT_TYPES`），混进来就分不清是谁发的了。
+    """
+    box = [0]
+    original = runtime._read_session_events_of_types
+
+    async def counted(session_id: str, types):
+        if tuple(types) == (EventType.SESSION_CREATED,):
+            box[0] += 1
+        return await original(session_id, types)
+
+    runtime._read_session_events_of_types = counted   # type: ignore[method-assign]
+    return box
+
+
 async def test_tenant_comes_from_session_created_without_a_full_read() -> None:
     runtime = _runtime()
     # 一条正常会话：SessionCreated + 一串后续事件
@@ -98,17 +116,68 @@ async def test_live_task_manager_short_circuits_before_any_read() -> None:
         1, EventType.SESSION_CREATED, user_prompt="go",
         template_id="agent:tpl_echo", root_agent_id="agt_root"))
 
-    hits = [0]
-    original = runtime._read_session_events_of_types
-
-    async def counted(session_id: str, types):
-        hits[0] += 1
-        return await original(session_id, types)
-
-    runtime._read_session_events_of_types = counted   # type: ignore[method-assign]
+    hits = _count_tenant_lookups(runtime)
     reads = _count_full_reads(runtime)
 
     runtime._task_managers[_SID] = SimpleNamespace(   # type: ignore[assignment]
         session=SimpleNamespace(tenant_id="hot-tenant"))
     assert await runtime._tenant_for_session(_SID) == "hot-tenant"
     assert (hits[0], reads[0]) == (0, 0), "热路径是纯内存查表，不该碰事件库"
+
+
+async def test_rebuild_session_uses_the_tenant_host_supplies() -> None:
+    """host 传了 tenant → core 不再去事件日志反查。
+
+    tenant 是 host 侧的概念（宿主那边是 `"{surrogate_id}:{cowork_id}"`，由它的 API 层拼
+    出来、写进自己的 session 记录），core 只负责搬运。host 手上有的时候没理由让 core
+    回头反查。
+    """
+    runtime = _runtime()
+    await runtime.event_store.append(_ev(
+        1, EventType.SESSION_CREATED, tenant=_TENANT, user_prompt="go",
+        template_id="agent:tpl_echo", root_agent_id="agt_root"))
+
+    hits = _count_tenant_lookups(runtime)
+    reads = _count_full_reads(runtime)
+
+    await runtime.rebuild_session(_SID, tenant_id="host-knows")
+
+    assert (hits[0], reads[0]) == (0, 0), "host 传了 tenant 就不该有任何解 tenant 的 IO"
+
+
+async def test_rebuild_session_without_tenant_still_resolves() -> None:
+    """host 没传（旧 host / 其它 host 实现）→ 回落解析，行为与改造前一致。"""
+    runtime = _runtime()
+    await runtime.event_store.append(_ev(
+        1, EventType.SESSION_CREATED, tenant=_TENANT, user_prompt="go",
+        template_id="agent:tpl_echo", root_agent_id="agt_root"))
+
+    hits = _count_tenant_lookups(runtime)
+    reads = _count_full_reads(runtime)
+
+    await runtime.rebuild_session(_SID)
+
+    assert hits[0] == 1, "没传就该解一次（走收窄查询）"
+    assert reads[0] == 0, "而且不该退到全量读——SessionCreated 在，收窄查询就够了"
+
+
+async def test_default_tenant_is_treated_as_possibly_unset() -> None:
+    """`"default"` 既是合法真租户名、又是每一环的缺省值，两者值上不可区分。
+
+    `_tenant_or_resolve` 因此把它当「可能没填」：再解一次。解出来仍是 default 则行为不变，
+    解出真 tenant 则救回一个本该带上却没带的值。
+    """
+    runtime = _runtime()
+    await runtime.event_store.append(_ev(
+        1, EventType.SESSION_CREATED, tenant=_TENANT, user_prompt="go",
+        template_id="agent:tpl_echo", root_agent_id="agt_root"))
+
+    # 带真 tenant → 原样返回，零 IO
+    reads = _count_full_reads(runtime)
+    assert await runtime._tenant_or_resolve("acme-real", _SID) == "acme-real"
+    assert reads[0] == 0
+
+    # 带 "default" / 空 → 都去解，解出事件里的真值
+    assert await runtime._tenant_or_resolve("default", _SID) == _TENANT
+    assert await runtime._tenant_or_resolve("", _SID) == _TENANT
+    assert await runtime._tenant_or_resolve(None, _SID) == _TENANT

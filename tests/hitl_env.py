@@ -14,9 +14,18 @@ from ctx_weft.core.hitl.service import HitlService
 
 
 class PassthroughNormalizer:
-    """显式的恒等 normalizer：`(memory 侧内容, event 侧载荷)` 二元组，两侧同值。"""
+    """显式的恒等 normalizer：`(memory 侧内容, event 侧载荷)` 二元组，两侧同值。
 
-    async def __call__(self, content, session_id):
+    `tenant_id` 随 `ContentNormalizer` 契约收下并记在 `seen_tenants` 上——它是 blob 的
+    落点锚点，由 `ReplyIntake` 从 `PendingHitl.tenant_id` 递来（core 不再拿 session_id
+    回查），需要断言这条链没断的用例读它。
+    """
+
+    def __init__(self) -> None:
+        self.seen_tenants: list[str] = []
+
+    async def __call__(self, content, session_id, tenant_id):
+        self.seen_tenants.append(tenant_id)
         return content, content
 
 

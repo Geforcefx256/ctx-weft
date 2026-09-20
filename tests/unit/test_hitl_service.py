@@ -41,14 +41,16 @@ class PassthroughNormalizer:
 
     def __init__(self) -> None:
         self.calls = 0
+        self.seen_tenants: list[str] = []
 
-    async def __call__(self, content, session_id):
+    async def __call__(self, content, session_id, tenant_id):
         self.calls += 1
+        self.seen_tenants.append(tenant_id)
         return content, content
 
 
 class RejectingNormalizer:
-    async def __call__(self, content, session_id):
+    async def __call__(self, content, session_id, tenant_id):
         raise ValueError("unsupported media type")
 
 

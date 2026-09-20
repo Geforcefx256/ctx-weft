@@ -197,7 +197,7 @@ async def test_hitl_service_emits_with_hitl_service_origin():
             self.events.append(event)
 
     class _PassthroughNormalizer:
-        async def __call__(self, content, session_id):
+        async def __call__(self, content, session_id, tenant_id):
             return content, content
 
     bus = _RecordingBus()

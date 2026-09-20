@@ -668,3 +668,82 @@ async def test_hitl_event_payload_carries_an_event_ref_not_the_memory_ref():
     # 两侧各写各的，各一次
     assert mem_store.put_calls == 1
     assert evt_store.put_calls == 1
+
+
+# ── tenant 随请求带着走（2026-09-19）──────────────────────────────────────────
+#
+# tenant 是 host 侧的概念，core 只搬运：`ProviderContext` → `HitlService.open` →
+# `PendingHitl.tenant_id` → 应答内容管线。上面那三条用例走的是**兜底**路径（请求上的
+# tenant 是缺省 "default"，靠活 TM / 事件日志解出真值）；下面两条钉的是那条链本身。
+
+
+async def _pending_with_tenant(rt, *, session_id: str, tenant_id: str) -> str:
+    """开一个**带 tenant** 的未决请求——生产路径就是这么开的
+    （`capability_gateway` 传 `ctx.provider_ctx.tenant_id`、`act` 传
+    `state.session.tenant_id`）。"""
+    req = await rt.hitl.open(
+        HitlAsk(form="wait", delivery=NoResumeDelivery()),
+        session_id=session_id, task_id="tsk-1", stage="tool", unattended=False,
+        tenant_id=tenant_id,
+    )
+    return req.id
+
+
+def _count_event_reads(rt) -> list[str]:
+    """给两条读事件库的路都装计数——`_tenant_for_session` 先走类型收窄、再兜底全量。"""
+    hits: list[str] = []
+    orig_typed = rt._read_session_events_of_types
+    orig_full = rt.event_store.read_by_session
+
+    async def typed(session_id, types):
+        hits.append("typed")
+        return await orig_typed(session_id, types)
+
+    async def full(session_id):
+        hits.append("full")
+        return await orig_full(session_id)
+
+    rt._read_session_events_of_types = typed          # type: ignore[method-assign]
+    rt.event_store.read_by_session = full            # type: ignore[method-assign]
+    return hits
+
+
+@pytest.mark.asyncio
+async def test_tenant_on_the_request_anchors_the_blob_without_any_lookup():
+    """请求自带真 tenant → blob 落在它上面，且**一次事件库都不读**。
+
+    改造前这里是拿 session_id 去事件日志反查 tenant 的，而那个值从请求被开出来的那一刻
+    就一直在手里（`HitlService.open` 的契约：「本类自己不持有、也不去解」）。
+    """
+    store = _CountingStore()
+    rt = _make_runtime(_VisionClient(), store)
+    hid = await _pending_with_tenant(rt, session_id="ses-carried", tenant_id="tenant-carried")
+    reads = _count_event_reads(rt)
+
+    await _reply(rt, hid, [ImagePart(data=_PNG, media_type="image/png")])
+
+    assert store.ctx_tenant_ids == ["tenant-carried"], "blob 该落在请求带来的 tenant 上"
+    assert reads == [], f"不该为解 tenant 读事件库，实际读了：{reads}"
+
+
+@pytest.mark.asyncio
+async def test_default_tenant_on_the_request_still_gets_resolved():
+    """请求上是 `"default"` → **仍要解一次**。
+
+    `"default"` 既是合法的真租户名、又是这条链上每一环的缺省值，两者在值上不可区分。
+    保守地再解一次：解出来仍是 default 则行为不变，解出真 tenant 则救回了一个本该带上却
+    没带的值——多租户宿主下那正是「图落错锚点」与「落对」的差别。
+    """
+    store = _CountingStore()
+    rt = _make_runtime(_VisionClient(), store)
+    _install_live_owner(rt, "ses-default-carried", "tenant-real")
+    hid = await _pending_with_tenant(
+        rt, session_id="ses-default-carried", tenant_id="default")
+    reads = _count_event_reads(rt)
+
+    await _reply(rt, hid, [ImagePart(data=_PNG, media_type="image/png")])
+
+    assert store.ctx_tenant_ids == ["tenant-real"], (
+        "请求上的 default 该被当成「可能没填」，由解析救回真 tenant")
+    # 活 owner TM 命中在读事件库之前，所以这一路仍是零 IO
+    assert reads == [], f"热路径该在内存里命中，实际读了：{reads}"
