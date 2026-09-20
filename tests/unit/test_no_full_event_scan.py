@@ -7,8 +7,10 @@
    `/resume` 都走一遍（`_recover_session_locked`），与快照有没有无关；
 2. 快照不可用时那趟**正当的**全量重放也要分批，不把整条流驻留内存。
 
-第 2 条在本分支走 `read_range` 的 position 区间：position 是连续整数、`committed_head`
-是这一刻的提交位点，所以区间切分既不重也不漏，整趟重放还锚在同一个 head 上（一致切面）。
+第 2 条的分批**由 store 产出**（`EventStore.replay`，基类默认实现即真分批——`read_range`
+与 `committed_head` 都是必需方法，按 position 区间切就行）。core 只管
+`async for batch in store.replay(sid)`，不问「你支不支持分页」、不替谁选降级路：那种能力
+探测曾经写在 core 里，一个坏设计生出两个分支和两种失败形态。
 """
 
 from __future__ import annotations
@@ -18,13 +20,15 @@ from datetime import UTC, datetime
 import pytest
 
 from ctx_weft.core.control.reducers import (
-    _REPLAY_BATCH,
     TASK_RECAP_EVENT_TYPES,
     rebuild_view,
     reduce_events,
 )
-from ctx_weft.protocols.events import Event, EventType
+from ctx_weft.protocols.events import Event, EventStore, EventType
 from ctx_weft.providers.events import InMemoryEventStore
+
+#: 分批大小现在是 store 的事（`EventStore.REPLAY_BATCH`），core 不持有它。
+_REPLAY_BATCH = EventStore.REPLAY_BATCH
 
 pytestmark = pytest.mark.asyncio
 
@@ -119,7 +123,11 @@ async def test_recap_type_set_matches_what_the_fold_actually_reads() -> None:
 
 
 async def test_full_replay_is_batched_by_position_range() -> None:
-    """无可用快照时按 position 区间分多批读，**一次全量读都不发**。"""
+    """无可用快照时由 store 分多批产出，**一次全量读都不发**。
+
+    区间的首尾相接由 `EventStore.replay` 的默认实现负责；这里连带验证它，因为 core 正是
+    靠「每批首尾相接、末批上界 == head」才等价于整批折叠。
+    """
     store = _CountingStore()
     await _seed(store, n_noise=_REPLAY_BATCH * 2 + 17)   # 跨 3 批，末批不满
 

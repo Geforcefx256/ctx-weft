@@ -636,7 +636,10 @@ class CtxWeftRuntime:
         # 按 ID 排序的回落分支。这里做的是契约校验而非能力协商——Protocol 的
         # @abstractmethod 只拦得住显式继承的实现，鸭子类型 store 缺方法要到第一次
         # 提交才炸，那时错误已经离现场很远。
-        from ctx_weft.protocols.events import supports_ordered_commit
+        from ctx_weft.protocols.events import (
+            supports_ordered_commit,
+            supports_replay,
+        )
         if not supports_ordered_commit(self.event_store):
             raise ValueError(
                 f"EventStore {type(self.event_store).__name__} 未实现有序提交："
@@ -645,6 +648,12 @@ class CtxWeftRuntime:
                 "事件会永久落在快照游标之外，两条恢复路径给出不同的世界且不报错"
                 "（可靠性方案 H2）。内置 InMemoryEventStore / SqlEventStore 均已实现；"
                 "自定义 store 请参照 tests/unit/test_ordered_event_store_conformance.py。")
+        if not supports_replay(self.event_store):
+            raise ValueError(
+                f"EventStore {type(self.event_store).__name__} 没有 replay："
+                "快照不可用时的全量重放由 store 分批产出（EventStore.replay），core 只"
+                "`async for` 折叠，不做能力探测也不备降级路。显式继承 EventStore 即可白拿"
+                "默认实现（按 position 区间切，真分批）；鸭子类型 store 请自己写一个。")
         # 存储不可用健康表（spec: event-commit）：session_id → 原因。CommitGate 失败时
         # **先标记后抛**；公开查询走 storage_health()。内存态——崩溃后由持久日志重建。
         self._storage_unavailable: dict[str, str] = {}

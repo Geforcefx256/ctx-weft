@@ -432,25 +432,6 @@ def snapshot_is_usable(
     return True
 
 
-#: 全量回放的分批大小。回放是左折叠、可分批，所以内存峰值由它而不是会话长度决定。
-#:
-#: 取 2000 是实测的权衡点（3 万条事件 / 45MB 的 events 表，SQLite 本地）：
-#:
-#:     批大小    查询次数    耗时      内存峰值
-#:     一次性        1      3.75s    121.5 MB
-#:      1000       30      6.10s      6.3 MB
-#:      2000       15      5.09s     12.3 MB     ← 取这档
-#:      5000        6      4.58s     30.2 MB
-#:     10000        3      4.47s     60.1 MB
-#:
-#: 判据是「内存是硬约束、耗时是软约束」：121MB 单会话在并发恢复下会叠成几百 MB ~ GB，
-#: 那是会崩的；而这条路只在**快照不可用**时走（罕见），多花一秒用户等得起。
-#:
-#: ⚠️ 数字来自 SQLite 本地文件。Postgres 走网络时每次查询多一个 RTT，分批的耗时劣势会
-#: 放大（但单次大查询传 45MB 也更慢）；真要调，照上面的方法在目标库上重测。
-_REPLAY_BATCH = 2000
-
-
 async def rebuild_view(event_store: Any, session_id: str) -> RunStateView:
     """按快照+增量或全量回放重建 RunStateView（spec: snapshot-recovery，wp4 改造）。
 
@@ -483,25 +464,17 @@ async def rebuild_view(event_store: Any, session_id: str) -> RunStateView:
             through_position=head,
         )
         return apply_events([se.event for se in delta], view)
-    # 全量：忽略快照（存量/损坏/超前），按 position 序重放；重造快照由 writer 负责。
+    # 全量：忽略快照（存量/损坏/超前），按提交序重放；重造快照由 writer 负责。
     #
-    # **分批读，不把整条流一次性驻留内存**：`read_range(0..head)` 一次性返回会让内存峰值
-    # 随会话长度走——实测一条 3 万事件的会话约 120MB 常驻。而重放是左折叠
-    # （`reduce_events(evts)` 就是 `apply_events(evts, 空 view)`，本文件里两段循环体逐字
-    # 相同；apply 是 for 循环、可结合），所以按 position 区间切开逐批 apply 与整批
-    # **逐字段等价**，内存峰值降到 O(batch)。
+    # **分批由 store 产出**（`EventStore.replay`），这里只管折叠。从前这段自己算 position
+    # 区间、还先探一次「这个 store 支不支持分页」再选路——那是把 store 的知识和能力判断
+    # 漏进了 core，一个坏设计生出两个分支与两种失败形态。现在 core 不问、不选、不降级。
     #
-    # position 是连续整数、`head` 是这一刻的提交位点，所以区间切分是精确的——既不重也
-    # 不漏，且整趟重放锚在同一个 `head` 上（一致切面，不受期间新提交影响）。
+    # 分批与整批逐字段等价：重放是左折叠（`reduce_events` 就是 `apply_events` 在空 view
+    # 上的调用，本文件里两段循环体逐字相同），而 apply 是 for 循环、可结合。
     view = RunStateView(run_id=session_id, session_id="", task_id="", agent_id="")
-    cursor = 0
-    while cursor < head:
-        upper = min(cursor + _REPLAY_BATCH, head)
-        stored = await event_store.read_range(
-            session_id, after_position=cursor, through_position=upper)
-        if stored:
-            apply_events([se.event for se in stored], view)
-        cursor = upper
+    async for batch in event_store.replay(session_id):
+        apply_events(batch, view)
     return view
 
 

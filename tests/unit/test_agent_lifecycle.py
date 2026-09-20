@@ -16,6 +16,7 @@ from ctx_weft.protocols.events import (
     EVENT_TYPES,
     L_TIER_EVENT_TYPES,
     Event,
+    EventStore,
     EventType,
 )
 
@@ -490,16 +491,23 @@ def test_new_exception_codes_follow_existing_naming_style():
 # ── Task 14: reducers 折叠 AGENT_* ──────────────────────────────────────────
 
 
-class _MemStore:
+class _MemStore(EventStore):
     """只读 fake：喂一段事件给 `rebuild_view`，不模拟快照。
 
     有序提交是 `EventStore` 的必需部分（spec: event-log），恢复路径无条件走
     `committed_head` + `read_range`，所以 fake 也得提供这两个——position 直接用
     列表下标（1-based），语义上等价于「这些事件按此顺序提交过」。
+
+    **显式继承协议**，不用鸭子类型：分批重放（`EventStore.replay`）在协议里有能用的默认
+    实现，只调这两个必需方法，继承下来就白拿。不继承就得自己再写一遍那段区间切分，那正是
+    「照抄一份必然和 core 分叉」。顺带还进了 ABC 检查——少一个必需方法在实例化时就炸。
     """
 
     def __init__(self, events):
         self._events = events
+
+    async def append(self, event):  # pragma: no cover - 只读 fake
+        raise NotImplementedError
 
     async def read_by_session(self, session_id, **_kw):
         return list(self._events)

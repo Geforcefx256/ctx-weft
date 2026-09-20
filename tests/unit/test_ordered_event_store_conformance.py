@@ -19,6 +19,7 @@ from ctx_weft.protocols.events import (
     EventStore,
     StoredEvent,
     supports_ordered_commit,
+    supports_replay,
 )
 from ctx_weft.providers.events.store.in_memory.store import InMemoryEventStore
 from ctx_weft.providers.events.store.sql.store import SqlEventStore, open_sqlite_event_store
@@ -265,6 +266,66 @@ def test_supports_ordered_commit_requires_all_three():
         async def append_batch(self, session_id, batch_id, events): ...
 
     assert not supports_ordered_commit(PartialStore())
+
+
+def test_replay_default_is_inherited_not_reimplemented():
+    """`replay` 在协议里是**能用的默认实现**，继承即可用——不是又一个要各自实现的桩。
+
+    它只调 `read_range` / `committed_head`，两者都是必需方法，所以默认实现本身就是真分批。
+    内置两个 store 都不覆盖它：覆盖等于照抄一份区间切分，必然和协议分叉。
+    """
+    assert EventStore.replay is not None
+    assert "replay" not in EventStore.__abstractmethods__
+    for cls in (InMemoryEventStore, SqlEventStore):
+        assert cls.replay is EventStore.replay, f"{cls.__name__} 不该自己再写一遍分批"
+    assert supports_replay(InMemoryEventStore())
+
+
+def test_supports_replay_asks_only_whether_it_exists():
+    """判据与 `supports_ordered_commit` 相反：继承下来的默认实现算「有」。
+
+    那三个方法在协议里是抽象桩，继承而不覆盖等于没实现；`replay` 是能用的实现，继承就能用。
+    两个谓词判据不同不是笔误，这条把它钉住。
+    """
+    class Inheriting(EventStore):
+        async def append(self, event): ...
+        async def read_by_session(self, session_id): return []
+        async def append_batch(self, session_id, batch_id, events): ...
+        async def read_range(self, session_id, **kw): return []
+        async def committed_head(self, session_id): return 0
+
+    assert supports_replay(Inheriting()), "继承来的默认实现算有"
+
+    class DuckWithoutReplay:
+        async def append_batch(self, session_id, batch_id, events): ...
+        async def read_range(self, session_id, **kw): return []
+        async def committed_head(self, session_id): return 0
+
+    assert supports_ordered_commit(DuckWithoutReplay()), "三个方法齐全"
+    assert not supports_replay(DuckWithoutReplay()), "但没有 replay——鸭子类型拿不到默认实现"
+
+
+def test_runtime_rejects_duck_typed_store_without_replay():
+    """构造期拒绝缺 `replay` 的鸭子类型 store——把缺失挪到启动时。
+
+    恢复路径无条件 `async for batch in store.replay(sid)`：core 不问「你支不支持分页」、
+    不备降级路（那种能力探测曾经写在 core 里，一个坏设计生出两个分支和两种失败形态）。
+    代价是缺了它只会在**快照不可用的那次** `/resume` 里才炸，那是最罕见最难复现的路径，
+    所以这道门必须在构造期。
+    """
+    from ctx_weft.core.models.config import RuntimeConfig
+    from ctx_weft.core.runtime import CtxWeftRuntime
+
+    class DuckStoreNoReplay:
+        """三个必需方法齐全，但不继承协议 → 没有 replay。"""
+        async def append(self, event): ...
+        async def read_by_session(self, session_id): return []
+        async def append_batch(self, session_id, batch_id, events): ...
+        async def read_range(self, session_id, **kw): return []
+        async def committed_head(self, session_id): return 0
+
+    with pytest.raises(ValueError, match="没有 replay"):
+        CtxWeftRuntime(event_store=DuckStoreNoReplay(), config=RuntimeConfig())
 
 
 def test_runtime_rejects_store_without_ordered_commit():

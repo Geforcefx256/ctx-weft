@@ -573,6 +573,56 @@ class EventStore(Protocol):
         """该会话最新已确认提交的 position；无提交时为 0。"""
         ...
 
+    #: `replay` 每批多少条。见 `replay` 的 docstring。
+    REPLAY_BATCH: int = 2000
+
+    async def replay(self, session_id: str) -> "AsyncIterator[list[Event]]":
+        """按提交序**分批**产出该会话的全部已提交事件。
+
+        给「快照不可用、必须从头重放」那条路用。调用方只管
+        ``async for batch in store.replay(sid): apply_events(batch, view)``——**怎么分批
+        是 store 的私事**，core 既不问「你支不支持分页」也不替谁选路。那种能力探测
+        （`getattr` / `except NotImplementedError` 再降级）曾经写在 core 的重放函数里，
+        一个坏设计生出两个分支和两种失败形态；这里把它收回实现侧。
+
+        **为什么必须分批**：一次性把整条流变成 `list[Event]` 的代价是实测过的——一条
+        3 万事件 / 45MB `events` 表的会话约 130MB 常驻、读一次 3.5 秒（SQLite 本地文件；
+        Postgres 走网更慢）。而重放是左折叠（`reduce_events(evts)` 就是
+        `apply_events(evts, 空 view)`，`core/control/reducers.py` 里两段循环体逐字相同；
+        apply 是 for 循环、可结合），所以分批与整批**逐字段等价**，内存峰值降到 O(batch)。
+
+        本默认实现已经是**真分批**，任何 store 都不必覆盖：`read_range` 与
+        `committed_head` 都是必需方法（见上面两个 `@abstractmethod`），所以按 position
+        区间切就行。position 是连续整数、`head` 是这一刻的提交位点，因此切分既不重也不漏，
+        整趟重放还锚在同一个 `head` 上——期间的新提交不会掺进来（一致切面）。
+
+        `REPLAY_BATCH` 取 2000 是实测的权衡点（3 万事件，SQLite 本地）：
+
+            批大小    查询次数    耗时      内存峰值
+            一次性        1      3.75s    121.5 MB
+             1000       30      6.10s      6.3 MB
+             2000       15      5.09s     12.3 MB     ← 取这档
+             5000        6      4.58s     30.2 MB
+            10000        3      4.47s     60.1 MB
+
+        判据是「内存是硬约束、耗时是软约束」：121MB 单会话在并发恢复下会叠成几百 MB ~ GB，
+        那是会崩的；而这条路只在快照不可用时走（罕见），多花一秒用户等得起。数字来自
+        SQLite 本地文件——Postgres 每次查询多一个 RTT，真要调就在目标库上照这个方法重测。
+
+        ⚠️ 默认实现只白送给**显式继承本协议**的 store。鸭子类型的 store（不继承、靠方法
+        齐全冒充）拿不到它——所以 Runtime 在构造期用 `supports_replay(store)` 兜一道：
+        缺 `replay` 就拒绝启动，而不是等到某次快照不可用的 `/resume` 深处抛 AttributeError。
+        """
+        head = await self.committed_head(session_id)
+        cursor = 0
+        while cursor < head:
+            upper = min(cursor + self.REPLAY_BATCH, head)
+            stored = await self.read_range(
+                session_id, after_position=cursor, through_position=upper)
+            if stored:
+                yield [se.event for se in stored]
+            cursor = upper
+
     # ── 可选快照扩展 ──────────────────────────────────────────────────────────
     # 未实现时抛 NotImplementedError；core 捕获后降级为全量 replay。
 
@@ -634,6 +684,22 @@ def supports_ordered_commit(store: object) -> bool:
         if impl is None or impl is getattr(EventStore, name, None):
             return False
     return True
+
+
+def supports_replay(store: object) -> bool:
+    """store 能不能被分批重放（`EventStore.replay`）。
+
+    判据与 `supports_ordered_commit` **相反**，这不是笔误：那三个方法在协议里是抽象桩，
+    「继承了但没覆盖」等于没实现；`replay` 在协议里是**能用的默认实现**，继承下来就真能
+    用（它只调 `read_range` / `committed_head`，两者都是必需方法）。所以这里只问「有没有
+    这个属性」——继承协议的 store 恒为真，鸭子类型的 store 得自己写一个。
+
+    存在的理由与 `supports_ordered_commit` 相同：把缺失挪到构造期。恢复路径无条件
+    `async for batch in store.replay(sid)`，core 既不问「你支不支持分页」也不备降级路
+    （那种能力探测曾经写在 core 里，一个坏设计生出两个分支和两种失败形态）；代价是缺了它
+    就会在**快照不可用的那次** `/resume` 里才炸——那是最罕见、最难复现的路径。
+    """
+    return getattr(type(store), "replay", None) is not None
 
 
 # ── Blob 存储（事件流的字节侧）─────────────────────────────────────────────────
