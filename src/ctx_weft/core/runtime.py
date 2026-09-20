@@ -4484,23 +4484,25 @@ class CtxWeftRuntime:
         用它把 PAUSED 会话的内存态填回来；应答入口也可在内存为空时按需自愈（重启后
         registry 还没被 recover 填上时，据事件即时装填，避免应答 KeyError；spec/07 §9）。
 
-        ── 已知代价：**O(该会话 HITL 事件数)，且这条路每次冷应答都走一遍**（复审 I6）──
-        交互式会话里每条用户消息都是一次 `UserTurn` HITL，所以 N 轮对话 ≈ 2N 条 HITL
-        事件；每次冷应答重跑一次全量折叠 + 一次装填。读取已经收窄到 `HITL_FOLD_EVENT_TYPES`
-        （事件库支持轻查询时不全量回放），blob 还原也只碰**非纯文本**的决定
-        （`_hydrate_snapshot_messages` 对 `str` 内容零 blob IO），所以常数很小；但阶数是
-        线性的，长会话的每次应答都要付。
+        ── 代价：**O(delta)**，不再随会话长度增长（复审 I6 的那个阶数已经去掉）──
+        这个判断没有年龄上界（三个月前开出、至今未决的请求今天仍必须被看见），所以它一度
+        只能每次冷应答把该会话**全部** HITL 事件读回来折一遍——实测 800 次人工确认的会话
+        取回 1600 条、读放大 1600×、218ms，而交互式会话里每条用户消息都是一次 `UserTurn`
+        HITL，那个量只增不减。按类型收窄只把斜率降了一档，阶数还是线性的。
 
-        **为什么不截尾**：自然的界是「只折最近一段」，但那会漏掉一条很久以前开出、至今
-        未决的请求——`list_pending` 看不见它 ⟹ `parked_task_ids` 少一个 ⟹ 那个任务在人还
-        没回答时就被重排跑起来。未决请求的年龄没有上界，任何按条数/时间截尾的界都可能
-        踩中它，所以这里**不猜**。真要去掉这个阶数，需要的是事件库侧「只取未终局 HITL」
-        的查询能力（或一份 HITL 检查点），那是 provider 契约的改动，不属于本次修复。
+        现在那份活账是**投影字段**（`RunStateView.hitl`），随快照 + 增量走。截尾这条路始终
+        是错的（任何按条数/时间的界都可能踩中那条很久以前开出、至今未决的请求：`list_pending`
+        看不见它 ⟹ `parked_task_ids` 少一个 ⟹ 任务在人还没回答时就被重排跑起来），而进投影
+        不是截尾——是让那份账**自己销账**（`HitlClosed` / `outcome=cancelled`），所以它有界
+        而不是被截断。
+
+        `_hydrate_snapshot_messages` 仍在这里：blob 里的决定 message 是**事件** blob 命名空间
+        下的引用，装填进 registry 之前必须转成记忆侧的（spec §12.3.3）。它只碰非纯文本内容,
+        纯文本零 IO。
         """
-        from ctx_weft.core.control.reducers import HITL_FOLD_EVENT_TYPES, fold_hitl_snapshot
+        from ctx_weft.core.control.reducers import rebuild_view
 
-        events = await self._read_session_events_of_types(session_id, HITL_FOLD_EVENT_TYPES)
-        snapshot = fold_hitl_snapshot(events)
+        snapshot = (await rebuild_view(self.event_store, session_id)).hitl
         await self._hydrate_snapshot_messages(snapshot, session_id)
         return self.hitl_registry.load_snapshot(snapshot)
 

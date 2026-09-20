@@ -99,6 +99,13 @@ class AgentView:
     current_task_id: str | None = None
 
 
+def _new_hitl_snapshot():
+    """延迟 import：`core.hitl` 在 `core.control` **之上**，模块级 import 会成环。"""
+    from ctx_weft.core.hitl.snapshot import HitlSnapshot
+
+    return HitlSnapshot()
+
+
 @dataclass
 class RunStateView:
     """Point-in-time view of a run's state for inspect/replay."""
@@ -127,6 +134,25 @@ class RunStateView:
     events_replayed: int = 0
 
     # Full projections rebuilt from events
+    #: HITL 的**活账**（`HitlSnapshot`）：未决请求、已终局未消费的决定、以及折叠期的两份
+    #: 工作账。由 `apply_hitl_event` 逐条折出，与一次性 `fold_hitl_snapshot` 同一份实现。
+    #:
+    #: **为什么它回到了投影里。** 这个判断没有年龄上界（三个月前开出、至今未决的请求今天仍
+    #: 必须被看见），所以 `rebuild_hitl` 从前每次冷应答都要把该会话**全部** HITL 事件读回来
+    #: 折一遍——实测 800 次人工确认的会话取回 1600 条、读放大 1600×、218ms。进投影之后随
+    #: 快照 + 增量走，变成 O(delta)。
+    #:
+    #: **为什么现在进得起。** 四份账都有退役了（`HitlClosed` 销 `resolved` /
+    #: `decisions_for` / `opened`，`outcome=cancelled` 销 `opened`），所以大小 ≈ 活跃数，
+    #: 不随会话长度增长。当初把 HITL 移出投影是因为**两份折叠会漂移**，而现在折叠只有一份
+    #: （`apply_hitl_event`），那条理由不再适用——registry 仍是查询的唯一真相源，投影只是
+    #: 它的装填来源。
+    #:
+    #: ⚠️ 两样东西**不进** blob（见 `serialize_view`）：`slot`（活的 asyncio 对象）与
+    #: `pending_decision`（待终局——它对应的 `HitlResolved` 压根没落库，冷重建必须把那条
+    #: 请求看成未决）。后者是结构保证的：折叠只在 `HitlResolved` 时写 `decision`。
+    hitl: "HitlSnapshot" = field(default_factory=lambda: _new_hitl_snapshot())
+
     #: 被崩溃打断的段 recap：{task_id: {"boundary", "agent_id"}}。
     #:
     #: 某 task 有 `TASK_RECAP_STARTED` 而无其后的 `TASK_RECAP_DONE`，说明那段 background

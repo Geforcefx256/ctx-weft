@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from ctx_weft.core.utils.content import (
@@ -170,6 +170,119 @@ def prune_view_for_snapshot(view: RunStateView) -> RunStateView:
     return replace(view, tasks=tasks)
 
 
+# ── HITL 活账的 blob 往返 ──────────────────────────────────────────────────────
+#
+# 复用既有往返器,不另造一套编码：`delivery_to_payload` / `_delivery_from_payload` 就是
+# `HitlOpened` 载荷用的那对,`content_to_jsonable` / `content_from_jsonable` 就是决定 message
+# 用的那对。两处各自只有一份实现,blob 与事件因此不会在编码上分叉。
+#
+# **不存的字段,每一个都有理由：**
+#   slot                  活的 asyncio `WaitSlot`——进程内对象,序列化没有意义
+#   pending_decision      待终局。它对应的 `HitlResolved` 压根没落库,冷重建必须把这条请求
+#   pending_event_payload  看成未决。这是结构保证的（折叠只在 `HitlResolved` 时写
+#                         `decision`）,不靠这里记得排除,但仍然显式不写,免得将来有人
+#                         「顺手补全字段」把它加回来
+#   claimed               同上,它描述的是热投递有没有接住,那是进程内的事
+#   opened                由 `pending` ∪ `resolved` 完全重建（见 `_hitl_from_blob`）——
+#                         存它是把同一份信息写两遍,而两份会分叉
+#   decision_owner        同上,由 `resolved` 重建
+
+
+def _pending_to_blob(r: "PendingHitl") -> dict[str, Any]:
+    from ctx_weft.core.hitl.service import delivery_to_payload
+
+    d = r.decision
+    return {
+        "id": r.id, "form": r.form, "session_id": r.session_id, "task_id": r.task_id,
+        "agent_id": r.agent_id, "delivery": delivery_to_payload(r.delivery),
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+        "tenant_id": r.tenant_id, "subject_id": r.subject_id,
+        "prompt": r.prompt, "detail": r.detail,
+        "fields": list(r.fields), "proposal": r.proposal,
+        "tool_call_id": r.tool_call_id, "stage": r.stage,
+        "invocation_key": r.invocation_key, "resume_state": r.resume_state,
+        "reply_as_result": r.reply_as_result,
+        "reply_attempt": r.reply_attempt,
+        "resolved_at": r.resolved_at.isoformat() if r.resolved_at else None,
+        "legacy_origin": r.legacy_origin,
+        "closed": r.closed,
+        "decision": None if d is None else {
+            "outcome": d.outcome,
+            "message": content_to_jsonable(d.message),
+            "modified_arguments": d.modified_arguments,
+        },
+    }
+
+
+#: 存量 blob 缺 `created_at` 时的回落。**不用 `now_utc()`**：那会让一条几个月前开出的请求
+#: 每次读快照都「刚刚创建」，而 `created_at` 是 `find_for_tool_call`「取最近一条」的排序键,
+#: 也是 host 展示待答列表的排序键——用当下时刻会让它插到队首。固定值至少是稳定的。
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _pending_from_blob(b: dict[str, Any]) -> "PendingHitl":
+    def _dt(x):
+        return datetime.fromisoformat(x) if x else None
+
+    d = b.get("decision")
+    req = PendingHitl(
+        id=b["id"], form=b.get("form", ""), session_id=b.get("session_id", ""),
+        task_id=b.get("task_id", ""), agent_id=b.get("agent_id", ""),
+        delivery=_delivery_from_payload(b.get("delivery") or {}, hitl_id=b["id"]),
+        created_at=_dt(b.get("created_at")) or _EPOCH,
+        tenant_id=b.get("tenant_id", "default"), subject_id=b.get("subject_id", ""),
+        prompt=b.get("prompt", ""), detail=b.get("detail", ""),
+        fields=list(b.get("fields") or []), proposal=b.get("proposal"),
+        tool_call_id=b.get("tool_call_id", ""), stage=b.get("stage", ""),
+        invocation_key=b.get("invocation_key", ""), resume_state=b.get("resume_state"),
+        reply_as_result=bool(b.get("reply_as_result", False)),
+    )
+    req.reply_attempt = int(b.get("reply_attempt", 0) or 0)
+    req.resolved_at = _dt(b.get("resolved_at"))
+    req.legacy_origin = bool(b.get("legacy_origin", False))
+    req.closed = bool(b.get("closed", False))
+    if d is not None:
+        req.decision = HitlDecision(
+            outcome=d.get("outcome", ""),
+            message=content_from_jsonable(d.get("message") or ""),
+            modified_arguments=d.get("modified_arguments"),
+        )
+    return req
+
+
+def _hitl_to_blob(snap: HitlSnapshot) -> dict[str, Any]:
+    """HITL 活账 → blob。只写 `pending` / `resolved`,其余可重建（见上方说明）。"""
+    return {
+        "pending": {rid: _pending_to_blob(r) for rid, r in snap.pending.items()},
+        "resolved": {rid: _pending_to_blob(r) for rid, r in snap.resolved.items()},
+    }
+
+
+def _hitl_from_blob(b: dict[str, Any]) -> HitlSnapshot:
+    """blob → HITL 活账,并把三份派生账重建出来。
+
+    `opened` / `decision_owner` / `decisions_for` 都从 `pending` ∪ `resolved` 推出来,不从
+    blob 读——存它们等于把同一份信息写两遍,而两份会分叉。推导必须和 `apply_hitl_event` 的
+    记账口径一致,所以：
+      · `opened` = 两者的并（折叠里正是「开过且还没了结」留在 opened 的那批）；
+      · `decisions_for` / `decision_owner` 只收 `resolved` 里带 `tool_call_id` 的,键三维,
+        与折叠那两处写入逐字对应。
+    """
+    snap = HitlSnapshot()
+    for rid, raw in (b.get("pending") or {}).items():
+        snap.pending[rid] = _pending_from_blob(raw)
+    for rid, raw in (b.get("resolved") or {}).items():
+        snap.resolved[rid] = _pending_from_blob(raw)
+    snap.opened.update(snap.pending)
+    snap.opened.update(snap.resolved)
+    for rid, r in snap.resolved.items():
+        if r.tool_call_id and r.decision is not None:
+            key = (r.session_id, r.tool_call_id, r.stage)
+            snap.decisions_for[key] = (r.decision, r.resume_state)
+            snap.decision_owner[key] = rid
+    return snap
+
+
 def serialize_view(view: RunStateView) -> dict[str, Any]:
     """把 RunStateView 序列化为可 JSON 存储的 dict（用于快照写入）。"""
     def _dt(d: datetime | None) -> str | None:
@@ -188,6 +301,7 @@ def serialize_view(view: RunStateView) -> dict[str, Any]:
         "events_total": view.events_total,
         "tasks_total": view.tasks_total,
         # 不裁：它由自己的 DONE 销账，不随会话长度增长（见字段 docstring）。
+        "hitl": _hitl_to_blob(view.hitl),
         "pending_recap": {
             tid: {"boundary": info.get("boundary", ""), "agent_id": info.get("agent_id", "")}
             for tid, info in view.pending_recap.items()
@@ -358,6 +472,7 @@ def deserialize_view(data: dict[str, Any]) -> RunStateView:
         # v2 及更早的 blob 无此键 → 空。那些 blob 已因 projection_version 不匹配被判不可用、
         # 走全量回放（全量回放会正确折出它），所以这里的回落只是形态完整性——**这正是
         # bump 版本号换来的东西**：不必为「老快照里没有这个字段」另留一条兜底查询。
+        hitl=_hitl_from_blob(data.get("hitl") or {}),
         pending_recap={
             tid: {"boundary": v.get("boundary", ""), "agent_id": v.get("agent_id", "")}
             for tid, v in (data.get("pending_recap") or {}).items()
@@ -385,7 +500,11 @@ def deserialize_view(data: dict[str, Any]) -> RunStateView:
 #: 一次独立的按类型收窄查询）。必须 bump：v2 的 blob 没有这个键，拿它当增量基底会让
 #: 「崩溃打断的 recap」静默变成「没有待重跑的」，那段 memory 写就永远补不上了。bump 之后
 #: v2 blob 判不可用 → 全量回放 → 正确折出该字段，无需任何迁移分支。
-_PROJECTION_VERSION = 3
+#: v4（2026-09-20）：blob 新增 `hitl`（HITL 活账，从前是 `rebuild_hitl` 每次冷应答一次的全量
+#: 折叠）。必须 bump：v3 的 blob 没有这个键，拿它当增量基底会让**未决 HITL 集合凭空为空**
+#: ——`parked_task_ids` 随之为空，于是「人还没答，任务却自己跑起来了」。这是这套版本号防的
+#: 最严重的一种退化，不是性能问题。
+_PROJECTION_VERSION = 4
 
 
 def snapshot_is_usable(
@@ -846,10 +965,18 @@ def _apply(view: RunStateView, ev: Event) -> None:
     elif t == EventType.ACT_TURN_COMPLETED:
         view.transcript_turns = p.get("turn", view.transcript_turns)
 
-    # ── HITL projection ───────────────────────────────────────────────────────
-    # **只投影会话状态**：pending HITL 的真相源是 `HitlRegistry`（由 `fold_hitl_snapshot`
-    # 装填），不再在 RunStateView 里另存一份——两份口径不同的 HITL 折叠正是旧实现里
-    # 「重建了 pending 却没重建已解决」那类漂移的来源。
+    # ── HITL ──────────────────────────────────────────────────────────────────
+    # **同一份折叠**：`apply_hitl_event` 就是 `fold_hitl_snapshot` 在已有累加器上的一次调用，
+    # 不是投影另写的一版。当初把 HITL 移出投影是因为「两份口径不同的折叠会漂移」（旧实现
+    # 「重建了 pending 却没重建已解决」就是那么来的）；现在折叠只有一份，那条理由不再适用，
+    # 而它回到投影换来的是 `rebuild_hitl` 不必再全量读（实测 1600 条 / 218ms / 读放大 1600×）。
+    #
+    # `HitlRegistry` 仍是**查询**的唯一真相源，投影只是它的装填来源（spec §3.1：恢复是
+    # 喂进来，不是查回去）。
+    if t in HITL_FOLD_EVENT_TYPES:
+        apply_hitl_event(ev, view.hitl)
+
+    # ── HITL 会话状态 ──────────────────────────────────────────────────────────
     elif t in (
         # L 档：这五个不再发射，保留只为读存量日志。HITL_RESOLVED（新模型）**不在其中**
         # ——新流量里会话状态由 AGENT_* 折叠推出，不再由会话级事件承载。
