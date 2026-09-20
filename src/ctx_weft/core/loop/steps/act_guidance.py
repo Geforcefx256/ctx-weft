@@ -163,9 +163,10 @@ def build_resume_cue(task, task_manager) -> str:
     if _finished_subtasks(task, task_manager):
         cue += (
             " Parts of it have ALREADY been delegated to sub-tasks that are now complete — "
-            "they are listed with their results in the situational notes below. Never execute "
-            "that work a second time: instead of redoing or re-delegating it, build on those "
-            "results and judge what, if anything, still remains."
+            "they are listed with their results in the situational notes below. Do not execute "
+            "that work a second time: build on those results and judge what, if anything, still "
+            "remains. The exception is a result the review note flags as falling short — for "
+            "that piece you decide whether to delegate it afresh or handle it yourself."
         )
     return cue
 
@@ -206,10 +207,13 @@ def build_act_guidance(task, task_manager) -> str:
         parts.append(
             "## Your current task has ALREADY been delegated to the sub-tasks below, and they "
             "are ALREADY COMPLETED — the digest under each is what it produced (full results "
-            "are in the conversation above). That work is done and must never be executed a "
-            "second time: Do NOT redo their work yourself and do NOT delegate them again. Your "
-            "next step is to judge whether any work still remains for the task goal beyond "
-            "these results — if it does, do only that part, building on what they produced:"
+            "are in the conversation above). Treat that work as done: do NOT redo it yourself "
+            "and do NOT delegate it again merely to have it repeated. Your next step is to "
+            "judge whether any work still remains for the task goal beyond these results — if "
+            "it does, do only that part, building on what they produced. The one exception is a "
+            "result that the review note below says does not actually achieve its goal: for "
+            "that piece it is YOUR call — delegate a fresh sub-task for it, or just do it "
+            "yourself, whichever is the better use of this turn:"
         )
         for t in done:
             parts.append(f"- [FINISHED] {_task_label(t)}")
@@ -218,9 +222,12 @@ def build_act_guidance(task, task_manager) -> str:
                 parts.append(f"    → {snippet}")
         parts.append("")
 
+    # review 的 note 也是「某个子任务产出不合格」的唯一入口（observer 只写判决与提示，
+    # 不动任何 task 状态；reopen 已于 2026-09-19 删除）。上面那段的「例外」指的就是这里。
     hint = (getattr(task, "next_step_hint", None) or "").strip()
     if hint:
-        parts.append("## Note from the review of your previous attempt:")
+        parts.append("## Note from the review of your previous attempt "
+                     "(it may name a sub-task whose result falls short):")
         parts.append(hint)
         parts.append("")
 

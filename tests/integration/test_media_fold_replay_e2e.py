@@ -895,72 +895,6 @@ async def test_recovery_converts_event_refs_into_memory_refs(runtime_with_images
     assert await evt_store.get(img.data, _ctx()) is None          # 不是 event 的 ref
 
 
-@pytest.mark.asyncio
-async def test_recovery_populates_both_event_jsonable_fields_for_reopen(runtime_with_images) -> None:
-    """恢复之后、任何 reopen 发生之前，两个 event jsonable 字段都必须已经被填好。
-
-    `reopen_task` 首次 reopen 时会把 ``user_prompt_event_jsonable`` 快照进
-    ``original_user_prompt_event_jsonable``；若恢复路径只填了其中一个、或一个都
-    没填，被重开的携图任务其事件载荷会静默降级成纯文本，而不会有任何报错——这条
-    用例直接钉住恢复后 `user_prompt_event_jsonable` **与**
-    `original_user_prompt_event_jsonable` 都非 None，且内容是 **event 侧**形态
-    （ref 归 evt_store 解，归 mem_store 解不开）。
-
-    构造一个「崩在 reopen 之后」的持久态：TASK_CREATED（FINISHED）之后紧跟一条真实的
-    TASK_REQUEUED（`user_prompt` / `original_user_prompt` 均携带 event ref 图片）——
-    reducer 把 TASK_REQUEUED 的状态折成 PENDING（非终态），故不需要再补一条终态事件；
-    留在可恢复集合里，TaskManager 才不会被 `finalize_idle_session` 同步收尾摘掉
-    （摘掉后 `runtime._task_managers` 查不到、Task 对象也就无从断言）。本用例只验证
-    `_restore_task_prompts` 这一段的落地结果，不依赖真实 LLM 跑完一轮
-    （`recover_agent` 用 `asyncio.create_task` 派发真正的执行，不 await 就不会被
-    后台协程抢跑）。
-    """
-    runtime, mem_store, evt_store = runtime_with_images
-    sid, tid, aid = "ses_t4b", "tsk_t4b", "agt_root"
-    ref_a = await evt_store.put(_RAW_A, "image/png", _ctx())
-    original_jsonable = content_to_jsonable([
-        TextPart(text="look at this"),
-        ImagePart(data=ref_a, media_type="image/png", source_type="ref"),
-    ])
-    revised_jsonable = content_to_jsonable([
-        TextPart(text="look at this"),
-        ImagePart(data=ref_a, media_type="image/png", source_type="ref"),
-        TextPart(text="\n\n## Revision required\nplease redo it"),
-    ])
-
-    events = [
-        _seed_event(1, sid, EventType.SESSION_CREATED, user_prompt="look at this",
-                    template_id="agent:tpl_echo", root_agent_id=aid),
-        _seed_event(2, sid, EventType.RUN_STARTED),
-        _seed_event(3, sid, EventType.TASK_CREATED, task={
-            "id": tid, "status": "FINISHED", "title": "T", "kind": "reasoning",
-            "assigned_agent_id": aid, "creator_agent_id": aid,
-            "user_prompt": original_jsonable}),
-        _seed_event(4, sid, EventType.TASK_REQUEUED, task_id=tid,
-                    reason="observer_review_reopen",
-                    user_prompt=revised_jsonable, original_user_prompt=original_jsonable),
-    ]
-    for e in events:
-        await runtime.event_store.append(e)
-
-    await runtime.recover_agent(aid)
-
-    tm = runtime._task_managers[sid]
-    task = tm.get_task(tid)
-    assert task is not None
-
-    for field_name in ("user_prompt_event_jsonable", "original_user_prompt_event_jsonable"):
-        jsonable = getattr(task, field_name)
-        assert jsonable is not None, f"{field_name} 恢复后必须非 None"
-        images = [p for p in jsonable if isinstance(p, dict) and p.get("type") == "image"]
-        assert images, f"{field_name} 里没有 image part：{jsonable}"
-        ref = images[0]["data"]
-        assert await evt_store.get(ref, _ctx()) is not None, (
-            f"{field_name} 里的 ref 必须是 event 侧的、能被 evt_store 解开")
-        assert await mem_store.get(ref, _ctx()) is None, (
-            f"{field_name} 混进了 memory 侧 ref——它是事件侧载荷，命名空间不该相通")
-
-
 # ── review 追加轮 1：hydrate_event_content 的「取不回字节」降级分支 ──────────────
 #
 # 这是 Task 4 新增的真实行为（恢复时取不回 event blob → 图变成确定性文本占位），
@@ -1008,7 +942,7 @@ async def test_hydrate_event_content_missing_blob_placeholder_is_deterministic()
     assert missing_ref not in a[0].text
 
 
-# ── review 追加轮 1：_restore_task_prompts 的 per-field 韧性 ────────────────────
+# ── review 追加轮 1：_restore_task_prompts 的 per-task 韧性 ─────────────────────
 #
 # 裁定：per-task/per-field 转换失败必须只降级那一个字段，绝不中断整场恢复
 # ——崩溃恢复恰是最不能再崩一次的地方。构造一个会让 `normalize_content` 抛出的
@@ -1085,81 +1019,6 @@ async def test_restore_task_prompts_isolates_one_bad_task_and_logs_error(
                for r in error_records), (
         f"必须有一条 error 日志点名坏 task 的 id 与字段名，实际记录：" +
         repr([r.getMessage() for r in error_records]))
-
-
-# ── 全分支终审：C1 / I1 的跨任务接缝回归 ───────────────────────────────────────
-
-
-class _CapturingBus:
-    """只收事件、不落库的 event bus 桩：用来读 reopen 发出的 TASK_REQUEUED 载荷。"""
-
-    def __init__(self) -> None:
-        self.events: list = []
-
-    async def emit(self, event) -> None:  # noqa: ANN001
-        self.events.append(event)
-
-
-@pytest.mark.asyncio
-async def test_recovery_then_reopen_preserves_text_only_prompt(runtime_with_images) -> None:
-    """**纯文本** prompt 的 task：恢复之后被 reopen，原始指令不得从事件流里消失（C1）。
-
-    `_restore_task_prompts` 曾对 ``isinstance(content, str)`` 直接 continue，导致
-    ``user_prompt_event_jsonable`` 恢复后恒为 None；`reopen_task` 拿到 None 之后
-    `_append_text_sections` 把它当「base 为空」，发出的 TASK_REQUEUED 只剩一句
-    「## Revision required」——下一次重放据此重建 task，用户的原始指令就此蒸发。
-    内存里当场看不出任何异常（`task.user_prompt` 仍是对的），所以断言必须落在
-    **事件载荷**上，而不是 task 的 memory 侧字段。
-    """
-    from ctx_weft.core.orchestrator.task.manager import TaskManager
-    from ctx_weft.core.models.task import Task
-
-    runtime, _mem_store, _evt_store = runtime_with_images
-    sid, tid = "ses_c1", "tsk_c1"
-    original = "写一份 Q3 周报，重点写风险项"
-    task = Task(id=tid, session_id=sid, status="FINISHED", user_prompt=original)
-
-    await runtime._restore_task_prompts([task], sid, "default")
-
-    assert task.user_prompt_event_jsonable == original, (
-        "纯文本 prompt 恢复后也必须有事件侧快照（str 往返即自身，零成本）")
-
-    bus = _CapturingBus()
-    tm = TaskManager(session_id=sid, event_bus=bus)
-    tm.register_task(task)
-    assert await tm.reopen_task(tid, reason="补上数据来源") is True
-
-    requeued = next(e for e in bus.events if e.type == EventType.TASK_REQUEUED)
-    assert requeued.payload["user_prompt"].startswith(original), (
-        f"TASK_REQUEUED 丢了原始指令：{requeued.payload['user_prompt']!r}")
-    assert "补上数据来源" in requeued.payload["user_prompt"]
-    assert requeued.payload["original_user_prompt"] == original
-    # 事件侧与 memory 侧对纯文本必须逐字节一致（重放重建出的 task 与在途 task 同形）。
-    assert requeued.payload["user_prompt"] == task.user_prompt
-
-
-@pytest.mark.asyncio
-async def test_reopen_falls_back_to_original_prompt_when_jsonable_missing() -> None:
-    """兜底：event jsonable 为 None 而 base 是非空 str 时，不得被当成「base 为空」（C1）。
-
-    这是与上一条正交的第二道闸——即便日后又出现一条没填 `user_prompt_event_jsonable`
-    的路径，「字段没填」也不该再伪装成「原始 prompt 是空的」。
-    """
-    from ctx_weft.core.orchestrator.task.manager import TaskManager
-    from ctx_weft.core.models.task import Task
-
-    bus = _CapturingBus()
-    tm = TaskManager(session_id="s_fb", event_bus=bus)
-    task = Task(id="t_fb", session_id="s_fb", status="FINISHED",
-                user_prompt="原始指令")
-    assert task.user_prompt_event_jsonable is None  # 刻意不填
-    tm.register_task(task)
-
-    assert await tm.reopen_task("t_fb", reason="重做") is True
-
-    requeued = next(e for e in bus.events if e.type == EventType.TASK_REQUEUED)
-    assert requeued.payload["user_prompt"].startswith("原始指令")
-    assert requeued.payload["original_user_prompt"] == "原始指令"
 
 
 @pytest.mark.asyncio

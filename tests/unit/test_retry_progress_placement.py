@@ -35,7 +35,7 @@ def _task(**over) -> SimpleNamespace:
     base = dict(id="R", user_prompt_in_memory=True,
                 process_report=None, process_report_at=None,
                 outputs="THE FINAL ANSWER", title="", description="", user_prompt="do X",
-                tracking_task_ids=[], parent_task_id=None)
+                parent_task_id=None)
     base.update(over)
     return SimpleNamespace(**base)
 

@@ -18,7 +18,7 @@ from ctx_weft.core.utils.content import (
 from ctx_weft.core.control.types import AgentView, RunStateView, SessionView, TaskView
 from ctx_weft.core.hitl.registry import HITL_STAGE_AUTHZ, HITL_STAGE_TOOL, PendingHitl
 from ctx_weft.core.hitl.snapshot import HitlSnapshot
-from ctx_weft.core.models.status import WAITING, TaskStatus
+from ctx_weft.core.models.status import TERMINAL_TASK_STATUSES, WAITING, TaskStatus
 from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.protocols.hitl import (
     HITL_FORM_QUESTION,
@@ -127,6 +127,68 @@ def apply_events(events: list[Event], view: RunStateView) -> RunStateView:
     return view
 
 
+def prune_view_for_snapshot(view: RunStateView) -> RunStateView:
+    """裁出快照该存的那部分投影：`tasks` 只留「活闭包」，其余原样返回。
+
+    **为什么要裁。** `tasks` 是 blob 里唯一随会话历史**线性增长**的部分——每个 task 一条，
+    且带 `user_prompt` / `outputs` 全文。而 `SnapshotWriter.on_event` 是在 `EventBus.emit()`
+    里**内联**执行的（见那个类的 ⚠️ 注释），blob 多大，代价就直接压在 loop 主路径上，每
+    ~50 条持久事件付一次；增量写还要把整份 blob 过一遍 deserialize→serialize 往返。裁完
+    之后 blob 的大小只跟「当前有多少活」有关，与会话跑了多久无关。
+
+    **闭包三类，判据全部来自真实消费者：**
+
+    1. **非终态 task** → 全字段。`TaskManager.restore` 要重排它们，driver 立刻要读
+       `user_prompt` 等。
+    2. **(1) 的直接子任务**（含终态）→ 全字段。两个消费者：`restore` 的 SUSPENDED 闸门
+       （`all(cid in terminal_ids for cid in children)`，缺一个终态子任务父任务就永不
+       重排），以及 act guidance 的「已完成子任务」清单（`_task_label` 读 `title`、
+       `_subtask_result_snippet` 读 `outputs`）。这个集合的大小是「活 task 数 × 分支度」，
+       本身有界，所以**刻意不降级字段**——降级只省常数，却要为 title/outputs 的每条
+       fallback 各做一遍正确性论证，不值当。
+    3. **被 (1) 的 `dag_deps` 引用、又不在 1/2 里的 task** → 只留 `id` / `session_id` /
+       `status`。这一类的消费者只看状态：`TaskQueue.seed_succeeded`（`== "FINISHED"` 才
+       释放后继）与 `TaskManager._find_blocked_forever`（`in ("FAILED", "CANCELED")` 才
+       判永久阻塞）。**状态要如实留，不能只留 FINISHED 的**——漏掉 FAILED/CANCELED 的
+       前驱会让 `_find_blocked_forever` 认不出永久阻塞，那个后继就永远卡在队列里。
+
+    其余一律丢弃：它们终态，且既不是任何活 task 的子任务、也不是它的依赖，没有消费者。
+
+    **唯一的已知分叉，无害。** 丢掉的 task 之后仍可能收到一条 `TASK_FINALIZED`（它在
+    task 终态**之后**才发，只写 `finished_at`）。`_apply` 那一支是 `view.tasks.get()`，
+    取不到就跳过，于是「全量回放」与「快照+增量」在这个字段上不再逐字节等价。无害的
+    理由是被裁掉的 task 进不了 `restore` 的 `all_tasks`，没有任何消费者读它的
+    `finished_at`。⚠️ **要给终态 task 加新消费者时，先回来看这一条。**
+
+    **`agents` 不裁**，也不需要为它补偿：它们是纯标量、每 agent 一条，而 `_rebuild_agents`
+    只覆盖它能在 `tasks` 里找到的 agent（循环碰不到的 agent 原样保留）。所以历史 agent 的
+    `spawn_depth` / `parent_agent_id` 保持 blob 里存的那份，不会因为它的 task 被裁掉而
+    被重置回 0。
+
+    幂等：裁两次与裁一次等价（第 1/2 类的判据只看 status 与 parent_task_id，第 3 类的
+    瘦身结果仍带 status）。增量链因此可以反复以裁过的 blob 为基底。
+    """
+    live_ids = {tid for tid, t in view.tasks.items()
+                if t.status not in TERMINAL_TASK_STATUSES}
+    child_ids = {tid for tid, t in view.tasks.items()
+                 if t.parent_task_id and t.parent_task_id in live_ids}
+    keep_full = live_ids | child_ids
+
+    dep_ids: set[str] = set()
+    for tid in live_ids:
+        dep_ids.update(view.tasks[tid].dag_deps or ())
+    dep_ids -= keep_full
+
+    tasks: dict[str, TaskView] = {tid: view.tasks[tid] for tid in keep_full}
+    for tid in dep_ids:
+        dep = view.tasks.get(tid)
+        if dep is None:
+            continue          # 引用了投影里没有的 id（数据异常）——跳过，不造占位
+        tasks[tid] = TaskView(id=dep.id, session_id=dep.session_id, status=dep.status)
+
+    return replace(view, tasks=tasks)
+
+
 def serialize_view(view: RunStateView) -> dict[str, Any]:
     """把 RunStateView 序列化为可 JSON 存储的 dict（用于快照写入）。"""
     def _dt(d: datetime | None) -> str | None:
@@ -143,6 +205,7 @@ def serialize_view(view: RunStateView) -> dict[str, Any]:
         "assembled_prompt_tokens": view.assembled_prompt_tokens,
         "transcript_turns": view.transcript_turns,
         "events_total": view.events_total,
+        "tasks_total": view.tasks_total,
         "sessions": {
             sid: {
                 "id": s.id,
@@ -184,7 +247,6 @@ def serialize_view(view: RunStateView) -> dict[str, Any]:
                 "creator_agent_id": t.creator_agent_id,
                 "parent_task_id": t.parent_task_id,
                 "user_prompt": content_to_jsonable(t.user_prompt),
-                "original_user_prompt": content_to_jsonable(t.original_user_prompt),
                 "interaction_mode": t.interaction_mode,
                 "unattended": t.unattended,
                 "origin_tool_call_id": t.origin_tool_call_id,
@@ -258,7 +320,6 @@ def deserialize_view(data: dict[str, Any]) -> RunStateView:
             creator_agent_id=t.get("creator_agent_id", ""),
             parent_task_id=t.get("parent_task_id", ""),
             user_prompt=content_from_jsonable(t.get("user_prompt", "")),
-            original_user_prompt=content_from_jsonable(t.get("original_user_prompt", "")),
             interaction_mode=t.get("interaction_mode", "auto"),
             # 存量快照无此键 → False（无人值守是新增语义，旧数据一律「有人在」）。
             unattended=t.get("unattended", False),
@@ -304,15 +365,30 @@ def deserialize_view(data: dict[str, Any]) -> RunStateView:
         assembled_prompt_tokens=data.get("assembled_prompt_tokens", 0),
         transcript_turns=data.get("transcript_turns", 0),
         events_total=data.get("events_total", 0),
+        # 存量（v1）blob 无此键 → 0。那类 blob 的 `tasks` 是全量的，恢复闸门走
+        # `not all_tasks` 那一半仍然对；且 v1 blob 已因 projection_version 不匹配
+        # 被判不可用、走全量回放，这里的回落只是形态完整性。
+        tasks_total=data.get("tasks_total", 0),
         sessions=sessions,
         tasks=tasks,
         agents=agents,
     )
 
 
-#: 恢复路径认可的投影版本（spec: snapshot-recovery）：不匹配的快照被忽略走全量。
-#: 与 SnapshotWriter.PROJECTION_VERSION 同步 bump。
-_PROJECTION_VERSION = 1
+#: 快照 blob 的投影版本（spec: snapshot-recovery）：不匹配的快照被忽略、走全量回放。
+#:
+#: **读写两侧共用这一个常量**——`snapshot_is_usable` 判定用它，`SnapshotWriter` 盖章
+#: 也从这里取。从前是两处独立字面量（本文件与 `providers/events/snapshot.py` 各一个），
+#: 只 bump 一个的后果是所有快照**永远**判不可用：恢复全量回放、writer 每次全量重锚，
+#: O(delta) 退回 O(n)，而且不报任何错——只能从 SnapshotWriter 日志里的 `mode=anchor`
+#: 看出来。合成一个常量，把这个类别消灭掉。
+#:
+#: v2（2026-09-19）：blob 的 `tasks` 改为只存「活闭包」（见 `prune_view_for_snapshot`）。
+#: v1 的 blob 是全量 tasks、信息上是 v2 的超集，拿它当增量基底本来也是对的；bump 是为了
+#: **回滚安全**——v1 的代码读到 v2 blob 会因版本不匹配走全量回放，而不是把一份裁过的
+#: tasks 当全量用（那会让 `restore` 静默少掉 task）。代价是存量快照集体失效一次、
+#: 各会话首次写快照时全量重锚一次。
+_PROJECTION_VERSION = 2
 
 
 def snapshot_is_usable(
@@ -622,6 +698,8 @@ def _apply(view: RunStateView, ev: Event) -> None:
                 tenant_id=ev.tenant_id or "default",
                 created_at=ev.timestamp,
             )
+            if task_id not in view.tasks:
+                view.tasks_total += 1      # 只数「新建」，重放同一条事件不重复计
             view.tasks[task_id] = task
             if not view.task_id:
                 view.task_id = task_id
@@ -651,8 +729,11 @@ def _apply(view: RunStateView, ev: Event) -> None:
                     slot.current_task_id = task_id
 
     elif t == EventType.TASK_REQUEUED and ev.task_id:
-        # 重排（observer active 或 review reopen）：状态回 PENDING、清旧产出；
-        # reopen 还会携带改写后的 user_prompt / 原始 prompt 快照，replay 时一并恢复。
+        # 重排（observer active / retry）：状态回 PENDING、清旧产出。
+        #
+        # `user_prompt` 这一读是**存量兼容**：今天没有发射点往 TASK_REQUEUED 里放它
+        # （已删的 reopen 是唯一一个），但存量日志里有 reopen 写下的改写版 prompt——
+        # 不读它，那些会话重放后 prompt 会退回 TaskCreated 的原始值，即重启前后不一致。
         task = view.tasks.get(ev.task_id)
         if task is not None:
             task.status = "PENDING"
@@ -660,9 +741,6 @@ def _apply(view: RunStateView, ev: Event) -> None:
             up = p.get("user_prompt")
             if up is not None:
                 task.user_prompt = content_from_jsonable(up)
-            oup = p.get("original_user_prompt")
-            if oup is not None:
-                task.original_user_prompt = content_from_jsonable(oup)
         view.task_status = "PENDING"
 
     elif t == EventType.TASK_HUMAN_RESOLVED and ev.task_id:

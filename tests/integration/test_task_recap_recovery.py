@@ -438,3 +438,55 @@ async def test_no_tasks_at_all_still_raises() -> None:
 
     with pytest.raises(RuntimeError, match="no resumable tasks"):
         await runtime.recover_agent(aid)
+
+
+async def test_all_tasks_terminal_with_a_pruned_snapshot_does_not_raise() -> None:
+    """`test_no_tasks_at_all_still_raises` 的孪生反面：**所有 task 都已终态**的会话，
+    在快照被裁过（v2，`prune_view_for_snapshot`）之后恢复，不得抛「no resumable tasks」。
+
+    裁剪之后这类会话的 `view.tasks` 是空的——与「从来没有过 task」在集合上不可区分。
+    闸门若按 `not all_tasks` 判，就会把一个正常完工的会话当成坏投影抛错，正是本文件
+    docstring 里记的那个「resume 点了没反应」的老 bug。判据因此改用 `view.tasks_total`。
+
+    ⚠️ 这条**必须有快照参与**：不写快照时 `rebuild_view` 走全量回放、`view.tasks` 是
+    全量的，裁剪不参与，旧判据同样是绿的（上面那条 Test A 就是这样）。
+    """
+    from ctx_weft.core.control.reducers import (
+        _PROJECTION_VERSION, prune_view_for_snapshot, serialize_view,
+    )
+    from ctx_weft.protocols.events import RunSnapshot
+
+    runtime, _mem, _seen = _make_runtime()
+    sid, tid, aid = "ses_recap", "tsk_done", "agt_root"
+
+    seed = [
+        _ev(1, EventType.SESSION_CREATED, user_prompt="do it",
+            template_id="agent:tpl_echo", root_agent_id=aid),
+        _ev(2, EventType.TASK_CREATED, task={
+            "id": tid, "status": "ACTIVE", "title": "T", "kind": "reasoning",
+            "assigned_agent_id": aid, "creator_agent_id": aid}),
+        _ev(3, EventType.TASK_STARTED, task_id=tid, assigned_agent_id=aid),
+        _ev(4, EventType.TASK_FINISHED, task_id=tid, outcome="success",
+            summary="done", outputs={"result": "ok"}),
+    ]
+    for e in seed:
+        await runtime.event_store.append(e)
+
+    # 按生产口径写一张**裁过的**快照，并让它成为可用基底
+    head = await runtime.event_store.committed_head(sid)
+    pruned = prune_view_for_snapshot(await rebuild_view(runtime.event_store, sid))
+    assert pruned.tasks == {}, "前置条件：唯一的 task 已终态，活闭包为空"
+    assert pruned.tasks_total == 1
+    await runtime.event_store.save_snapshot(RunSnapshot(
+        id="snp_pruned", run_id="run_1", session_id=sid,
+        last_event_id="evt_0004", last_event_sequence=4,
+        state_blob=serialize_view(pruned), snapshot_reason="test",
+        snapshot_at=_TS, last_commit_position=head,
+        projection_version=_PROJECTION_VERSION, chain_depth=0,
+    ))
+
+    # 恢复读到的就是那份空 tasks —— 闸门必须靠 tasks_total 认出「这不是坏投影」
+    view = await rebuild_view(runtime.event_store, sid)
+    assert view.tasks == {} and view.tasks_total == 1
+
+    await runtime.recover_agent(aid)   # 不抛即通过（没有活可重排，但会话是好的）

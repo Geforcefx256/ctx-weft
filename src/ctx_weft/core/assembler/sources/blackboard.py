@@ -2,7 +2,7 @@
 
 两个用途：
 1. 相关任务通信：pull 当前 task 订阅的 topic → kind=blackboard, target=messages
-   - intent=subtask     → 自己派生的子任务结果（observe 渲染为可 review/reopen 段）
+   - intent=subtask     → 自己派生的子任务结果（observe 渲染为可 review 段）
    - intent=predecessor → 同 plan 前序结果（observe 渲染为只读段）
 2. 跨 session 长期上下文：pull session 订阅的 topic
    - intent=long_term_background → kind=background, target=system

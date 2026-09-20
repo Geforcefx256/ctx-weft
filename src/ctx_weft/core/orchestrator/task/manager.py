@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from ctx_weft.core.models.discriminators import CancelReason, InterruptReason, TaskErrorCode
@@ -16,7 +16,6 @@ from ctx_weft.core.models.status import PARKED_TASK_STATUSES, TERMINAL_TASK_STAT
 from ctx_weft.core.utils.event import emit_event
 from ctx_weft.core.orchestrator.task.failure_threshold import plan_threshold_trip
 from ctx_weft.core.orchestrator.task.hooks import TaskManagerHooks
-from ctx_weft.core.orchestrator.task.reopen import build_reopen_prompt
 from ctx_weft.core.models.errors import crash_error_code, crash_run_outcome
 from ctx_weft.core.loop.park import RoundDiscarded
 from ctx_weft.core.orchestrator.task.disposition import (
@@ -30,7 +29,7 @@ from ctx_weft.core.orchestrator.task.runner import AgentBinding, TaskRunner, eff
 from ctx_weft.core.models.session import Session
 from ctx_weft.core.models.status import TaskStatus
 from ctx_weft.core.models.task import CompactTaskSettings, MetadataFillerTaskSettings, NormalTaskSettings, Task
-from ctx_weft.core.utils.clock import as_utc, now_utc
+from ctx_weft.core.utils.clock import now_utc
 from ctx_weft.protocols.events import PersistenceUnavailableError
 from ctx_weft.protocols.events import EventOrigin, EventType
 
@@ -122,8 +121,8 @@ class TaskManager:
         # 事件侧 blob store 的注入点（set_event_blob_store / _event_blob_store /
         # _event_ctx）已删除：TASK_CREATED 自 Task 3 起、TASK_REQUEUED 自本任务
         # （blob-store 解耦 Task 5）起都改由调用方/task 上携带的现成 event jsonable
-        # 供给，TaskManager 不再需要持有 event blob store——reopen_task 零 blob IO
-        # 是**结构性**保证：这个类根本没有能力发起一次 blob 调用。
+        # 供给，TaskManager 不再需要持有 event blob store——「本类不发起 blob 调用」
+        # 是**结构性**保证：它根本没有能力发起一次。
 
     def track_background(self, t: "asyncio.Task") -> None:
         """Track a fire-and-forget background coroutine so the session awaits it before close."""
@@ -282,8 +281,7 @@ class TaskManager:
                     "事件库恒不含字节，这里没有原始字节可用"
                 )
             user_prompt_jsonable = task.user_prompt   # str | None，本身即 jsonable
-        # 挂在 task 上供 reopen_task 直接复用（零 blob IO——reopen 不引入新图，见
-        # Task.user_prompt_event_jsonable 的字段注释）。
+        # 挂在 task 上（见 Task.user_prompt_event_jsonable 的字段注释）。
         task.user_prompt_event_jsonable = user_prompt_jsonable
         await self._emit(
             EventType.TASK_CREATED, task_id=task.id,
@@ -936,118 +934,6 @@ class TaskManager:
         )
         await self.on_task_finished(task_id, status=final_status)
 
-    async def reopen_chain(self, head_id: str, reason: str = "") -> bool:
-        """Reopen a FINISHED sub-task **and force-reopen its plan successors**.
-
-        When a plan step is reopened, every later step in the same plan chain
-        (tasks that carry `head_id` in their `tracking_task_ids`) is invalidated too,
-        because they were produced against the now-rejected result. This re-queues the
-        whole chain in plan order, re-establishing `blocked_by` so each step waits for
-        its predecessor's corrected result (delivered via the blackboard subscription).
-
-        - head: reopened with the direct revision `reason`.
-        - successors: reopened with an "upstream revised" note instead, pointing them at
-          head's updated result.
-
-        Returns True if the head was reopened.
-        """
-        head = self._tasks.get(head_id)
-        if head is None or head.status != "FINISHED":
-            return False
-
-        _epoch = datetime.min.replace(tzinfo=timezone.utc)
-        successors = sorted(
-            (
-                t for t in self._tasks.values()
-                if t.session_id == self._session_id
-                and t.status == "FINISHED"
-                and head_id in (t.tracking_task_ids or [])
-            ),
-            key=lambda t: as_utc(t.created_at) if t.created_at else _epoch,
-        )
-        head_ref = task_ref(head)   # 上游任务的规范称呼（标题 + id），注入后继 prompt
-
-        prev_id: str | None = None
-        for t in [head, *successors]:
-            blocked = None if prev_id is None else [prev_id]
-            upstream = None if t.id == head_id else (head_ref, reason)
-            await self.reopen_task(t.id, reason, blocked_by=blocked, upstream=upstream)
-            prev_id = t.id
-        return True
-
-    async def reopen_task(
-        self,
-        task_id: str,
-        reason: str = "",
-        *,
-        blocked_by: list[str] | None = None,
-        upstream: tuple[str, str] | None = None,
-    ) -> bool:
-        """Re-queue a previously FINISHED task (observer review 'reopen').
-
-        Resets the task to a clean PENDING state and rewrites `user_prompt` =
-        original prompt + previous output + revision reason, so the re-run's prompt
-        (task_spec block + re-ingested USER_PROMPT memory) tells the actor what was
-        produced before and what to fix. The rewrite is always based on
-        `original_user_prompt` so repeated reopens don't accumulate. Clearing
-        `outputs` re-arms the success-guardrail so a no-op cannot be re-marked
-        FINISHED with stale output.
-
-        `blocked_by` gates re-execution until the given tasks complete (used by
-        reopen_chain to keep plan order). `upstream=(head_ref, head_reason)` marks a
-        cascade-reopened successor: instead of a direct revision note it gets an
-        "upstream task revised" instruction pointing at the predecessor's updated result
-        (delivered via the blackboard subscription once the predecessor re-finishes).
-
-        Emits TASK_REQUEUED (projections/SSE + restart-safe). Scheduling happens on
-        the next drain (after the current run returns); does not drain re-entrantly.
-        Returns True if the task was re-queued.
-        """
-        task = self._tasks.get(task_id)
-        if task is None or task.status != "FINISHED":
-            return False
-
-        prompt = build_reopen_prompt(task, reason, upstream)
-
-        async with self._lock:
-            self._queue.unmark_succeeded(task_id)
-            self._queue.unmark_running(task_id)
-            task.status = "PENDING"
-            task.actor_done = False
-            task.retry_count = 0
-            task.outputs = None
-            task.finished_at = None
-            task.user_prompt = prompt.user_prompt
-            # 无条件写回（幂等）：非首次 reopen 时 build_reopen_prompt 返回的就是
-            # task 上已有的那份 base，不会把快照冲掉。
-            task.original_user_prompt = prompt.original_user_prompt
-            task.original_user_prompt_event_jsonable = (
-                prompt.original_user_prompt_event_jsonable
-            )
-            task.user_prompt_event_jsonable = prompt.user_prompt_event_jsonable
-            task.user_prompt_in_memory = False  # let the driver re-ingest the revised prompt
-            if blocked_by is not None:
-                task.dag_deps = list(blocked_by)  # restart 时由 dag_deps 重建依赖链
-            self._queue.push(QueueEntry(
-                task_id=task_id, session_id=self._session_id, priority=task.priority,
-                blocked_by=set(blocked_by or []),
-            ))
-        # 把改写后的 prompt 一并落进事件，使崩溃恢复（event replay）能重建修订后的
-        # user_prompt。reopen 只在 prompt 尾部追加**文本** section，不可能引入事件流
-        # 没见过的图。故事件形态直接由首次发射那份 + 文本拼出，零 blob IO，且同一张图
-        # 的 event ref 跨 reopen 逐字节相同（重放确定性）。
-        await self._emit(
-            EventType.TASK_REQUEUED,
-            task_id=task_id,
-            payload={
-                "reason": "observer_review_reopen",
-                "user_prompt": prompt.user_prompt_event_jsonable,
-                "original_user_prompt": prompt.original_user_prompt_event_jsonable,
-            },
-        )
-        logger.info("TaskManager.reopen_task: re-queued %s", task_id)
-        return True
-
     async def _handle_task_failure(
         self, task_id: str, *, reason: str, error: str = "",
         exc: BaseException | None = None,
@@ -1283,8 +1169,7 @@ class TaskManager:
         """定位一个依赖已判明永不可满足的排队任务 → (task_id, 阻塞源 dep_id)。
 
         判据是**当前状态**而非回调：任何时刻某依赖已 FAILED/CANCELED，该条目就永不
-        可能被释放（没有再让它成功的路径——reopen 会把依赖链整个重排，那是观察者的
-        决定，不是调度的）。幂等：已终态任务跳过。
+        可能被释放（没有再让它成功的路径）。幂等：已终态任务跳过。
         """
         for entry in self._queue.peek_all():
             task = self._tasks.get(entry.task_id)

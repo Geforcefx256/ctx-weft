@@ -55,7 +55,6 @@ def task_from_projection(proj: TaskView) -> Task:
         title=proj.title,
         description=proj.description,
         user_prompt=proj.user_prompt or None,
-        original_user_prompt=proj.original_user_prompt or None,
         assigned_agent_id=proj.assigned_agent_id or None,
         creator_agent_id=proj.creator_agent_id or None,
         parent_task_id=proj.parent_task_id or None,

@@ -52,8 +52,6 @@ class TaskView:
     creator_agent_id: str = ""
     parent_task_id: str = ""
     user_prompt: "str | list[ContentPart]" = ""
-    # reopen 重写前的原始 prompt 快照（防多轮累加，跨重启保留）
-    original_user_prompt: "str | list[ContentPart]" = ""
     interaction_mode: str = "auto"  # interactive=纯文本暂停等用户 / auto=自治（跨重启保留，否则 resume 后丢失暂停语义）
     # 无人值守（跨重启保留）：丢了它，resume 之后一个后台自治任务就变回「有人看顾」，
     # 随后第一次 HITL 会把它 park 到死。见 `Task.unattended`。
@@ -117,6 +115,13 @@ class RunStateView:
     assembled_prompt_tokens: int = 0
     transcript_turns: int = 0
     events_total: int = 0
+    #: 这个会话**创建过**多少个 task（只增不减，与 `tasks` 里当下留了几条无关）。
+    #:
+    #: 存在的理由：快照的 `tasks` 只存活闭包（`prune_view_for_snapshot`），于是「所有
+    #: task 都已终态」与「从来没有过 task」都表现为 `tasks` 为空——而恢复路径的空投影
+    #: 闸门要区分这两者（前者是正常的已完工会话，后者才是 SESSION_CREATED 之后就崩的
+    #: 坏投影）。集合区分不了，就用计数。
+    tasks_total: int = 0
 
     target_event_id: str | None = None
     events_replayed: int = 0

@@ -9,9 +9,11 @@ from ctx_weft.core.models.task import Task
 class _FakeTM:
     def __init__(self) -> None:
         self.staged: list[Task] = []
+        self.blocked: list[list[str] | None] = []
 
     def stage_task(self, child: Task, **kwargs) -> None:
         self.staged.append(child)
+        self.blocked.append(kwargs.get("blocked_by"))
 
     def get_task(self, tid: str):
         return None
@@ -32,7 +34,7 @@ def test_delegate_task_ack_carries_child_id():
     tm = _FakeTM()
     res = delegate_task(title="load", task_prompt="p", ctx=_ctx(tm))
     assert len(tm.staged) == 1
-    # ack 同时给标题与 id：id 是后续 task_reviews 的稳定句柄，标题让模型对得上刚派的是哪个。
+    # ack 同时给标题与 id：id 是后续指名这个子任务的稳定句柄，标题让模型对得上刚派的是哪个。
     child = tm.staged[0]
     assert f"{child.title!r} ({child.id})" in res.content
 
@@ -53,6 +55,5 @@ def test_delegate_plan_chains_each_task_on_the_previous():
     tm = _FakeTM()
     delegate_plan(tasks=[{"title": "a"}, {"title": "b"}, {"title": "c"}], ctx=_ctx(tm))
     a, b, c = tm.staged
-    assert a.tracking_task_ids == []
-    assert b.tracking_task_ids == [a.id]
-    assert c.tracking_task_ids == [a.id, b.id]
+    # 链式而非累积：每一步只等前一步（前序全成功由链的传递性保证）。
+    assert tm.blocked == [None, [a.id], [b.id]]

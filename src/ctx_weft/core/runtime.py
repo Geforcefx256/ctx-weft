@@ -1448,8 +1448,8 @@ class CtxWeftRuntime:
         # validate → normalize 的顺序与另外两个入口共用同一个方法，不再各写一遍。
         # event 侧产物在这条路径上没有**入口事件**载得下它（run_single_task 自己
         # register_task、不经 push_task，也不发 SESSION_CREATED），但它必须挂到 Task 上：
-        # 这条路径产出的 task 一样会被 observer reopen，`reopen_task` 要用它发
-        # TASK_REQUEUED；丢掉它等于让 reopen 把原始 prompt 从事件流里抹掉（终审 C1）。
+        # 这条路径产出的 task 与另外两个入口共用同一份 `user_prompt_event_jsonable`
+        # 契约（`Task` 的字段注释），入口不同不该让 task 上的字段形态不同。
         # 代价是携图时会在 event blob store 里留一份暂时无人引用的字节；不为此加分支，
         # 是因为「三入口共用同一个真源」这条不变量比省掉一次 compat 路径上的 put 更值钱
         # （宿主的 event blob 回收本就按自己的保留策略走，见 EventBlobStore 协议）。
@@ -2476,7 +2476,13 @@ class CtxWeftRuntime:
         await self._restore_task_prompts(all_tasks, session_id, sess_proj.tenant_id)
         # 「开始过的 task 提问一定在 memory 里」只是 `task_from_projection` 的推断，恢复前对着
         # memory 核一遍；缺了就让 driver 按刚还原出来的 prompt 补写。
-        await self._verify_task_prompts_in_memory(all_tasks, session_id, sess_proj.tenant_id)
+        #
+        # **只核要重排的那些**：这一步每个 task 付一次 `load_view`，而它修正的是「driver
+        # 要不要再写一次这条提问」——终态 task 不会再跑，核它纯属白付。上面的
+        # `_restore_task_prompts` 反过来仍吃全量：它对纯文本是零 IO 的，而终态子任务的
+        # prompt 仍可能被 `_task_label` 在 title 为空时读作描述性名字。
+        resumable = [t for t in all_tasks if t.status not in TERMINAL_TASK_STATUSES]
+        await self._verify_task_prompts_in_memory(resumable, session_id, sess_proj.tenant_id)
 
         # 装填 HitlRegistry：**park / 重排的判据从此只读内存**（spec §3.1）。必须在算下面
         # 两个集合之前——registry 空着算出来的 parked 是空集，等于「人还没答，任务却自己
@@ -2498,20 +2504,22 @@ class CtxWeftRuntime:
         # `_inject_resolved_user_turns`。
 
         terminal_ids = {t.id for t in all_tasks if t.status in TERMINAL_TASK_STATUSES}
-        resumable = [t for t in all_tasks if t.status not in TERMINAL_TASK_STATUSES]
 
         # 折出被崩溃打断的段 recap（started 无 done）——覆盖全部 observe 段边界。
         from ctx_weft.core.control.reducers import fold_pending_task_recap
         events_all = await self.event_store.read_by_session(session_id)
         pending_recap = fold_pending_task_recap(events_all)
 
-        # 既无可恢复 task 又无 task（空/损坏投影）→ 确无事可做，保留原抛错——
+        # 既无可恢复 task、且这个会话**从来没有过** task（空/损坏投影）→ 确无事可做，
+        # 保留原抛错。判据是 `view.tasks_total`（创建过几个）而**不是** `all_tasks` 是否为空：
+        # 快照只存活闭包（`prune_view_for_snapshot`）之后，「所有 task 都已终态」同样会让
+        # `all_tasks` 空掉，用集合判就会把一个正常完工的会话误判成坏投影、恢复时直接抛错。
         # 除非 `keep_alive`：`_start_task_for_agent` 调这里正是为了给一个从没跑过
         # task 的 agent（冷启动只被 ALM.load() 装填、从未真正执行过）建一个空 TM，
         # 空历史在这条调用路径上是合法起点，不是损坏投影（终审 CRITICAL 1；
         # `tests/integration/test_task_recap_recovery.py::test_no_tasks_at_all_still_raises`
         # 钉死的是 `keep_alive=False` 的默认路径，不受影响）。
-        if not resumable and not all_tasks and not keep_alive:
+        if not resumable and not view.tasks_total and not keep_alive:
             raise RuntimeError(f"Session {session_id!r} has no resumable tasks")
 
         lm = self._agent_lifecycle_manager
@@ -2607,12 +2615,12 @@ class CtxWeftRuntime:
         - 猜「没写」其实有（`AWAITING_HUMAN` / `INTERRUPTED` / 恢复后的 `PENDING`）：driver
           会**再写一条**，时间戳是恢复时刻、排在对话末尾。实测复现过。
 
-        提问本身不会丢：它在 `TaskCreated`（reopen 后是 `TaskRequeued`）的 payload 里，
+        提问本身不会丢：它在 `TaskCreated`（重排过的话是 `TaskRequeued`）的 payload 里，
         `_restore_task_prompts` 刚把它还原到 `task.user_prompt` 上。
 
         「这条提问在不在」的判据有两道，命中一道即算在：
-        1. 确定性 id（`task_prompt_record_id`）已在视图里——新数据走这条，reopen 改写过提问
-           时哈希不同，于是如实判「不在」，修订版照常写入；
+        1. 确定性 id（`task_prompt_record_id`）已在视图里——新数据走这条，提问被改写过
+           （存量 reopen 数据）时哈希不同，于是如实判「不在」，修订版照常写入；
         2. 存量数据（自动 id）：该 task 的 TASK 层 user 回合、不带 `metadata["source"]`
            （那是 HITL 应答 / 注入消息）、且拍平文本与当前提问一致。L3 坍缩物以原文开头，
            因此用前缀匹配。
@@ -2666,14 +2674,11 @@ class CtxWeftRuntime:
     async def _restore_task_prompts(
         self, tasks: "list[Task]", session_id: str, tenant_id: str,
     ) -> None:
-        """恢复态的 prompt 从 event ref 转回 memory ref。**逐 task、逐字段独立降级：任一
-        字段转换失败只降级它自己，不牵连同一 task 的另一字段、不牵连其他 task、更不
-        中断整场恢复。**
+        """恢复态的 prompt 从 event ref 转回 memory ref。**逐 task 独立降级：任一 task
+        转换失败只降级它自己，不牵连其他 task、更不中断整场恢复。**
 
         转换前先把事件侧的原样形态快照到 `user_prompt_event_jsonable`（见 Task 5）：
-        `reopen_task` 要用它发 TASK_REQUEUED，此时它就是从事件里读来的那一份，
-        零成本、且与首次发射逐字节相同。**纯文本字段同样要快照**（str 往返即自身），
-        否则 reopen 会把「字段没填」误读成「原始 prompt 是空的」（终审 C1）。
+        它就是从事件里读来的那一份，零成本、且与首次发射逐字节相同。
 
         本函数刻意不走 `validate_content`——它的输入直接来自事件重放，不是入口，
         套不上「先 validate 后 normalize」那条不变量（`_validate_and_normalize_content`，
@@ -2696,32 +2701,28 @@ class CtxWeftRuntime:
         blob_store = self.providers.get_memory_blob_store()
         ctx = ProviderContext(session_id=session_id, tenant_id=tenant_id)
         for task in tasks:
-            for field_name in ("user_prompt", "original_user_prompt"):
-                content = getattr(task, field_name)
-                if not content:
-                    continue
-                # 快照恒先于「要不要转换」的判断：纯文本 prompt 也必须落这一份。
-                # str 经 content_to_jsonable 往返即自身、零成本，而少落它的代价是
-                # `reopen_task` 拿到 None、被 `_append_text_sections` 当成「base 为空」，
-                # 发出的 TASK_REQUEUED 只剩一句修订说明——用户的原始指令在下一次重放
-                # 时蒸发（终审 C1）。纯文本恰恰是绝大多数情形。
-                setattr(task, f"{field_name}_event_jsonable", content_to_jsonable(content))
-                if isinstance(content, str):
-                    continue  # 纯文本无 ref 可转，零 blob IO 直通
-                try:
-                    hydrated = await hydrate_event_content(
-                        content, event_blob_store=event_blob_store, ctx=ctx)
-                    if blob_store.can_externalize:
-                        hydrated = await normalize_content(
-                            hydrated, blob_store=blob_store, ctx=ctx)
-                except Exception:
-                    logger.error(
-                        "_restore_task_prompts: task_id=%s field=%s 转换失败，"
-                        "降级为纯文本占位（不让解不开的 ref 混进 memory）",
-                        task.id, field_name, exc_info=True,
-                    )
-                    hydrated = downgrade_images_to_text(content)
-                setattr(task, field_name, hydrated)
+            content = task.user_prompt
+            if not content:
+                continue
+            # 快照恒先于「要不要转换」的判断：纯文本 prompt 也必须落这一份
+            # （str 经 content_to_jsonable 往返即自身、零成本）。
+            task.user_prompt_event_jsonable = content_to_jsonable(content)
+            if isinstance(content, str):
+                continue  # 纯文本无 ref 可转，零 blob IO 直通
+            try:
+                hydrated = await hydrate_event_content(
+                    content, event_blob_store=event_blob_store, ctx=ctx)
+                if blob_store.can_externalize:
+                    hydrated = await normalize_content(
+                        hydrated, blob_store=blob_store, ctx=ctx)
+            except Exception:
+                logger.error(
+                    "_restore_task_prompts: task_id=%s user_prompt 转换失败，"
+                    "降级为纯文本占位（不让解不开的 ref 混进 memory）",
+                    task.id, exc_info=True,
+                )
+                hydrated = downgrade_images_to_text(content)
+            task.user_prompt = hydrated
 
     async def _find_finish_pair_tool_call_id(
         self, memory: MemoryProvider, scope: MemoryAddress, task_id: str, pctx: ProviderContext,

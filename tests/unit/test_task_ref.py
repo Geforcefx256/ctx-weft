@@ -1,7 +1,7 @@
 """spec: task-handoff——任务称呼的规范形式：id 与标题恒同时出现。
 
 模型用**标题**建立心智模型（act 的任务树 / 已完成清单 / 派发对 / finish 对归属），
-却用 **id** 执行操作（`task_reviews` 只认 `task_id`）。这里钉死两件事：形式只有一种，
+却用 **id** 指名（observer 在 `next_step_hint` 里点名子任务）。这里钉死两件事：形式只有一种，
 且每张模型可见的脸上两者都在——否则模型得在中间做一次没有凭据的映射。
 """
 
@@ -68,7 +68,7 @@ def test_act_guidance_plan_tree_carries_both():
 
 
 def test_act_guidance_completed_children_carry_both():
-    """这些正是 observe 阶段要按 id confirm/reopen 的任务。"""
+    """这些正是 observe 阶段要按 id 指名的任务。"""
     parent = _t("t1", "Parent", "ACTIVE")
     child = _t("t2", "Research", "FINISHED", parent="t1")
     g = build_act_guidance(_cur("t1", "Parent"), _tm([parent, child]))
@@ -83,13 +83,13 @@ def test_act_guidance_anchor_and_resume_cue_carry_both():
     assert task_ref_parts("t1", "Fix importer") in cue
 
 
-def _observer_cue(reviews):
+def _observer_cue(subtasks):
     req = SimpleNamespace(
         purpose="observe", scope=SimpleNamespace(session_id="s1", task_id="t1", agent_id="a1"),
         task=SimpleNamespace(id="t1", title="parent", description="", user_prompt="",
                              user_prompt_in_memory=False, process_report=None, outputs=None),
         agent=SimpleNamespace(id="a1"), session=SimpleNamespace(id="s1"),
-        template=None, bound_capabilities=[], extra={"subtask_reviews": reviews},
+        template=None, bound_capabilities=[], extra={"subtasks": subtasks},
         token_counter=len,
     )
     blocks = [ContextBlock(id="b1", source="t", kind="history", target="messages",
@@ -109,10 +109,10 @@ def test_observer_review_face_carries_both_for_every_entry():
     assert task_ref_parts("tsk_b", "Greet Lily") in cue
 
 
-def test_observer_review_instruction_says_task_id_not_task_title():
-    """指令行是这条链上最吃重的一句：它决定模型用哪个键发起 task_reviews。"""
+def test_observer_subtask_instruction_says_task_id_not_task_title():
+    """指令行是这条链上最吃重的一句：它决定模型用哪个键指名子任务。"""
     cue = _observer_cue([{"task_id": "tsk_a", "title": "Greet Amy", "outcome": "finished"}])
-    assert "referencing the exact task_id" in cue
+    assert "task_id" in cue
     assert "task_title" not in cue
 
 

@@ -246,8 +246,9 @@ def task_prompt_record_id(task_id: str, content: "str | list[Any]") -> str:
     """task 提问的**确定性** memory 记录 id。全仓唯一派生点（落库侧与恢复核对侧共用）。
 
     确定性的用处是让「这条提问写过没有」不必再靠猜：同一条提问重复写命中同一个 id，
-    memory 的 id 契约（已存在的 id——含已 superseded——= no-op）直接兜住；`reopen_task`
-    改写过提问则哈希不同，照常写进去。被 L3 坍缩掉的旧提问仍占着它的旧 id，不会被复活。
+    memory 的 id 契约（已存在的 id——含已 superseded——= no-op）直接兜住；提问被改写过
+    （存量 reopen 数据）则哈希不同，照常写进去。被 L3 坍缩掉的旧提问仍占着它的旧 id，
+    不会被复活。
 
     指纹取自**拍平的文本 + 各 part 的种类计数**：跨重启时提问从事件还原，文本形态稳定，
     而图片的引用形态在 event / memory 两个命名空间下并不相同，不能进指纹。纯图片提问
@@ -325,8 +326,9 @@ class StepDriver:
         Predecessor results now reach a task via memory recall (Phase 2 inherit/recall), and the
         observer's own-children review affordance is surfaced in the observe cue from task_manager
         (see ObserveStep). The blackboard mechanism (subscribe_topic/recall_topic/BlackboardSource/
-        BLACKBOARD_PUBLISH) and `tracking_task_ids` are intentionally kept; only the subscription
-        wiring is removed.
+        BLACKBOARD_PUBLISH) is intentionally kept; only the subscription wiring is removed.
+        (`tracking_task_ids`, the other thing this used to key off, was deleted with reopen
+        on 2026-09-19.)
         """
         return
 
@@ -357,8 +359,7 @@ class StepDriver:
         # （`tests/integration/test_media_fold_replay_e2e.py` 钉住这条）。
         await _persist_user_prompt(state, ctx)
 
-        # Blackboard 订阅：本 task 订阅相关任务的结果 topic，下一次 reason 即可感知。
-        # 幂等，每次 run 都执行：① 同 plan 前序（tracking_task_ids）② 已派生的子任务。
+        # Blackboard 订阅：Phase 3 起是 no-op（见该方法 docstring），保留调用点。
         await self._ensure_blackboard_subscriptions(state, ctx)
 
         next_step_name: str | None = self.initial_step

@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 from ctx_weft.core.capabilities.schema import extract_schema
 from ctx_weft.core.utils.clock import now_utc
-from ctx_weft.core.utils.headings import SUBTASKS_REVIEW_HEADING
+from ctx_weft.core.utils.headings import SUBTASKS_HEADING
 from ctx_weft.core.utils.ids import generate_id
 from ctx_weft.core.utils.task_ref import task_ref
 from ctx_weft.core.models.task import NormalTaskSettings
@@ -101,7 +101,6 @@ class ControlMetaKey:
     """Step 间传递的 metadata key。仅保留仍需通过 metadata 传递的信号。"""
     CONTROL_ACTION = "control_action"
     HITL_REQUESTED = "hitl_requested"
-    REOPEN_TASK_IDS = "reopen_task_ids"  # observer review：需重新入队的子任务 id（→ reopen_chain）
 
 
 # ── ControlContext ─────────────────────────────────────────────────────────────
@@ -294,7 +293,6 @@ def delegate_plan(
             description=spec.get("description", ""),
             user_prompt=spec.get("task_prompt") or spec.get("description", ""),
             origin_tool_call_id=generate_id("tcall"),
-            tracking_task_ids=list(prev_ids),
             interaction_mode=_child_mode(bool(spec.get("interactive", False)), ctx.task),
             # 同 delegate_task：继承而非声明；interaction_mode 由 `_child_mode` 接住。
             unattended=ctx.task.unattended,
@@ -349,98 +347,6 @@ def finish_task(
     return ControlResult(content="Task finished.")
 
 
-def _collect_reviews(
-    task_reviews: list,
-    ctx: "ControlContext",
-) -> tuple[dict[str, str], str]:
-    """匹配**自己派生的子任务**的 review，返回 ({待 reopen 的子任务 id: reasoning}, 给 LLM 的摘要)。
-
-    每条 review: {task_id, review_status('confirmed'|'reopen'|'skip'), reasoning}。
-
-    权限范围：只有当前 task 直接派生的子任务（children_of）才能被 review / reopen。
-    同 plan 前序仅作只读上下文（经 memory recall 以对话形态出现，无专门段），不可在此操作；
-    任何不在子任务集合内的 task_id 都会被拒绝并在摘要里反馈给 LLM。
-
-    条目级显式校验（spec: task-handoff）：gateway 的控制工具严格校验只查顶层参数，
-    嵌套条目它不管——所以在这里逐条把关：缺 task_id / task_id 非字符串 / 携带未知
-    字段（含旧 task_title）→ 该条目拒绝且回执说明，其余合法条目照常生效。同名、
-    改名、顺序变化都不影响配对（键是稳定 id，标题仅展示）。
-
-    本函数**不直接改状态**——仅收集需 reopen 的 FINISHED 子任务及其 reasoning，交由
-    ControlCapabilityProvider 通过 TaskManager.reopen_chain(id, reason) 正规重排
-    （head + 其 plan 后续一并入队 + 重写 user_prompt + 发 TASK_REQUEUED）。reasoning 会成为重做指令。
-    'confirmed' / 'skip' 仅记录摘要。按 task_id 精确匹配。
-    """
-    if not isinstance(task_reviews, list) or ctx.task_manager is None or ctx.task is None:
-        return {}, ""
-
-    allowed_keys = {"task_id", "review_status", "reasoning"}
-    child_ids = ctx.task_manager.children_of(ctx.task.id)
-    children = {t.id: t for t in ctx.task_manager.all_tasks() if t.id in child_ids}
-
-    reopen: dict[str, str] = {}
-    applied: list[str] = []
-    denied: list[str] = []
-    for review in task_reviews:
-        if not isinstance(review, dict):
-            denied.append("non-object entry")
-            continue
-        # 条目级校验：缺 task_id / 非字符串 / 未知字段（含旧 task_title）→ 整条拒绝
-        task_id = review.get("task_id")
-        unknown = set(review) - allowed_keys
-        if not isinstance(task_id, str) or not task_id:
-            # 「旧式条目」的真实形态就走这一支——`{task_title, review_status, reasoning}`
-            # 没有 task_id，够不到下面那个 unknown 分支。所以引导语必须写在这里。
-            denied.append(f"entry without a valid string 'task_id' ({sorted(review)}); "
-                          "reference sub-tasks by their task_id — 'task_title' is no "
-                          "longer accepted")
-            continue
-        if unknown:
-            denied.append(f"{task_id!r} (unknown field(s) {sorted(unknown)}; "
-                          "use exactly task_id / review_status / reasoning)")
-            continue
-        review_status = review.get("review_status", "")
-        reasoning = review.get("reasoning", "")
-        target = children.get(task_id)
-        if target is None:
-            denied.append(f"{task_id!r}")  # 非自己的子任务（含前序 / 其它）→ 越权
-            continue
-        ref = task_ref(target)
-        # 以下两条此前是**静默 continue**：条目合法、在权限范围内，却既不进 applied 也不进
-        # denied，模型收到的回执里它就这么消失了。而 schema 明写 `reasoning (str, required)`
-        # 且只枚举三种 review_status——承诺了契约就得在违约时说话。
-        if not reasoning:
-            denied.append(f"{ref} (missing 'reasoning'; it is required — for 'reopen' it "
-                          "becomes the revision instruction)")
-            continue
-        if review_status not in ("reopen", "confirmed", "skip"):
-            denied.append(f"{ref} (unknown review_status {review_status!r}; "
-                          "use 'confirmed' | 'reopen' | 'skip')")
-            continue
-        if review_status == "reopen":
-            if target.status == "FINISHED":
-                reopen[target.id] = reasoning
-                applied.append(f"reopened {ref} (+ its plan successors)")
-            else:
-                # 已是 PENDING/进行中，本来就会跑，无需 reopen
-                applied.append(f"already active {ref}")
-        elif review_status == "confirmed":
-            applied.append(f"confirmed {ref}")
-        else:  # skip（枚举已在上面校验过，这里不会有第四种）
-            applied.append(f"skipped {ref}")
-
-    parts: list[str] = []
-    if applied:
-        parts.append(f"Reviews applied: {'; '.join(applied)}.")
-    if denied:
-        parts.append(
-            f"Ignored (invalid or out of scope — reference YOUR OWN sub-tasks by task_id "
-            f"exactly as listed): {'; '.join(denied)}."
-        )
-    summary = ("\n" + " ".join(parts)) if parts else ""
-    return reopen, summary
-
-
 @control_tool(purposes=["observe"])
 def report_task_outcome(
     task_status: Annotated[
@@ -477,38 +383,20 @@ def report_task_outcome(
         "For 'retry': state what concretely blocked or fell short in this attempt — if the retry limit is hit, "
         "this is shown to the user as the failure reason. Leave empty only for 'success'.",
     ] = "",
-    task_reviews: Annotated[
-        list,
-        "Optional reviews of YOUR OWN sub-tasks only — exactly those listed under the "
-        f"'{SUBTASKS_REVIEW_HEADING}' section in the context. You may NOT review anything "
-        "else (upstream/predecessor tasks appear as read-only conversation context); "
-        "such entries are rejected. "
-        f"Each entry is an object with exactly these fields: task_id (str — the id in "
-        f"parentheses after each title under '{SUBTASKS_REVIEW_HEADING}', NOT the title "
-        "itself), review_status ('confirmed'|'reopen'|'skip'), reasoning (str, required). "
-        "An entry is rejected individually — and the receipt says why — if it has no "
-        "string task_id (including old-style entries keyed by 'task_title'), carries any "
-        "other field, names a task that is not your own sub-task, omits reasoning, or "
-        "uses a review_status outside the three values above. "
-        "'reopen' re-runs that FINISHED sub-task from scratch: its previous output is "
-        "automatically shown to the re-run and your 'reasoning' becomes the revision "
-        "instruction — so write 'reasoning' as concrete, actionable feedback (what is "
-        "wrong and what must be fixed), not just a verdict. Reopening a sub-task that is "
-        "part of a plan AUTOMATICALLY reopens its later plan steps as well (they will be "
-        "redone against the corrected result), so you only need to reopen the earliest "
-        "step that is wrong. "
-        "'confirmed'/'skip' are recorded only, no re-run. Only FINISHED sub-tasks can be "
-        "reopened. Omit sub-tasks you have no information about; leave empty otherwise.",
-    ] = None,
     next_step_hint: Annotated[
         str,
         "Optional. If there are obvious risks, blockers, or important concerns the next actor turn should be "
-        "aware of, describe them here. Leave empty if nothing notable.",
+        "aware of, describe them here. Leave empty if nothing notable. "
+        "This is also where you flag a sub-task whose result does not actually achieve its goal: "
+        f"name it (title + id, as listed under '{SUBTASKS_HEADING}') and say what is wrong and "
+        "what must be different. You do not decide what happens next — the actor reads this hint on its "
+        "next turn and chooses for itself whether to delegate a fresh sub-task for that work or "
+        "just do it directly.",
     ] = "",
     *,
     ctx: ControlContext = None,
 ) -> ControlResult:
-    """Record the review verdict for the current task (success / retry / fail), and optionally review your own sub-tasks in the same call."""
+    """Record the review verdict for the current task (success / retry / fail)."""
     task = ctx.task if ctx else None
     # observe 裁决三态。机械退出（max_turns/context_limit）由系统在 ObserveStep 归为 retry。
     if task_status not in ("success", "retry", "fail"):
@@ -547,15 +435,9 @@ def report_task_outcome(
             # （TaskFailed 的 TASK_FAILED_RETRY_EXHAUSTED 携带）；下一轮判决必然覆盖或清空。
             task.error = task_failure_reason or None
 
-    review_msg = ""
-    if task_reviews and ctx:
-        reopen_map, review_msg = _collect_reviews(task_reviews, ctx)
-        if reopen_map:
-            metadata[ControlMetaKey.REOPEN_TASK_IDS] = reopen_map
-
     failure_part = f" Failure reason: {task_failure_reason}" if task_status == "fail" and task_failure_reason else ""
     return ControlResult(
-        content=f"Assessment recorded: outcome={task_status}.{failure_part} {act_recap}{review_msg}",
+        content=f"Assessment recorded: outcome={task_status}.{failure_part} {act_recap}",
         metadata=metadata,
     )
 
@@ -770,14 +652,6 @@ class ControlCapabilityProvider(ToolCapabilityProvider, SessionScopedCapabilityP
             return
 
         K = ControlMetaKey
-
-        # report_task_outcome 的 review：把命中的子任务正规重排（reopen_chain：
-        # head + 其 plan 后续一并入队 + 重写 user_prompt + 发 TASK_REQUEUED）。不在此
-        # drain——下一次 drain（当前 run 返回后）会自然调度，避免 run 内重入。
-        reopen_map = result.metadata.get(K.REOPEN_TASK_IDS)
-        if reopen_map and tm is not None:
-            for tid, reason in reopen_map.items():
-                await tm.reopen_chain(tid, reason)
 
         # ask_user：声明「我需要一个人的决定」并立即停——不在此 park、不自己等人。
         # 「答复即结果」：gateway 收到 needs_human 后开等待、拿到答复直接回灌为本次工具结果，

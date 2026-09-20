@@ -70,4 +70,7 @@ async def test_late_committed_event_is_skipped_by_snapshot_recovery():
     )
     snap = await store.load_latest_snapshot("s")
     assert snap is not None and snap.last_commit_position is not None
-    assert snap.projection_version == 1
+    # 断言的是「writer 给新快照盖了当前版本的章」，不是某个具体数字——所以引常量而不写
+    # 字面量：`_PROJECTION_VERSION` 每次因投影语义变化而 bump 时，这条不该跟着红。
+    from ctx_weft.core.control.reducers import _PROJECTION_VERSION
+    assert snap.projection_version == _PROJECTION_VERSION

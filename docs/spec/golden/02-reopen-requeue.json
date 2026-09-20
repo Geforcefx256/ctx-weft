@@ -1,42 +1,92 @@
 {
   "name": "reopen-requeue",
-  "description": "tsk_1 跑完并 finalize 出 outputs（TaskFinalized 自 2026-09-05 起带 `outputs:{output,summary}` + `error`：output=答复正文，summary=finish_task 的交付物自评清单；reducer 仍不折它们，投影里的 outputs 只认 TaskFinished）；reopen 触发 TaskRequeued → 回 PENDING、清 outputs、恢复改写后的 prompt。验证 TaskRequeued reducer 规则。task 状态所有权重构（2026-09-02）后 TaskFinished 由 TaskManager 在 run 返回之后发、不带 run_id；本用例的 TaskRequeued 是 reopen（显式操作，不经 RunOutcome），不受本次重构影响。",
+  "description": "tsk_1 跑完并 finalize 出 outputs（TaskFinalized 自 2026-09-05 起带 `outputs:{output,summary}` + `error`：output=答复正文，summary=finish_task 的交付物自评清单；reducer 仍不折它们，投影里的 outputs 只认 TaskFinished）；reopen 触发 TaskRequeued → 回 PENDING、清 outputs、恢复改写后的 prompt。验证 TaskRequeued reducer 规则。task 状态所有权重构（2026-09-02）后 TaskFinished 由 TaskManager 在 run 返回之后发、不带 run_id；本用例的 TaskRequeued 是 reopen（显式操作，不经 RunOutcome），不受本次重构影响。 （2026-09-19：reopen 机制已删，本用例固定的是**存量事件流**的回放契约——携 user_prompt 的 TaskRequeued 在老日志里真实存在，reducer 必须继续认它。`original_user_prompt` 随 reopen 一并删除，故不再出现在 expected 里。）",
   "runId": "s1",
   "events": [
     {
-      "id": "evt_0001", "runId": "run_1", "sequence": 1, "sessionId": "s1",
-      "type": "SessionCreated", "timestamp": "2026-06-05T00:00:01Z",
-      "payload": { "user_prompt": "do it", "template_id": "tmpl_a", "root_agent_id": "agt_root" }
-    },
-    {
-      "id": "evt_0002", "runId": "run_1", "sequence": 2, "sessionId": "s1",
-      "type": "TaskCreated", "timestamp": "2026-06-05T00:00:02Z",
-      "payload": { "task": {
-        "id": "tsk_1", "status": "PENDING", "title": "T1",
-        "assigned_agent_id": "agt_root", "creator_agent_id": "agt_root"
-      } }
-    },
-    {
-      "id": "evt_0003", "runId": "run_1", "sequence": 3, "sessionId": "s1", "taskId": "tsk_1",
-      "type": "TaskStarted", "timestamp": "2026-06-05T00:00:03Z",
-      "payload": { "assigned_agent_id": "agt_root" }
-    },
-    {
-      "id": "evt_0004", "runId": null, "sequence": 0, "sessionId": "s1", "taskId": "tsk_1",
-      "type": "TaskFinished", "timestamp": "2026-06-05T00:00:04Z",
-      "payload": { "outcome": "success", "summary": "", "outputs": { "result": "v1" } }
-    },
-    {
-      "id": "evt_0005", "runId": "run_1", "sequence": 5, "sessionId": "s1", "taskId": "tsk_1",
-      "type": "TaskFinalized", "timestamp": "2026-06-05T00:00:05Z",
+      "id": "evt_0001",
+      "runId": "run_1",
+      "sequence": 1,
+      "sessionId": "s1",
+      "type": "SessionCreated",
+      "timestamp": "2026-06-05T00:00:01Z",
       "payload": {
-        "task_id": "tsk_1", "outcome": "success",
-        "outputs": { "output": "v1", "summary": "wrote v1" }, "error": ""
+        "user_prompt": "do it",
+        "template_id": "tmpl_a",
+        "root_agent_id": "agt_root"
       }
     },
     {
-      "id": "evt_0006", "runId": "run_1", "sequence": 6, "sessionId": "s1", "taskId": "tsk_1",
-      "type": "TaskRequeued", "timestamp": "2026-06-05T00:00:06Z",
+      "id": "evt_0002",
+      "runId": "run_1",
+      "sequence": 2,
+      "sessionId": "s1",
+      "type": "TaskCreated",
+      "timestamp": "2026-06-05T00:00:02Z",
+      "payload": {
+        "task": {
+          "id": "tsk_1",
+          "status": "PENDING",
+          "title": "T1",
+          "assigned_agent_id": "agt_root",
+          "creator_agent_id": "agt_root"
+        }
+      }
+    },
+    {
+      "id": "evt_0003",
+      "runId": "run_1",
+      "sequence": 3,
+      "sessionId": "s1",
+      "taskId": "tsk_1",
+      "type": "TaskStarted",
+      "timestamp": "2026-06-05T00:00:03Z",
+      "payload": {
+        "assigned_agent_id": "agt_root"
+      }
+    },
+    {
+      "id": "evt_0004",
+      "runId": null,
+      "sequence": 0,
+      "sessionId": "s1",
+      "taskId": "tsk_1",
+      "type": "TaskFinished",
+      "timestamp": "2026-06-05T00:00:04Z",
+      "payload": {
+        "outcome": "success",
+        "summary": "",
+        "outputs": {
+          "result": "v1"
+        }
+      }
+    },
+    {
+      "id": "evt_0005",
+      "runId": "run_1",
+      "sequence": 5,
+      "sessionId": "s1",
+      "taskId": "tsk_1",
+      "type": "TaskFinalized",
+      "timestamp": "2026-06-05T00:00:05Z",
+      "payload": {
+        "task_id": "tsk_1",
+        "outcome": "success",
+        "outputs": {
+          "output": "v1",
+          "summary": "wrote v1"
+        },
+        "error": ""
+      }
+    },
+    {
+      "id": "evt_0006",
+      "runId": "run_1",
+      "sequence": 6,
+      "sessionId": "s1",
+      "taskId": "tsk_1",
+      "type": "TaskRequeued",
+      "timestamp": "2026-06-05T00:00:06Z",
       "payload": {
         "user_prompt": "## Revision required\nfix it",
         "original_user_prompt": "do it"
@@ -47,8 +97,14 @@
     "sessionStatus": "RUNNING",
     "taskStatus": "PENDING",
     "tasks": {
-      "tsk_1": { "status": "PENDING", "outputs": null, "userPrompt": "## Revision required\nfix it", "originalUserPrompt": "do it" }
+      "tsk_1": {
+        "status": "PENDING",
+        "outputs": null,
+        "userPrompt": "## Revision required\nfix it"
+      }
     },
-    "agents": ["agt_root"]
+    "agents": [
+      "agt_root"
+    ]
   }
 }

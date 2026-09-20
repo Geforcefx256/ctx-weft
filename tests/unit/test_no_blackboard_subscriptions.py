@@ -28,7 +28,7 @@ async def test_no_blackboard_subscriptions_created() -> None:
         def children_of(self, tid: str) -> set[str]:
             return {"c1", "c2"}
 
-    task = Task(id="T", session_id="s1", status="ACTIVE", tracking_task_ids=["p0"])
+    task = Task(id="T", session_id="s1", status="ACTIVE")
     state = SimpleNamespace(task=task)
     ctx = SimpleNamespace(task_manager=FakeTM(), memory=FakeMem(), provider_ctx=_ctx())
 

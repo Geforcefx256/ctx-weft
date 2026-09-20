@@ -93,10 +93,6 @@ class TaskQueue:
         """
         self._succeeded.update(task_ids)
 
-    def unmark_succeeded(self, task_id: str) -> None:
-        """Remove from the succeeded set so a reopened task can be scheduled again."""
-        self._succeeded.discard(task_id)
-
     def mark_complete(self, task_id: str) -> None:
         """FINISHED——唯一会解锁后继的收尾。"""
         self._running.discard(task_id)

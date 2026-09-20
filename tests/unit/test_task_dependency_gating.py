@@ -90,14 +90,6 @@ def test_seed_succeeded_only_takes_finished():
     assert q.pop().task_id == "c"
 
 
-def test_unmark_succeeded_reblocks_reopened_dep():
-    q = TaskQueue()
-    q.mark_complete("a")
-    q.unmark_succeeded("a")            # a 被 reopen → 后继重新等它
-    q.push(QueueEntry(task_id="b", session_id="s", blocked_by={"a"}))
-    assert q.pop() is None
-
-
 # ── restore ──────────────────────────────────────────────────────────────────
 
 

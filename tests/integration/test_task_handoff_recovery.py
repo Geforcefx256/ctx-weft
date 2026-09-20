@@ -1,4 +1,4 @@
-"""spec: task-handoff——集成路径：ack-id→reopen、计划断裂、阻塞原因可解释。
+"""spec: task-handoff——集成路径：ack-id→review、计划断裂、阻塞原因可解释。
 
 驱动方式：真 TaskManager + 真 InProcessEventBus 发射真事件 →（模拟崩溃）事件列表经
 reduce_events → converters → 新 TaskManager.restore 重建——这正是 rebuild_view 的
@@ -11,10 +11,8 @@ import pytest
 
 from ctx_weft.core.capabilities.control_tools import (
     ControlContext,
-    ControlMetaKey,
     delegate_plan,
     delegate_task,
-    report_task_outcome,
 )
 from ctx_weft.core.control.converters import task_from_projection
 from ctx_weft.core.control.reducers import reduce_events
@@ -82,11 +80,17 @@ async def _delegate_plan_ordered(tm: TaskManager, parent: Task, specs: list[dict
     return ack, order
 
 
-# ── 3.3 端到端：派发 ack 的 id → observer 以 task_id 发起 reopen ─────────────
+# ── 3.3 端到端：派发 ack 的 id 就是 observer 看到的那个句柄 ──────────────────
 
 
 @pytest.mark.asyncio
-async def test_delegate_ack_id_drives_review_reopen_by_id():
+async def test_delegate_ack_id_matches_the_observer_subtask_list():
+    """派发 ack 里的 id 与 observe 子任务清单里的 id 必须是同一个。
+
+    这是「稳定句柄」这条链的端到端判据：actor 派发时从 ack 记下 id，observer 之后据
+    同一个 id 在 `next_step_hint` 里指名哪个子任务的产出不合格（2026-09-19 起 observer
+    不再有 `task_reviews`，也不动任何 task 状态；重派还是自己做由下一轮 actor 决定）。
+    """
     bus = _CapturingBus()
     tm = _tm(bus)
     parent = _parent()
@@ -101,28 +105,17 @@ async def test_delegate_ack_id_drives_review_reopen_by_id():
     for i, c in enumerate(children, start=1):
         assert f"{i}. {c.title!r} ({c.id})" in res.content
 
-    # 子任务完成（step one FINISHED），observer 用 ack 里的 id 发起 reopen
     c1 = children[0].id
     c1_task = tm.get_task(c1)
     c1_task.status = "FINISHED"
     c1_task.outputs = "done"
     tm._queue.mark_complete(c1)
 
-    parent.id = parent.id
-    review_ctx = ControlContext(
-        session_id="s1", task_id=parent.id, agent_id="a1", task=parent,
-        task_manager=tm, session=None, tool_call_id="tc_2",
-    )
-    out = report_task_outcome(
-        task_status="success", act_recap="reviewed",
-        task_reviews=[{"task_id": c1, "review_status": "reopen", "reasoning": "redo step one"}],
-        ctx=review_ctx,
-    )
-    reopen_map = out.metadata.get(ControlMetaKey.REOPEN_TASK_IDS)
-    assert reopen_map == {c1: "redo step one"}
-
-    assert await tm.reopen_chain(c1, "redo step one") is True
-    assert tm.get_task(c1).status == "PENDING"        # 按 id 命中、链路重排
+    # observe 侧的子任务清单（ObserveStep 就是这么构造 extra["subtasks"] 的）
+    listed = {cid: tm.get_task(cid) for cid in tm.children_of(parent.id)}
+    assert c1 in listed, "派发出来的子任务必须出现在 observer 的清单里"
+    assert listed[c1].title == c1_task.title
+    assert listed[c1].status == "FINISHED"      # 结局随清单一起给 observer
 
 
 # ── 4.4 计划断裂：step2 失败 → 其后各步级联取消（带原因），会话不被误标 ──────
@@ -160,42 +153,6 @@ async def test_plan_break_cancels_all_successors():
     assert cleanup.error and final.id in cleanup.error
     assert tm.session.status != "CANCELED"            # 会话不被误标
     assert not any(e.task_id in (final.id, cleanup.id) for e in tm._queue.peek_all())
-
-
-# ── 5.2 行为变更专项回归 ─────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_legacy_title_entries_rejected_with_guidance_through_tool():
-    """旧 task_reviews 条目经完整工具链被拒：回执引导改用 task_id，合法条目照常。"""
-    bus = _CapturingBus()
-    tm = _tm(bus)
-    parent = _parent()
-    tm.register_task(parent)
-    _, children = await _delegate_plan_ordered(
-        tm, parent, [{"title": "same name"}, {"title": "same name"}],
-    )
-    c1, c2 = children
-    for c in (c1, c2):
-        c.status = "FINISHED"
-        c.outputs = "done"
-        tm._queue.mark_complete(c.id)
-
-    out = report_task_outcome(
-        task_status="success", act_recap="reviewed",
-        task_reviews=[
-            {"task_title": "same name", "review_status": "reopen", "reasoning": "old"},
-            {"task_id": c1.id, "review_status": "reopen", "reasoning": "redo first"},
-            {"task_id": 123, "review_status": "skip", "reasoning": "bad"},
-        ],
-        ctx=_ctx(tm, parent),
-    )
-    # 只有按 id 的合法条目进入 reopen 指令；同名另一子不受影响
-    reopen_map = out.metadata.get(ControlMetaKey.REOPEN_TASK_IDS)
-    assert reopen_map == {c1.id: "redo first"}
-    # 回执携带可引导重发的说明
-    assert "task_title" in out.content and "task_id" in out.content
-    assert c2.status == "FINISHED"
 
 
 # ── 4.5 阻塞原因的持久化与恢复后可解释 ────────────────────────────────────────

@@ -85,7 +85,9 @@ async def test_migrated_db_recovers_via_position_and_ignores_legacy_snapshot(tmp
         snap = await store.load_latest_snapshot("s1")
         assert snap is not None
         assert snap.last_commit_position == 4            # position 游标（非事件 ID）
-        assert snap.projection_version == 1
+        # 同上：引常量，不写字面量（投影语义变化时 bump，这条不该跟着红）。
+        from ctx_weft.core.control.reducers import _PROJECTION_VERSION
+        assert snap.projection_version == _PROJECTION_VERSION
 
         # 两路等价：全量 vs 快照+增量
         after = await rebuild_view(store, "s1")

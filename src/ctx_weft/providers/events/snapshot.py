@@ -18,9 +18,22 @@
 折叠策略（spec: snapshot-recovery）：**常态增量**，内容 = 上一张可用快照 + 
 ``read_range((base, C])``，满足上面那条 O(delta) 约束。全量 ``read_range(0..C)`` 降为
 **重锚点**——无可用基底（首张 / 存量快照 / 版本不匹配 / 位置超前）、链深到顶、或本
-进程首次为该 session 写快照时各触发一次，用来纠正历史快照的偏差。两种模式下 blob 都
-恒等于 fold(0..C)（``reduce_events`` 就是 ``apply_events`` 在空 view 上的调用，左折叠
-可结合），「全量回放 vs 快照+增量」两路恢复因此同样天然等价（E5）。
+进程首次为该 session 写快照时各触发一次，用来纠正历史快照的偏差。
+
+两种模式下 blob 都恒等于 ``prune(fold(0..C))``（``reduce_events`` 就是 ``apply_events``
+在空 view 上的调用，左折叠可结合；``prune`` 见 `reducers.prune_view_for_snapshot`）。
+
+⚠️ **v2 起等价性是「裁剪后等价」，不再是逐字节等价**（projection_version 2，2026-09-19）：
+blob 里的 ``tasks`` 只有活闭包，而全量回放得到的是全部 task。增量链不漂移靠的是
+``prune`` 与 ``apply`` 在闭包上**可交换**：
+
+    prune(apply(δ, prune(v))) == prune(apply(δ, v))
+
+它成立是因为 ``prune`` 的三类判据只读 ``status`` / ``parent_task_id`` / ``dag_deps``
+（这几个字段两路相同），而被裁掉的 task 之后再不会被任何事件**有效**改动——唯一的例外
+是 ``TASK_FINALIZED`` 只写的 ``finished_at``，那条分叉已在 ``prune_view_for_snapshot``
+的 docstring 里论证为无害（被裁的 task 进不了 `restore` 的 `all_tasks`，无人读它）。
+给终态 task 加新消费者之前，先回去看那一条。
 
 有序提交是 EventStore 的必需部分，故这里没有 legacy 回落分支。
 """
@@ -30,6 +43,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from ctx_weft.core.control.reducers import _PROJECTION_VERSION
 from ctx_weft.protocols.events import TRANSIENT_EVENT_TYPES
 
 if TYPE_CHECKING:
@@ -93,7 +107,12 @@ class SnapshotWriter:
 
     #: 当前投影版本（spec: snapshot-recovery）——apply 语义变更时 bump，旧快照据此
     #: 在恢复路径被忽略并全量重建。
-    PROJECTION_VERSION = 1
+    #:
+    #: **不写字面量，直接引读侧那一个常量。** 从前这里是独立的 `1`，与
+    #: `reducers._PROJECTION_VERSION` 两处各写一遍：只改一个的后果是所有快照永远判不
+    #: 可用（写侧盖 1、读侧要 2），恢复全量回放、writer 每次全量重锚，O(delta) 退回
+    #: O(n)，且**不报任何错**。绑成同一个值之后这种漂移不可能再发生。
+    PROJECTION_VERSION = _PROJECTION_VERSION
 
     #: 快照链的最大深度：连续增量写到这个层数就强制一次全量重锚（spec: snapshot-recovery）。
     #: 存在的理由是 `serialize_view` / `deserialize_view` 往返——链式写让 blob 反复过这
@@ -125,6 +144,7 @@ class SnapshotWriter:
         from ctx_weft.core.control.reducers import (
             apply_events,
             deserialize_view,
+            prune_view_for_snapshot,
             reduce_events,
             serialize_view,
         )
@@ -141,11 +161,13 @@ class SnapshotWriter:
 
         if base is not None:
             # ── 常态：增量，O(delta)────────────────────────────────────────
-            # blob 恒等于 fold(0..cursor)，证明是一行归纳：`reduce_events(evts)` 就是
-            # `apply_events(evts, 空 view)`（reducers.py 里两段循环体逐字相同），而
+            # blob 恒等于 prune(fold(0..cursor))，证明是一行归纳：`reduce_events(evts)`
+            # 就是 `apply_events(evts, 空 view)`（reducers.py 里两段循环体逐字相同），而
             # apply 是 for 循环左折叠、可结合，故
-            #   reduce(0..C) = apply((p, C], reduce(0..p)) = apply((p, C], blob_p)
-            # 两路等价（E5）因此与全量折时**同样**成立，不需要额外证明。
+            #   fold(0..C) = apply((p, C], fold(0..p))
+            # 基底是裁过的，所以这里成立的是**裁剪后**的那条等式
+            #   prune(fold(0..C)) = prune(apply((p, C], prune(fold(0..p))))
+            # ——它靠 prune 与 apply 在闭包上可交换（见模块 docstring 的 ⚠️ 段）。
             delta = await self._store.read_range(
                 session_id, after_position=base.last_commit_position,
                 through_position=head)
@@ -163,6 +185,11 @@ class SnapshotWriter:
 
         if not view.session_id:
             return  # 该 session 尚无任何已提交事件，跳过（不记 anchored，下次仍重锚）
+        # 裁到「活闭包」再落盘（spec: snapshot-recovery v2）。放在这里而**不是**塞进
+        # `serialize_view`：那个函数的语义是「全字段序列化」，一堆往返测试依赖它不丢东西；
+        # 裁剪是快照写入侧的策略，显式一步、可单独测。契约因此是
+        # `blob == serialize_view(prune(fold(0..C)))`，见 `prune_view_for_snapshot`。
+        view = prune_view_for_snapshot(view)
         snapshot = RunSnapshot(
             id=generate_id("snp"),
             run_id=event.run_id or "",

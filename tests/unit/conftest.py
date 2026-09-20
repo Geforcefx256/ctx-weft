@@ -100,7 +100,6 @@ async def fake_state_ctx():
         user_prompt_in_memory=True,
         process_report="",
         session_id="s1",
-        tracking_task_ids=[],
     )
 
     # Minimal session

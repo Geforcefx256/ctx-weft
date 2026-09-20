@@ -103,10 +103,11 @@ def test_task_user_prompt_survives_event_replay():
 
 
 def test_task_requeued_replay_restores_multimodal_prompt():
-    """TASK_REQUEUED 回放分支（reducers.py ~159-164 行）须把两个 prompt 字段完整还原为 part 列表。
+    """TASK_REQUEUED 回放分支须把携带的 prompt 完整还原为 part 列表。
 
-    reopen 携带改写后的 user_prompt / original_user_prompt 快照，replay 必须无损，
-    这是 Task 5 大改过的高风险路径，此前无测试驱动过多模态内容。
+    今天没有发射点往这个 payload 里放 `user_prompt`（已删的 reopen 是唯一一个），
+    但**存量日志里有**——这条覆盖的正是那条存量兼容读取：不还原它，被 reopen 过的
+    老会话重放后 prompt 会退回 TaskCreated 的原始值，即重启前后不一致。
     """
     events = [
         _ev(1, EventType.SESSION_CREATED, user_prompt="看这张图",
@@ -117,13 +118,11 @@ def test_task_requeued_replay_restores_multimodal_prompt():
             "user_prompt": "纯文本",
         }),
         _ev(3, EventType.TASK_REQUEUED, task_id="tsk_1",
-            user_prompt=content_to_jsonable(_content()),
-            original_user_prompt=content_to_jsonable(_content())),
+            user_prompt=content_to_jsonable(_content())),
     ]
     view = reduce_events(events, run_id="s1")
     task = task_from_projection(view.tasks["tsk_1"])
     assert task.user_prompt == _content(), "requeue 后的 user_prompt 必须还原为 part 列表"
-    assert task.original_user_prompt == _content(), "original_user_prompt 快照同样必须无损还原"
 
 
 def test_snapshot_roundtrip_preserves_parts():

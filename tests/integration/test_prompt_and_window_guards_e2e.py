@@ -113,8 +113,9 @@ async def test_recovery_keeps_exactly_one_prompt(status_event, record_id) -> Non
     assert len(prompts) == 1, f"提问必须恰好一条：{[(r.id, content_to_text(r.content)) for r in prompts]}"
 
 
-async def test_reopened_task_still_writes_its_revised_prompt() -> None:
-    """reopen 改写过提问：旧提问还在 memory 里，修订版仍然必须写进去（核对不得误判成已存在）。"""
+async def test_requeued_task_with_revised_prompt_still_writes_it() -> None:
+    """TASK_REQUEUED 携带改写过的提问（存量 reopen 数据）：旧提问还在 memory 里，
+    修订版仍然必须写进去——核对不得因为「这个 task 的提问已经有了」就误判成已存在。"""
     llm = _ActRouterLLM(act_responses=[MockResponse(text="done")], context_limit=100_000)
     mem = InMemoryMemoryProvider()
     rt = _runtime(llm, memory=mem)
@@ -127,7 +128,7 @@ async def test_reopened_task_still_writes_its_revised_prompt() -> None:
             "assigned_agent_id": AID, "creator_agent_id": AID, "user_prompt": PROMPT}),
         _ev(3, EventType.TASK_STARTED, task_id=TID, assigned_agent_id=AID),
         _ev(4, EventType.TASK_REQUEUED, task_id=TID, reason="revise",
-            user_prompt=revised, original_user_prompt=PROMPT),
+            user_prompt=revised),
     ]:
         await rt.event_store.append(e)
     scope, pctx = _scope_ctx()

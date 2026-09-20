@@ -25,7 +25,7 @@ def _blocks():
 def _req(boundary, outputs=""):
     return SimpleNamespace(purpose="background_observe", task=SimpleNamespace(
         id="t1", user_prompt_in_memory=True, title="", description="", user_prompt="x",
-        outputs=outputs, process_report="", process_report_at=None, tracking_task_ids=[],
+        outputs=outputs, process_report="", process_report_at=None,
         parent_task_id=None), session=SimpleNamespace(user_prompt="x"),
         template=None, bound_capabilities=[],
         extra={"observe_boundary": boundary})

@@ -33,7 +33,7 @@
 | 文件 | 覆盖的 reducer 分支 |
 |------|------|
 | `01-session-two-tasks.json` | 基本生命周期 + TASK_STATUS 映射 + 快照/增量一致；**RunStarted / RunFinished 不写 sessionStatus** |
-| `02-reopen-requeue.json` | TaskRequeued：回 PENDING、清 outputs、恢复改写后的 prompt |
+| `02-reopen-requeue.json` | TaskRequeued：回 PENDING、清 outputs、恢复改写后的 prompt（存量 reopen 事件流） |
 | `03-suspend-resume.json` | TaskSuspended → TaskResumed 状态分支 |
 | `04-subagent-spawn-depth.json` | `_rebuild_agents` 子 agent 推算（spawnDepth=1、parent=root） |
 | `05-step-and-context-progress.json` | RunStarted / StepStarted / StepCompleted → currentStep；ReasonCompleted；ActTurnCompleted |
@@ -41,7 +41,7 @@
 | `07-session-resumed.json` | RunInterrupted(no-op) → TaskInterrupted(task→INTERRUPTED)；SessionResumed 更新 userPrompt + 回 RUNNING |
 | `08-metadata-filler-goal.json` | RecognizeIntentToolCall 回填 session.goal |
 | `09-failure-threshold.json` | failureCounter 折叠：TaskFailed +1、熔断失败不计、FailureThresholdHit 本身 no-op（跨快照边界） |
-| `10-reopen-chain-multi-step.json` | 三步 plan 级联 reopen（head vs 后续 prompt 改写） |
+| `10-reopen-chain-multi-step.json` | 三步 plan 的级联 TaskRequeued（存量 reopen 事件流） |
 | `11-compact-task.json` | compact 子任务作为普通 task；compact 域事件 no-op |
 | `12-inert-events-noop.json` | token budget / capability / HITL / LLM 事件对投影无副作用 |
 | `13-task-canceled.json` | TaskCanceled → CANCELED；**RunCanceled 在 reducer 中 no-op**（会话取消看 SessionFinished{CANCELED}） |
@@ -54,5 +54,5 @@
 参照实现：`tests/unit/test_golden_conformance.py` —— 读本目录所有 JSON，对真实
 `reduce_events` 跑全量 + 快照/增量两类断言。**这是 Java / TS 移植可直接照搬的测试模板**。
 
-> 扩充用例时优先把 Python `test_reopen.py`、`test_task_scheduling.py` 的断言抽成本目录的 JSON，
+> 扩充用例时优先把 Python `test_subtask_reviews.py`、`test_task_scheduling.py` 的断言抽成本目录的 JSON，
 > 使三份实现共用同一套真相。

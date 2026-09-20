@@ -77,7 +77,7 @@ messages —— 组装步骤（_build_actor_messages）：
   observe            ROLE facet → [## Final output ← task.outputs（finish 为
                      SILENT 工具，对话里不可见，须显式回填）] → 裁决 cue
                      (_OBSERVE_JUDGMENT_CUE) → [## Your sub-tasks 可 review 清单
-                     ← extra["subtask_reviews"]]。tools = report_task_outcome。
+                     ← extra["subtasks"]]。tools = report_task_outcome。
   background_observe ROLE facet → [## Actor 的最终产出（仅 close 边界）] →
                      边界 cue（interrupt / plain_text / finish / normal）。
                      tools = collect_process_report。
@@ -116,7 +116,7 @@ from ctx_weft.core.utils.content import (
     downgrade_images_to_text,
     image_tokens,
 )
-from ctx_weft.core.utils.headings import SUBTASKS_REVIEW_HEADING
+from ctx_weft.core.utils.headings import SUBTASKS_HEADING
 from ctx_weft.core.utils.task_ref import task_ref_parts
 from ctx_weft.protocols import LLMMessage
 from ctx_weft.protocols.capability import qualify
@@ -155,7 +155,9 @@ _OBSERVE_JUDGMENT_CUE = (
     "first observation, so start after `## Current Task`). Don't re-narrate anything before that point. "
     "And — when status is success/fail — a concise `task_summary`: the important steps and lessons of the "
     "whole task (a process report, not verbose, and NOT the final output), incorporating the results of any "
-    "sub-tasks you dispatched. Optionally review your own sub-tasks via `task_reviews`. Call no other tools."
+    "sub-tasks you dispatched. If one of your sub-tasks' results does not actually achieve its goal, "
+    "name it in `next_step_hint` and say what must be different — the next actor turn decides what to do "
+    "about it. Call no other tools."
 )
 
 # task compact cue：整体式——坍缩会替掉原始 prompt + 之前所有 `## Progress So Far`，故须概括
@@ -1062,22 +1064,25 @@ class DefaultComposer(Composer):
         """act 风格完整会话 + 尾部一条 observe user message（仅发送，不入 memory）。
 
         复用 _build_facet_trailing_messages：observe facet（ROLE）+ 判定提示 + 可复核清单。
-        subtask 可 confirm/reopen，predecessor 只读。
+        subtask 清单只作信息（供 next_step_hint 指名），predecessor 只读。
         """
         # Phase 3 (2026-06-30): blackboard subtask/predecessor block rendering removed.
         # Predecessor results surface via memory recall (Phase 2); subtask review handles come
-        # from task_manager via request.extra["subtask_reviews"] (Task 1 below).
+        # from task_manager via request.extra["subtasks"] (Task 1 below).
         # The blackboard mechanism (subscribe_topic/recall_topic/BlackboardSource) is kept intact.
 
         extra_sections: list[str] = []
 
-        # Phase 3: reviewable sub-tasks come from task_manager via request.extra (not blackboard).
+        # Phase 3: the sub-task list comes from task_manager via request.extra (not blackboard).
         # The observer reads each child's RESULT from the conversation (Phase 2); this clause only
-        # surfaces the actionable handles (task_id/title/outcome) so it can confirm/reopen via task_reviews.
-        reviews = (getattr(request, "extra", {}) or {}).get("subtask_reviews") or []
-        if reviews:
-            lines = [f"{SUBTASKS_REVIEW_HEADING} (confirm / reopen via `task_reviews`, referencing the exact task_id):"]
-            for r in reviews:
+        # surfaces the handles (task_id/title/outcome) so it can NAME one in next_step_hint when
+        # its result falls short. Nothing here re-runs anything — `task_reviews` (and reopen with
+        # it) was removed 2026-09-19; what to do about a bad result is the next actor turn's call.
+        subtasks = (getattr(request, "extra", {}) or {}).get("subtasks") or []
+        if subtasks:
+            lines = [f"{SUBTASKS_HEADING} (their results are in the conversation above; refer to "
+                     "one by its exact task_id if you need to flag it in `next_step_hint`):"]
+            for r in subtasks:
                 note = r.get("note")
                 suffix = f" — {note}" if note else ""
                 ref = task_ref_parts(r.get("task_id", "") or "", r.get("title", "") or "")

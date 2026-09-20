@@ -201,12 +201,27 @@ def test_finished_children_listed_with_no_redo_emphasis():
     c2 = _task("t3", "Draft", "FINISHED", parent="t1")
     g = build_act_guidance(_cur(id="t1"), _tm(tasks=[parent, c1, c2]))
     assert "ALREADY COMPLETED" in g
-    assert "Do NOT redo their work" in g
+    assert "do NOT redo it yourself" in g
     assert "- [FINISHED] 'Research' (t2)" in g
     assert "- [FINISHED] 'Draft' (t3)" in g
     # 树里仍只有非终态节点
     assert "▶ 'Parent' (t1)" in g
     assert "  - [FINISHED]" not in g.split("ALREADY COMPLETED")[0]
+
+
+def test_finished_children_ban_has_an_explicit_exception_for_bad_results():
+    """勿重做是**默认**，不是绝对——review note 点名的那一个由 actor 自己决定。
+
+    这条例外是 reopen 删除（2026-09-19）之后「子任务产出不合格怎么办」的唯一出口：
+    observer 只在 next_step_hint 里指名，重派还是自己做归 actor。少了这句，上面那条
+    禁令就把唯一的出口也堵死了——observer 手里并没有任何能重跑子任务的工具。
+    """
+    parent = _task("t1", "Parent", "ACTIVE")
+    c1 = _task("t2", "Research", "FINISHED", parent="t1")
+    g = build_act_guidance(_cur(id="t1"), _tm(tasks=[parent, c1]))
+    assert "The one exception" in g
+    assert "YOUR call" in g
+    assert "delegate a fresh sub-task" in g
 
 
 def test_finished_child_renders_outputs_result_snippet():
@@ -393,7 +408,9 @@ def test_resume_cue_points_to_completed_list_only_when_children_finished():
     parent = _task("t1", "Parent", "ACTIVE")
     child = _task("t2", "Research", "FINISHED", parent="t1")
     cue = build_resume_cue(_cur(title="Parent", id="t1"), _tm(tasks=[parent, child]))
-    assert "situational notes" in cue and "re-delegating" in cue
+    assert "situational notes" in cue and "a second time" in cue
+    # 同 build_act_guidance：勿重做是默认，review note 点名的那一个由 actor 自己决定
+    assert "you decide" in cue
     # 无 title → 退化为裸 id（仍是可用句柄，不再是「见上文」）
     cue2 = build_resume_cue(_cur(title="", id="t1"), _tm())
     assert "the task: t1" in cue2

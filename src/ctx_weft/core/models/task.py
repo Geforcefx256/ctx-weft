@@ -117,20 +117,14 @@ class Task:
     parent_task_id: str | None = None
 
     dag_deps: list[str] = field(default_factory=list)
-    tracking_task_ids: list[str] = field(default_factory=list)
 
     title: str = ""
     description: str = ""
     user_prompt: "str | list[ContentPart] | None" = None
-    # 首次执行时的原始 user_prompt 快照；reopen 重写 user_prompt 时以此为 base，
-    # 避免多轮 reopen 把"上轮产出/修订提示"反复累加进 prompt。None = 尚未快照。
-    original_user_prompt: "str | list[ContentPart] | None" = None
     # 事件侧的 prompt 形态（event ref，`content_to_event_jsonable` 的产物）。
     # **纯瞬态**：不进 TaskProjection / 快照——恢复时由 Runtime._restore_task_prompts
     # 从事件 payload 直接重填，那本来就是这份数据的原样形态，没必要再持久化第二遍。
-    # reopen_task 据此发 TASK_REQUEUED，零 blob IO：reopen 只追加文本，不可能引入新图。
     user_prompt_event_jsonable: "str | list[dict] | None" = None
-    original_user_prompt_event_jsonable: "str | list[dict] | None" = None
     #: 这条 user_prompt 已经进了对话历史（memory，或这一轮未提交窗口的暂存区——装配时两者
     #: 都看得见，见 `_persist_user_prompt`）。
     user_prompt_in_memory: bool = False

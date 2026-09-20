@@ -5,9 +5,9 @@
 2. 订阅按 task 隔离 + session 级可见 + 幂等（保留 cursor）。
 3. BlackboardSource 只拉本 task 的订阅，并把 title/outcome 透传到 block。
 4. driver 启动钩子（Phase 3 后为 no-op）：不再建立任何订阅——predecessor 经 memory recall 获取，
-   subtask review handles 经 observe cue（extra["subtask_reviews"]）获取。
+   子任务句柄经 observe cue（extra["subtasks"]）获取。
 5. composer 不再渲染 blackboard 块为 observer 段（Phase 3 后 subtask/predecessor bb 段已移除）——
-   subtask review handles 经 extra["subtask_reviews"] 渲染；predecessor 不出现于 prompt。
+   子任务句柄经 extra["subtasks"] 渲染；predecessor 不出现于 prompt。
 """
 
 from __future__ import annotations
@@ -185,13 +185,12 @@ async def test_blackboard_source_pulls_only_current_task_subs() -> None:
 async def test_driver_hook_subscribes_predecessors_and_children() -> None:
     # Phase 3 (2026-06-30): _ensure_blackboard_subscriptions is a no-op.
     # Predecessors now surface via memory recall (Phase 2); subtask review handles via
-    # the observe cue (extra["subtask_reviews"]). The METHOD still exists (mechanism kept),
+    # the observe cue (extra["subtasks"]). The METHOD still exists (mechanism kept),
     # but it must not call subscribe_topic at all.
     m = InMemoryMemoryProvider()
     tm = TaskManager(session_id="s1")
     # task with predecessors and a child — neither should generate a subscription.
-    task = Task(id="T", session_id="s1", status="ACTIVE",
-                tracking_task_ids=["P1", "P2"])
+    task = Task(id="T", session_id="s1", status="ACTIVE")
     tm.register_task(task)
     tm._children_of["T"] = {"K1"}
 
@@ -211,8 +210,7 @@ async def test_driver_hook_idempotent_across_runs() -> None:
     # Phase 3: multiple calls to the no-op still produce zero subscriptions.
     m = InMemoryMemoryProvider()
     tm = TaskManager(session_id="s1")
-    task = Task(id="T", session_id="s1", status="ACTIVE",
-                tracking_task_ids=["P1"])
+    task = Task(id="T", session_id="s1", status="ACTIVE")
     tm.register_task(task)
     driver = StepDriver(steps={})
     state = SimpleNamespace(task=task)
@@ -230,9 +228,9 @@ async def test_driver_hook_idempotent_across_runs() -> None:
 
 async def test_composer_renders_subtask_results_with_title() -> None:
     # Phase 3 (2026-06-30): blackboard blocks with intent="subtask" no longer render as the
-    # "Your sub-task results" section. Subtask review handles now come via extra["subtask_reviews"]
+    # "Your sub-task results" section. Sub-task handles now come via extra["subtasks"]
     # (Task 1). This test verifies: (a) old blackboard rendering is GONE, and (b) the new
-    # extra-based path still surfaces the review cue.
+    # extra-based path still surfaces the sub-task list.
     comp = DefaultComposer()
     task = Task(id="T", session_id="s1", status="ACTIVE",
                 title="Parent", description="do it", user_prompt="please")
@@ -253,17 +251,19 @@ async def test_composer_renders_subtask_results_with_title() -> None:
         "Phase 3: blackboard subtask blocks must not render as a subtask section"
     )
 
-    # (b) New path: extra["subtask_reviews"] still renders the cue.
+    # (b) New path: extra["subtasks"] still renders the cue.
     req_with_extra = ContextRequest(
         purpose="observe", scope=MemoryAddress(session_id="s1", task_id="T", agent_id="a"),
-        task=task, agent=None, session=session, template=None, bound_capabilities=[],        extra={"subtask_reviews": [{"task_id": "K1", "title": "Build report", "outcome": "success"}]},
+        task=task, agent=None, session=session, template=None, bound_capabilities=[],        extra={"subtasks": [{"task_id": "K1", "title": "Build report", "outcome": "success"}]},
     )
     msgs2 = comp._build_observer_messages([block], req_with_extra)
     text2 = msgs2[-1].content
     assert "## Your sub-tasks" in text2 and "K1" in text2, (
-        "Phase 3: subtask review handles must appear via the extra cue"
+        "Phase 3: sub-task handles must appear via the extra cue"
     )
-    assert "task_reviews" in text2
+    # 清单只作信息：指路的是 next_step_hint，不再是已删的 task_reviews 参数
+    assert "next_step_hint" in text2
+    assert "task_reviews" not in text2
 
 
 async def test_composer_splits_subtask_and_predecessor_sections() -> None:
@@ -300,7 +300,7 @@ async def test_composer_splits_subtask_and_predecessor_sections() -> None:
 
 async def test_composer_no_related_results_when_empty() -> None:
     # Phase 3: "Your sub-task results" (old blackboard heading) never appears — it was removed.
-    # The extra["subtask_reviews"] section ("## Your sub-tasks") is also absent when no reviews.
+    # The extra["subtasks"] section ("## Your sub-tasks") is also absent when there are none.
     comp = DefaultComposer()
     task = Task(id="T", session_id="s1", status="ACTIVE", title="Parent")
     session = Session(id="s1", user_prompt="go", status="RUNNING")
@@ -310,5 +310,5 @@ async def test_composer_no_related_results_when_empty() -> None:
     msgs = comp._build_observer_messages([], req)
     joined = " ".join(m.content for m in msgs if isinstance(m.content, str))
     assert "Your sub-task results" not in joined   # Phase 3: old blackboard heading removed
-    assert "## Your sub-tasks" not in joined        # no extra["subtask_reviews"] → no cue section
+    assert "## Your sub-tasks" not in joined        # no extra["subtasks"] → no cue section
     assert "report_task_outcome" in joined          # 仍带判定提示

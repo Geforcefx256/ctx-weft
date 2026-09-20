@@ -293,7 +293,7 @@ class Subscription:
     session_id: str
     topic: str
     cursor: int  # 已读到的 seq_no
-    # subtask=自己派生的子任务结果（可 review/reopen）；predecessor=同 plan 前序结果（只读）；
+    # subtask=自己派生的子任务结果（可 review）；predecessor=同 plan 前序结果（只读）；
     # long_term_*=跨 session 长期上下文。
     intent: Literal["subtask", "predecessor", "long_term_background", "long_term_project_log"]
     task_id: str = ""

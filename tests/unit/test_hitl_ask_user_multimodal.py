@@ -61,7 +61,7 @@ def _env():
     provider = ControlCapabilityProvider()
     session = Session(id="s1", tenant_id="default", user_prompt="do it", status="RUNNING")
     task = Task(id="tsk_1", session_id="s1", status="ACTIVE", title="T1")
-    tm = SimpleNamespace(get_task=lambda tid: task, reopen_chain=None)
+    tm = SimpleNamespace(get_task=lambda tid: task)
     provider.register_session("s1", tm, session)
 
     registry = HitlRegistry()
