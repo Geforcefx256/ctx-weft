@@ -21,7 +21,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, select, text, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -238,17 +238,28 @@ class SqlEventStore(EventStore):
             return head.next_position if head else 0
 
     async def read_session_events_of_types(
-        self, session_id: str, types: "tuple[str, ...]",
+        self, session_id: str, types: "tuple[str, ...]", *, task_id: str = "",
     ) -> list[Event]:
         if not types:
             return []
+        conds = [
+            EventModel.session_id == session_id,
+            EventModel.type.in_(tuple(str(t) for t in types)),
+        ]
+        if task_id:
+            # **只排除明确属于别的 task 的**。`task_id` 为 NULL / 空串的照样取回——那一档是
+            # 「无从归属」，不是「属于别人」。判错方向的代价不对称：把一条没归属的
+            # `CapabilityInvoked` 漏掉，gateway 就以为那次调用没跑过 → 静默重跑一个有副作用
+            # 的工具；而多取回几条只是多折几下。
+            conds.append(or_(
+                EventModel.task_id == task_id,
+                EventModel.task_id.is_(None),
+                EventModel.task_id == "",
+            ))
         async with self._factory() as db:
             result = await db.execute(
                 select(EventModel)
-                .where(
-                    EventModel.session_id == session_id,
-                    EventModel.type.in_(tuple(str(t) for t in types)),
-                )
+                .where(*conds)
                 .order_by(
                     text("CASE WHEN events.position IS NULL THEN 0 ELSE 1 END"),
                     EventModel.position,

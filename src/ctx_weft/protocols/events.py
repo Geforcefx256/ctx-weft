@@ -665,9 +665,20 @@ class EventStore(Protocol):
         raise NotImplementedError
 
     async def read_session_events_of_types(
-        self, session_id: str, types: "tuple[str, ...]",
+        self, session_id: str, types: "tuple[str, ...]", *, task_id: str = "",
     ) -> list[Event]:
         """只加载 session 中指定类型的事件（按提交序升序排序）。
+
+        `task_id` 非空时再按 task 收窄。这不是可选的性能糖——对 capability 折叠它是**唯一
+        安全的界**：那个折叠要回答「这次调用跑过没有」，漏掉一条 `CapabilityInvoked` 的后果
+        是 gateway 以为它没跑过、静默重跑一个有副作用的工具。所以不能按「最近 N 条」截尾
+        （那是猜），而按 task 收窄是精确的：dangling tool_call 必定属于正在 reconcile 的那个
+        task，capability 事件也确实带着它（`make_event` 从 `LoopState` 取 `task_id`）。
+
+        ⚠️ **只排除明确属于别的 task 的**：`task_id` 为 NULL / 空串的事件照样取回。那一档是
+        「无从归属」（存量数据、非 run 域事件），不是「属于别人」，而判错方向的代价不对称
+        ——把一条没归属的 `CapabilityInvoked` 漏掉就会静默重跑一个有副作用的工具，多取回
+        几条只是多折几下。
 
         排序口径与 `read_by_session` 完全一致：有序提交 store 按 `position`、legacy
         store 按 `id`；两者都不用 `sequence`（它只在同一 `run_id` 内单调，跨 run 的

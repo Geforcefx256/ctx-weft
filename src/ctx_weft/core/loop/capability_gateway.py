@@ -473,9 +473,11 @@ class CapabilityGateway:
         if reentry and ledger_key and ctx.event_store is not None:
             from ctx_weft.core.control.reducers import (
                 CAP_FOLD_EVENT_TYPES, fold_operations, load_events_of_types)
+            # 按 task 收窄，理由同 `ReconcileStep`：否则这一读随会话的工具调用总数增长，
+            # 而要查的那个 `ledger_key` 必定属于本 task。
             facts = fold_operations(await load_events_of_types(
                 ctx.event_store, ctx.provider_ctx.session_id,
-                CAP_FOLD_EVENT_TYPES)).get(ledger_key)
+                CAP_FOLD_EVENT_TYPES, task_id=state.task.id)).get(ledger_key)
 
         # 2a. 同逻辑调用重入且已有结局 → 复用结果，**这里就 return**。
         #

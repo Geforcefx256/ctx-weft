@@ -139,11 +139,14 @@ class InMemoryEventStore(EventStore):
         return list(self._active)
 
     async def read_session_events_of_types(
-        self, session_id: str, types: tuple[str, ...],
+        self, session_id: str, types: tuple[str, ...], *, task_id: str = "",
     ) -> list[Event]:
         type_set = set(types)
         return [se.event for se in self._stored.get(session_id, [])
-                if se.event.type in type_set]
+                if se.event.type in type_set
+                # 与 SQL 同口径：只排除明确属于别的 task 的（见那边的说明）
+                and (not task_id or not se.event.task_id
+                     or se.event.task_id == task_id)]
 
     async def save_snapshot(self, snapshot: RunSnapshot) -> None:
         # 仅保留每个 session 的最新快照——恢复只需最新一条（snapshot + delta replay）。

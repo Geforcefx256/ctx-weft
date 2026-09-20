@@ -518,9 +518,9 @@ async def test_resume_does_not_read_the_whole_event_stream() -> None:
         full_reads[0] += 1
         return await orig(session_id)
 
-    async def _counting_typed(session_id, types):
+    async def _counting_typed(session_id, types, *, task_id: str = ""):
         typed_reads.append(tuple(str(t) for t in types))
-        return await orig_typed(session_id, types)
+        return await orig_typed(session_id, types, task_id=task_id)
 
     store.read_by_session = _counting          # type: ignore[method-assign]
     store.read_session_events_of_types = _counting_typed   # type: ignore[method-assign]

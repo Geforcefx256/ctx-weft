@@ -63,9 +63,10 @@ class _CountingStore(InMemoryEventStore):
         self.full_reads += 1
         return await super().read_by_session(session_id)
 
-    async def read_session_events_of_types(self, session_id: str, types):
+    async def read_session_events_of_types(self, session_id: str, types, *, task_id: str = ""):
         self.typed_reads.append(tuple(str(t) for t in types))
-        return await super().read_session_events_of_types(session_id, types)
+        return await super().read_session_events_of_types(
+            session_id, types, task_id=task_id)
 
     async def read_range(self, session_id: str, *, after_position=0, through_position=None):
         self.ranges.append((after_position, through_position))

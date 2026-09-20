@@ -73,8 +73,16 @@ class ReconcileStep(Step):
         # 没接事件库（宿主直构 / 测试替身）→ 空事实 → 一律按「无从判断」保守处理。
         facts: dict = {}
         if ctx.event_store is not None:
+            # **按 task 收窄**：这个折叠的量否则随会话的工具调用总数增长（实测 4000 次调用
+            # 的会话取回 8000 条 / 779ms / 24.4MB），而它要回答的只是本 task 那几个 dangling
+            # tool_call 跑过没有。收窄是精确的，不是截尾——dangling 调用必定属于本 task，而
+            # capability 事件带着 `task_id`（`make_event` 从 `LoopState` 取）。
+            #
+            # 为什么不能按「最近 N 条」截尾：漏掉一条 `CapabilityInvoked`，gateway 就以为那次
+            # 调用没跑过 → 静默重跑一个有副作用的工具。失败方向朝错的那边，所以不猜。
             facts = fold_operations(await load_events_of_types(
-                ctx.event_store, state.scope.session_id, CAP_FOLD_EVENT_TYPES))
+                ctx.event_store, state.scope.session_id, CAP_FOLD_EVENT_TYPES,
+                task_id=state.task.id))
 
         for tc in dangling:
             if ctx.cancel_token is not None and ctx.cancel_token.is_cancelled:
