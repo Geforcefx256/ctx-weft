@@ -598,8 +598,14 @@ class EventStore(Protocol):
         *,
         after_position: int = 0,
         through_position: int | None = None,
+        exclude_types: "tuple[str, ...] = ()",
     ) -> "list[StoredEvent]":
-        """按 position 升序读取 (after_position, through_position] 的已提交事件。"""
+        """按 position 升序读取 (after_position, through_position] 的已提交事件。
+
+        `exclude_types` 非空时跳过这些类型。**通用读原语，不带任何特定类型的语义**——
+        调用方（core）自己填要排除什么。全量重放用它排掉状态快照事件：那些事件的存在是为了
+        省重放，把它们读回来反而更贵。
+        """
         ...
 
     @abstractmethod
@@ -662,6 +668,21 @@ class EventStore(Protocol):
 
     async def list_active_session_ids(self) -> list[str]:
         """返回有 SessionCreated 但无终态事件的 session ID 列表（用于启动时 crash recovery）。"""
+        raise NotImplementedError
+
+    async def read_last_of_type(
+        self, session_id: str, type_: str,
+    ) -> "StoredEvent | None":
+        """按提交序取该会话**最后一条**指定类型的事件；没有则 None。
+
+        通用读原语，同样不带特定类型的语义。存在的理由是「取最新那一条」必须只读**一条**
+        ——用 `read_session_events_of_types` 会把全部同类事件连载荷一起捞回来，对状态快照
+        这种一条一条攒下来的类型就是 O(快照张数) 的浪费。
+
+        「最后一条」= position 最大。与 `read_range` / `committed_head` 同一个序，不引入
+        第二种「最新」口径（从前快照那条口径要靠 `snapshot_at` + `id` 兜，因为写入序 ≠
+        时间序）。
+        """
         raise NotImplementedError
 
     async def read_session_events_of_types(

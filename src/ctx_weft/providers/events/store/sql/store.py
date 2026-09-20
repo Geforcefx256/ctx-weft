@@ -216,6 +216,7 @@ class SqlEventStore(EventStore):
         *,
         after_position: int = 0,
         through_position: int | None = None,
+        exclude_types: tuple[str, ...] = (),
     ) -> list[StoredEvent]:
         """按 position 升序读 (after, through]；只含已提交（position 非空）的事件。"""
         conds = [
@@ -225,11 +226,33 @@ class SqlEventStore(EventStore):
         ]
         if through_position is not None:
             conds.append(EventModel.position <= through_position)
+        if exclude_types:
+            conds.append(EventModel.type.not_in(tuple(str(t) for t in exclude_types)))
         async with self._factory() as db:
             result = await db.execute(
                 select(EventModel).where(*conds).order_by(EventModel.position))
             return [StoredEvent(event=_row_to_event(r), position=r.position)
                     for r in result.scalars().all()]
+
+    async def read_last_of_type(
+        self, session_id: str, type_: str,
+    ) -> "StoredEvent | None":
+        """取该会话最后一条指定类型的已提交事件（position 最大）。只读一条。"""
+        async with self._factory() as db:
+            result = await db.execute(
+                select(EventModel)
+                .where(
+                    EventModel.session_id == session_id,
+                    EventModel.type == str(type_),
+                    EventModel.position.isnot(None),
+                )
+                .order_by(EventModel.position.desc())
+                .limit(1)
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return None
+            return StoredEvent(event=_row_to_event(row), position=row.position)
 
     async def committed_head(self, session_id: str) -> int:
         # next_position 存的是「最后已分配的 position」（0 = 无提交），即 head 本身

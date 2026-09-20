@@ -121,15 +121,29 @@ class InMemoryEventStore(EventStore):
         *,
         after_position: int = 0,
         through_position: int | None = None,
+        exclude_types: tuple[str, ...] = (),
     ) -> list[StoredEvent]:
+        skip = {str(t) for t in exclude_types}
         out = []
         for se in self._stored.get(session_id, []):
             if se.position <= after_position:
                 continue
             if through_position is not None and se.position > through_position:
                 continue
+            if skip and se.event.type in skip:
+                continue
             out.append(se)
         return out
+
+    async def read_last_of_type(
+        self, session_id: str, type_: str,
+    ) -> "StoredEvent | None":
+        """取该会话最后一条指定类型的事件（position 最大）。只读一条。"""
+        want = str(type_)
+        for se in reversed(self._stored.get(session_id, [])):
+            if se.event.type == want:
+                return se
+        return None
 
     async def committed_head(self, session_id: str) -> int:
         # _next_position 存的是「最后已分配的 position」（0 = 无提交），即 head 本身
