@@ -259,3 +259,40 @@ def test_the_writer_appends_directly_instead_of_going_through_the_bus() -> None:
     src = inspect.getsource(SnapshotWriter._write)
     assert "append_batch" in src
     assert "event_bus.emit" not in src and "_bus.emit" not in src
+
+
+# ── 协议不提及快照 ────────────────────────────────────────────────────────────
+
+
+def test_the_protocol_has_no_snapshot_api() -> None:
+    """`EventStore` 上不得再有任何快照专属方法或类型。
+
+    留着它们不只是「多几行没人用的代码」：一个可选的 `load_latest_snapshot` 会诱导下一个人
+    在 core 里探一次「这个 store 支不支持快照」，而那种能力探测在这个仓里已经生出过两次两分支
+    两失败形态（`replay` 与 `read_by_session_after`）。方法不存在，那条路就走不通。
+    """
+    import ctx_weft.protocols.events as mod
+    from ctx_weft.protocols.events import EventStore
+
+    for gone in ("save_snapshot", "load_latest_snapshot"):
+        assert not hasattr(EventStore, gone), f"{gone} 还在协议上"
+    assert not hasattr(mod, "RunSnapshot")
+
+    import ctx_weft.protocols as pkg
+
+    assert not hasattr(pkg, "RunSnapshot"), "还从 protocols 包里导出着"
+
+
+def test_the_builtin_stores_have_no_snapshot_api_either() -> None:
+    """两个内置 store 也清干净——包括那条「保留最新 N 张」的**恢复策略**。
+
+    `_prune_snapshots` 从前住在 store 里，由它自己决定删哪些快照。那是 core 的恢复策略
+    （恢复只取最新一张，所以旧的可删），剪错一张的后果是恢复退化甚至找不到可用基底。快照变成
+    事件之后，保留归入事件保留策略，store 不再做这个决定。
+    """
+    from ctx_weft.providers.events import InMemoryEventStore
+    from ctx_weft.providers.events.store.sql import SqlEventStore
+
+    for cls in (InMemoryEventStore, SqlEventStore):
+        for gone in ("save_snapshot", "load_latest_snapshot", "_prune_snapshots"):
+            assert not hasattr(cls, gone), f"{cls.__name__}.{gone} 还在"

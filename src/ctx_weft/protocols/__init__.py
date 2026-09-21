@@ -59,7 +59,6 @@ from ctx_weft.protocols.events import (
     EventStore,
     EventType,
     NullEventBlobStore,
-    RunSnapshot,
     SubscriptionHandle,
 )
 from ctx_weft.protocols.filesystem import FS_PROVIDER_NAME, FsTool, SpillSink
@@ -160,7 +159,6 @@ __all__ = [
     "EventStore",
     "EventType",
     "NullEventBlobStore",
-    "RunSnapshot",
     "SubscriptionHandle",
     # Filesystem capability
     "FS_PROVIDER_NAME",

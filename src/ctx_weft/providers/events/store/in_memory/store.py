@@ -17,7 +17,6 @@ from ctx_weft.protocols.events import (
     Event,
     EventConflictError,
     EventStore,
-    RunSnapshot,
     StoredEvent,
 )
 from ctx_weft.providers.events._lifecycle import apply_lifecycle
@@ -35,7 +34,6 @@ class InMemoryEventStore(EventStore):
     def __init__(self) -> None:
         self._stored: dict[str, list[StoredEvent]] = {}   # session → 按提交序
         self._active: set[str] = set()
-        self._snapshots: dict[str, RunSnapshot] = {}
         self._lock = asyncio.Lock()
         self._next_position: dict[str, int] = {}          # session → 下一个 position
         self._batches: dict[str, CommitReceipt] = {}      # batch_id → receipt
@@ -162,18 +160,7 @@ class InMemoryEventStore(EventStore):
                 and (not task_id or not se.event.task_id
                      or se.event.task_id == task_id)]
 
-    async def save_snapshot(self, snapshot: RunSnapshot) -> None:
-        # 仅保留每个 session 的最新快照——恢复只需最新一条（snapshot + delta replay）。
-        # 「最新」按协议口径（protocols/events.py::load_latest_snapshot）取
-        # (snapshot_at, id) 的最大值，**不是**「最后一次调用 save_snapshot」——
-        # 写入顺序不保证与时间顺序一致，与 SqlEventStore 的 `ORDER BY created_at
-        # DESC, id DESC` 对齐，避免乱序写入时两个实现返回不同快照。
-        async with self._lock:
-            existing = self._snapshots.get(snapshot.session_id)
-            if existing is None or (snapshot.snapshot_at, snapshot.id) >= (
-                existing.snapshot_at, existing.id,
-            ):
-                self._snapshots[snapshot.session_id] = snapshot
-
-    async def load_latest_snapshot(self, session_id: str) -> RunSnapshot | None:
-        return self._snapshots.get(session_id)
+    # 快照不在这里：它是日志里的一条 `EventType.STATE_SNAPSHOT` 事件，跟别的事件一样经
+    # `append_batch` 进来、经 `read_last_of_type` 出去。从前这里有 `save_snapshot` /
+    # `load_latest_snapshot` 和一份单独的 `_snapshots` 字典，连「最新」的口径都要自己实现一遍
+    # （按 `(snapshot_at, id)` 取最大，因为写入序 ≠ 时间序）——现在那套全没了。

@@ -14,7 +14,6 @@ from datetime import datetime, timezone
 from ctx_weft.core.control.reducers import rebuild_view, reduce_events, serialize_view
 from ctx_weft.providers.events import InProcessEventBus
 from ctx_weft.protocols.events import Event, EventType
-from ctx_weft.protocols.events import RunSnapshot
 from ctx_weft.providers.events import InMemoryEventStore
 from ctx_weft.providers.events import EventPersister
 from tests._snapshot_helpers import latest_snapshot, seed_snapshot

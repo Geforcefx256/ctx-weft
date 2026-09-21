@@ -6,7 +6,8 @@
 
 故本模块装：`Event` / `EventFilter` / `EventType` 与两个常量集（host 要构造事件、
 要持久化、要按类型分派）、`EventBus` 协议（README 明说 host 可换 Redis Streams）、
-`EventStore` 协议与 `RunSnapshot`（host 必须实现 append + read_by_session）。
+`EventStore` 协议（必需面：append / append_batch / read_range / committed_head /
+read_last_of_type / read_session_events_of_types——快照不在其中，它是一种事件）。
 
 **不装**：`InProcessEventBus` / `InMemoryEventStore`（内置实现，在
 `providers/events/bus/in_process/bus.py` / `providers/events/store/in_memory/store.py`）、
@@ -467,31 +468,6 @@ class EventBus(Protocol):
     async def _unsubscribe(self, subscriber_id: str) -> None: ...
 
 
-# ── RunSnapshot ───────────────────────────────────────────────────────────────
-
-
-@dataclass
-class RunSnapshot:
-    """事件流的某一时刻快照（供 host 实现 snapshot/restore 优化用）。"""
-
-    id: str
-    run_id: str
-    session_id: str
-    last_event_id: str
-    last_event_sequence: int
-    state_blob: dict[str, Any]
-    snapshot_reason: str = ""
-    snapshot_at: datetime | None = None
-    # spec: snapshot-recovery（reliability-wp4）——一致切面的提交位置与投影版本。
-    # 旧快照/旧实现读出为 None/1 → 恢复路径忽略快照走全量回放重建（不猜测位置）。
-    last_commit_position: int | None = None
-    projection_version: int = 1
-    #: 快照链深度：0 = 从日志全量重锚，n = 在上一张之上连续增量 n 次。写入侧据此
-    #: 在到顶时强制重锚（见 SnapshotWriter.MAX_CHAIN_DEPTH）；恢复侧不读它。
-    #: 旧快照读出 0，等价于「当作刚重锚过」——保守但安全，最多多重锚一次。
-    chain_depth: int = 0
-
-
 # ── 提交位置、批次与存储错误（spec: event-log / event-commit）──────────────────
 
 
@@ -550,7 +526,6 @@ class EventStore(Protocol):
        **有序提交是底线，不是可选项**——理由见下节。
     2. **可选扩展**（默认 `raise NotImplementedError`，core 捕获后降级为全量 replay）：
        `list_active_session_ids` / `read_session_events_of_types` /
-       `save_snapshot` / `load_latest_snapshot`。
 
     读取一律按 position：**不存在**「按事件 ID 取增量」的 API。ID 铸造序 ≠ 提交序，
     那种游标正是 H2 的根因（详见下节）。
@@ -744,22 +719,22 @@ class EventStore(Protocol):
         """
         raise NotImplementedError
 
-    async def save_snapshot(self, snapshot: RunSnapshot) -> None:
-        """持久化一个状态快照。"""
-        raise NotImplementedError
-
-    async def load_latest_snapshot(self, session_id: str) -> RunSnapshot | None:
-        """加载 session 最新快照，无快照时返回 None。
-
-        **「最新」的定义（跨实现必须一致）：按 `snapshot.snapshot_at` 取最大；
-        `snapshot_at` 相同时按 `snapshot.id` 取最大。** 这条口径选 `snapshot_at`
-        而不是「最后一次 `save_snapshot` 调用」，是因为写入顺序不保证与时间顺序
-        一致（并发写、重试补写都可能乱序），而 `created_at` / `id` 是可以跨实现
-        定义的稳定排序键，「哪次调用最后执行」不是。`SnapshotWriter` 目前只按
-        `snapshot_at` 升序写，所以这条口径暂不影响现有行为，但实现方不得依赖
-        「最后写入即最新」这个更强、不受协议保证的假设。
-        """
-        raise NotImplementedError
+    # ── 快照 ────────────────────────────────────────────────────────────────
+    # **协议不提及快照。** 一张状态快照就是日志里的一条 `EventType.STATE_SNAPSHOT` 事件，
+    # 读写都走通用原语（`append_batch` / `read_last_of_type` /
+    # `read_range(exclude_types=)`），store 对那个类型不做任何特殊处理——它是 core 的词表，
+    # 不是存储契约的一部分。
+    #
+    # 从前这里有 `save_snapshot` / `load_latest_snapshot` 与 `RunSnapshot`，2026-09-20 删除。
+    # 删掉换来的不只是协议变小：
+    #
+    #   · 「哪张最新」不再需要一套快照专属口径。从前必须规定「按 `snapshot_at` 取最大，相同
+    #     时按 `id` 取最大」——因为写入顺序不保证与时间顺序一致（并发写、重试补写都可能乱序），
+    #     而「哪次调用最后执行」不是可跨实现定义的排序键。现在 = position 最大，与
+    #     `read_range` / `committed_head` 同一个序，不存在第二种「最新」。
+    #   · 切面位置 / `projection_version` / `chain_depth` 从**列**变成 payload 里的键，而
+    #     payload 对 store 是整体不透明的——它没法只丢其中一个。m020 补的就是那几列，而丢了
+    #     它们 `snapshot_is_usable` 恒判不可用，恢复永远全量回放且**不报错**。
 
 
 #: 有序提交的三个必需方法——`supports_ordered_commit` 要求**全部**落地

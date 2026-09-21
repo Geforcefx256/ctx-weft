@@ -30,7 +30,6 @@ from ctx_weft.protocols.events import (
     Event,
     EventConflictError,
     EventStore,
-    RunSnapshot,
     StoredEvent,
 )
 from ctx_weft.providers._sqlalchemy import make_session_factory
@@ -328,68 +327,10 @@ class SqlEventStore(EventStore):
 
     # ── 快照 ──────────────────────────────────────────────────────────────────
 
-    async def save_snapshot(self, snapshot: RunSnapshot) -> None:
-        async with self._factory() as db, db.begin():
-            db.add(SnapshotModel(
-                id=snapshot.id,
-                session_id=snapshot.session_id,
-                run_id=snapshot.run_id or "",
-                last_event_id=snapshot.last_event_id,
-                last_event_sequence=snapshot.last_event_sequence,
-                state_blob_json=json.dumps(snapshot.state_blob),
-                snapshot_reason=snapshot.snapshot_reason,
-                last_commit_position=snapshot.last_commit_position,
-                projection_version=snapshot.projection_version,
-                chain_depth=snapshot.chain_depth,
-                created_at=snapshot.snapshot_at,
-            ))
-            await db.flush()          # 让新行参与下面的「保留最新」排序
-            await self._prune_snapshots(db, snapshot.session_id)
-
-    async def _prune_snapshots(self, db: AsyncSession, session_id: str) -> None:
-        """删除该 session 除最新 keep_snapshots 张之外的旧快照。
-
-        恢复只取最新一张（`load_latest_snapshot`），逐 RunFinished 定期写入会让旧快照
-        无界累积，故每次写入后顺手清理。按 id（ULID，时间可排序）取最新 N 个保留；
-        子查询带 LIMIT，Postgres / SQLite 均支持。
-        """
-        keep_ids = (
-            select(SnapshotModel.id)
-            .where(SnapshotModel.session_id == session_id)
-            .order_by(SnapshotModel.id.desc())
-            .limit(self._keep_snapshots)
-        )
-        await db.execute(
-            delete(SnapshotModel).where(
-                SnapshotModel.session_id == session_id,
-                SnapshotModel.id.not_in(keep_ids),
-            )
-        )
-
-    async def load_latest_snapshot(self, session_id: str) -> RunSnapshot | None:
-        async with self._factory() as db:
-            result = await db.execute(
-                select(SnapshotModel)
-                .where(SnapshotModel.session_id == session_id)
-                .order_by(SnapshotModel.created_at.desc(), SnapshotModel.id.desc())
-                .limit(1)
-            )
-            row = result.scalar_one_or_none()
-            if row is None:
-                return None
-            return RunSnapshot(
-                id=row.id,
-                run_id=row.run_id,
-                session_id=row.session_id,
-                last_event_id=row.last_event_id,
-                last_event_sequence=row.last_event_sequence,
-                state_blob=json.loads(row.state_blob_json),
-                snapshot_reason=row.snapshot_reason,
-                snapshot_at=row.created_at,
-                last_commit_position=row.last_commit_position,
-                projection_version=row.projection_version if row.projection_version is not None else 1,
-                chain_depth=row.chain_depth if row.chain_depth is not None else 0,
-            )
+    # 快照不在这里：它是日志里的一条 `EventType.STATE_SNAPSHOT` 事件。从前这里有
+    # `save_snapshot` / `load_latest_snapshot` / `_prune_snapshots` 与 `event_snapshots` 表
+    # ——连「保留最新 N 张」那条**恢复策略**都写在 store 里（它自己决定删哪些），而那是 core
+    # 的事。快照变成事件之后，保留归入事件保留策略，store 不再做这个决定。
 
 
 def _row_to_event(row: EventModel) -> Event:

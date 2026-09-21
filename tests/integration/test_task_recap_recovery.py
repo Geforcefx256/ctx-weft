@@ -452,10 +452,7 @@ async def test_all_tasks_terminal_with_a_pruned_snapshot_does_not_raise() -> Non
     ⚠️ 这条**必须有快照参与**：不写快照时 `rebuild_view` 走全量回放、`view.tasks` 是
     全量的，裁剪不参与，旧判据同样是绿的（上面那条 Test A 就是这样）。
     """
-    from ctx_weft.core.control.reducers import (
-        _PROJECTION_VERSION, prune_view_for_snapshot, serialize_view,
-    )
-    from ctx_weft.protocols.events import RunSnapshot
+    from ctx_weft.core.control.reducers import prune_view_for_snapshot
 
     runtime, _mem, _seen = _make_runtime()
     sid, tid, aid = "ses_recap", "tsk_done", "agt_root"
