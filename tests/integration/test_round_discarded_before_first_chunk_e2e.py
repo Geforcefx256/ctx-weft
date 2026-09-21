@@ -29,6 +29,7 @@ from tests.integration.test_minimal_loop import (
     make_echo_template,
     make_runtime,
 )
+from tests._event_helpers import all_events
 
 pytestmark = pytest.mark.asyncio
 
@@ -77,7 +78,7 @@ def _runtime(llm):
 
 
 async def _stored_types(rt, session_id: str) -> list[str]:
-    return [e.type for e in await rt.event_store.read_by_session(session_id)]
+    return [e.type for e in await all_events(rt.event_store, session_id)]
 
 
 async def _user_texts(rt, session_id: str, agent_id: str, task_id: str) -> list[str]:

@@ -27,6 +27,7 @@ from tests.integration.test_minimal_loop import (
     make_echo_template,
     make_runtime,
 )
+from tests._event_helpers import all_events
 
 pytestmark = pytest.mark.asyncio
 
@@ -130,7 +131,7 @@ async def test_subagent_instantiation_emits_event_with_own_template():
     _view, sub_task = await _wait_for_subagent_task(runtime, handle.session_id)
     sub_agent_id = sub_task.assigned_agent_id
 
-    events = await runtime.event_store.read_by_session(handle.session_id)
+    events = await all_events(runtime.event_store, handle.session_id)
     instantiated = [
         e for e in events
         if e.type == EventType.AGENT_INSTANTIATED and e.agent_id == sub_agent_id
@@ -191,7 +192,7 @@ async def test_agent_spawned_emitted_with_parent_and_subtask():
     view, sub_task = await _wait_for_subagent_task(runtime, handle.session_id)
     root_agent_id = view.sessions[handle.session_id].root_agent_id
 
-    events = await runtime.event_store.read_by_session(handle.session_id)
+    events = await all_events(runtime.event_store, handle.session_id)
     spawned = [e for e in events if e.type == EventType.AGENT_SPAWNED]
 
     assert spawned, (
@@ -221,7 +222,7 @@ async def test_agent_spawned_precedes_agent_instantiated():
     _view, sub_task = await _wait_for_subagent_task(runtime, handle.session_id)
     sub_agent_id = sub_task.assigned_agent_id
 
-    events = await runtime.event_store.read_by_session(handle.session_id)
+    events = await all_events(runtime.event_store, handle.session_id)
     order = [
         e.type for e in events
         if e.agent_id == sub_agent_id

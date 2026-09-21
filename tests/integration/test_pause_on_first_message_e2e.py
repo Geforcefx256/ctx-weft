@@ -34,6 +34,7 @@ from tests.integration.test_minimal_loop import (
     make_echo_template,
     make_runtime,
 )
+from tests._event_helpers import all_events
 
 pytestmark = pytest.mark.asyncio
 
@@ -128,7 +129,7 @@ async def test_pause_on_the_very_first_message_parks_and_stays_usable() -> None:
     # 代价是标题晚一轮，**不是永远没有**——见 ⑥：判据是「root task 且无 title」，
     # 这一轮夭折之后 title 仍是空的，下一轮照样判定成立、照样在那一轮的提交点起飞。
     assert llm.sidecar_calls == 0, "这一轮没到提交点，旁路不该已经烧掉一次 LLM 调用"
-    types = [e.type for e in await rt.event_store.read_by_session(sid)]
+    types = [e.type for e in await all_events(rt.event_store, sid)]
     assert EventType.RECOGNIZE_INTENT_STARTED not in types
 
     # ⑤ 回答那个气泡：会话继续
@@ -139,7 +140,7 @@ async def test_pause_on_the_very_first_message_parks_and_stays_usable() -> None:
     assert view is not None
     await asyncio.sleep(1.0)
 
-    types = [e.type for e in await rt.event_store.read_by_session(sid)]
+    types = [e.type for e in await all_events(rt.event_store, sid)]
     assert EventType.HITL_RESOLVED in types, "续跑没起来——这一句的答复没能驱动下一轮"
 
     # ⑥ **标题在下一轮补上。** 这一条是 ④ 的另一半：夭折那一轮不起飞是对的，但不能
@@ -191,7 +192,7 @@ async def test_pause_immediately_after_start_before_the_run_is_dispatched() -> N
         hitl_id=bubble.id, outcome="accepted", agent_id=bubble.agent_id,
         message="继续")) is not None
     await asyncio.sleep(1.0)
-    types = [e.type for e in await rt.event_store.read_by_session(sid)]
+    types = [e.type for e in await all_events(rt.event_store, sid)]
     assert EventType.HITL_RESOLVED in types, "续跑没起来"
 
 

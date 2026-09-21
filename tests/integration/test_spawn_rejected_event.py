@@ -26,6 +26,7 @@ from tests.integration.test_subagent_instantiated_event import (
     SUB_TEMPLATE_ID,
     _SpawnLLM,
 )
+from tests._event_helpers import all_events
 
 pytestmark = pytest.mark.asyncio
 
@@ -49,12 +50,12 @@ async def _wait_for_event(runtime, session_id, event_type, timeout=8.0):
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while loop.time() < deadline:
-        events = await runtime.event_store.read_by_session(session_id)
+        events = await all_events(runtime.event_store, session_id)
         hits = [e for e in events if e.type == event_type]
         if hits:
             return hits
         await asyncio.sleep(0.02)
-    events = await runtime.event_store.read_by_session(session_id)
+    events = await all_events(runtime.event_store, session_id)
     raise TimeoutError(
         f"{event_type} not emitted within {timeout}s; saw types = "
         f"{sorted({e.type for e in events})}"
@@ -114,7 +115,7 @@ async def test_rejected_spawn_produces_no_agent_instantiated():
     rejected = await _wait_for_event(runtime, handle.session_id, EventType.SPAWN_REJECTED)
     attempted = rejected[-1].payload["attempted_subtask_id"]
 
-    events = await runtime.event_store.read_by_session(handle.session_id)
+    events = await all_events(runtime.event_store, handle.session_id)
     born_for_subtask = [
         e for e in events
         if e.type in (EventType.AGENT_INSTANTIATED, EventType.AGENT_SPAWNED)

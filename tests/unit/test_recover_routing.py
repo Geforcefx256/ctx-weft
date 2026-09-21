@@ -224,8 +224,11 @@ async def test_recover_agent_resolves_session_from_the_record() -> None:
 
 
 async def test_recover_agent_unknown_raises() -> None:
-    """未登记、且事件库里也确实不存在的 agent_id → 自愈（`rebuild_agent`）之后仍然
-    找不到 → 才真的抛 `AgentNotFound`（控制方裁决：不是一撞见 registry miss 就抛）。"""
+    """事件库里也确实不存在的 agent_id → 抛 `AgentNotFound`。
+
+    今天走的是 `AgentNotLoaded` 那条（它是子类，断言照样成立）：core 不再区分「没装填」
+    与「真不存在」——要区分就得扫全库，而那正是 2026-09-21 删掉的东西。调用方先
+    `rebuild_session` 再撞上这个错，才说明是真的查无此 agent。"""
     from ctx_weft.core.models.errors import AgentNotFound
 
     rt = _runtime_for_recover_agent()
@@ -233,37 +236,60 @@ async def test_recover_agent_unknown_raises() -> None:
         await rt.recover_agent("agt_nope")
 
 
-async def test_recover_agent_self_heals_a_cold_registry_before_giving_up() -> None:
-    """这是 controller ruling 要守的那条线：`_resume_after_hitl` 在冷启动（registry
-    尚未被 `recover()` 填过）时调用 `recover_agent`，如果这里对 miss 直接抛，人类
-    答完一句话、会话却永远醒不过来——`reply_to_hitl` 已经把 HITL 判成终局，没有
-    重试的第二次机会。种下事件后**不调 `rt.recover()`**（模拟进程重启后 ALM 还是
-    空的），直接 `recover_agent(root_agent_id)`：必须能自愈装填并跑通，而不是撞见
-    `AgentNotFound`。"""
+async def test_recover_agent_refuses_a_cold_registry_then_works_after_rebuild_session() -> None:
+    """`recover_agent` 对未装填的 registry **抛 `AgentNotLoaded`，不自己去找**
+    （2026-09-21）。
+
+    从前它对 miss 会先扫全部 active session 把记录找出来（`rebuild_agent` →
+    `rebuild_all_agents`）。那条 sweep 已删：它拿 O(会话数) 换一个调用方本来就知道的
+    值，而且扫的集合是坏的（`list_active_session_ids` 的 discard 依据从不 emit，判据
+    恒真 = 历史全部会话）。装填改由调用方负责，与 `rebuild_session` 定下的用户驱动
+    模型一致（「用到哪条装哪条」）。
+
+    **冷 HITL 应答不受影响**，那是从前留着自愈的唯一理由（`reply_to_hitl` 把 HITL 判成
+    终局后没有第二次机会，续跑摔了会话就永久卡住）：那条路由 `_resume_after_hitl` 在调
+    `recover_agent` **之前**的 `_hydrate_agent_for_cold_resume(req)` 用 `req.session_id`
+    精确装填接住，由下面那条 `test_cold_hitl_reply_hydrates_only_its_own_session_not_a_sweep`
+    走一次真实的 `reply_to_hitl` 钉住。
+
+    本条钉两件事：① 冷 registry 直接抛，错误类型可诊断；② 先 `rebuild_session` 再调就
+    照常跑通——即「装填是前提」而不是「这条路没了」。
+    """
+    from ctx_weft.core.models.errors import AgentNotFound, AgentNotLoaded
+
     rt = _runtime_for_recover_agent()
     session_id, root_agent_id = await _crashed_session(rt)
 
-    # 冷启动断言：这个进程从没跑过 recover()/rebuild_agent()，registry 应确实是空的。
+    # 冷启动断言：这个进程从没装填过，registry 应确实是空的。
     assert rt._agent_lifecycle_manager.record_of(root_agent_id) is None
 
-    await rt.recover_agent(root_agent_id)          # 必须自愈，不抛 AgentNotFound
+    with pytest.raises(AgentNotLoaded) as exc:
+        await rt.recover_agent(root_agent_id)
+    # 宿主既有的 `except AgentNotFound` 必须照样接住（子类，不是新的顶层类型）。
+    assert isinstance(exc.value, AgentNotFound)
+    assert "rebuild_session" in str(exc.value), "报错要告诉调用方下一步做什么"
+
+    # 装填之后同一句调用照常跑通——被推翻的是「core 替你找」，不是这条路径本身。
+    await rt.rebuild_session(session_id)
+    await rt.recover_agent(root_agent_id)
 
     assert rt.get_agent(root_agent_id).session_id == session_id
     assert [r.id for r in rt.hitl_registry.list_pending(session_id=session_id)] == ["hit_1"]
 
 
 async def test_cold_hitl_reply_hydrates_only_its_own_session_not_a_sweep() -> None:
-    """复审 Important：冷 HITL 应答手上明明有 session_id（`PendingHitl.session_id`
-    本来就有），不该让 `recover_agent` 的 registry-miss 自愈退化成
-    `rebuild_all_agents` 扫**全部** active session——`_resume_after_hitl` 现在会先
-    用 `session_id` 精确装填这一个 session，让随后 `recover_agent` 里的
-    `record_of` 直接命中，永不落到它自己的 sweep 兜底。
+    """冷 HITL 应答只装填**它自己那一个** session：`_resume_after_hitl` 用
+    `req.session_id`（`PendingHitl` 本来就带）精确装填，让随后 `recover_agent` 里的
+    `record_of` 直接命中。
 
-    种两个都在事件库里「活着」的 session：S1 是这次真正要续跑的，S2 只是一个真实
-    存在、若 sweep 被触达就会被顺带扫进 ALM 的旁观者。全程不调 `rt.recover()`
-    （冷启动），只走一次真实的 `reply_to_hitl`。断言 S2 的 agent 事后仍然不在
-    registry 里——如果 `recover_agent` 的 sweep 兜底被触达，`rebuild_all_agents`
-    会把 S2 也扫进来，这条断言就会失败，正是它在守住这次修复。
+    这条原本守的是「别退化成 `rebuild_all_agents` 的全库 sweep」。那条 sweep 已于
+    2026-09-21 删除，所以今天它守的是**更强的一条**：`recover_agent` 对 miss 直接抛
+    `AgentNotLoaded`，前面那次精确装填因此不是优化而是**前提**——漏掉它，人刚答完的
+    这次续跑就会摔掉，而 `reply_to_hitl` 已把 HITL 判成终局、没有第二次机会。
+
+    种两个都在事件库里「活着」的 session：S1 是这次真正要续跑的，S2 是旁观者。全程
+    冷启动（不预先装填），只走一次真实的 `reply_to_hitl`。两条断言各守一半：S1 跑通
+    说明精确装填确实接住了；S2 的 agent 事后仍不在 registry 里说明没有任何人在扫全库。
     """
     rt = _runtime_for_recover_agent()
 
@@ -292,8 +318,8 @@ async def test_cold_hitl_reply_hydrates_only_its_own_session_not_a_sweep() -> No
         session_id=sid1, task_id=tid1, agent_id=aid1, tool_call_id="tcB", stage=HITL_STAGE_TOOL, unattended=False,
     )
 
-    # S2：另一个真实 active 的 session——事件库里有它自己的 agent。若 recover_agent
-    # 的自愈退化成 `rebuild_all_agents` 的 sweep，它会被顺带扫进 ALM。
+    # S2：另一个真实 active 的 session——事件库里有它自己的 agent。任何「按 agent 找
+    # session 就扫全库」的写法回来，它都会被顺带扫进 ALM，下面那条断言就红。
     sid2, aid2 = "ses_2", "agt_2"
     await rt.event_store.append(Event(
         id="evt_s2_0001", run_id="r2", sequence=1, session_id=sid2,

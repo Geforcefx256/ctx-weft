@@ -19,6 +19,7 @@ from ctx_weft.protocols.events import Event
 from ctx_weft.providers.events import InMemoryEventStore, InProcessEventBus
 from ctx_weft.core.control.snapshot_writer import attach_snapshotting
 from tests._snapshot_helpers import latest_snapshot
+from tests._event_helpers import all_events
 
 pytestmark = pytest.mark.asyncio
 
@@ -63,7 +64,7 @@ async def test_late_committed_event_is_skipped_by_snapshot_recovery():
     await bus.commit_provisional("a")
 
     # 全量回放：a、b 都在（日志里 evt_0002 确实存在）
-    full = reduce_events(await store.read_by_session("s"), "s")
+    full = reduce_events(await all_events(store, "s"), "s")
     assert sorted(full.tasks) == ["a", "b"], (
         f"full replay must see both tasks; got {sorted(full.tasks)}"
     )

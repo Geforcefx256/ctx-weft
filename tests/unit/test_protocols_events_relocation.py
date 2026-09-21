@@ -18,6 +18,7 @@ TASK_STATUS_BY_EVENT 不进 protocols）、包根导出、以及 shim 不得复�
 """
 
 from __future__ import annotations
+from tests._event_helpers import all_events
 
 
 
@@ -251,7 +252,7 @@ async def test_runtime_still_gets_a_working_default_store() -> None:
     # 订阅是异步投递的，给它一次调度机会
     import asyncio
     await asyncio.sleep(0.05)
-    assert await rt.event_store.read_by_session("ses_1")
+    assert await all_events(rt.event_store, "ses_1")
 
 
 def test_blob_ref_prefix_lives_in_context() -> None:

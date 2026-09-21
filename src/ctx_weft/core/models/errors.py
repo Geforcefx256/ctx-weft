@@ -29,6 +29,26 @@ class AgentNotFound(CtxWeftError):
     code = "AGENT_NOT_FOUND"
 
 
+class AgentNotLoaded(AgentNotFound):
+    """这个 agent 所属的会话还没装填进内存，而调用方没给 `session_id` 可供定址。
+
+    **不是「不存在」**——事实一直在事件日志里。ALM 是只增不删的缓存（`forget_session`
+    逐出、进程刚起来时整个是空的），一次 miss 只说明还没喂进来。装填是调用方的责任：
+    先 `rebuild_session(session_id)`，或者给 `send_message` 传 `session_id`。
+
+    **为什么 core 不自己去找那个 session。** 事件按 session 分区存（spec §6.1），
+    `agent_id` 全局唯一却没有反向索引，所以「只有 agent_id」时唯一的找法是扫全部会话
+    逐个装填——那是拿 O(会话数) 去换一个调用方本来就知道的值。恢复早已改成用户驱动
+    （见 `rebuild_session`：「用到哪条装哪条」），这条 sweep 是旧模型的残留，
+    2026-09-21 删除。
+
+    **是 `AgentNotFound` 的子类**：宿主既有的 `except AgentNotFound` 照样接住，想区分
+    「没装填」与「真不存在」的再按本类型分支。
+    """
+
+    code = "AGENT_NOT_LOADED"
+
+
 class AgentBusyError(CtxWeftError):
     """agent 正在执行（running），拒收新消息（spec §4.1：忙碌直接拒绝，不排队）。
 

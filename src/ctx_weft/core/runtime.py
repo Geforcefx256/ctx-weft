@@ -86,6 +86,7 @@ from ctx_weft.core.models.session import Session
 from ctx_weft.core.models.task import NormalTaskSettings, Task
 from ctx_weft.core.models.errors import (
     AgentNotFound,
+    AgentNotLoaded,
     AgentNotRunningError,
     SessionAlreadyExistsError,
     crash_error_code,
@@ -2176,8 +2177,8 @@ class CtxWeftRuntime:
         """把这条 session 的内存状态**装填**回来：agent record + 未决 HITL + 成员登记。
         返回装填的 agent 条数。
 
-        **只装填，不跑**——与 `rebuild_agent` / `rebuild_all_agents` / `rebuild_hitl`
-        同族（`rebuild_*` = 喂内存，`recover_*` = 喂内存 + 建 TM + drain）。`forget_session`
+        **只装填，不跑**——与 `rebuild_hitl` 同族（`rebuild_*` = 喂内存，
+        `recover_*` = 喂内存 + 建 TM + drain）。`forget_session`
         的逆操作：host 的缓存回填走这条，把一条冷会话拉回内存**不会**把它的任务跑起来。
         要续跑用 `recover_agent`。
 
@@ -2449,34 +2450,31 @@ class CtxWeftRuntime:
         ``req.id``。纯 ``/resume``（无 hitl 语境）留空。
 
         **未登记的 ``agent_id`` 先自愈、仍缺才抛**：冷启动重启后 ALM registry 可能
-        是空的（这条会话还没被 `rebuild_session` 装填过），若这里直接对 miss 报
-        `AgentNotFound`，`_resume_after_hitl` 的冷
-        HITL 应答路径就会在人类刚回答完问题时把这次续跑摔在地上——`reply_to_hitl`
-        已经把 HITL 判成终局（`registry.resolve()` 幂等），没有第二次机会，会话永久
-        卡住。这正是 `rebuild_hitl` 自己的纪律要防的那类事故（见其 docstring：
-        "应答入口也可在内存为空时按需自愈……避免应答 KeyError"）——`recover_agent`
-        对 `record_of` 一次 miss 不是终局判决，而是"还没装填"的信号：先调
-        `rebuild_agent(agent_id)`（据事件扫活跃 session 装填）把记录喂进来，再查一次；
-        仍然找不到（这个 agent_id 压根不存在、或它的 session 已终结/不活跃）才真的
-        抛 `AgentNotFound`。不要把这一步"简化"回直接抛——那正是本方法要避免的冷启动
-        应答丢失。
+        是空的（这条会话还没被 `rebuild_session` 装填过）。
 
-        **这条自愈是「只有 agent_id、不知道 session」时的最后手段，不是常态路径**：
-        `rebuild_agent` 找不到活内存记录时落到 `rebuild_all_agents`——扫**全部** active
-        session 各读一遍事件日志，因为除了 registry 本身，没有别的 agent_id→session_id
-        索引。持有 `session_id` 的调用方（`_resume_after_hitl` 就是——`PendingHitl`
-        本来就两个字段都带）应该在调用这里之前就用 `_load_agents_of(session_id, ...)`
-        精确装填那一个 session，让这里的 `record_of` 直接命中、永不落到这条 sweep——
-        复审 Important：不然一次冷 HITL 应答会退化成 O(active session 数) 次事件日志
-        读取，而调用方明明知道是哪个 session。这条 sweep 因此只应该被真正「没有
-        session 语境」的调用方触达（比如未来某个只给 agent_id 的 host 端点）。
+        **装填是调用方的责任，本方法不自愈**（2026-09-21）。从前这里对 miss 会先调
+        `rebuild_agent(agent_id)` 扫全部 active session 把记录喂进来——那条 sweep 已删
+        （理由见 `rebuild_all_pending_hitl` 之后那段墓碑注释）。现在 miss 直接抛
+        `AgentNotLoaded`。
+
+        **这不会把冷 HITL 应答摔在地上**，那正是从前留着自愈的理由：`reply_to_hitl`
+        把 HITL 判成终局之后没有第二次机会，续跑失败 ⟹ 会话永久卡住。这条路今天由
+        `_resume_after_hitl` 在调用本方法**之前**的 `_hydrate_agent_for_cold_resume(req)`
+        接住——`PendingHitl` 本来就同时带着 `agent_id` 和 `session_id`，用它精确装填那
+        一个 session，比让本方法去猜精确得多、也便宜得多。`_start_task_for_agent` 那条
+        同理：它在调用本方法之前已经 `record_of` 命中过。所以两个内部调用点都到不了
+        下面这个 raise。
+
+        走到这个 raise 的只剩「宿主直接调 `recover_agent`、而这条会话还没装填」——
+        按 `rebuild_session` 定下的用户驱动模型（「用到哪条装哪条」），那本就该由宿主
+        先装填。`AgentNotLoaded` 是 `AgentNotFound` 的子类，既有的 except 照样接住。
         """
         rec = self._agent_lifecycle_manager.record_of(agent_id)
         if rec is None:
-            await self.rebuild_agent(agent_id)
-            rec = self._agent_lifecycle_manager.record_of(agent_id)
-        if rec is None:
-            raise AgentNotFound(f"unknown agent: {agent_id}")
+            raise AgentNotLoaded(
+                f"agent {agent_id!r} is not loaded — call rebuild_session(session_id) "
+                f"for its session first"
+            )
         session_id = rec.session_id
         lock = self._resume_locks.setdefault(session_id, asyncio.Lock())
         async with lock:
@@ -3275,8 +3273,13 @@ class CtxWeftRuntime:
 
         `session_id` 不参与路由（`agent_id` 全局唯一，路由永远只看 `current_task_id`），
         但有两个用途：提前发现「这个 agent 不属于该 session」这类误用；以及给上面那次
-        自愈当精确索引——手握 session_id 就只装填这一个 session，落不到
-        `rebuild_agent` 的全量 sweep。调用方**应该**传它。
+        自愈当定址索引。
+
+        **后一个用途自 2026-09-21 起是硬要求**：registry miss 且没给 `session_id` →
+        抛 `AgentNotLoaded`（`AgentNotFound` 的子类）。从前那条「没 session 语境就扫全部
+        active session」的 sweep 已删，理由见 `rebuild_all_pending_hitl` 之后的墓碑注释。
+        热路径不受影响——registry 命中时本参数仍然只用于防呆，路由永远只看 `agent_id`
+        （spec §4.2：`agent_id` 全局唯一，足以路由）。
 
         路由三条路径（spec §4.2）：
 
@@ -3343,11 +3346,14 @@ class CtxWeftRuntime:
         但本方法仍是必要的——上面三种来源都还在。）
 
         与 `_hydrate_agent_for_cold_resume` 同一形状、同一理由（那边是冷 HITL 应答，
-        这边是终态后续聊）：手握 `session_id` 就用 `_load_agents_of` 精确装填这一个
-        session，**不让 `recover_agent` 自己的 registry-miss 自愈（`rebuild_agent` →
-        扫全部 active session）替我们兜底**——一次续聊不该退化成 O(active session 数)
-        次事件日志读取。没有 `session_id` 的调用方才落到那条 sweep（`rebuild_agent`），
-        它仍是「只有 agent_id、不知道 session」时的最后手段。
+        这边是终态后续聊）：手握 `session_id` 就精确装填这一个 session，一次定址、
+        成本有界。
+
+        **没有 `session_id` 就抛 `AgentNotLoaded`，不去找**（2026-09-21）。从前这条路
+        落到 `rebuild_agent` 的全量 sweep——扫遍全部 active session 直到撞见那个 agent。
+        删它的理由见下面那段墓碑注释（`rebuild_all_pending_hitl` 之后）：装填是调用方的
+        责任，而 core 替它猜要付 O(会话数)，换的是一个调用方本来就知道的值。
+        `AgentNotLoaded` 是 `AgentNotFound` 的子类，既有的 `except AgentNotFound` 照样接住。
 
         **走 `rebuild_session` 而不是只调 `_load_agents_of`**：后者只喂 agent record，
         而 `send_message` 的注入分支会 `_cancel_pending_hitl_of`（`waiting_human` 的
@@ -3358,18 +3364,18 @@ class CtxWeftRuntime:
 
         **只装填 ALM + HITL，不建 TaskManager**：TM 那一半由 `_start_task_for_agent`
         已有的探测接住（`tm is None or not tm.is_alive()` → `recover_agent(keep_alive=True)`），
-        那时 `record_of` 已经命中，`recover_agent` 内部的 `rebuild_agent` 直接返回，
-        不会触发 sweep。两段各管一半，不重复。
+        那时 `record_of` 已经命中。两段各管一半，不重复。
 
-        **绝不抛**：`rebuild_session` 自己就是绝不抛的。装填不成，调用方那边
-        `record_of` 仍是 None，照常抛 `AgentNotFound`——那才是真的查无此 agent。
+        **给了 session_id 就绝不抛**：`rebuild_session` 自己就是绝不抛的。装填不成，
+        调用方那边 `record_of` 仍是 None，照常抛 `AgentNotFound`——那才是真的查无此 agent。
         """
         if session_id is None:
-            # 没有 session 语境 → 只能走全量 sweep（`rebuild_agent` 内部扫全部 active
-            # session）。HITL 那半在这条路上装不了：`rebuild_hitl` 按 session 定址，而
-            # 这里恰恰不知道是哪个 session。调用方**应该**传 session_id。
-            await self.rebuild_agent(agent_id)
-            return
+            # HITL 那半在这条路上本来也装不了（`rebuild_hitl` 按 session 定址），所以
+            # 从前那条 sweep 连自己的目标都只完成一半。
+            raise AgentNotLoaded(
+                f"agent {agent_id!r} is not loaded and no session_id was given — "
+                f"call rebuild_session(session_id) first, or pass session_id to send_message"
+            )
         await self.rebuild_session(session_id)
 
     def _task_is_terminal(self, session_id: str, task_id: str) -> bool:
@@ -3564,10 +3570,10 @@ class CtxWeftRuntime:
             await self.recover_agent(agent_id, keep_alive=True)
             rec = reg.record_of(agent_id)
             if rec is None:
-                # recover_agent 内部的自愈（rebuild_agent）已经跑过一轮，仍然找不到
-                # 这个 agent —— 不该发生（keep_alive 只短路了"没有可恢复 task"这一条
-                # 判据，不影响"session 在事件日志里压根不存在"那条更早的 RuntimeError，
-                # 那条会直接从上面 `recover_agent` 里抛出、传播到这里之前）。防御性地
+                # 上面那次 `recover_agent` 返回了，记录却不在——只可能是并发的
+                # `forget_session` / `forget_agent` 在这两步之间把它摘掉了（`recover_agent`
+                # 自己对 miss 是直接抛 `AgentNotLoaded` 的，走不到这里；"session 在事件
+                # 日志里压根不存在"那条 RuntimeError 同样从它里面就抛出去了）。防御性地
                 # 给一个可诊断的类型化错误，而不是让下面的 `rec.session_id` 撞
                 # AttributeError。
                 raise AgentNotFound(
@@ -3966,12 +3972,12 @@ class CtxWeftRuntime:
         成），但**先**用 `hitl_id` 记一条响亮的 exception 日志，让运维不必去反查
         「host 报的这次失败对应哪个已经提交但没跑起来的 HITL」。
 
-        **冷路径先精确装填这一个 session，不让 `recover_agent` 落到它的 sweep 兜底**：
-        `req` 本来就同时带着 `agent_id` **和** `session_id`（`PendingHitl` 两个字段都
-        有），比 `recover_agent` 自己的 registry-miss 自愈（`rebuild_agent` → 扫全部
-        active session）精确得多——那条 sweep 是留给「只有 agent_id、不知道 session」
-        的调用方的最后手段，这里明明手握 session_id，没有理由让它多付这个代价
-        （复审 Important：一次冷应答不该变成 O(active session 数) 次事件日志读取）。
+        **冷路径必须先精确装填这一个 session**：`req` 本来就同时带着 `agent_id` **和**
+        `session_id`（`PendingHitl` 两个字段都有），而 `recover_agent` 对 registry miss
+        是直接抛 `AgentNotLoaded` 的——它没有 session 语境，无从装填（2026-09-21 起；
+        从前那条「扫全部 active session」的 sweep 已删）。所以这一步不是优化，是**这条
+        冷应答路径能走通的前提**：漏掉它，人刚答完问题的那次续跑就会摔在
+        `AgentNotLoaded` 上，而 `reply_to_hitl` 已经把 HITL 判成终局、没有第二次机会。
         `record_of` 命中就直接跳过——热路径（registry 已装填）里 `_load_agents_of`
         每次都要付一次 `rebuild_view` 的折叠代价，不能让它变成每次应答都白付一遍。
 
@@ -4018,10 +4024,9 @@ class CtxWeftRuntime:
         **legacy 冷 HITL 的 `agent_id == ""` 必须回退到 `session_id`**：一条折叠自
         旧版 `HITL_REQUIRED` 事件的 `PendingHitl`（该事件从未持久化 `agent_id`，见
         `_reply_turn_agent_id` 与 `tests/unit/test_cold_resume_agent_scope.py`）永远
-        没有 `agent_id` 可给 `recover_agent` 路由——`record_of("")` 必 miss，落到它
-        自己的 registry-miss 自愈（`rebuild_agent("")` → `rebuild_all_agents()` 扫
-        全部 active session）也不可能命中键为 `""` 的记录，最终必然
-        `AgentNotFound: unknown agent: `（空 id 原样拼进消息）。这一步发生在
+        没有 `agent_id` 可给 `recover_agent` 路由——`record_of("")` 必 miss，而键为 `""`
+        的记录无论如何装填都不会出现，最终必然抛错（今天是 `AgentNotLoaded`，空 id
+        原样拼进消息）。这一步发生在
         `HitlService._commit` 已经把这条 HITL 判成终局**之后**（`reply_to_hitl` 的
         docstring："冷续跑由本返回值驱动，不挂总线订阅"），没有第二次机会——会话因此
         永久卡住。
@@ -4050,12 +4055,10 @@ class CtxWeftRuntime:
 
         `record_of` 命中直接跳过：热路径（registry 已装填，常态）零额外开销，不必
         为每次应答都白付一次 `_load_agents_of` 的 `rebuild_view` 折叠代价。只有真
-        遇到 miss（冷启动 / 这个 agent 恰好属于本进程还没扫到的 session）才解一次
-        tenant、装填这一个 session——不让 `recover_agent` 自己的 registry-miss 自愈
-        （`rebuild_agent` → 扫全部 active session）替我们兜底：调用方明明手握
-        `session_id`，没理由付 sweep 那一份 O(active session 数) 的代价（复审
-        Important）。`recover_agent` 的 sweep 因此仍然保留，作为「只有 agent_id、
-        不知道 session」的调用方的最后手段——这里只是从不落到那条路而已。
+        遇到 miss（冷启动 / 这个 agent 所属的 session 还没被装填过）才解一次 tenant、
+        装填这一个 session。`recover_agent` 帮不上忙：它对 miss 直接抛
+        `AgentNotLoaded`（2026-09-21 起没有 sweep 兜底了），而调用方这里明明手握
+        `session_id`——这一步是这条冷应答路径的前提，不是优化。
         """
         if self._agent_lifecycle_manager.record_of(req.agent_id) is None:
             # tenant **就在手里**：`PendingHitl.tenant_id` 由开请求的调用方从其上下文传入
@@ -4662,46 +4665,29 @@ class CtxWeftRuntime:
                 logger.exception("rebuild_all_pending_hitl: failed for session %s", sid)
         return total
 
-    async def rebuild_agent(self, agent_id: str) -> bool:
-        """据事件把**单个** agent 装填进 ALM；找不到返回 False。
-
-        `rebuild_hitl` 的 agent 侧对应物（2026-09-04 spec §6.2）。用于「只有 agent_id、
-        不知道 session」的调用方，或运行期发现某个 agent 记录缺失时的按需自愈。手上有
-        session_id 的应当直接用 `rebuild_session`，别落到本方法的全量 sweep。
-
-        **实现是 `_load_agents_of` 的一次调用后再查一次**，不另写折叠逻辑：
-        `agent_id` 全局唯一但事件按 session 分区存（spec §6.1），要定位它就得先知道
-        它属于哪个 session——已在内存里的直接读 `record_of`，不在内存里的扫活跃
-        session 逐个装填（`rebuild_all_agents` 的路径），装完再查一次。
-
-        幂等：`ALM.load` 对同一批 `AgentView` 重复调用只是覆盖同值。
-        """
-        rec = self._agent_lifecycle_manager.record_of(agent_id)
-        if rec is not None:
-            return True
-        await self.rebuild_all_agents()
-        return self._agent_lifecycle_manager.record_of(agent_id) is not None
-
-    async def rebuild_all_agents(self) -> int:
-        """据事件把**所有 active session** 的 agent 装填进 ALM，返回总条数。
-
-        `rebuild_all_pending_hitl` 的 agent 侧对应物。不发中断、不 drain、不派发任何
-        任务——与 `rebuild_session` 的「装填不跑」同一纪律，区别只是它不碰 HITL。
-        """
-        try:
-            session_ids = await self.event_store.list_active_session_ids()
-        except NotImplementedError:
-            return 0
-        total = 0
-        for sid in session_ids:
-            try:
-                # 不传 tenant：这条路没有上游可问，由 `_load_agents_of` 从它自己折出的
-                # session 投影里照搬（每条 Event 都带 tenant_id）。
-                loaded, _ = await self._load_agents_of(sid)
-                total += loaded
-            except Exception:
-                logger.exception("rebuild_all_agents: failed for session %s", sid)
-        return total
+    # 这里从前有 `rebuild_agent(agent_id)` 与 `rebuild_all_agents()`——「只有 agent_id、
+    # 不知道 session」时扫**全部** active session 逐个装填，直到撞见那个 agent。
+    # 2026-09-21 删，两个理由：
+    #
+    # ① **它是旧恢复模型的残留。** `recover()` 于 2026-09-09 删除后，装填已整体改成用户
+    #    驱动（`rebuild_session` 的 docstring：「这是唯一的按需装填入口……用到哪条装哪条」）。
+    #    调用方先装填、再按 agent 操作，是这套模型下的正确用法；替它猜是在补一件它本来就
+    #    该做、而且做得到的事。
+    # ② **它拿 O(会话数) 换一个调用方本来就知道的值。** 事件按 session 分区存
+    #    （spec §6.1），`agent_id` 全局唯一却没有反向索引，所以「只有 agent_id」时找法
+    #    只剩枚举。更糟的是它枚举的那个集合是坏的：`list_active_session_ids` 的两条
+    #    discard 依据（`SessionFinished` / `SessionStatusChanged`）在 src 下没有任何 emit
+    #    调用点，判据因此恒真——「active 集」= 这台机器历史上跑过的**全部**会话。这正是
+    #    当初删 `recover()` 的同一个理由，只是它藏在一个按需自愈里、没被一起清掉。
+    #
+    # registry miss 且调用方没给 `session_id` → 抛 `AgentNotLoaded`（`AgentNotFound` 的
+    # 子类，宿主既有的 except 照样接住）。手握 session_id 的 miss 仍然精确自愈，那是
+    # 一次定址装填、成本有界，见 `_hydrate_agent_for_send` / `_hydrate_agent_for_cold_resume`。
+    #
+    # ⚠️ `rebuild_all_pending_hitl`（上面那个）**刻意留着**：`/hitl/{id}/*` 端点真的只有
+    # hitl_id，而 HITL 状态没有第二个存储（宿主也没有 hitl 表），它无从定址。那条要治得先
+    # 给 core 一个 hitl_id → session_id 的定址读，是独立一件事。在它之前
+    # `list_active_session_ids` 仍有这一个消费者，故协议与 `_lifecycle` 状态机都还不能删。
 
     # ── Internal execution ───────────────────────────────────────────────────
 

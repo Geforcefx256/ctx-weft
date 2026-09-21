@@ -18,6 +18,7 @@ from ctx_weft.protocols.events import (
 )
 from ctx_weft.providers.events import InMemoryEventStore, InProcessEventBus
 from ctx_weft.protocols.events import Event
+from tests._event_helpers import all_events
 
 _T0 = datetime(2026, 9, 11, tzinfo=UTC)
 
@@ -45,7 +46,7 @@ async def test_commit_confirms_before_notification():
     seen_in_store_at_notify: list[int] = []
 
     async def _observer(ev: Event) -> None:
-        seen_in_store_at_notify.append(len(await store.read_by_session("s1")))
+        seen_in_store_at_notify.append(len(await all_events(store, "s1")))
 
     bus.subscribe(None, _observer)
     await bus.emit(_ev(1))
@@ -177,11 +178,11 @@ async def test_window_commit_atomic_and_retryable():
     assert observers == []
     with pytest.raises(PersistenceUnavailableError):
         await bus.commit_provisional("t1")       # 第一次提交失败
-    assert await store.read_by_session("s1") == []
+    assert await all_events(store, "s1") == []
     assert observers == []                       # 观察者仍未收到任何事件
 
     await bus.commit_provisional("t1")           # 重试：同 batch_id，成功
-    stored = await store.read_by_session("s1")
+    stored = await all_events(store, "s1")
     assert [e.id for e in stored] == ["evt_0001"]   # 恰好一次、不双写
     assert observers == ["evt_0001"]                # 成功后才补投
 
@@ -222,7 +223,7 @@ async def test_derived_session_event_inherits_round_and_discarded():
                          type=EventType.TASK_STARTED, timestamp=_T0, task_id="t1"))
     bus.discard_provisional("t1")                # 整窗丢弃：派生事件随之消失
 
-    assert await store.read_by_session("s1") == []   # 无逃逸落库
+    assert await all_events(store, "s1") == []   # 无逃逸落库
     assert observers == []                           # 宿主可见流无逃逸
 
 
@@ -243,4 +244,4 @@ async def test_required_consumer_failure_propagates_and_observers_unnotified():
         await bus.emit(_ev(1))
     assert observers == []                       # committed 通知未流出
     # 事件本身已提交（store 有）——提交与通知是两件事；恢复由持久日志收口
-    assert len(await store.read_by_session("s1")) == 1
+    assert len(await all_events(store, "s1")) == 1

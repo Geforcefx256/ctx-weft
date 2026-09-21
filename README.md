@@ -513,7 +513,8 @@ runtime = CtxWeftRuntime(
 | `run_single_task(...)` | 单任务端到端，**等待完成** | `(RunHandle, LoopState)` |
 | `start_session(params)` | 新建会话，多 agent 编排，**异步后台跑** | `RunHandle` |
 | `start_session(params)`（带 `session_id`） | 恢复已有会话续跑 | `RunHandle` |
-| `recover()` / `recover_session(id)` | 进程重启后的崩溃恢复 | `int` / `None` |
+| `rebuild_session(id)` | 把一条冷会话装填回内存（**只装填，不跑**） | `int` |
+| `recover_agent(agent_id)` | 续跑一个被打断的 agent（装填 + 建 TM + drain） | `None` |
 | `interrupt_session(id)` | 协作式取消正在跑的 session | `bool` |
 
 ### run_single_task() — 单任务直跑
@@ -584,16 +585,30 @@ compact 由 ReasonStep 命中阈值后内联直调 CompactStep；metadata_filler
 
 ### 崩溃恢复
 
-进程重启后救活之前无终态的 session，**在所有 provider 注册完成、接收新请求之前**调用：
+**恢复是用户驱动的：用到哪条会话，就装填哪条。** 启动时不做任何预热——从前那个扫「全部 active session」的
+`runtime.recover()` 已于 2026-09-09 删除（它的活跃判据只增不减，开销与历史会话数线性增长且永不收敛）。
 
 ```python
-count = await runtime.recover()
-# recover() 直接查 EventStore（无需 host 投影表）据事件决策、且**无回调、不 drain**:
-#   · 有未解决 pending HITL 的 session → 只 rebuild 内存 HitlManager,保持 PAUSED_HITL,等应答;
-#   · 其余（崩溃前在跑）→ core emit SessionStatusChanged(INTERRUPTED),host 既有事件订阅者
-#     （投影/SSE）按事件自行反映,等用户 /resume。
-# 故 load_sessions_from_db 须排在 recover() 之后,从更新后的投影把状态灌回内存缓存。返回处理的 session 数
+# ① 装填：把一条冷会话的内存态喂回来。只读事件日志，**不建 TaskManager、不跑任何东西**。
+#    幂等，随便调。进程重启后、或宿主的 LRU 把它逐出（forget_session）之后，都用这条拉回来。
+n = await runtime.rebuild_session(session_id)      # 返回装填的 agent 条数
+
+# ② 之后才谈操作这条会话里的 agent：
+await runtime.send_message(agent_id, "继续", session_id=session_id)   # 接着聊
+await runtime.recover_agent(agent_id)                                 # 续跑被打断的
 ```
+
+⚠️ **顺序不能反。** agent record 是只增不删的**缓存**，一次 miss 只说明「还没喂进来」，事实一直在事件日志里。
+但 core 不会替你去找那条会话——事件按 session 分区存，`agent_id` 没有反向索引，「只有 agent_id」时唯一的找法
+是扫全部会话。所以：
+
+- `send_message` 撞上 miss 时，**带了 `session_id` 就自愈**（精确装填那一个 session），没带就抛 `AgentNotLoaded`。
+- `recover_agent` 没有 session 语境，撞上 miss 一律抛 `AgentNotLoaded`。宿主该先 `rebuild_session`。
+
+`AgentNotLoaded` 是 `AgentNotFound` 的子类，既有的 `except AgentNotFound` 照样接住；想区分「没装填」与
+「真不存在」的再按它分支。
+
+宿主的投影表（`load_sessions_from_db` 那类）不再需要排在某个全局恢复步骤之后——按会话装填，各自独立。
 
 恢复流程的内部细节见 [ARCHITECTURE.md §会话生命周期与崩溃恢复](./ARCHITECTURE.md#会话生命周期与崩溃恢复)。
 

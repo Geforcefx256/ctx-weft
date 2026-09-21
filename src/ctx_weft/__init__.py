@@ -4,6 +4,7 @@ from ctx_weft.core.models.config import RuntimeConfig
 from ctx_weft.core.models.errors import (
     AgentBusyError,
     AgentNotFound,
+    AgentNotLoaded,
     AgentNotRunningError,
     AgentTerminatedError,
     SessionAlreadyExistsError,
@@ -47,6 +48,7 @@ __all__ = [
     "HitlRequestView",
     # 错误
     "AgentNotFound",
+    "AgentNotLoaded",
     "AgentNotRunningError",
     "AgentBusyError",
     "AgentTerminatedError",

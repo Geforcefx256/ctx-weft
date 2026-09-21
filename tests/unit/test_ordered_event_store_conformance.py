@@ -23,6 +23,7 @@ from ctx_weft.protocols.events import (
 )
 from ctx_weft.providers.events.store.in_memory.store import InMemoryEventStore
 from ctx_weft.providers.events.store.sql.store import SqlEventStore, open_sqlite_event_store
+from tests._event_helpers import all_events
 
 _T0 = datetime(2026, 9, 11, tzinfo=UTC)
 
@@ -104,11 +105,11 @@ async def test_batch_atomicity_kth_failure_leaves_no_trace(store):
     """
     with pytest.raises(EventConflictError):
         await store.append_batch("s1", "bad", [_ev(1), _ev(1)])  # 同 id 第二条撞主键
-    assert await store.read_by_session("s1") == []
+    assert await all_events(store, "s1") == []
     assert await store.committed_head("s1") == 0
     receipt = await store.append_batch("s1", "bad", [_ev(1), _ev(2)])  # 同 batch_id 重试
     assert _ids(receipt) == ["evt_0001", "evt_0002"]
-    assert len(await store.read_by_session("s1")) == 2
+    assert len(await all_events(store, "s1")) == 2
 
 
 async def test_batch_must_share_session(store):
@@ -125,7 +126,7 @@ async def test_idempotent_retry_returns_original_receipt(store):
     r1 = await store.append_batch("s1", "b1", [_ev(1), _ev(2)])
     r2 = await store.append_batch("s1", "b1", [_ev(1), _ev(2)])
     assert r1 == r2  # frozen dataclass：含 position 的全等
-    assert len(await store.read_by_session("s1")) == 2
+    assert len(await all_events(store, "s1")) == 2
     assert await store.committed_head("s1") == 2
 
 
@@ -135,7 +136,7 @@ async def test_same_batch_different_content_conflicts(store):
         await store.append_batch("s1", "b1", [_ev(1), _ev(2)])
     with pytest.raises(EventConflictError):  # 同 id 异 payload 也算内容冲突
         await store.append_batch("s1", "b1", [_ev(1, payload={"n": 999})])
-    assert len(await store.read_by_session("s1")) == 1
+    assert len(await all_events(store, "s1")) == 1
 
 
 # ── append 兼容 ──────────────────────────────────────────────────────────────
@@ -151,10 +152,10 @@ async def test_append_is_single_event_batch_and_mixes(store):
     await store.append(_ev(2))
     r = await store.append_batch("s1", "b3", [_ev(3), _ev(4)])
     assert _positions(r) == [3, 4]
-    assert [e.sequence for e in await store.read_by_session("s1")] == [1, 2, 3, 4]
+    assert [e.sequence for e in await all_events(store, "s1")] == [1, 2, 3, 4]
     # append 的幂等键 = event.id：重复 append 同一事件是 no-op
     await store.append(_ev(1))
-    assert len(await store.read_by_session("s1")) == 4
+    assert len(await all_events(store, "s1")) == 4
 
 
 # ── 跨会话隔离 + 双连接争用 ──────────────────────────────────────────────────
@@ -228,9 +229,9 @@ def test_single_event_protocol_no_parallel_ordered_protocol():
 
 
 def test_ordered_commit_methods_are_mandatory():
-    """三个方法是 @abstractmethod，与 append / read_by_session 同档——不是可选扩展。"""
+    """三个方法是 @abstractmethod，与 append 同档——不是可选扩展。"""
     assert EventStore.__abstractmethods__ >= {
-        "append", "read_by_session", "append_batch", "read_range", "committed_head",
+        "append", "append_batch", "read_range", "committed_head",
         # 这两个后来也升为必需：恢复路径无条件靠它们（取快照 / 按类型收窄折叠），做成可选就
         # 又要在 core 里探一次能力——那个坏设计在这个仓生出过三次「两分支 + 两失败形态」。
         "read_last_of_type", "read_session_events_of_types"}
@@ -238,13 +239,18 @@ def test_ordered_commit_methods_are_mandatory():
     for name in ("save_snapshot", "load_latest_snapshot",
                  "list_active_session_ids",):
         assert name not in EventStore.__abstractmethods__
+    # `read_by_session`（整条会话读成一个 list）2026-09-21 整个从协议删了——**不是**降为
+    # 可选。所以钉「协议面上没有它」，而不是「它不在 abstractmethods 里」：后者在它被降为
+    # 可选扩展时也会绿，而那正是不该发生的形态。
+    assert not hasattr(EventStore, "read_by_session"), (
+        "read_by_session 回来了：它是本仓花很长时间清掉的那个形状，且留着会让「断言它被调"
+        "用 0 次」那类守卫重新变得空洞")
 
 
 def test_subclass_missing_ordered_commit_cannot_instantiate():
     """第一层强制：显式继承 EventStore 而不实现三方法 → ABC 在实例化时就拒绝。"""
     class StubStore(EventStore):
         async def append(self, event): ...
-        async def read_by_session(self, session_id): return []
 
     with pytest.raises(TypeError, match="append_batch"):
         StubStore()
@@ -292,7 +298,6 @@ def test_supports_replay_asks_only_whether_it_exists():
     """
     class Inheriting(EventStore):
         async def append(self, event): ...
-        async def read_by_session(self, session_id): return []
         async def append_batch(self, session_id, batch_id, events): ...
         async def read_range(self, session_id, **kw): return []
         async def committed_head(self, session_id): return 0
@@ -324,7 +329,6 @@ def test_runtime_rejects_duck_typed_store_without_replay():
     class DuckStoreNoReplay:
         """三个必需方法齐全，但不继承协议 → 没有 replay。"""
         async def append(self, event): ...
-        async def read_by_session(self, session_id): return []
         async def append_batch(self, session_id, batch_id, events): ...
         async def read_range(self, session_id, **kw): return []
         async def committed_head(self, session_id): return 0
@@ -345,7 +349,6 @@ def test_runtime_rejects_store_without_ordered_commit():
     class LegacyStore:
         """只有旧接口的 store——WP2 之前的形态。"""
         async def append(self, event): ...
-        async def read_by_session(self, session_id): return []
         # 没有 append_batch / read_range / committed_head
 
     for policy in ("required", "best_effort"):

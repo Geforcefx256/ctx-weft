@@ -55,13 +55,20 @@ class _CountingStore(InMemoryEventStore):
 
     def __init__(self) -> None:
         super().__init__()
-        self.full_reads = 0
         self.typed_reads: list[tuple[str, ...]] = []
         self.ranges: list[tuple[int, int | None]] = []
 
-    async def read_by_session(self, session_id: str):
-        self.full_reads += 1
-        return await super().read_by_session(session_id)
+    @property
+    def full_reads(self) -> int:
+        """无界的 read_range 次数（after=0 且无上界 = 整条会话）。
+
+        从前这里数的是 `read_by_session` 的调用次数。那个方法 2026-09-21 从协议删了
+        （src 零调用者），而「方法不存在时调用 0 次」由语言保证、不需要测试。改数
+        `read_range` 里无界的那一形状——那是删掉它之后**仅剩**的整条会话读法，也就是这条
+        守卫真正要防的东西。
+        """
+        return sum(1 for after, through in self.ranges
+                   if after == 0 and through is None)
 
     async def read_session_events_of_types(self, session_id: str, types, *, task_id: str = ""):
         self.typed_reads.append(tuple(str(t) for t in types))
@@ -147,7 +154,7 @@ async def test_full_replay_is_batched_by_position_range() -> None:
 
     view = await rebuild_view(store, _SID)
 
-    assert store.full_reads == 0, "分批路径不该触发 read_by_session"
+    assert store.full_reads == 0, "分批路径不该发出无界的 read_range"
     assert len(store.ranges) >= 3, f"应分多批，实际 {len(store.ranges)} 批"
     # 区间首尾相接、不重不漏，且都锚在同一个 head 上
     head = await store.committed_head(_SID)

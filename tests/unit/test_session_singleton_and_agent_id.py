@@ -43,6 +43,7 @@ from tests.integration.test_send_message_after_session_done import (
     _wait_until,
 )
 from tests.unit._stub_runner import StubRunner
+from tests._event_helpers import all_events
 
 pytestmark = pytest.mark.asyncio
 
@@ -190,7 +191,7 @@ async def test_start_session_refuses_to_create_a_session_id_that_already_exists(
         ))
 
     assert rt._task_managers[sid] is owner
-    created = [e for e in await rt.event_store.read_by_session(sid)
+    created = [e for e in await all_events(rt.event_store, sid)
                if e.type == EventType.SESSION_CREATED]
     assert len(created) == 1, "入口即拒：不得落第二条 SESSION_CREATED"
 

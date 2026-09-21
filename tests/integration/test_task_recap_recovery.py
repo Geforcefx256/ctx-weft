@@ -490,7 +490,8 @@ async def test_resume_does_not_read_the_whole_event_stream() -> None:
     走的是真实恢复路径（`/resume` → `recover_agent` → `restore_session`），而不是直接调
     折叠：护住的正是「调用点用错工具」这件事。这条护栏经历过两版收紧——
 
-    1. 最初这里是 `read_by_session(session_id)`，每次用户点「继续」都把整条流读一遍
+    1. 最初这里是 `read_by_session(session_id)`（该方法已于 2026-09-21 从协议删除），
+       每次用户点「继续」都把整条流读一遍
        （实测 3 万事件 ≈ 3.5s / 130MB），且与快照有没有无关；
     2. 然后收窄成「只读那两种类型」，代价降到 272ms / 5.1MB，但**仍随会话长度线性增长**
        ——recap 事件只增不减，1 万个 task 就是 ~2.7s / 51MB；
@@ -503,18 +504,22 @@ async def test_resume_does_not_read_the_whole_event_stream() -> None:
     store = runtime.event_store
     full_reads = [0]
     typed_reads: list[tuple[str, ...]] = []
-    orig = store.read_by_session
+    orig_range = store.read_range
     orig_typed = store.read_session_events_of_types
 
-    async def _counting(session_id):
-        full_reads[0] += 1
-        return await orig(session_id)
+    # 从前这里数 `read_by_session`。那个方法 2026-09-21 从协议删了，而「不存在的方法被调
+    # 0 次」由语言保证。改数**无界的 read_range**（after=0 且无上界 = 整条会话）——那是删掉
+    # 它之后仅剩的整条会话读法，也就是这条守卫真正要防的形状。
+    async def _counting(session_id, **k):
+        if k.get("after_position", 0) == 0 and k.get("through_position") is None:
+            full_reads[0] += 1
+        return await orig_range(session_id, **k)
 
     async def _counting_typed(session_id, types, *, task_id: str = ""):
         typed_reads.append(tuple(str(t) for t in types))
         return await orig_typed(session_id, types, task_id=task_id)
 
-    store.read_by_session = _counting          # type: ignore[method-assign]
+    store.read_range = _counting               # type: ignore[method-assign]
     store.read_session_events_of_types = _counting_typed   # type: ignore[method-assign]
 
     sid, tid, aid = "ses_recap", "tsk_recap", "agt_root"

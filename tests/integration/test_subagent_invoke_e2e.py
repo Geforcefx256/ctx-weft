@@ -32,6 +32,7 @@ from tests.integration.test_minimal_loop import (
     make_echo_template,
     make_runtime,
 )
+from tests._event_helpers import all_events
 
 pytestmark = pytest.mark.asyncio
 
@@ -192,7 +193,7 @@ async def test_subagent_runs_its_own_loop_and_result_flows_back():
     assert sub_av.spawn_depth == 1, f"expected depth 1, got {sub_av.spawn_depth}"
 
     # ── 3. root 因等子任务而挂起过（真 suspend，不是 detach 直跑）────────────
-    events = await runtime.event_store.read_by_session(session_id)
+    events = await all_events(runtime.event_store, session_id)
     suspended = [
         e for e in events
         if e.type == EventType.TASK_SUSPENDED

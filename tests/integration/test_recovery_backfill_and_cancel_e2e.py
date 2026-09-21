@@ -32,6 +32,7 @@ from tests.integration.test_hitl_hot_reply_round_window_e2e import (
 from tests.integration.test_minimal_loop import (
     InlineAgentTemplateProvider, make_echo_template, make_runtime,
 )
+from tests._event_helpers import all_events
 
 pytestmark = pytest.mark.asyncio
 
@@ -129,7 +130,7 @@ async def test_cancel_session_closes_open_rounds_and_finalizes_claimed_replies()
     rec = rt.hitl_registry.get(q1.id)
     assert rec.resolved and rec.decision.outcome == "cancelled", (
         "待终局的答复必须被退回再收口，否则它既不在待答列表里、也永远不终局")
-    types = [e.type for e in await rt.event_store.read_by_session(sid)]
+    types = [e.type for e in await all_events(rt.event_store, sid)]
     assert EventType.HITL_CANCELLED in types or EventType.HITL_RESOLVED in types, (
         f"收口事实必须落盘，否则重启后这条提问又成了未决：{types}")
     assert not tm.open_round_task_ids, "取消之后不得留下开着的窗"

@@ -2,8 +2,7 @@
 没有 `agent_id`（该事件从未持久化它，见 `_reply_turn_agent_id` 与
 `tests/unit/test_cold_resume_agent_scope.py`）。`_resume_after_hitl` 此前按
 `req.agent_id` 路由到 `recover_agent`：`recover_agent("")` 必然 `record_of("")` miss
-→ 自愈 `rebuild_agent("")` → `rebuild_all_agents()` 扫全部 active session 也不可能
-命中键为 `""` 的记录 → 最终 `AgentNotFound: unknown agent: `——而这一步发生在
+→ 而键为 `""` 的记录无论怎么装填都不会出现 → 最终抛错——而这一步发生在
 `HitlService._commit` 已经把这条 HITL 判成终局**之后**，没有第二次机会，会话永久
 卡住。
 

@@ -116,8 +116,17 @@ async def test_the_silent_failure_it_replaces_really_was_silent(tmp_path):
         view = await rebuild_view(store, "s1")
         assert view.tasks == {}, "居然读到了——那守卫也许可以放宽"
         assert view.events_total == 0
-        # 而按 session 的那条读法看得见它们：差别只在「按 position 还是按 id 序」
-        assert len(await store.read_by_session("s1")) == 4
+        # 行确实在库里——只是没有任何 store 读法能看见它们。从前 `read_by_session` 能
+        # （它的口径是「NULL 段按 id 序排前」），那个方法 2026-09-21 随协议删掉了，于是
+        # 「未回填的行不可见」从「取决于用哪个读法」变成了绝对的。这里改用裸 SQL 数，因为
+        # 要证明的正是「库里有、协议读不到」。
+        legacy = sqlite3.connect(db)
+        try:
+            assert legacy.execute("SELECT count(*) FROM events").fetchone()[0] == 4
+            assert legacy.execute(
+                "SELECT count(*) FROM events WHERE position IS NULL").fetchone()[0] == 4
+        finally:
+            legacy.close()
     finally:
         await engine.dispose()
 

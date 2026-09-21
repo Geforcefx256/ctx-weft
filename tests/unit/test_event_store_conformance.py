@@ -28,6 +28,7 @@ import pytest
 
 from ctx_weft.protocols.events import Event, EventStore
 from ctx_weft.providers.events import InMemoryEventStore
+from tests._event_helpers import all_events
 
 
 @asynccontextmanager
@@ -100,7 +101,7 @@ async def test_append_read_roundtrip_preserves_every_field(store):
         schema_version=3,
     )
     await store.append(ev)
-    (got,) = await store.read_by_session("s1")
+    (got,) = await all_events(store, "s1")
     for field in (
         "id", "run_id", "sequence", "session_id", "type", "tenant_id",
         "task_id", "agent_id", "payload", "metadata", "causation_id",
@@ -110,8 +111,11 @@ async def test_append_read_roundtrip_preserves_every_field(store):
     assert got.timestamp == _T0          # 时区保真：naive 回读会让这条恒 False
 
 
-async def test_read_by_session_is_ordered(store):
-    """read_by_session 按提交序（= position 序）返回。
+async def test_reading_a_session_is_ordered_by_commit(store):
+    """整条会话的读（`read_range`）按提交序（= position 序）返回。
+
+    2026-09-21 起这条测的是 `read_range`：`read_by_session` 整个从协议删了（src 零调用者，
+    而它是「整条会话读成一个 list」那个形状）。排序口径没变，所以这条测试的内容没变。
 
     旧契约钉的是 id（ULID）排序——对乱序 append 做防御性归一。2026-09 起（change
     reliability-wp2，spec: event-log）有意改为提交序：append/append_batch 全在锁内按
@@ -120,17 +124,17 @@ async def test_read_by_session_is_ordered(store):
     """
     for seq in (3, 1, 2):
         await store.append(_ev(seq))
-    assert [e.sequence for e in await store.read_by_session("s1")] == [3, 1, 2]
+    assert [e.sequence for e in await all_events(store, "s1")] == [3, 1, 2]
 
 
-async def test_read_by_session_isolates_sessions(store):
+async def test_reading_a_session_isolates_sessions(store):
     await store.append(_ev(1, session="s1"))
     await store.append(_ev(2, session="s2"))
-    assert [e.session_id for e in await store.read_by_session("s1")] == ["s1"]
+    assert [e.session_id for e in await all_events(store, "s1")] == ["s1"]
 
 
-async def test_read_by_session_unknown_returns_empty(store):
-    assert await store.read_by_session("nope") == []
+async def test_reading_an_unknown_session_returns_empty(store):
+    assert await all_events(store, "nope") == []
 
 
 # ── read_session_events_of_types ─────────────────────────────────────────────

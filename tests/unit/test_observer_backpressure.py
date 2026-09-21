@@ -15,6 +15,7 @@ import pytest
 from ctx_weft.core.events.commit_gate import CommitGate
 from ctx_weft.protocols.events import Event, EventFilter, EventType
 from ctx_weft.providers.events import InMemoryEventStore, InProcessEventBus
+from tests._event_helpers import all_events
 
 _T0 = datetime(2026, 9, 11, tzinfo=UTC)
 
@@ -71,7 +72,7 @@ async def test_slow_stream_observer_drops_visible_and_backfillable():
     # 提交与必要状态推进不受阻；内联观察者全量无缺口
     assert required_seen == [f"evt_{n:04d}" for n in range(1, 7)]
     assert handler_out == [f"evt_{n:04d}" for n in range(1, 7)]
-    assert len(await store.read_by_session("s1")) == 6
+    assert len(await all_events(store, "s1")) == 6
 
     # 慢观察者：放行后 drain 自己的队列——看到 EventsDropped 通报（丢弃可观测）
     unpark.set()

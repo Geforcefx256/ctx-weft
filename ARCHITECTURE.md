@@ -381,7 +381,8 @@ v2 里「子任务结果怎么到父」有三条，全部落在 memory、由 `Ag
 
 旧 `recover()` / `recover_session()` 已删除；现在的面：
 
-- `rebuild_session`（`core/runtime.py:1901`）/ `rebuild_all_agents`（`:3816`）/ `rebuild_agent`（`:3796`）/ `rebuild_hitl`（`:3683`）；active session 判定用 `providers/events/_lifecycle.py` 的 `apply_lifecycle` / `replay_lifecycle`（`:45` / `:65`）。
+- `rebuild_session`（`core/runtime.py:2173`，**唯一的按需装填入口**）/ `rebuild_hitl`（`:4540`）/ `rebuild_all_pending_hitl`（`:4647`）。
+- 按 agent 的 sweep（`rebuild_agent` / `rebuild_all_agents`）已于 2026-09-21 删除：registry miss 且没有 `session_id` 时抛 `AgentNotLoaded`，装填是调用方的责任。`providers/events/_lifecycle.py` 的 `apply_lifecycle` / `replay_lifecycle` 因此只剩 `rebuild_all_pending_hitl` 一个消费者（`/hitl/{id}/*` 端点真的只有 hitl_id，无从定址）。⚠️ 那台状态机的两条 discard 依据（`SessionFinished` / `SessionStatusChanged`）目前**没有任何 emit 调用点**，判据恒真 = 历史全部会话；要治得先给 core 一个 hitl_id → session_id 的定址读。
 - `recover_agent(agent_id, ...)`（`core/runtime.py:2130`；per-session resume 锁 `:719`）→ `_recover_session_locked`（`:2210`），**单 owner 架构**（session 的 TaskManager 是单例：`_bind_task_manager` 是唯一写 `_task_managers` 的地方，已有别的 TM 在册即抛）：
   - 内存里有活 owner TM → `_recover_in_existing_tm`（`:2528`）就地续跑、**绝不重建**：冷 HITL 应答走 `_resume_in_existing_tm`（`:2579`）重排被应答的 task；`/resume` 走 `TaskManager.requeue_resumable`（判据同 `restore()`，读内存）；
   - 内存里没有 TM（进程重启 / 从未建过 / 已被 forget·purge 逐出）→ `rebuild_view`（`core/control/reducers.py:351`，快照+增量 `read_range`）→ converters 转 dataclass（`core/control/converters.py:21` / `:41`）→ `TaskManager.restore(all_tasks, terminal_ids, parked_task_ids)`（`core/orchestrator/task/manager.py:156`，跳过已废弃的 compact/metadata ephemeral task `:197`）→ `_load_agents_of` 装填 ALM（`:3644`）→ set_runner + `_register_and_drain` 续跑。

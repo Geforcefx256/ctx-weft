@@ -521,11 +521,12 @@ class EventStore(Protocol):
 
     ## 两档强制性
 
-    1. **必须实现**（`@abstractmethod`）：`append` / `read_by_session` /
-       `append_batch` / `read_range` / `committed_head`。
-       **有序提交是底线，不是可选项**——理由见下节。
+    1. **必须实现**（`@abstractmethod`）：`append` / `append_batch` / `read_range` /
+       `committed_head` / `read_last_of_type` / `read_session_events_of_types`。
+       **有序提交是底线，不是可选项**——理由见下节。后两个是恢复路径无条件要走的（取最新
+       快照 / 按类型收窄折叠），做成可选就又要在 core 里探一次能力。
     2. **可选扩展**（默认 `raise NotImplementedError`）：
-       `list_active_session_ids` / `read_session_events_of_types` /
+       `list_active_session_ids` /
 
     读取一律按 position：**不存在**「按事件 ID 取增量」的 API。ID 铸造序 ≠ 提交序，
     那种游标正是 H2 的根因（详见下节）。
@@ -556,7 +557,7 @@ class EventStore(Protocol):
 
     ## 排序口径
 
-    `read_by_session` / `read_session_events_of_types` 按 **position（提交序）** 排序。
+    `read_session_events_of_types` 按 **position（提交序）** 排序。
     `append(event)` 由单事件 `append_batch` 实现（batch_id 确定性取 event.id），
     既有调用方语义不变。
     """
@@ -566,21 +567,20 @@ class EventStore(Protocol):
         """持久化单条事件（= 单事件 `append_batch`，batch_id 取 event.id）。"""
         ...
 
-    @abstractmethod
-    async def read_by_session(self, session_id: str) -> list[Event]:
-        """按 session_id 加载全部事件，按 `position`（提交序）升序排序。
-
-        存量 position 为 NULL 的 legacy 行排在前、其内部按 id 序（迁移前后的确定性
-        口径，见 `scripts/migrate_event_positions.py`）。
-
-        **排序键不是 `sequence`。** `sequence` 只在同一 `run_id` 内单调递增
-        （见 `Event.sequence`）；一个 session 可以跨多个 run，按 sequence 排会把
-        不同 run 的事件交错在一起（run A 的 1,2,3 与 run B 的 1,2,3 排成
-        A1,B1,A2,B2,A3,B3）。
-
-        **也不是 `id`。** 理由见类 docstring「有序提交为何必选」。
-        """
-        ...
+    # **这里没有 `read_by_session`**（2026-09-21 删）。它是「把一个会话的全部事件读成
+    # 一个 list」，也就是本仓花了很长时间清掉的那个形状——代价随会话长度线性增长，实测
+    # 3 万事件约 130MB 常驻。删它的时候 src 里已经零调用者：恢复走
+    # `read_last_of_type` + `read_range` 或 `replay()`，按类型查走
+    # `read_session_events_of_types`（带 task 收窄），没有任何路径需要「全都给我」。
+    #
+    # **为什么不是留着加一条禁令注释就够**。留着的直接后果不是有人会误用，而是**守卫它的
+    # 负向断言会变空洞**：本仓有过两处「给某个方法装计数器、断言调用 0 次」的测试，其中
+    # 一处守的方法早已零调用（`Runtime._read_session_events_of_types`），于是那条断言永远
+    # 绿、永远什么都没验。方法不存在时「调用 0 次」由语言保证，不需要测试。
+    #
+    # 顺带消失的一个能力：只有它能看见 position 为 NULL 的存量行（它的排序口径是「NULL 段
+    # 按 id 序排前、其后按 position 序」）。那个混合状态现在没有读者——core 侧
+    # `open_sqlite_event_store` 直接拒绝打开未回填的库，宿主侧 m020 在任何读之前回填完。
 
     # ── 有序提交（必须实现；spec: event-log）──────────────────────────────────
 
@@ -711,7 +711,7 @@ class EventStore(Protocol):
         ——把一条没归属的 `CapabilityInvoked` 漏掉就会静默重跑一个有副作用的工具，多取回
         几条只是多折几下。
 
-        排序口径与 `read_by_session` 完全一致：有序提交 store 按 `position`、legacy
+        排序口径与 `read_range` 完全一致：有序提交 store 按 `position`、legacy
         store 按 `id`；两者都不用 `sequence`（它只在同一 `run_id` 内单调，跨 run 的
         session 按它排会交错两个 run 的事件）。
 

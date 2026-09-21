@@ -34,6 +34,7 @@ from tests.integration.test_minimal_loop import (
     make_echo_template,
     make_runtime,
 )
+from tests._event_helpers import all_events
 
 pytestmark = pytest.mark.asyncio
 
@@ -97,7 +98,7 @@ async def _next_question(rt, sid, *, exclude=()):
 
 
 async def _stored_types(rt, sid) -> list[str]:
-    return [e.type for e in await rt.event_store.read_by_session(sid)]
+    return [e.type for e in await all_events(rt.event_store, sid)]
 
 
 async def _ask_user_results(rt, sid, req) -> list[str]:
@@ -256,7 +257,7 @@ class _MemoryIngestSpy:
 
     async def ingest(self, event, ctx):
         if self._predicate(event):
-            stored = [e.type for e in await self._rt.event_store.read_by_session(ctx.session_id)]
+            stored = [e.type for e in await all_events(self._rt.event_store, ctx.session_id)]
             self.seen.append((content_to_text(event.content), EventType.HITL_RESOLVED in stored))
         return await self._inner.ingest(event, ctx)
 

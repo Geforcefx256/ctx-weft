@@ -24,7 +24,7 @@ class EventPersister:
     """订阅 EventBus，把非瞬态事件 append 进任意 `EventStore`。
 
     **瞬态过滤在这里，不在 store 里**（spec 2026-08-29 §6.4）：每 token 一个的流式
-    delta 只为实时流而发，落库会让事件表无界膨胀、且被 `read_by_session` /
+    delta 只为实时流而发，落库会让事件表无界膨胀、且被 `read_range` /
     `reduce_events` 全量回放（真相由 `LLMResponseFinished` 承载）。这是**订阅策略**，
     不是存储策略——`EventStore.append` 因此是「让存什么就存什么」，一致性测试才能
     直接测往返而不被 store 悄悄吃掉测试事件。

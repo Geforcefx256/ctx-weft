@@ -108,11 +108,6 @@ class InMemoryEventStore(EventStore):
 
     # ── 读 ────────────────────────────────────────────────────────────────────
 
-    async def read_by_session(self, session_id: str) -> list[Event]:
-        # 提交序（= position 序）。旧版按 id 排序只在「乱序 append」时分叉——新版
-        # append/append_batch 全在锁内按提交顺序入列，position 序即列表序。
-        return [se.event for se in self._stored.get(session_id, [])]
-
     async def read_range(
         self,
         session_id: str,

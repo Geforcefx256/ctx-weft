@@ -41,6 +41,7 @@ from tests.integration.test_minimal_loop import (
     make_echo_template,
     make_runtime,
 )
+from tests._event_helpers import all_events
 
 pytestmark = pytest.mark.asyncio
 
@@ -112,7 +113,7 @@ async def test_task_human_resolved_emitted_via_task_manager() -> None:
     task = await _poll(_final_task)
     assert task.status == "FINISHED"
 
-    events = await runtime.event_store.read_by_session(sid)
+    events = await all_events(runtime.event_store, sid)
     resolved = _human_resolved_events(events, req.task_id)
     assert len(resolved) == 1, (
         f"expected exactly one TaskHumanResolved for {req.task_id}, got {resolved!r}"
@@ -158,7 +159,7 @@ async def test_task_human_resolved_emitted_via_task_manager() -> None:
     task = await _poll(_final_task)
     assert task.status == "FINISHED"
 
-    events = await runtime.event_store.read_by_session(sid)
+    events = await all_events(runtime.event_store, sid)
     resolved = _human_resolved_events(events, req.task_id)
     assert len(resolved) == 1, (
         f"expected exactly one TaskHumanResolved for {req.task_id}, got {resolved!r}"
@@ -169,7 +170,7 @@ async def test_task_human_resolved_emitted_via_task_manager() -> None:
     second_view = await runtime.reply_to_hitl(reply)
     assert second_view is None
     await asyncio.sleep(0.05)
-    events_after = await runtime.event_store.read_by_session(sid)
+    events_after = await all_events(runtime.event_store, sid)
     resolved_after = _human_resolved_events(events_after, req.task_id)
     assert len(resolved_after) == 1, (
         f"duplicate reply produced a second TaskHumanResolved: {resolved_after!r}"

@@ -197,21 +197,6 @@ class SqlEventStore(EventStore):
 
     # ── 读 ────────────────────────────────────────────────────────────────────
 
-    async def read_by_session(self, session_id: str) -> list[Event]:
-        """提交序（= position 序）；存量 NULL 行排前、按 id 序（迁移前后的确定性口径）。"""
-        async with self._factory() as db:
-            result = await db.execute(
-                select(EventModel)
-                .where(EventModel.session_id == session_id)
-                .order_by(
-                    # (position IS NULL) → 0 排前；SQLite/PG 同义表达式
-                    text("CASE WHEN events.position IS NULL THEN 0 ELSE 1 END"),
-                    EventModel.position,
-                    EventModel.id,
-                )
-            )
-            return [_row_to_event(r) for r in result.scalars().all()]
-
     async def read_range(
         self,
         session_id: str,
@@ -344,7 +329,7 @@ class SqlEventStore(EventStore):
                 select(EventModel)
                 .where(EventModel.type.in_(LIFECYCLE_EVENT_TYPES))
                 .order_by(
-                    # 与 read_by_session / read_session_events_of_types 同一口径：
+                    # 与 read_session_events_of_types 同一口径：
                     # 存量 NULL position 行排前，再按 position，最后 id 兜底确定性。
                     text("CASE WHEN events.position IS NULL THEN 0 ELSE 1 END"),
                     EventModel.position,

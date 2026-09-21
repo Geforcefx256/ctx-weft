@@ -77,6 +77,7 @@ from tests.integration.test_minimal_loop import (
     make_echo_template,
     make_runtime,
 )
+from tests._event_helpers import all_events
 
 # 两张**不同**的真字节图。全链路上任何一处把 A 和 B 弄混、或把 ref 解成别的 blob，
 # 逐字节断言都会当场炸——这正是不用「非空/不以 blob: 开头」做判据的理由。
@@ -371,7 +372,7 @@ async def _view(memory, state) -> list:
 
 
 async def _l05_events(runtime, state) -> list:
-    events = await runtime.event_store.read_by_session(state.session.id)
+    events = await all_events(runtime.event_store, state.session.id)
     return [e for e in events
             if e.type == EventType.MEMORY_COMPACTED
             and e.payload.get("source") == "demote_images"]

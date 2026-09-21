@@ -35,6 +35,7 @@ from tests.integration.test_hitl_hot_reply_round_window_e2e import (
 from tests.integration.test_minimal_loop import (
     InlineAgentTemplateProvider, make_echo_template, make_runtime,
 )
+from tests._event_helpers import all_events
 
 pytestmark = pytest.mark.asyncio
 
@@ -172,7 +173,7 @@ async def test_reply_to_a_terminal_task_opens_no_window() -> None:
     assert not tm.open_round_task_ids, "没有下一轮来关的窗，就不该开"
     assert rt.hitl_registry.get(q1.id).resolved, "不开窗 → 一步终局，事实当场落盘"
     assert EventType.HITL_RESOLVED in [
-        e.type for e in await rt.event_store.read_by_session(sid)]
+        e.type for e in await all_events(rt.event_store, sid)]
 
 
 async def test_no_resume_delivery_opens_no_window() -> None:

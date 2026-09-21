@@ -96,6 +96,7 @@ from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from tests.integration.test_minimal_loop import (
     InlineAgentTemplateProvider, make_echo_template, make_runtime,
 )
+from tests._event_helpers import all_events
 
 
 class _RouterLLM(MockLLMAdapter):
@@ -352,7 +353,7 @@ async def test_sql_event_store_round_trips_origin(tmp_path):
     async with open_sqlite_event_store(tmp_path / "events.db") as store:
         ev = _ev(id="evt_a", type="TaskStarted", origin=EventOrigin.LOOP_ACT)
         await store.append(ev)
-        loaded = await store.read_by_session("s1")
+        loaded = await all_events(store, "s1")
         assert len(loaded) == 1
         assert loaded[0].origin == "loop.act"
 
@@ -363,6 +364,6 @@ async def test_sql_event_store_round_trips_blank_origin(tmp_path):
     async with open_sqlite_event_store(tmp_path / "events.db") as store:
         ev = _ev(id="evt_b", type="TaskStarted")  # origin 默认 ""
         await store.append(ev)
-        loaded = await store.read_by_session("s1")
+        loaded = await all_events(store, "s1")
         assert len(loaded) == 1
         assert loaded[0].origin == ""

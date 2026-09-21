@@ -34,6 +34,7 @@ from tests.integration.test_minimal_loop import (
     make_echo_template,
     make_runtime,
 )
+from tests._event_helpers import all_events
 
 pytestmark = pytest.mark.asyncio
 
@@ -77,7 +78,7 @@ def _runtime(llm):
 
 
 async def _stored_types(rt, session_id: str) -> list[str]:
-    return [e.type for e in await rt.event_store.read_by_session(session_id)]
+    return [e.type for e in await all_events(rt.event_store, session_id)]
 
 
 async def _user_texts(rt, session_id: str, agent_id: str, task_id: str) -> list[str]:
@@ -148,7 +149,7 @@ async def test_pause_before_first_chunk_puts_the_answered_bubble_back() -> None:
     assert types_after == types_before + [EventType.HITL_REPLY_RETRACTED], (
         f"这一轮只该留下那一条不含正文的撤回事实；实得 {types_after[len(types_before):]}"
     )
-    retraction = (await rt.event_store.read_by_session(sid))[-1]
+    retraction = (await all_events(rt.event_store, sid))[-1]
     assert retraction.payload == {"hitl_id": bubble.id}, (
         f"撤回事件不得带正文——被撤回的话留在日志里就白撤了：{retraction.payload}"
     )

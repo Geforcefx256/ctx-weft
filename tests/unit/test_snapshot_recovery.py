@@ -17,6 +17,7 @@ from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.providers.events import InMemoryEventStore
 from ctx_weft.providers.events import EventPersister
 from tests._snapshot_helpers import latest_snapshot, seed_snapshot
+from tests._event_helpers import all_events
 
 
 def _ts() -> datetime:
@@ -121,7 +122,7 @@ async def test_inmemory_store_drops_transient_token_events() -> None:
     await persister.on_event(_ev(3, EventType.LLM_REASONING_STREAMED, delta="..."))
     await persister.on_event(_ev(4, EventType.LLM_RESPONSE_FINISHED, content="hello"))
 
-    types = [e.type for e in await store.read_by_session("s1")]
+    types = [e.type for e in await all_events(store, "s1")]
     assert types == [EventType.SESSION_CREATED, EventType.LLM_RESPONSE_FINISHED]
     # 非瞬态事件仍正常入库并参与 active 追踪
     assert "s1" in await store.list_active_session_ids()
@@ -137,13 +138,13 @@ async def test_detach_stops_receiving_events() -> None:
     persister = EventPersister(store, bus)
 
     await bus.emit(_ev(1, EventType.SESSION_CREATED, template_id="t", root_agent_id="a"))
-    assert len(await store.read_by_session("s1")) == 1
+    assert len(await all_events(store, "s1")) == 1
 
     await persister.detach()
     await bus.emit(_ev(2, EventType.RUN_FINISHED, final_status="FINISHED"))
 
     # detach 之后的事件不应再落入本 store
-    assert len(await store.read_by_session("s1")) == 1
+    assert len(await all_events(store, "s1")) == 1
     # 幂等：重复 detach 不报错
     await persister.detach()
 

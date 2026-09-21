@@ -41,6 +41,7 @@ from tests.integration.test_minimal_loop import (
     make_echo_template,
     make_runtime,
 )
+from tests._event_helpers import all_events
 
 _MULTIMODAL_PROMPT = [
     TextPart(text="describe this image"),
@@ -208,7 +209,7 @@ async def _run_and_collect_context_assembled_tokens(user_prompt) -> int:
     state = await handle.wait_for_finish(timeout=5.0)
     assert state.task.status == "FINISHED"
 
-    events = await runtime.event_store.read_by_session(state.session.id)
+    events = await all_events(runtime.event_store, state.session.id)
     counts = [e.payload["token_count"] for e in events if e.type == EventType.CONTEXT_ASSEMBLED]
     assert counts, "expected at least one CONTEXT_ASSEMBLED event"
     return counts[0]
@@ -747,7 +748,7 @@ async def test_event_refs_and_memory_refs_are_independent(runtime_with_two_blob_
     assert state is not None
 
     ctxp = ProviderContext(session_id=state.session.id)
-    events = await runtime.event_store.read_by_session(state.session.id)
+    events = await all_events(runtime.event_store, state.session.id)
     b64 = _MULTIMODAL_PROMPT[1].data
 
     for event_type, extract in (

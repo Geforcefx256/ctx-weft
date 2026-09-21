@@ -13,6 +13,7 @@ from tests.integration.test_minimal_loop import (
     make_echo_template,
     make_runtime,
 )
+from tests._event_helpers import all_events
 
 pytestmark = pytest.mark.asyncio
 
@@ -218,7 +219,7 @@ async def test_inject_requeue_does_not_emit_task_human_resolved():
     # 本用例盯的是「发的是哪一条」，不是「什么时候发」。
     await _reach_commit_point(rt)
 
-    events = await rt.event_store.read_by_session("s1")
+    events = await all_events(rt.event_store, "s1")
     types = [e.type for e in events]
     assert EventType.TASK_HUMAN_RESOLVED not in types, (
         f"must not emit TaskHumanResolved for a non-HITL wakeup, got {types}"

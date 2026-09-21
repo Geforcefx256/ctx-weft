@@ -39,6 +39,7 @@ from tests.integration.test_hitl_hot_reply_round_window_e2e import (
 from tests.integration.test_minimal_loop import (
     InlineAgentTemplateProvider, make_echo_template, make_runtime,
 )
+from tests._event_helpers import all_events
 
 pytestmark = pytest.mark.asyncio
 
@@ -225,7 +226,7 @@ async def test_injected_message_is_recorded_in_the_event_log() -> None:
     await rt.send_message(wait[0].agent_id, MESSAGE, session_id=sid)
     await asyncio.wait_for(llm.stalled.wait(), timeout=5.0)
     await asyncio.sleep(0.2)
-    appended = [e for e in await rt.event_store.read_by_session(sid)
+    appended = [e for e in await all_events(rt.event_store, sid)
                 if e.type == EventType.TASK_MESSAGE_APPENDED]
     assert len(appended) == 1 and appended[0].payload["content"] == MESSAGE
 

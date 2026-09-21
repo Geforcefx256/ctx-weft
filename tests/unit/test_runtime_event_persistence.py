@@ -89,7 +89,7 @@ async def test_runtime_persists_events_into_the_injected_sql_store(tmp_path) -> 
         await runtime.event_bus.emit(_ev(1, "SessionCreated"))
         await runtime.event_bus.emit(_ev(2, "RunStarted"))
 
-        got = await store.read_by_session("s1")
+        got = await all_events(store, "s1")
         assert [e.type for e in got] == ["SessionCreated", "RunStarted"]
 
 
@@ -113,7 +113,7 @@ async def test_no_double_write_via_attach_persistence_single_entry_point(
         with caplog.at_level(logging.ERROR):
             await runtime.event_bus.emit(_ev(1, "SessionCreated"))
 
-        got = await store.read_by_session("s1")
+        got = await all_events(store, "s1")
         assert len(got) == 1, f"同一条事件不应该被存两份，实际：{got}"
         assert "IntegrityError" not in caplog.text
 
@@ -123,6 +123,7 @@ async def test_no_double_write_via_attach_persistence_single_entry_point(
 
 from ctx_weft.core.models.config import RuntimeConfig
 from tests._snapshot_helpers import latest_snapshot
+from tests._event_helpers import all_events
 
 
 async def test_snapshot_every_n_zero_means_no_snapshot_writer(tmp_path) -> None:
@@ -162,13 +163,13 @@ async def test_detach_stops_persistence(tmp_path) -> None:
             config=RuntimeConfig(event_commit_policy="best_effort"))
 
         await runtime.event_bus.emit(_ev(1, "SessionCreated"))
-        assert len(await store.read_by_session("s1")) == 1
+        assert len(await all_events(store, "s1")) == 1
 
         await runtime.persistence.detach()
 
         await runtime.event_bus.emit(_ev(2, "RunStarted"))
         # detach 之后新事件不应该再落库——store 里仍然只有 detach 之前那一条。
-        assert len(await store.read_by_session("s1")) == 1
+        assert len(await all_events(store, "s1")) == 1
 
 
 async def test_required_mode_persists_via_gate_not_persister(tmp_path) -> None:
@@ -179,8 +180,8 @@ async def test_required_mode_persists_via_gate_not_persister(tmp_path) -> None:
         assert runtime.persistence.persister is None
 
         await runtime.event_bus.emit(_ev(1, "SessionCreated"))
-        assert len(await store.read_by_session("s1")) == 1   # gate 已确认提交
+        assert len(await all_events(store, "s1")) == 1   # gate 已确认提交
 
         await runtime.persistence.detach()                    # 空壳 detach：无订阅可停
         await runtime.event_bus.emit(_ev(2, "RunStarted"))
-        assert len(await store.read_by_session("s1")) == 2    # 提交不因 detach 停
+        assert len(await all_events(store, "s1")) == 2    # 提交不因 detach 停

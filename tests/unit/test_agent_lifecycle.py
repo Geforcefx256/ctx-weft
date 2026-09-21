@@ -509,9 +509,6 @@ class _MemStore(EventStore):
     async def append(self, event):  # pragma: no cover - 只读 fake
         raise NotImplementedError
 
-    async def read_by_session(self, session_id, **_kw):
-        return list(self._events)
-
     async def committed_head(self, session_id):
         return len(self._events)
 

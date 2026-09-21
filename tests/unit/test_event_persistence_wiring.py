@@ -18,6 +18,7 @@ from ctx_weft.providers.events import (
     InProcessEventBus,
     )
 from tests._snapshot_helpers import latest_snapshot
+from tests._event_helpers import all_events
 
 
 def _ev(type_: str, seq: int = 1, session: str = "s1") -> Event:
@@ -42,7 +43,7 @@ async def test_store_append_no_longer_filters_transient():
     transient = next(iter(TRANSIENT_EVENT_TYPES))
     store = InMemoryEventStore()
     await store.append(_ev(transient))
-    assert len(await store.read_by_session("s1")) == 1
+    assert len(await all_events(store, "s1")) == 1
 
 
 async def test_persister_drops_transient():
@@ -51,7 +52,7 @@ async def test_persister_drops_transient():
     p = EventPersister(store)
     await p.on_event(_ev(transient, 1))
     await p.on_event(_ev("SessionCreated", 2))
-    stored = await store.read_by_session("s1")
+    stored = await all_events(store, "s1")
     assert [e.type for e in stored] == ["SessionCreated"]
 
 
@@ -60,7 +61,7 @@ async def test_persister_subscribes_when_given_a_bus():
     store = InMemoryEventStore()
     EventPersister(store, bus)
     await bus.emit(_ev("SessionCreated"))
-    assert len(await store.read_by_session("s1")) == 1
+    assert len(await all_events(store, "s1")) == 1
 
 
 async def test_persister_swallows_store_errors():
@@ -79,7 +80,7 @@ async def test_detach_stops_receiving():
     p = EventPersister(store, bus)
     await p.detach()
     await bus.emit(_ev("SessionCreated"))
-    assert await store.read_by_session("s1") == []
+    assert await all_events(store, "s1") == []
 
 
 async def test_attach_persistence_wires_persister():
@@ -87,10 +88,10 @@ async def test_attach_persistence_wires_persister():
     store = InMemoryEventStore()
     handle = attach_snapshotting(bus, store)
     await bus.emit(_ev("SessionCreated"))
-    assert len(await store.read_by_session("s1")) == 1
+    assert len(await all_events(store, "s1")) == 1
     await handle.detach()
     await bus.emit(_ev("SessionFinished", 2))
-    assert len(await store.read_by_session("s1")) == 1
+    assert len(await all_events(store, "s1")) == 1
 
 
 # ── SnapshotWriter ──────────────────────────────────────────────────────────

@@ -40,6 +40,7 @@ from ctx_weft.protocols.hitl import (
     HitlReply,
     NoResumeDelivery,
 )
+from tests._event_helpers import all_events
 
 _PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"x" * 100
 _PNG = base64.b64encode(_PNG_BYTES).decode()
@@ -476,13 +477,15 @@ async def test_plain_text_reply_never_touches_the_event_store():
     store = _CountingStore()
     rt = _make_runtime(_VisionClient(), store)
     reads: list[str] = []
-    _orig = rt.event_store.read_by_session
+    _orig = rt.event_store.read_range
 
-    async def _counting(session_id):
+    # 盯 `read_range`：`read_by_session` 2026-09-21 从协议删了，而这条守的是「应答内容管线
+    # 不该为任何理由回头读事件流」——任何读都算，不只是整条会话的那种。
+    async def _counting(session_id, **k):
         reads.append(session_id)
-        return await _orig(session_id)
+        return await _orig(session_id, **k)
 
-    rt.event_store.read_by_session = _counting  # type: ignore[method-assign]
+    rt.event_store.read_range = _counting       # type: ignore[method-assign]
     hid = await _pending(rt)
 
     await _reply(rt, hid, "纯文本")
@@ -560,7 +563,7 @@ async def test_hitl_event_payload_carries_an_event_ref_not_the_memory_ref():
     await _reply(rt, hid,
                  [TextPart(text="看这张"), ImagePart(data=_PNG, media_type="image/png")])
 
-    events = await rt.event_store.read_by_session("ses-two-stores")
+    events = await all_events(rt.event_store, "ses-two-stores")
     answered = next(e for e in events if e.type == "HitlResolved")
     parts = answered.payload["message"]
     assert isinstance(parts, list), f"message 不得被拍扁，实为 {type(parts).__name__}"
@@ -608,16 +611,16 @@ def _count_event_reads(rt) -> list[str]:
     应答内容管线**不该**为任何理由回头读事件流（tenant 随请求带着走，2026-09-19 起 core
     里连解析入口都没有了）。每条路都装上，免得将来有人换一条路读、断言还以为是绿的。
 
-    ⚠️ 这个函数从前装的是 `rt._read_session_events_of_types` 与 `read_by_session`。前者
-    2026-09-20 删了（src 里零调用者，而它正是「按类型读整条会话」那个要清的形状），于是那
-    一条计数器守的是一个不存在的方法——**负向断言在这种情况下不会红，只会变得空洞**。现在
-    改成装 store 的三个读原语，覆盖面反而更全。
+    ⚠️ 这个函数从前装的是 `rt._read_session_events_of_types` 与 `read_by_session`，两个都
+    在 2026-09-20/21 删掉了（src 零调用者，而它们正是要清的那个形状）。于是那两条计数器守
+    的是不存在的方法——**负向断言在这种情况下不会红，只会变得空洞**。现在装 store 现存的两
+    个读原语。
     """
     hits: list[str] = []
     store = rt.event_store
     originals = {
         name: getattr(store, name)
-        for name in ("read_by_session", "read_range", "read_session_events_of_types")
+        for name in ("read_range", "read_session_events_of_types")
     }
 
     def _wrap(name, fn):

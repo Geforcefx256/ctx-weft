@@ -163,8 +163,22 @@ async def test_send_message_self_heals_after_an_explicit_forget_session():
     assert sid in rt._task_managers, "TM 那一半由 _start_task_for_agent 的探测接住"
 
 
-async def test_send_message_without_session_id_still_self_heals():
-    """没有 session 语境的调用方回落 `rebuild_agent` 的全量 sweep——慢，但不该失败。"""
+async def test_send_message_without_session_id_refuses_instead_of_sweeping():
+    """逐出之后不传 `session_id` 再发 → `AgentNotLoaded`，**不扫全库找**（2026-09-21）。
+
+    从前这条路回落 `rebuild_agent` 的全量 sweep（扫遍 active session 直到撞见那个
+    agent），本用例当时钉的是「慢，但不该失败」。那条 sweep 已删：它拿 O(会话数) 换一个
+    调用方本来就知道的值，而 `list_active_session_ids` 的 discard 依据从不 emit、判据恒真
+    ——「active 集」实际是历史上跑过的全部会话。
+
+    装填因此是调用方的责任（`rebuild_session` 的 docstring：「这是唯一的按需装填入口
+    ……用到哪条装哪条」）。本用例钉三件事：① 不传 session_id 的 miss 直接抛；
+    ② 类型仍在 `AgentNotFound` 之下，宿主既有的 except 不会漏接；③ 传了 session_id 的
+    同一场景照常自愈（上面那条 `..._self_heals_the_registry` 覆盖），即被推翻的是
+    「core 替你找」，不是逐出后还能不能接着聊。
+    """
+    from ctx_weft.core.models.errors import AgentNotFound, AgentNotLoaded
+
     rt = _make_runtime()
     handle = await rt.start_session(SessionStartParams.create(
         template_id="agent:tpl_echo", user_prompt="first question", context_limit=100_000,
@@ -180,7 +194,13 @@ async def test_send_message_without_session_id_still_self_heals():
     await asyncio.sleep(0.3)
     rt.forget_session(sid)
 
-    second = await rt.send_message(aid, "second question")   # 不传 session_id
+    with pytest.raises(AgentNotLoaded) as exc:
+        await rt.send_message(aid, "second question")        # 不传 session_id
+    assert isinstance(exc.value, AgentNotFound)
+    assert "session_id" in str(exc.value), "报错要告诉调用方缺的是什么"
+
+    # 补齐 session_id 就照常跑通——路径本身没被拿掉，只是不再替调用方猜。
+    second = await rt.send_message(aid, "second question", session_id=sid)
     assert second.task_id and second.task_id != first_task
 
 
