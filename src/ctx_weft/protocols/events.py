@@ -524,7 +524,7 @@ class EventStore(Protocol):
     1. **必须实现**（`@abstractmethod`）：`append` / `read_by_session` /
        `append_batch` / `read_range` / `committed_head`。
        **有序提交是底线，不是可选项**——理由见下节。
-    2. **可选扩展**（默认 `raise NotImplementedError`，core 捕获后降级为全量 replay）：
+    2. **可选扩展**（默认 `raise NotImplementedError`）：
        `list_active_session_ids` / `read_session_events_of_types` /
 
     读取一律按 position：**不存在**「按事件 ID 取增量」的 API。ID 铸造序 ≠ 提交序，
@@ -694,6 +694,7 @@ class EventStore(Protocol):
         """
         ...
 
+    @abstractmethod
     async def read_session_events_of_types(
         self, session_id: str, types: "tuple[str, ...]", *, task_id: str = "",
     ) -> list[Event]:
@@ -715,9 +716,13 @@ class EventStore(Protocol):
         session 按它排会交错两个 run 的事件）。
 
         轻查询——供恢复决策按事件折叠（如 HITL 待解决判定）而**不必全量回放**。
-        未实现时抛 NotImplementedError；调用方降级为 read_by_session + 内存过滤。
+
+        **必需**，不是可选扩展。从前它「未实现时抛 NotImplementedError，调用方降级为
+        read_by_session + 内存过滤」——那条降级是 core 里最后一处能力探测，而它通往的正是
+        「把整条流读进内存」（实测 3 万事件 ≈ 130MB / 3.5s）。同一个坏设计在这个仓已经生出过
+        三次两分支两失败形态（`replay`、`read_by_session_after`、快照），所以这里不留第四次。
         """
-        raise NotImplementedError
+        ...
 
     # ── 快照 ────────────────────────────────────────────────────────────────
     # **协议不提及快照。** 一张状态快照就是日志里的一条 `EventType.STATE_SNAPSHOT` 事件，

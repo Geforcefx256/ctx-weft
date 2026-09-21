@@ -230,10 +230,13 @@ def test_single_event_protocol_no_parallel_ordered_protocol():
 def test_ordered_commit_methods_are_mandatory():
     """三个方法是 @abstractmethod，与 append / read_by_session 同档——不是可选扩展。"""
     assert EventStore.__abstractmethods__ >= {
-        "append", "read_by_session", "append_batch", "read_range", "committed_head"}
+        "append", "read_by_session", "append_batch", "read_range", "committed_head",
+        # 这两个后来也升为必需：恢复路径无条件靠它们（取快照 / 按类型收窄折叠），做成可选就
+        # 又要在 core 里探一次能力——那个坏设计在这个仓生出过三次「两分支 + 两失败形态」。
+        "read_last_of_type", "read_session_events_of_types"}
     # 可选扩展仍是可选：不在 abstractmethods 里
     for name in ("save_snapshot", "load_latest_snapshot",
-                 "list_active_session_ids", "read_session_events_of_types"):
+                 "list_active_session_ids",):
         assert name not in EventStore.__abstractmethods__
 
 
@@ -294,6 +297,7 @@ def test_supports_replay_asks_only_whether_it_exists():
         async def read_range(self, session_id, **kw): return []
         async def committed_head(self, session_id): return 0
         async def read_last_of_type(self, session_id, type_): return None
+        async def read_session_events_of_types(self, sid, types, *, task_id=""): return []
 
     assert supports_replay(Inheriting()), "继承来的默认实现算有"
 

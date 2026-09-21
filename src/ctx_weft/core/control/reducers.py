@@ -1415,22 +1415,17 @@ async def load_events_of_types(
 ) -> list[Event]:
     """按类型取该会话的事件——**本文件这些折叠的统一数据入口**。
 
-    `read_session_events_of_types` 是 `EventStore` 的可选扩展；未实现时退化为全量读 +
-    内存过滤。这段降级本来在 runtime 里是个只有一个调用方的私有方法，capability 折叠
-    落地后成了第二个需要它的人——与其各写各的，不如和折叠住在一起：需要它的理由完全
-    一样（「恢复决策按事件折叠，不必全量回放」）。
+    `read_session_events_of_types` 是 `EventStore` 的**必需**方法，所以这里不再有「未实现就
+    退化为全量读 + 内存过滤」那条降级——那是 core 里最后一处能力探测，而它通往的正是「把整条
+    流读进内存」。本函数因此只剩透传，留着是因为它是本文件这些折叠的统一数据入口（`task_id`
+    的收窄口径写在这里一处，不让每个调用方各记一遍）。
 
     `task_id` 非空时再按 task 收窄。capability 折叠**必须**传它：那个折叠的量随会话的工具调用
     总数增长（实测 4000 次调用的会话取回 8000 条 / 779ms / 24.4MB），而它真正要回答的只是「正在
     reconcile 的那个 task 里那几个 dangling tool_call 跑过没有」。按 task 收窄是**精确**的界，
     不是猜——dangling 调用必定属于那个 task，而 capability 事件确实带着它。
     """
-    try:
-        return await store.read_session_events_of_types(session_id, types, task_id=task_id)
-    except NotImplementedError:
-        return [e for e in await store.read_by_session(session_id)
-                if e.type in types
-                and (not task_id or not e.task_id or e.task_id == task_id)]
+    return await store.read_session_events_of_types(session_id, types, task_id=task_id)
 
 
 #: 折叠所需的事件类型。供事件库按类型过滤读取，无需全量回放。

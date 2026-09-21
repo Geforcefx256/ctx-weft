@@ -141,18 +141,24 @@ def test_package_root_store_comes_from_providers() -> None:
     assert ctx_weft.InMemoryEventStore is InMemoryEventStore
 
 
-def test_dead_simplified_store_is_gone() -> None:
-    """`core/control/replay.py` 的同名简化版是死代码（零使用者），已删。
+def test_the_replay_module_is_gone() -> None:
+    """`core/control/replay.py` 整个删除（2026-09-20）。
 
-    留着的危害是「同名不同实现、都对外可见」：
-    `from ctx_weft.core.control import InMemoryEventStore` 会拿到一个缺快照方法的对象。
+    从前这条钉的是「那个文件里的简化版 InMemoryEventStore 已删」。现在整个模块没了：里面的
+    `ReplayEngine` 全仓零调用，而它是 src 里**最后一处** `read_by_session` 全量读。留着是地雷
+    ——「重建到某个历史事件点」读起来是个合理需求，下一个人照它写就会把整条流读进内存
+    （实测 3 万事件 ≈ 130MB / 3.5s）。真需要的话按 position 区间做，`read_range` 现成。
     """
-    import ctx_weft.core.control as cc
-    import ctx_weft.core.control.replay as replay
+    import importlib
 
-    assert not hasattr(replay, "InMemoryEventStore")
-    assert not hasattr(cc, "InMemoryEventStore")
-    assert "InMemoryEventStore" not in getattr(cc, "__all__", [])
+    import pytest
+
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("ctx_weft.core.control.replay")
+
+    import ctx_weft.core.control as ctl
+
+    assert not hasattr(ctl, "ReplayEngine"), "还从 control 包里导出着"
 
 
 async def test_runtime_still_gets_a_working_default_store() -> None:

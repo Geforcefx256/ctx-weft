@@ -195,7 +195,10 @@ async def test_steady_state_writes_are_incremental(env):
 
 async def test_incremental_blob_equals_full_fold(env):
     """增量写出来的 blob 必须逐字段等于「从日志全量折」——这是两路等价的前提。"""
-    from ctx_weft.core.control.reducers import deserialize_view
+    from ctx_weft.core.control.reducers import (
+        REPLAY_EXCLUDE_TYPES,
+        deserialize_view,
+    )
 
     store = env
     bus = _make_bus(store)
@@ -207,8 +210,11 @@ async def test_incremental_blob_equals_full_fold(env):
     assert snap.chain_depth > 0, "本例要覆盖的是增量路径"
     incremental = deserialize_view(snap.state_blob)
     full = reduce_events(
+        # 这里必须和恢复路径排除同一批类型：快照自己也是日志里的一条事件，读进来会被
+        # 当成普通事件计进 events_total（实测差 4 条 = 本例写出的 4 张快照）。
         [se.event for se in await store.read_range(
-            "s1", after_position=0, through_position=snap.last_commit_position)],
+            "s1", after_position=0, through_position=snap.last_commit_position,
+            exclude_types=REPLAY_EXCLUDE_TYPES)],
         run_id="s1")
 
     assert sorted(incremental.tasks) == sorted(full.tasks)

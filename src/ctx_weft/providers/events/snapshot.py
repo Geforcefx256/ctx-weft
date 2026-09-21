@@ -198,6 +198,7 @@ class SnapshotWriter:
         from ctx_weft.core.control.reducers import (
             apply_events,
             deserialize_view,
+            REPLAY_EXCLUDE_TYPES,
             prune_view_for_snapshot,
             reduce_events,
             serialize_view,
@@ -219,9 +220,13 @@ class SnapshotWriter:
             # 基底是裁过的，所以这里成立的是**裁剪后**的那条等式
             #   prune(fold(0..C)) = prune(apply((p, C], prune(fold(0..p))))
             # ——它靠 prune 与 apply 在闭包上可交换（见模块 docstring 的 ⚠️ 段）。
+            # **排除快照事件本身**（`REPLAY_EXCLUDE_TYPES`）——与恢复侧同一口径。不排除的话
+            # 这条增量会把区间里的历史快照也折进来，而恢复侧排除了：两条路给出不同的世界，
+            # 最直接的表现是 blob 里 `events_total` 多算了几张快照。两路等价是这整套设计的
+            # 承重不变式，所以这里必须和 `rebuild_view` 用同一个集合，不能各写一遍。
             delta = await self._store.read_range(
                 session_id, after_position=base.last_commit_position,
-                through_position=head)
+                through_position=head, exclude_types=REPLAY_EXCLUDE_TYPES)
             view = apply_events(
                 [se.event for se in delta], deserialize_view(base.state_blob))
             folded, depth, anchored = len(delta), base.chain_depth + 1, False
@@ -230,7 +235,8 @@ class SnapshotWriter:
             # 无可用基底（首张 / 存量快照 / 版本不匹配 / 位置超前 / 链深到顶 /
             # 本进程首次），从日志重新推导一张——这是纠正历史快照偏差的地方。
             stored = await self._store.read_range(
-                session_id, after_position=0, through_position=head)
+                session_id, after_position=0, through_position=head,
+                exclude_types=REPLAY_EXCLUDE_TYPES)
             view = reduce_events([se.event for se in stored], run_id=session_id)
             folded, depth, anchored = len(stored), 0, True
 

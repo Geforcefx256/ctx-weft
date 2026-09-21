@@ -296,3 +296,62 @@ def test_the_builtin_stores_have_no_snapshot_api_either() -> None:
     for cls in (InMemoryEventStore, SqlEventStore):
         for gone in ("save_snapshot", "load_latest_snapshot", "_prune_snapshots"):
             assert not hasattr(cls, gone), f"{cls.__name__}.{gone} 还在"
+
+
+async def test_writer_and_recovery_exclude_the_same_types() -> None:
+    """**写入侧与恢复侧必须用同一个排除集。**
+
+    这是两路等价那条承重不变式的一部分。实测过的分歧：日志里有 2 条真事件 + 2 条历史快照时，
+    writer 的重锚折出 `events_total=4`，而恢复侧的全量重放折出 2——两条路给出不同的世界。
+
+    各写一遍字面量正是这种分歧的来源，所以两边都引 `REPLAY_EXCLUDE_TYPES` 这一个集合。
+    """
+    from ctx_weft.core.control.reducers import (
+        REPLAY_EXCLUDE_TYPES,
+        RunStateView,
+        apply_events,
+    )
+    from ctx_weft.core.utils.event import new_event
+    from ctx_weft.protocols.events import EventOrigin
+    from ctx_weft.providers.events import SnapshotWriter
+
+    store = InMemoryEventStore()
+    base = [
+        _ev(1, EventType.SESSION_CREATED, user_prompt="go",
+            template_id="agent:tpl", root_agent_id="ag1"),
+        _ev(2, EventType.RUN_FINISHED, outcome="completed"),
+    ]
+    await store.append_batch(_SID, "b1", base)
+    view = reduce_events(base, run_id=_SID)
+    for k in (1, 2):                                   # 两条历史快照
+        await store.append_batch(_SID, f"snap{k}", [new_event(
+            EventType.STATE_SNAPSHOT, session_id=_SID, tenant_id="acme",
+            origin=EventOrigin.RUNTIME,
+            payload=snapshot_event_payload(view, cut=2, chain_depth=0, reason="t"))])
+
+    head = await store.committed_head(_SID)
+    assert head == 4, "2 条真事件 + 2 条快照"
+
+    # 写入侧的重锚读
+    writer_stored = await store.read_range(
+        _SID, after_position=0, through_position=head,
+        exclude_types=REPLAY_EXCLUDE_TYPES)
+    writer_view = reduce_events([se.event for se in writer_stored], run_id=_SID)
+
+    # 恢复侧的全量重放
+    rec = RunStateView(run_id=_SID, session_id="", task_id="", agent_id="")
+    async for batch in store.replay(_SID, exclude_types=REPLAY_EXCLUDE_TYPES):
+        apply_events(batch, rec)
+
+    assert writer_view.events_total == rec.events_total == 2
+
+    # 源码层面钉住两边引的是同一个集合，不是各写一遍字面量
+    import inspect
+
+    src = inspect.getsource(SnapshotWriter._write)
+    assert src.count("exclude_types=REPLAY_EXCLUDE_TYPES") == 2, (
+        "writer 的两条读（增量 / 重锚）都必须排除，且引那个共享集合"
+    )
+    assert src.count("read_range(") == 2, "读路径数变了，这条守卫要跟着更新"
+    # 不钉「源码里不出现 STATE_SNAPSHOT」——writer 发那条事件时必须指名它。要钉的是**读**用
+    # 的是共享集合而不是各写一遍字面量，上面那条计数就够了。
