@@ -4221,16 +4221,39 @@ class CtxWeftRuntime:
         幂等：按记录 id 判重（视图里已有即跳过）；已被压缩 supersede 的记录不在视图里，但
         memory 的 id 契约是「已存在的 id（含 superseded）= no-op」，再写一次也不会复活它。
         best-effort：单条失败只记日志，不拖垮整场恢复。
+
+        **只读快照切面之后的那一段**（`settled_memory_floor`），不读全会话。理由是那条
+        「快照不得领先于 memory」的不变式反过来用：存在一张切面为 P 的可用快照 ⟹ position
+        ≤ P 的事件其 memory 效果已落盘，所以 P 之前的每一条 `TaskMessageAppended` 必然撞上
+        下面那个「视图里已有」而跳过——纯浪费，且随会话长度线性增长（实测 600 条 43ms /
+        1.6MB，一条真实长会话上是几万条）。收窄之后上界是「一个快照间隔」（宿主配
+        `snapshot_every_n=50`）。
+
+        不变式在**每条**发 `TaskMessageAppended` 的路径上都成立，核对过三处：
+        `_inject_user_turn` 的两个分支都**先 ingest 再 emit**（直写分支根本没有窗口；开窗
+        分支整段时间窗都开着），而 `TaskManager.commit_round` 在**钩子之后**才 `pop` 掉那扇
+        窗，所以暂存落盘期间 `any_round_open()` 恒为真、快照写不下去。
+
+        取不到可用快照 → floor=0 → 退回全量，与从前行为一致。那只发生在首张快照之前或
+        `projection_version` 刚 bump 之后。
         """
-        from ctx_weft.core.control.reducers import load_events_of_types
+        from ctx_weft.core.control.reducers import (
+            REPLAY_EXCLUDE_TYPES,
+            settled_memory_floor,
+        )
         from ctx_weft.core.utils.content import (
             content_from_jsonable, downgrade_images_to_text, hydrate_event_content,
             normalize_content,
         )
         from ctx_weft.protocols import MemoryEvent
 
-        events = await load_events_of_types(
-            self.event_store, session.id, (EventType.TASK_MESSAGE_APPENDED,))
+        floor = await settled_memory_floor(self.event_store, session.id)
+        events = [
+            se.event for se in await self.event_store.read_range(
+                session.id, after_position=floor,
+                exclude_types=REPLAY_EXCLUDE_TYPES)
+            if se.event.type == EventType.TASK_MESSAGE_APPENDED
+        ]
         if not events:
             return
         memory = self.providers.get_memory()

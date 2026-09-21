@@ -617,6 +617,40 @@ def snapshot_is_usable(
     return True
 
 
+async def settled_memory_floor(event_store: Any, session_id: str) -> int:
+    """到哪个 position 为止，该会话的 memory 效果**必定**都已落盘。没有可用快照 → 0。
+
+    这是「快照不得领先于 memory」那条不变式的**读侧用法**。写侧由
+    `SnapshotWriter._is_safe_to_write` 把门（`memory_settled` 为假就不写），于是反过来
+    成立：
+
+        存在一张切面为 P 的可用快照 ⟹ position ≤ P 的每一条事件，其 memory 效果已落盘。
+
+    崩溃恢复里那些「日志说这件事来过、memory 里却没有」的补写，因此**只需要看 P 之后的
+    那一段**，不必扫全会话。首个用途是 `Runtime._restore_appended_messages`（注入消息的
+    崩溃窗口兜底）：它从前读整条会话的 `TaskMessageAppended`，而 P 之前的每一条都必然撞
+    上「视图里已有这个 id」而跳过——纯浪费，且那个浪费随会话长度线性增长。
+
+    **为什么不用 `rebuild_view` 内部用的那个切面**：那个切面没有暴露出来，而两边各自算也
+    完全安全——失效方向是对的。两边都套同一个 `snapshot_is_usable`；即便这里取到一张**更
+    新**的快照、算出更高的 P，不变式照样成立（切面越高，"已落盘"的断言越强），只是少读
+    几条。反过来取到更旧的 P 只是多读几条。**没有"两边不一致就漏读"这种失效模式**，所以
+    不值得为此改 `rebuild_view` 的签名。
+
+    取不到可用快照就返回 0 = 「什么都不敢保证」→ 调用方退回全量。那只发生在首张快照之前，
+    或者 `projection_version` 刚 bump 之后。
+
+    只读**一条**事件（`read_last_of_type`，索引直取）。
+    """
+    stored = await event_store.read_last_of_type(
+        session_id, EventType.STATE_SNAPSHOT)
+    snapshot = snapshot_facts_from_event(stored.event if stored else None)
+    head = await event_store.committed_head(session_id)
+    if not snapshot_is_usable(snapshot, head):
+        return 0
+    return int(snapshot.last_commit_position or 0)
+
+
 async def rebuild_view(event_store: Any, session_id: str) -> RunStateView:
     """按快照+增量或全量回放重建 RunStateView（spec: snapshot-recovery，wp4 改造）。
 
