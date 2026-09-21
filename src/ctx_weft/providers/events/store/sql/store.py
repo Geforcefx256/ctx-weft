@@ -423,6 +423,30 @@ async def open_sqlite_event_store(
             await conn.execute(text(
                 "CREATE INDEX IF NOT EXISTS ix_events_session_type_position "
                 "ON events (session_id, type, position)"))
+            # ── 未回填的存量库：**拒绝开**（2026-09-20）─────────────────────────
+            # 加了 position 列不等于回填了它。所有按 position 的读都带
+            # `position IS NOT NULL`（那是「只读已提交」的判据），所以一条 position 为
+            # NULL 的存量行对恢复**完全不可见**——`committed_head` 返回 0、`read_range`
+            # 返回空、`replay` 也是按 position 区间分批的，于是 `rebuild_view` 恢复出一个
+            # **空视图**：没有会话、没有 task、没有 agent，而且不报任何错。之后新事件从
+            # position 1 开始编号（与 NULL 行不撞唯一索引），整段历史就此永久不可见。
+            #
+            # 那是这套设计里最坏的失效方向：静默、彻底、且发生在恢复路径上。所以这里换成
+            # 启动就炸——回填是一个需要过目的操作（脚本默认 dry-run 并出报告），不在这里
+            # 悄悄替调用方做掉。宿主接 Postgres 的正路不经过本函数，它们在
+            # `open_database` 里先跑迁移再恢复（m020 顺带回填），不受影响。
+            #
+            # 代价：开库时一次 `LIMIT 1` 探测。命中即停；没有 NULL 行时是一次全表扫，而
+            # 本函数只给测试与单机部署用，且只在开库时跑一次。
+            pending = (await conn.execute(text(
+                "SELECT count(*) FROM (SELECT 1 FROM events "
+                "WHERE \"position\" IS NULL LIMIT 1)"))).scalar_one()
+            if pending:
+                raise RuntimeError(
+                    f"{db_path}: events 表里还有 position 为 NULL 的存量行，未回填。"
+                    "所有按 position 的读都会跳过它们，恢复会静默地得到一个空视图。"
+                    "先跑 `python scripts/migrate_event_positions.py --db <path> --execute`"
+                    "（默认 dry-run，出报告后再加 --execute）。")
         yield SqlEventStore(factory)
     finally:
         await engine.dispose()
