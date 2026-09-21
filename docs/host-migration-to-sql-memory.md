@@ -18,6 +18,42 @@
 
 ---
 
+## ⚠️ 实施回执（2026-09-21，NetliveCoworkPy 实际切完之后补记）
+
+三处「照手册做会踩到」的，按严重程度排：
+
+1. **「存量行零迁移」只在宿主的租户全是 `default` 时成立。** §2.2 那句话是本文最危险的
+   一句：真有租户的宿主（NetliveCowork 的 `session.tenant_id` 是
+   `"{surrogate_id}:{cowork_id}"`，且 tenant 随请求进 `ProviderContext`）切过去之后，
+   老会话的每个读都是 `COALESCE(tenant,'default') = '<真租户>'`，而存量行归一成
+   `'default'` —— **`load_view` 返回空列表，不报错**，表现是历史对话没了。
+   **必须**按宿主自己的会话表回填一次 `memory_events.tenant` / `memory_subscriptions.tenant`
+   （参考实现：该仓的 `m023_memory_tenant_and_content_format`）。
+   零迁移的只有「租户本来就是 default」那部分。
+2. **`tenant` 列别照抄 `String(64)`。** 本仓模型声明的是 64，而形如
+   `"{surrogate_id}:{cowork_id}"` 的租户 id 轻易超过它：Postgres 直接
+   `value too long for character varying(64)`，SQLite 不认长度、静默存进去——于是本地
+   测试全绿、上生产必炸。建表 DDL 归宿主，按自己的租户 id 长度放宽即可。
+3. **回填 `content_format` 时，判据要比 §2.4 给的那条严一档。** §2.4 写的是照搬读侧
+   启发式（`json.loads` 出 list 即 `'parts'`），但读侧解 parts 走
+   `content_from_jsonable`，它对每个元素调 `.get("type")`——正文恰为 `"[1, 2]"` 的行判成
+   `'parts'` 就是给它安排一次 `AttributeError`，炸在装配路径上。判据改成
+   **「list 且每个元素都是 dict」**：真正的多模态存量行照旧判 `'parts'`，`[1, 2]` 落
+   `'text'`（原样以 JSON 文本呈现）。「读得到、是文本」优于「一读就炸」。
+
+另有两条不是坑：
+
+- 第 4、5 步与第 7 步的坑，对**已经接完 blob** 的宿主是空操作——先核对再动手，别重复实现。
+- 第 4 步「强烈建议分开部署两个实例」那句，是给「不愿维护事件侧活引用枚举」的宿主的逃生
+  门。**有第三处引用边的宿主根本走不进这扇门**，该反过来选共用一个实例：NetliveCowork 的
+  帧日志（携图消息在 SSE 帧里也只留 ref）是它自己造的引用边，core 不知情，所以它的事件侧
+  回收一直喂的就是「事件 payload ∪ 帧日志」——并集的维护成本早就在付了，分开只是让它在
+  付着同样成本的同时，把同一张图在两个 root 各存一份（core 外部化进 memory 侧、宿主写帧
+  日志时又 put 进 event 侧），读路径还得两侧都试。它已按这个方向合并成一个实例、一个目录，
+  回收改喂一个 `all_live_blob_refs()`（三处并集，单一维护点）。
+
+---
+
 ## 0. 这次切换会得到什么 / 失去什么
 
 **得到**：
@@ -101,7 +137,9 @@ ALTER TABLE memory_subscriptions ADD COLUMN tenant         VARCHAR(64) NULL;
 
 - `tenant IS NULL` ≡ `'default'` 租户。读侧一律 `COALESCE(tenant,'default')`，
   与 core 侧的 `normalize_tenant(t) = t or "default"` 是同一条规则的 SQL 写法，
-  **存量行不迁移即落默认分区**。
+  **存量行不迁移即落默认分区**——⚠️ 这句只在你的租户全是 `default` 时成立，
+  否则必须回填，见文首「实施回执」第 1 条（不回填 = 历史记忆静默消失）。
+  列长度也别照抄 `String(64)`，见回执第 2 条。
 - `content_format IS NULL` **唯一地表示「存量行」**（见 2.4）。
 
 ### 2.3 建索引与两张新表
@@ -141,7 +179,7 @@ SQLite 单机部署可以直接用 `open_sqlite_memory(path)`，它会 `create_a
 `"[1, 2]"` 的存量纯文本消息会被误读成 parts**。这是继承自宿主参考实现的既有歧义
 （新行已无此问题——新行一律写非空判别列，`"text"` 或 `"parts"`，三态而非两态）。
 
-彻底治法是迁移时显式回填一次：
+彻底治法是迁移时显式回填一次（⚠️ 判据要比下面这条严一档，见文首「实施回执」第 3 条）：
 
 ```sql
 -- 只有当你确信存量 content 全是纯文本时（Phase 3c 之前的宿主正是如此）：
