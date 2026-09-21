@@ -118,7 +118,7 @@ async def test_completed_reentry_leaves_no_orphan_invoked():
     # 只发生一次，不该为重入白折一遍事件流。
     await gw.invoke("fx__act", {}, state, ctx, tool_call_id=TC, reentry=True)
 
-    evs = await store.read_session_events_of_types("s1", CAP_TYPES)
+    evs = [se.event for se in await store.read_range("s1", include_types=CAP_TYPES)]
     kinds = [e.type for e in evs]
     assert tool.calls == 1, "重入不得再打 provider"
     assert kinds == [EventType.CAPABILITY_INVOKED, EventType.CAPABILITY_FINISHED], kinds
@@ -142,7 +142,7 @@ async def test_invoking_a_tool_closes_the_provisional_window():
     assert ctx.task_manager.committed == ["t1"], "调用工具应触发关窗"
 
     ctx.event_bus.discard_provisional("t1")
-    evs = await store.read_session_events_of_types("s1", CAP_TYPES)
+    evs = [se.event for se in await store.read_range("s1", include_types=CAP_TYPES)]
     assert [e.type for e in evs] == [
         EventType.CAPABILITY_INVOKED, EventType.CAPABILITY_FINISHED], \
         "已发生的副作用不得被 discard 抹掉"
@@ -160,7 +160,7 @@ async def test_invoked_is_durable_before_the_provider_runs():
 
     def _probing_invoke(cid, args, pctx) -> AsyncIterator[CapabilityEvent]:
         async def _r():
-            evs = await store.read_session_events_of_types("s1", CAP_TYPES)
+            evs = [se.event for se in await store.read_range("s1", include_types=CAP_TYPES)]
             seen.append(any(e.type == EventType.CAPABILITY_INVOKED for e in evs))
             yield CapabilityEvent(kind="result", payload={"content": "ok"})
         return _r()

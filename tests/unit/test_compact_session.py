@@ -24,6 +24,7 @@ from tests.integration.test_minimal_loop import (
     make_echo_template,
     make_runtime,
 )
+from tests._event_helpers import append_one
 
 pytestmark = pytest.mark.asyncio
 
@@ -90,7 +91,7 @@ async def test_compact_agent_uses_agent_lifecycle_managers_current_model_not_sta
 
     sid, aid = "ses_m", "agt_root"
     ts = datetime(2026, 6, 16, tzinfo=timezone.utc)
-    await rt.event_store.append(Event(
+    await append_one(rt.event_store, Event(
         id="evt_0001", run_id="run_1", sequence=1, session_id=sid,
         type=EventType.SESSION_CREATED, timestamp=ts,
         payload={"template_id": f"agent:{tmpl.id}", "user_prompt": "x", "root_agent_id": aid,
@@ -153,7 +154,7 @@ async def test_compact_agent_folds_agent_layer() -> None:
 
     sid, aid = "ses_c", "agt_root"
     ts = datetime(2026, 6, 16, tzinfo=timezone.utc)
-    await rt.event_store.append(Event(
+    await append_one(rt.event_store, Event(
         id="evt_0001", run_id="run_1", sequence=1, session_id=sid,
         type=EventType.SESSION_CREATED, timestamp=ts,
         payload={"template_id": f"agent:{tmpl.id}", "user_prompt": "x", "root_agent_id": aid,

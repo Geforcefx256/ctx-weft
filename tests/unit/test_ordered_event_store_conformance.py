@@ -19,11 +19,10 @@ from ctx_weft.protocols.events import (
     EventStore,
     StoredEvent,
     supports_ordered_commit,
-    supports_replay,
 )
 from ctx_weft.providers.events.store.in_memory.store import InMemoryEventStore
 from ctx_weft.providers.events.store.sql.store import SqlEventStore, open_sqlite_event_store
-from tests._event_helpers import all_events
+from tests._event_helpers import all_events, append_one
 
 _T0 = datetime(2026, 9, 11, tzinfo=UTC)
 
@@ -148,13 +147,13 @@ async def test_append_is_single_event_batch_and_mixes(store):
     旧契约行为差异（钉基线用，wp2-1.2）：改道前 in-memory 对重复 id 双存、SQL 抛
     IntegrityError——改道后统一为幂等（同 id 同内容 no-op 返回原 receipt）。
     """
-    await store.append(_ev(1))
-    await store.append(_ev(2))
+    await append_one(store, _ev(1))
+    await append_one(store, _ev(2))
     r = await store.append_batch("s1", "b3", [_ev(3), _ev(4)])
     assert _positions(r) == [3, 4]
     assert [e.sequence for e in await all_events(store, "s1")] == [1, 2, 3, 4]
     # append 的幂等键 = event.id：重复 append 同一事件是 no-op
-    await store.append(_ev(1))
+    await append_one(store, _ev(1))
     assert len(await all_events(store, "s1")) == 4
 
 
@@ -196,7 +195,7 @@ async def test_dual_connection_same_session_contention(store_pair):
 
 async def test_read_range_bounds(store):
     for n in range(1, 6):
-        await store.append(_ev(n))
+        await append_one(store, _ev(n))
     got = await store.read_range("s1", after_position=2, through_position=4)
     assert [se.position for se in got] == [3, 4]
     assert [se.event.id for se in got] == ["evt_0003", "evt_0004"]
@@ -229,16 +228,34 @@ def test_single_event_protocol_no_parallel_ordered_protocol():
 
 
 def test_ordered_commit_methods_are_mandatory():
-    """三个方法是 @abstractmethod，与 append 同档——不是可选扩展。"""
-    assert EventStore.__abstractmethods__ >= {
-        "append", "append_batch", "read_range", "committed_head",
-        # 这两个后来也升为必需：恢复路径无条件靠它们（取快照 / 按类型收窄折叠），做成可选就
-        # 又要在 core 里探一次能力——那个坏设计在这个仓生出过三次「两分支 + 两失败形态」。
-        "read_last_of_type", "read_session_events_of_types"}
+    """协议面就是这四个，全是 @abstractmethod——没有可选扩展这一档了。
+
+    2026-09-19~21 一路收：`save_snapshot` / `load_latest_snapshot`（快照变成事件）、
+    `replay`（只由必需原语组合 → 归调用方）、`read_by_session`（整条会话读成一个 list）、
+    `list_active_session_ids`（host 自己的数据，core 不该回答）、
+    `read_session_events_of_types`（并进 `read_range`）、`append`（= `append_batch` 加一条
+    属于 core 的 batch_id 策略）。
+
+    判据用 `==` 而不是 `>=`：多出来一个方法同样该让这条红。协议面每多一个必需方法，每个自定义
+    store 就多一份必须写对的东西，而本仓的记录是——每一个"顺手加上"的方法后来都成了要清的
+    形状，或者生出一道能力探测的门。
+    """
+    assert EventStore.__abstractmethods__ == {
+        "append_batch", "read_range", "committed_head",
+        # 它后来也升为必需：恢复第一步无条件要取最新快照，做成可选就又要在 core 里探一次
+        # 能力——那个坏设计在这个仓生出过三次「两分支 + 两失败形态」。
+        "read_last_of_type"}
     # 可选扩展仍是可选：不在 abstractmethods 里
-    for name in ("save_snapshot", "load_latest_snapshot",
-                 "list_active_session_ids",):
+    for name in ("save_snapshot", "load_latest_snapshot"):
         assert name not in EventStore.__abstractmethods__
+    # `list_active_session_ids` 2026-09-21 整个从协议删了——**不是**降为可选，同
+    # `read_by_session`（见下）。「有哪些会话」是 host 自己的数据（它建的会话、它的会话表
+    # 和状态列），core 从事件流反推是职责倒置，而且推得更差：判据的两条 discard 依据
+    # （`SessionFinished` / `SessionStatusChanged`）在 src 下没有 emit 调用点，恒真。
+    # 钉「协议面上没有它」而不是「不在 abstractmethods 里」：后者在它被降为可选扩展时
+    # 也会绿，而那正是不该发生的形态。
+    assert not hasattr(EventStore, "list_active_session_ids"), (
+        "list_active_session_ids 回来了：会话清单是 host 的数据，不该由 core 从事件流推")
     # `read_by_session`（整条会话读成一个 list）2026-09-21 整个从协议删了——**不是**降为
     # 可选。所以钉「协议面上没有它」，而不是「它不在 abstractmethods 里」：后者在它被降为
     # 可选扩展时也会绿，而那正是不该发生的形态。
@@ -277,64 +294,41 @@ def test_supports_ordered_commit_requires_all_three():
     assert not supports_ordered_commit(PartialStore())
 
 
-def test_replay_default_is_inherited_not_reimplemented():
-    """`replay` 在协议里是**能用的默认实现**，继承即可用——不是又一个要各自实现的桩。
+def test_the_protocol_has_no_replay():
+    """分批重放不在协议面上——它是 core 的函数（`reducers.replay_session`）。
 
-    它只调 `read_range` / `committed_head`，两者都是必需方法，所以默认实现本身就是真分批。
-    内置两个 store 都不覆盖它：覆盖等于照抄一份区间切分，必然和协议分叉。
+    这条从前叫 `test_replay_default_is_inherited_not_reimplemented`，钉的是「`replay` 是协议上
+    一个能用的默认实现，两个内置 store 都不该覆盖它」。2026-09-21 整个搬进 core，理由写在
+    `replay_session` 的 docstring 里，一句话：**一个只由必需读原语组合而成的算法属于调用方**。
+    放在协议上宣称了「实现方可以换掉它」，而那份自由一次没被行使，代价却是实打实的——鸭子类型
+    的 store 继承不到默认实现，于是得补一道 `supports_replay` 门来兜。
+
+    钉「协议面上没有它」而不是「它不在 abstractmethods 里」：后者在它被加回成默认实现时也会
+    绿，而那正是不该发生的形态（同 `read_by_session` 那条）。
     """
-    assert EventStore.replay is not None
-    assert "replay" not in EventStore.__abstractmethods__
+    assert not hasattr(EventStore, "replay"), (
+        "replay 回到协议上了：它只用 read_range + committed_head，给协议加它等于宣称实现方可以"
+        "换掉它，而那份自由换来的是一道构造期能力门")
+    assert not hasattr(EventStore, "REPLAY_BATCH"), (
+        "批大小是 core 的权衡（内存硬约束 vs 耗时软约束），不是 store 的")
     for cls in (InMemoryEventStore, SqlEventStore):
-        assert cls.replay is EventStore.replay, f"{cls.__name__} 不该自己再写一遍分批"
-    assert supports_replay(InMemoryEventStore())
+        assert not hasattr(cls, "replay"), f"{cls.__name__} 自己实现了 replay"
 
 
-def test_supports_replay_asks_only_whether_it_exists():
-    """判据与 `supports_ordered_commit` 相反：继承下来的默认实现算「有」。
-
-    那三个方法在协议里是抽象桩，继承而不覆盖等于没实现；`replay` 是能用的实现，继承就能用。
-    两个谓词判据不同不是笔误，这条把它钉住。
-    """
-    class Inheriting(EventStore):
-        async def append(self, event): ...
-        async def append_batch(self, session_id, batch_id, events): ...
-        async def read_range(self, session_id, **kw): return []
-        async def committed_head(self, session_id): return 0
-        async def read_last_of_type(self, session_id, type_): return None
-        async def read_session_events_of_types(self, sid, types, *, task_id=""): return []
-
-    assert supports_replay(Inheriting()), "继承来的默认实现算有"
-
-    class DuckWithoutReplay:
-        async def append_batch(self, session_id, batch_id, events): ...
-        async def read_range(self, session_id, **kw): return []
-        async def committed_head(self, session_id): return 0
-
-    assert supports_ordered_commit(DuckWithoutReplay()), "三个方法齐全"
-    assert not supports_replay(DuckWithoutReplay()), "但没有 replay——鸭子类型拿不到默认实现"
+# 这里从前有 `test_supports_replay_asks_only_whether_it_exists`：钉「`supports_replay` 只问属性
+# 存不存在，判据与 `supports_ordered_commit` 相反」。那个函数 2026-09-21 随协议上的 `replay`
+# 一起删了——`replay` 变成 core 的 `reducers.replay_session`（只用 `read_range` +
+# `committed_head` 两个必需原语）之后，任何满足协议的 store 都能被重放，不需要这道门，也不
+# 需要解释「为什么这一个判据是反的」。
 
 
-def test_runtime_rejects_duck_typed_store_without_replay():
-    """构造期拒绝缺 `replay` 的鸭子类型 store——把缺失挪到启动时。
+# 这里从前有 `test_runtime_rejects_duck_typed_store_without_replay`：钉「三个必需方法齐全但不
+# 继承协议的鸭子 store，因为拿不到 `replay` 的默认实现而被构造期拒绝」。那道门 2026-09-21 随
+# `replay` 搬进 core 一起删了——`reducers.replay_session` 只用 `read_range` +
+# `committed_head`，这种鸭子 store 现在**能**被重放，拒绝它是错的。下面那条
+# `test_runtime_rejects_store_without_ordered_commit` 仍在（它兜的是抽象桩真的缺方法）。
 
-    恢复路径无条件 `async for batch in store.replay(sid)`：core 不问「你支不支持分页」、
-    不备降级路（那种能力探测曾经写在 core 里，一个坏设计生出两个分支和两种失败形态）。
-    代价是缺了它只会在**快照不可用的那次** `/resume` 里才炸，那是最罕见最难复现的路径，
-    所以这道门必须在构造期。
-    """
-    from ctx_weft.core.models.config import RuntimeConfig
-    from ctx_weft.core.runtime import CtxWeftRuntime
 
-    class DuckStoreNoReplay:
-        """三个必需方法齐全，但不继承协议 → 没有 replay。"""
-        async def append(self, event): ...
-        async def append_batch(self, session_id, batch_id, events): ...
-        async def read_range(self, session_id, **kw): return []
-        async def committed_head(self, session_id): return 0
-
-    with pytest.raises(ValueError, match="没有 replay"):
-        CtxWeftRuntime(event_store=DuckStoreNoReplay(), config=RuntimeConfig())
 
 
 def test_runtime_rejects_store_without_ordered_commit():

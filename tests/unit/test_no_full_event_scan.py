@@ -16,7 +16,7 @@
 
 第 2 条的分批**由 store 产出**（`EventStore.replay`，基类默认实现即真分批——`read_range`
 与 `committed_head` 都是必需方法，按 position 区间切就行）。core 只管
-`async for batch in store.replay(sid)`，不问「你支不支持分页」、不替谁选降级路：那种能力
+`async for batch in replay_session(store, sid)`，不问「你支不支持分页」、不替谁选降级路：那种能力
 探测曾经写在 core 里，一个坏设计生出两个分支和两种失败形态。
 """
 
@@ -28,14 +28,18 @@ import pytest
 
 from ctx_weft.core.control.reducers import (
     HITL_FOLD_EVENT_TYPES,
+    REPLAY_BATCH,
     rebuild_view,
     reduce_events,
 )
 from ctx_weft.protocols.events import Event, EventStore, EventType
 from ctx_weft.providers.events import InMemoryEventStore
+from tests._event_helpers import append_one
 
-#: 分批大小现在是 store 的事（`EventStore.REPLAY_BATCH`），core 不持有它。
-_REPLAY_BATCH = EventStore.REPLAY_BATCH
+#: 分批大小是 **core** 的决定（`reducers.REPLAY_BATCH`）——判据是「内存是硬约束、耗时是软
+#: 约束」，实测权衡表记在那个常量旁边。它一度挂在协议上（`EventStore.REPLAY_BATCH`），随
+#: `replay` 一起在 2026-09-21 搬进 core：一个只由必需读原语组合而成的算法，属于调用方。
+_REPLAY_BATCH = REPLAY_BATCH
 
 pytestmark = pytest.mark.asyncio
 
@@ -56,44 +60,45 @@ class _CountingStore(InMemoryEventStore):
     def __init__(self) -> None:
         super().__init__()
         self.typed_reads: list[tuple[str, ...]] = []
-        self.ranges: list[tuple[int, int | None]] = []
+        #: (after_position, through_position, 是否按类型收窄)
+        self.ranges: list[tuple[int, "int | None", bool]] = []
 
     @property
     def full_reads(self) -> int:
-        """无界的 read_range 次数（after=0 且无上界 = 整条会话）。
+        """**无界且不收窄**的 read_range 次数（after=0、无上界、无类型过滤 = 整条会话）。
+
+        「按类型收窄」的读 2026-09-21 也并进了 `read_range`，而那种读正是这条守卫要的**替代
+        品**，不是它要防的东西——所以判据里必须把它排掉，否则一条正确的收窄读会被当成全量读。
 
         从前这里数的是 `read_by_session` 的调用次数。那个方法 2026-09-21 从协议删了
         （src 零调用者），而「方法不存在时调用 0 次」由语言保证、不需要测试。改数
         `read_range` 里无界的那一形状——那是删掉它之后**仅剩**的整条会话读法，也就是这条
         守卫真正要防的东西。
         """
-        return sum(1 for after, through in self.ranges
-                   if after == 0 and through is None)
+        return sum(1 for after, through, narrowed in self.ranges
+                   if after == 0 and through is None and not narrowed)
 
-    async def read_session_events_of_types(self, session_id: str, types, *, task_id: str = ""):
-        self.typed_reads.append(tuple(str(t) for t in types))
-        return await super().read_session_events_of_types(
-            session_id, types, task_id=task_id)
-
-    async def read_range(self, session_id: str, *, after_position=0,
-                         through_position=None, exclude_types=()):
-        self.ranges.append((after_position, through_position))
-        return await super().read_range(
-            session_id, after_position=after_position,
-            through_position=through_position, exclude_types=exclude_types)
+    async def read_range(self, session_id: str, **k):
+        self.ranges.append((k.get("after_position", 0), k.get("through_position"),
+                            bool(k.get("include_types"))))
+        if k.get("include_types"):
+            # 「按类型收窄的那种读」2026-09-21 并进了 read_range，所以两笔账都记在这里。分开
+            # 记是因为断言要区分「有没有按类型收窄」与「有没有无界地读」——那是两件事。
+            self.typed_reads.append(tuple(str(t) for t in k["include_types"]))
+        return await super().read_range(session_id, **k)
 
 
 async def _seed(store: InMemoryEventStore, n_noise: int) -> None:
     """一条「长会话」：大量与段 recap 无关的噪音事件 + 两对 recap 事件。"""
-    await store.append(_ev(0, EventType.SESSION_CREATED, user_prompt="go",
+    await append_one(store, _ev(0, EventType.SESSION_CREATED, user_prompt="go",
                            template_id="agent:tpl", root_agent_id="agt_root"))
     for i in range(1, n_noise + 1):
-        await store.append(_ev(i, EventType.RUN_FINISHED, outcome="completed"))
+        await append_one(store, _ev(i, EventType.RUN_FINISHED, outcome="completed"))
     # 一对完成的（started + done）+ 一对被崩溃打断的（只有 started）
-    await store.append(_ev(n_noise + 1, EventType.TASK_RECAP_STARTED,
+    await append_one(store, _ev(n_noise + 1, EventType.TASK_RECAP_STARTED,
                            task_id="t_done", boundary="finish", agent_id="agt_root"))
-    await store.append(_ev(n_noise + 2, EventType.TASK_RECAP_DONE, task_id="t_done"))
-    await store.append(_ev(n_noise + 3, EventType.TASK_RECAP_STARTED,
+    await append_one(store, _ev(n_noise + 2, EventType.TASK_RECAP_DONE, task_id="t_done"))
+    await append_one(store, _ev(n_noise + 3, EventType.TASK_RECAP_STARTED,
                            task_id="t_stuck", boundary="finish", agent_id="agt_root"))
 
 
@@ -160,7 +165,8 @@ async def test_full_replay_is_batched_by_position_range() -> None:
     head = await store.committed_head(_SID)
     assert store.ranges[0][0] == 0
     assert store.ranges[-1][1] == head
-    for (_, prev_upper), (next_lower, _) in zip(store.ranges, store.ranges[1:]):
+    for (_, prev_upper, _n1), (next_lower, _, _n2) in zip(
+            store.ranges, store.ranges[1:]):
         assert prev_upper == next_lower, f"区间断裂：{store.ranges}"
     assert view.session_id == _SID
 

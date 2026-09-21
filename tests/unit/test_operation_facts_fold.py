@@ -121,7 +121,8 @@ def _harness(tool, *, authorizer=None, sink=False):
 
 
 async def _facts(store) -> OperationFacts:
-    evs = await store.read_session_events_of_types("s1", CAP_FOLD_EVENT_TYPES)
+    evs = [se.event for se in
+           await store.read_range("s1", include_types=CAP_FOLD_EVENT_TYPES)]
     return fold_operations(evs).get(TC, OperationFacts())
 
 

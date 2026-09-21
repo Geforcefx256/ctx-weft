@@ -39,6 +39,7 @@ from ctx_weft.protocols.memory import MemoryEvent
 from ctx_weft.providers.events import InProcessEventBus
 from ctx_weft.providers.events.store.in_memory.store import InMemoryEventStore
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
+from tests._event_helpers import append_one
 
 #: 摄入点铸造的内部标识——既是消息里的 tool_call id，也是事件 payload 的配对键。
 OP = mint_call_id(anchor="rec_fx", ordinal=0, raw_id="call_1", turn_seq=0)
@@ -103,7 +104,7 @@ async def _seed(store, *, tool_call_id: str, invoked: bool, finished: bool = Fal
             "capability_name": "fx__act", "outcome": "success",
             "result": result, "result_length": len(result)}))
     for ev in batch:
-        await store.append(ev)
+        await append_one(store, ev)
 
 
 async def _mk_fixture(policy="reviewed", *, invoked=True, finished=False, tool=None):
@@ -169,8 +170,9 @@ async def test_idempotent_started_reruns_exactly_once():
 
     assert tool.executions == 1
     assert outcome.next_step == "prepare"
-    evs = await store.read_session_events_of_types(
-        "s1", (EventType.CAPABILITY_INVOKED, EventType.CAPABILITY_FINISHED))
+    evs = [se.event for se in await store.read_range(
+        "s1", include_types=(EventType.CAPABILITY_INVOKED,
+                             EventType.CAPABILITY_FINISHED))]
     assert sum(1 for e in evs if e.type == EventType.CAPABILITY_INVOKED) == 2, \
         "播的那条 + 重跑这条"
 
@@ -402,7 +404,8 @@ async def test_conclude_closes_the_dangling_invoked():
 
     from ctx_weft.core.control.reducers import CAP_FOLD_EVENT_TYPES, fold_operations
     facts = fold_operations(
-        await store.read_session_events_of_types("s1", CAP_FOLD_EVENT_TYPES))[op_id]
+        [se.event for se in
+         await store.read_range("s1", include_types=CAP_FOLD_EVENT_TYPES)])[op_id]
     assert facts.finished, "作结之后这次调用不再是「已调用未完成」"
     assert facts.attempts == ("inv_first",), "没有多出一次从未发生的尝试"
 

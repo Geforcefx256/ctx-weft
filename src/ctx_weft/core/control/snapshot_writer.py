@@ -64,6 +64,7 @@ from ctx_weft.core.control.reducers import (
     apply_events,
     deserialize_view,
     prune_view_for_snapshot,
+    replay_session,
     snapshot_event_payload,
     snapshot_facts_from_event,
     snapshot_is_usable,
@@ -73,7 +74,6 @@ from ctx_weft.core.utils.event import new_event
 from ctx_weft.protocols.events import (
     TRANSIENT_EVENT_TYPES,
     EventOrigin,
-    EventStore,
     EventType,
 )
 
@@ -270,22 +270,22 @@ class SnapshotWriter:
             # （reducers.py 里两段循环体逐字相同），而 apply 是 for 循环左折叠、可结合，所以
             # 「一次折 n 条」与「分 k 批各折 n/k 条」等价。
             #
-            # ⚠️ **为什么不直接用 `store.replay()`**（恢复侧用的就是它）：`replay` 锚在它自己
-            # 进去那一刻的 `committed_head`，而切面 C 是上面那个 `head`。两者之间可能又提交了
-            # 新事件，于是 replay 会多折进 (head, head'] 那一段——blob 就**领先于它声明的切面**,
-            # 恢复时那段会被重复 apply（`events_total` 双计，不是幂等的）。所以这里自己按 C
-            # 截断分批。批大小仍取协议那个常量，不另起一个数。
+            # ⚠️ **必须显式传 `through_position=head`**：不传的话 `replay_session` 会自己去取
+            # `committed_head`，而切面 C 是上面那个 `head`。两者之间可能又提交了新事件，于是会
+            # 多折进 (C, head'] 那一段——blob 就**领先于它声明的切面**，恢复时那段被重复 apply
+            # （`events_total` 双计，不幂等）。`test_the_anchor_stops_at_the_declared_cut` 在折叠
+            # 中途注入新提交，钉住这一点。
+            #
+            # 这个循环从前是就地写的（协议上的 `replay` 锚死在自己取的 head，给不了这个参数）。
+            # 2026-09-21 `replay` 搬进 core 并加上 `through_position` 之后，两处合成一处。
             view = RunStateView(
                 run_id=session_id, session_id="", task_id="", agent_id="")
-            folded, cursor = 0, 0
-            while cursor < head:
-                upper = min(cursor + EventStore.REPLAY_BATCH, head)
-                batch = await self._store.read_range(
-                    session_id, after_position=cursor, through_position=upper,
-                    exclude_types=REPLAY_EXCLUDE_TYPES)
-                apply_events([se.event for se in batch], view)
+            folded = 0
+            async for batch in replay_session(
+                    self._store, session_id, through_position=head,
+                    exclude_types=REPLAY_EXCLUDE_TYPES):
+                apply_events(batch, view)
                 folded += len(batch)
-                cursor = upper
             depth, anchored = 0, True
 
         if not view.session_id:

@@ -37,6 +37,7 @@ from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from tests.integration.test_minimal_loop import (
     InlineAgentTemplateProvider, make_echo_template, make_runtime,
 )
+from tests._event_helpers import append_one
 
 pytestmark = pytest.mark.asyncio
 
@@ -479,11 +480,11 @@ async def _seed_crashed_running(rt, sid: str, aid: str) -> None:
                      type=type_, timestamp=ts, task_id="tsk_crashed",
                      agent_id=p.pop("agent_id", None), payload=p)
 
-    await rt.event_store.append(ev(1, EventType.SESSION_CREATED,
+    await append_one(rt.event_store, ev(1, EventType.SESSION_CREATED,
                                    template_id="agent:tpl_echo", root_agent_id=aid))
-    await rt.event_store.append(ev(2, EventType.AGENT_INSTANTIATED, agent_id=aid,
+    await append_one(rt.event_store, ev(2, EventType.AGENT_INSTANTIATED, agent_id=aid,
                                    template_id="agent:tpl_echo"))
-    await rt.event_store.append(ev(3, EventType.AGENT_RUNNING, agent_id=aid))
+    await append_one(rt.event_store, ev(3, EventType.AGENT_RUNNING, agent_id=aid))
 
 
 async def test_rebuild_settles_a_crashed_running_agent_to_interrupted():

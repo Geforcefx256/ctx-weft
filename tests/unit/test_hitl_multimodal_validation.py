@@ -611,16 +611,16 @@ def _count_event_reads(rt) -> list[str]:
     应答内容管线**不该**为任何理由回头读事件流（tenant 随请求带着走，2026-09-19 起 core
     里连解析入口都没有了）。每条路都装上，免得将来有人换一条路读、断言还以为是绿的。
 
-    ⚠️ 这个函数从前装的是 `rt._read_session_events_of_types` 与 `read_by_session`，两个都
-    在 2026-09-20/21 删掉了（src 零调用者，而它们正是要清的那个形状）。于是那两条计数器守
-    的是不存在的方法——**负向断言在这种情况下不会红，只会变得空洞**。现在装 store 现存的两
-    个读原语。
+    ⚠️ 这个函数从前装过三个名字（`rt._read_session_events_of_types` / `read_by_session` /
+    `read_session_events_of_types`），三个都在 2026-09-20/21 没了——前两个删掉、第三个并进
+    `read_range`。守着不存在的方法的计数器**不会红，只会变得空洞**，所以这里只装现存的那一个
+    区间读原语；按类型收窄的读现在也走它，覆盖面反而更全。
     """
     hits: list[str] = []
     store = rt.event_store
     originals = {
         name: getattr(store, name)
-        for name in ("read_range", "read_session_events_of_types")
+        for name in ("read_range",)
     }
 
     def _wrap(name, fn):

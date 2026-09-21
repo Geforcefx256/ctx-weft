@@ -29,6 +29,7 @@ import pytest
 from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.providers.events import InMemoryEventStore
 from tests._snapshot_helpers import latest_snapshot
+from tests._event_helpers import append_one
 
 pytestmark = pytest.mark.asyncio
 
@@ -141,7 +142,7 @@ async def test_writer_skips_while_memory_is_unsettled() -> None:
     w = SnapshotWriter(store, None, every_n_events=1,
                        memory_settled=lambda _sid: settled["v"])
 
-    await store.append(_ev(1, EventType.SESSION_CREATED))
+    await append_one(store, _ev(1, EventType.SESSION_CREATED))
     await w.on_event(_ev(2, EventType.RUN_FINISHED))
     assert await latest_snapshot(store, _SID) is None, "没落定就不该写"
 
@@ -163,7 +164,7 @@ async def test_skipping_still_counts_toward_the_threshold() -> None:
     w = SnapshotWriter(store, None, every_n_events=3,
                        memory_settled=lambda _sid: settled["v"])
 
-    await store.append(_ev(1, EventType.SESSION_CREATED))
+    await append_one(store, _ev(1, EventType.SESSION_CREATED))
     for n in (2, 3, 4):                       # 三条，但都在「没落定」期间
         await w.on_event(_ev(n, EventType.RUN_FINISHED))
     assert await latest_snapshot(store, _SID) is None
@@ -185,7 +186,7 @@ async def test_a_throwing_predicate_blocks_the_write() -> None:
     store = InMemoryEventStore()
     w = SnapshotWriter(store, None, every_n_events=1, memory_settled=_boom)
 
-    await store.append(_ev(1, EventType.SESSION_CREATED))
+    await append_one(store, _ev(1, EventType.SESSION_CREATED))
     await w.on_event(_ev(2, EventType.RUN_FINISHED))    # 不抛
 
     assert await latest_snapshot(store, _SID) is None
@@ -198,7 +199,7 @@ async def test_no_predicate_means_no_gate() -> None:
     store = InMemoryEventStore()
     w = SnapshotWriter(store, None, every_n_events=1)
 
-    await store.append(_ev(1, EventType.SESSION_CREATED))
+    await append_one(store, _ev(1, EventType.SESSION_CREATED))
     await w.on_event(_ev(2, EventType.RUN_FINISHED))
 
     assert await latest_snapshot(store, _SID) is not None

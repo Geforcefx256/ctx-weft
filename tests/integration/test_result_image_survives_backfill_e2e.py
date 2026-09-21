@@ -29,6 +29,7 @@ from tests.integration.test_hitl_e2e_v2 import _ActRouterLLM, _poll
 from tests.integration.test_minimal_loop import (
     InlineAgentTemplateProvider, make_echo_template, make_runtime,
 )
+from tests._event_helpers import append_one
 
 pytestmark = pytest.mark.asyncio
 
@@ -85,7 +86,7 @@ async def test_crash_between_result_event_and_memory_keeps_the_image_retrievable
             invocation_id="inv_1", capability_name="web__shot", outcome="success",
             result=result_event_payload, result_length=len(result_event_payload)),
     ]:
-        await rt.event_store.append(e)
+        await append_one(rt.event_store, e)
 
     scope = MemoryAddress(session_id=SID, task_id=TID, agent_id=AID)
     pctx = ProviderContext(session_id=SID, tenant_id="default", task_id=TID, agent_id=AID)
@@ -97,6 +98,9 @@ async def test_crash_between_result_event_and_memory_keeps_the_image_retrievable
         content="", timestamp=TS, role="assistant",
         metadata={"tool_calls": [{"id": tcid, "name": "web__shot", "input": {}}]}), pctx)
 
+    # 装填是调用方的责任（2026-09-21：`recover_agent` 对 registry miss 直接抛
+    # `AgentNotLoaded`，按 agent 扫全库的 sweep 已删）。只喂内存，不建 TM、不跑。
+    await rt.rebuild_session(SID)
     with mock.patch(
         "ctx_weft.core.loop.steps.background_observe.launch_background_observe",
         return_value=None,

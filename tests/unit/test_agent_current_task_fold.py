@@ -20,6 +20,7 @@ from tests.integration.test_minimal_loop import (
     InlineAgentTemplateProvider, make_echo_template, make_runtime,
 )
 from tests.unit._legacy_recover import rebuild_all_active
+from tests._event_helpers import append_one
 
 pytestmark = pytest.mark.asyncio
 _TS = datetime(2026, 6, 13, tzinfo=UTC)
@@ -45,15 +46,15 @@ def _runtime():
 async def test_task_created_updates_the_assigned_agents_current_task():
     rt = _runtime()
     sid, aid = "A", "agt_1"
-    await rt.event_store.append(_ev(1, sid, EventType.SESSION_CREATED,
+    await append_one(rt.event_store, _ev(1, sid, EventType.SESSION_CREATED,
                                     template_id="agent:tpl_echo", root_agent_id=aid))
-    await rt.event_store.append(_ev(2, sid, EventType.AGENT_INSTANTIATED, agent_id=aid,
+    await append_one(rt.event_store, _ev(2, sid, EventType.AGENT_INSTANTIATED, agent_id=aid,
                                     template_id="agent:tpl_echo"))
     # 上一轮：跑过 tsk_old，回 idle（task 已终态）
-    await rt.event_store.append(_ev(3, sid, EventType.AGENT_RUNNING, agent_id=aid, task_id="tsk_old"))
-    await rt.event_store.append(_ev(4, sid, EventType.AGENT_IDLE, agent_id=aid, task_id="tsk_old"))
+    await append_one(rt.event_store, _ev(3, sid, EventType.AGENT_RUNNING, agent_id=aid, task_id="tsk_old"))
+    await append_one(rt.event_store, _ev(4, sid, EventType.AGENT_IDLE, agent_id=aid, task_id="tsk_old"))
     # 新一轮 push 了，但还没派发（没有 TASK_STARTED / AgentRunning）
-    await rt.event_store.append(_ev(5, sid, EventType.TASK_CREATED, task_id="tsk_new",
+    await append_one(rt.event_store, _ev(5, sid, EventType.TASK_CREATED, task_id="tsk_new",
                                     task={"id": "tsk_new", "status": "ACTIVE",
                                           "assigned_agent_id": aid, "creator_agent_id": aid}))
 
@@ -71,12 +72,12 @@ async def test_load_no_longer_rewinds_current_task_id(monkeypatch):
 
     rt = _runtime()
     sid, aid = "A", "agt_1"
-    await rt.event_store.append(_ev(1, sid, EventType.SESSION_CREATED,
+    await append_one(rt.event_store, _ev(1, sid, EventType.SESSION_CREATED,
                                     template_id="agent:tpl_echo", root_agent_id=aid))
-    await rt.event_store.append(_ev(2, sid, EventType.AGENT_INSTANTIATED, agent_id=aid,
+    await append_one(rt.event_store, _ev(2, sid, EventType.AGENT_INSTANTIATED, agent_id=aid,
                                     template_id="agent:tpl_echo"))
-    await rt.event_store.append(_ev(3, sid, EventType.AGENT_RUNNING, agent_id=aid, task_id="tsk_old"))
-    await rt.event_store.append(_ev(4, sid, EventType.AGENT_IDLE, agent_id=aid, task_id="tsk_old"))
+    await append_one(rt.event_store, _ev(3, sid, EventType.AGENT_RUNNING, agent_id=aid, task_id="tsk_old"))
+    await append_one(rt.event_store, _ev(4, sid, EventType.AGENT_IDLE, agent_id=aid, task_id="tsk_old"))
     await rebuild_all_active(rt)
 
     reg = rt._agent_lifecycle_manager

@@ -249,7 +249,7 @@ class EventType(StrEnum):
     #
     # ⚠️ **store 对这个类型不做任何特殊处理**：它是 core 的词表，不是存储契约的一部分。
     # 需要「排除快照」的地方（全量重放）由 core 把类型传给 `read_range(exclude_types=...)` /
-    # `replay(exclude_types=...)`，不写死在协议的默认实现里。
+    # `read_range(exclude_types=...)`，不写死在协议里。
     #
     # ⚠️ **不经 EventBus，由写入侧直接 `append_batch`。** 三个理由，第三个是决定性的：它不是
     # 任何人该反应的领域事实；走 bus 会投给 SSE 转译 / 投影更新器 / 分析订阅者，那些都没理由
@@ -519,14 +519,17 @@ class PersistenceUnavailableError(Exception):
 class EventStore(Protocol):
     """事件流持久化抽象。host 提供具体实现（Postgres / SQLite / in-memory）。
 
-    ## 两档强制性
+    ## 全部必须实现，没有可选扩展
 
-    1. **必须实现**（`@abstractmethod`）：`append` / `append_batch` / `read_range` /
-       `committed_head` / `read_last_of_type` / `read_session_events_of_types`。
-       **有序提交是底线，不是可选项**——理由见下节。后两个是恢复路径无条件要走的（取最新
-       快照 / 按类型收窄折叠），做成可选就又要在 core 里探一次能力。
-    2. **可选扩展**（默认 `raise NotImplementedError`）：
-       `list_active_session_ids` /
+    `append` / `append_batch` / `read_range` / `committed_head` / `read_last_of_type` /
+    `read_session_events_of_types`。**有序提交是底线，不是可选项**——理由见下节。后两个是
+    恢复路径无条件要走的（取最新快照 / 按类型收窄折叠），做成可选就又要在 core 里探一次能力。
+
+    「可选扩展（未实现就抛 `NotImplementedError`，调用方降级）」那一档**已经没有了**
+    （2026-09-21）。它每多一个成员，core 里就多一处能力探测、两个分支、两种失败形态——这个
+    仓为此付过四次（`replay` / `read_by_session_after` / 快照 / `read_session_events_of_types`）。
+    最后一个成员 `list_active_session_ids` 连同它唯一的消费者一起删掉了：会话清单是 host
+    自己的数据，不该由 core 从事件流反推。
 
     读取一律按 position：**不存在**「按事件 ID 取增量」的 API。ID 铸造序 ≠ 提交序，
     那种游标正是 H2 的根因（详见下节）。
@@ -562,25 +565,17 @@ class EventStore(Protocol):
     既有调用方语义不变。
     """
 
-    @abstractmethod
-    async def append(self, event: Event) -> None:
-        """持久化单条事件（= 单事件 `append_batch`，batch_id 取 event.id）。"""
-        ...
-
-    # **这里没有 `read_by_session`**（2026-09-21 删）。它是「把一个会话的全部事件读成
-    # 一个 list」，也就是本仓花了很长时间清掉的那个形状——代价随会话长度线性增长，实测
-    # 3 万事件约 130MB 常驻。删它的时候 src 里已经零调用者：恢复走
-    # `read_last_of_type` + `read_range` 或 `replay()`，按类型查走
-    # `read_session_events_of_types`（带 task 收窄），没有任何路径需要「全都给我」。
+    # **这里没有 `append(event)`**（2026-09-21 删）。它在两个实现里逐字相同——
+    # `append_batch(event.session_id, event.id, [event])`——而 src 里只有一个调用者
+    # （`EventPersister`）。
     #
-    # **为什么不是留着加一条禁令注释就够**。留着的直接后果不是有人会误用，而是**守卫它的
-    # 负向断言会变空洞**：本仓有过两处「给某个方法装计数器、断言调用 0 次」的测试，其中
-    # 一处守的方法早已零调用（`Runtime._read_session_events_of_types`），于是那条断言永远
-    # 绿、永远什么都没验。方法不存在时「调用 0 次」由语言保证，不需要测试。
+    # 删它不是为了少一个便利方法，是因为 `batch_id = event.id` 那一句是**策略**：确定性取值，
+    # 好让原样重试撞上 batch 幂等账而不是写出第二份事件。让每个实现各写一遍，等于把一条正确性
+    # 策略复制 N 份——某个实现写成 `generate_id()`，重试就会写出第二份，而且不报错。本仓已经
+    # 为同一个形状付过一次（`PROJECTION_VERSION` 写侧读侧各一份字面量，改一个的后果是所有快照
+    # 永远判不可用、O(delta) 退回 O(n)、不报任何错）。
     #
-    # 顺带消失的一个能力：只有它能看见 position 为 NULL 的存量行（它的排序口径是「NULL 段
-    # 按 id 序排前、其后按 position 序」）。那个混合状态现在没有读者——core 侧
-    # `open_sqlite_event_store` 直接拒绝打开未回填的库，宿主侧 m020 在任何读之前回填完。
+    # 调用方直接用 `append_batch`；测试夹具里那个动作收在 `tests/_event_helpers.append_one`。
 
     # ── 有序提交（必须实现；spec: event-log）──────────────────────────────────
 
@@ -598,13 +593,38 @@ class EventStore(Protocol):
         *,
         after_position: int = 0,
         through_position: int | None = None,
+        include_types: "tuple[str, ...]" = (),
         exclude_types: "tuple[str, ...]" = (),
+        task_id: str = "",
     ) -> "list[StoredEvent]":
         """按 position 升序读取 (after_position, through_position] 的已提交事件。
 
-        `exclude_types` 非空时跳过这些类型。**通用读原语，不带任何特定类型的语义**——
-        调用方（core）自己填要排除什么。全量重放用它排掉状态快照事件：那些事件的存在是为了
-        省重放，把它们读回来反而更贵。
+        **本协议唯一的区间读**。四个过滤器都是可选的，都作用在同一个 position 区间上：
+
+        - `include_types` 非空 → 只要这些类型。空 = 不限。
+        - `exclude_types` 非空 → 跳过这些类型。全量重放用它排掉状态快照事件（那些事件的存在
+          是为了省重放，读回来反而更贵）。两者同时给时 exclude 胜出。
+        - `task_id` 非空 → **只排除明确属于别的 task 的行**。`task_id` 为 NULL / 空串的照样
+          取回，因为那一档是「无从归属」而不是「属于别人」。判错方向的代价不对称：把一条没
+          归属的 `CapabilityInvoked` 漏掉，capability gateway 就以为那次调用没跑过 → 静默重跑
+          一个有副作用的工具；而多取回几条只是多折几下。**这条语义两个实现必须逐字一致**，
+          由 `tests/unit/test_read_primitives_conformance.py` 对两者跑同一套用例钉住。
+
+        **通用读原语，不带任何特定类型的语义**——调用方（core）自己填要读/要排除什么。
+
+        ## 为什么没有单独的 `read_session_events_of_types`（2026-09-21 并进来）
+
+        从前有。它和本方法是同一个查询换了过滤条件，差三处：include 而非 exclude、多一个
+        `task_id`、**少了位置区间**。第三处是它的问题所在：capability 折叠靠它回答「这个
+        dangling tool_call 跑过没有」，而它读的是整条会话——按 task 收窄之后主干收住了，但那条
+        「无从归属」的安全阀仍然是全会话的，于是上界里始终留着一项随会话长度增长的成分。并进
+        来之后它自动获得 `after_position`，那一项就关掉了。
+
+        顺带清掉的另一个残留：它的排序口径带着
+        `ORDER BY CASE WHEN position IS NULL THEN 0 ELSE 1 END, position, id`，为的是让未回填的
+        存量行排在前面——而那个状态在 2026-09-20/21 之后没有读者了（`open_sqlite_event_store`
+        拒绝打开未回填的库、宿主侧 m020 在任何读之前回填完）。那个 CASE 表达式同时也是它必须
+        走 temp b-tree 的直接原因。
         """
         ...
 
@@ -613,65 +633,28 @@ class EventStore(Protocol):
         """该会话最新已确认提交的 position；无提交时为 0。"""
         ...
 
-    #: `replay` 每批多少条。见 `replay` 的 docstring。
-    REPLAY_BATCH: int = 2000
+    # **这里没有 `replay` / `REPLAY_BATCH`**（2026-09-21 搬走）。「按 position 区间分批重放
+    # 整条会话」现在是 `core.control.reducers.replay_session`——它只用 `read_range` 与
+    # `committed_head` 两个必需读原语，所以任何满足本协议的 store 都能被重放，**不需要任何
+    # 能力探测**。搬走的三条理由（没有 store 覆盖过它、它反而引入了一次构造期探测
+    # `supports_replay`、那层抽象两天内失效两次导致同一个循环抄了三份）写在那个函数的
+    # docstring 里。
+    #
+    # 留在这里的教训：给协议加一个「能用的默认实现」等于宣称「实现方可以换掉它」。那份自由
+    # 一次没被行使，而它的代价是实打实的——鸭子类型的 store 拿不到默认实现，于是必须补一道门
+    # 来兜；一个只由必需原语组合而成的算法，属于调用方。
 
-    async def replay(
-        self, session_id: str, *, exclude_types: "tuple[str, ...]" = (),
-    ) -> "AsyncIterator[list[Event]]":
-        """按提交序**分批**产出该会话的全部已提交事件。
 
-        给「快照不可用、必须从头重放」那条路用。调用方只管
-        ``async for batch in store.replay(sid): apply_events(batch, view)``——**怎么分批
-        是 store 的私事**，core 既不问「你支不支持分页」也不替谁选路。那种能力探测
-        （`getattr` / `except NotImplementedError` 再降级）曾经写在 core 的重放函数里，
-        一个坏设计生出两个分支和两种失败形态；这里把它收回实现侧。
-
-        **为什么必须分批**：一次性把整条流变成 `list[Event]` 的代价是实测过的——一条
-        3 万事件 / 45MB `events` 表的会话约 130MB 常驻、读一次 3.5 秒（SQLite 本地文件；
-        Postgres 走网更慢）。而重放是左折叠（`reduce_events(evts)` 就是
-        `apply_events(evts, 空 view)`，`core/control/reducers.py` 里两段循环体逐字相同；
-        apply 是 for 循环、可结合），所以分批与整批**逐字段等价**，内存峰值降到 O(batch)。
-
-        本默认实现已经是**真分批**，任何 store 都不必覆盖：`read_range` 与
-        `committed_head` 都是必需方法（见上面两个 `@abstractmethod`），所以按 position
-        区间切就行。position 是连续整数、`head` 是这一刻的提交位点，因此切分既不重也不漏，
-        整趟重放还锚在同一个 `head` 上——期间的新提交不会掺进来（一致切面）。
-
-        `REPLAY_BATCH` 取 2000 是实测的权衡点（3 万事件，SQLite 本地）：
-
-            批大小    查询次数    耗时      内存峰值
-            一次性        1      3.75s    121.5 MB
-             1000       30      6.10s      6.3 MB
-             2000       15      5.09s     12.3 MB     ← 取这档
-             5000        6      4.58s     30.2 MB
-            10000        3      4.47s     60.1 MB
-
-        判据是「内存是硬约束、耗时是软约束」：121MB 单会话在并发恢复下会叠成几百 MB ~ GB，
-        那是会崩的；而这条路只在快照不可用时走（罕见），多花一秒用户等得起。数字来自
-        SQLite 本地文件——Postgres 每次查询多一个 RTT，真要调就在目标库上照这个方法重测。
-
-        ⚠️ 默认实现只白送给**显式继承本协议**的 store。鸭子类型的 store（不继承、靠方法
-        齐全冒充）拿不到它——所以 Runtime 在构造期用 `supports_replay(store)` 兜一道：
-        缺 `replay` 就拒绝启动，而不是等到某次快照不可用的 `/resume` 深处抛 AttributeError。
-        """
-        head = await self.committed_head(session_id)
-        cursor = 0
-        while cursor < head:
-            upper = min(cursor + self.REPLAY_BATCH, head)
-            stored = await self.read_range(
-                session_id, after_position=cursor, through_position=upper,
-                exclude_types=exclude_types)
-            if stored:
-                yield [se.event for se in stored]
-            cursor = upper
-
-    # ── 可选快照扩展 ──────────────────────────────────────────────────────────
-    # 未实现时抛 NotImplementedError；core 捕获后降级为全量 replay。
-
-    async def list_active_session_ids(self) -> list[str]:
-        """返回有 SessionCreated 但无终态事件的 session ID 列表（用于启动时 crash recovery）。"""
-        raise NotImplementedError
+    # 这里从前有 `list_active_session_ids()`——从事件流反推「有 SessionCreated 但无终态
+    # 事件」的会话清单。2026-09-21 删，因为**这个问题 core 不该回答**：会话清单是 host
+    # 自己的数据（它建的会话、它的 sessions 表、它的状态列），core 从事件流把它重新推一遍
+    # 是职责倒置，而且推得更差——那台状态机的两条 discard 依据（`SessionFinished` /
+    # `SessionStatusChanged`）在 src 下没有任何 emit 调用点，判据恒真，返回的实际是「这个
+    # 库里出现过的全部会话」。host 侧同样的问题是一条带索引的 status 查询。
+    #
+    # 它唯一的消费者是 `Runtime.rebuild_all_pending_hitl`（同日删除）。要按会话装填，host
+    # 拿自己的清单逐条调 `Runtime.rebuild_hitl(session_id)` / `rebuild_session(session_id)`
+    # ——那两条都走快照 + 增量（`rebuild_view`），O(delta)。
 
     @abstractmethod
     async def read_last_of_type(
@@ -694,35 +677,10 @@ class EventStore(Protocol):
         """
         ...
 
-    @abstractmethod
-    async def read_session_events_of_types(
-        self, session_id: str, types: "tuple[str, ...]", *, task_id: str = "",
-    ) -> list[Event]:
-        """只加载 session 中指定类型的事件（按提交序升序排序）。
-
-        `task_id` 非空时再按 task 收窄。这不是可选的性能糖——对 capability 折叠它是**唯一
-        安全的界**：那个折叠要回答「这次调用跑过没有」，漏掉一条 `CapabilityInvoked` 的后果
-        是 gateway 以为它没跑过、静默重跑一个有副作用的工具。所以不能按「最近 N 条」截尾
-        （那是猜），而按 task 收窄是精确的：dangling tool_call 必定属于正在 reconcile 的那个
-        task，capability 事件也确实带着它（`make_event` 从 `LoopState` 取 `task_id`）。
-
-        ⚠️ **只排除明确属于别的 task 的**：`task_id` 为 NULL / 空串的事件照样取回。那一档是
-        「无从归属」（存量数据、非 run 域事件），不是「属于别人」，而判错方向的代价不对称
-        ——把一条没归属的 `CapabilityInvoked` 漏掉就会静默重跑一个有副作用的工具，多取回
-        几条只是多折几下。
-
-        排序口径与 `read_range` 完全一致：有序提交 store 按 `position`、legacy
-        store 按 `id`；两者都不用 `sequence`（它只在同一 `run_id` 内单调，跨 run 的
-        session 按它排会交错两个 run 的事件）。
-
-        轻查询——供恢复决策按事件折叠（如 HITL 待解决判定）而**不必全量回放**。
-
-        **必需**，不是可选扩展。从前它「未实现时抛 NotImplementedError，调用方降级为
-        read_by_session + 内存过滤」——那条降级是 core 里最后一处能力探测，而它通往的正是
-        「把整条流读进内存」（实测 3 万事件 ≈ 130MB / 3.5s）。同一个坏设计在这个仓已经生出过
-        三次两分支两失败形态（`replay`、`read_by_session_after`、快照），所以这里不留第四次。
-        """
-        ...
+    # **这里没有 `read_session_events_of_types`**（2026-09-21 并进 `read_range`）。它和那个
+    # 方法是同一个查询换过滤条件，而缺的那一样（位置区间）正是它的问题：capability 折叠靠它
+    # 回答「这个 dangling tool_call 跑过没有」，「无从归属」那条安全阀让它的上界始终留着一项
+    # 随会话长度增长的成分。合并的完整理由见 `read_range` 的 docstring。
 
     # ── 快照 ────────────────────────────────────────────────────────────────
     # **协议不提及快照。** 一张状态快照就是日志里的一条 `EventType.STATE_SNAPSHOT` 事件，
@@ -766,20 +724,14 @@ def supports_ordered_commit(store: object) -> bool:
     return True
 
 
-def supports_replay(store: object) -> bool:
-    """store 能不能被分批重放（`EventStore.replay`）。
-
-    判据与 `supports_ordered_commit` **相反**，这不是笔误：那三个方法在协议里是抽象桩，
-    「继承了但没覆盖」等于没实现；`replay` 在协议里是**能用的默认实现**，继承下来就真能
-    用（它只调 `read_range` / `committed_head`，两者都是必需方法）。所以这里只问「有没有
-    这个属性」——继承协议的 store 恒为真，鸭子类型的 store 得自己写一个。
-
-    存在的理由与 `supports_ordered_commit` 相同：把缺失挪到构造期。恢复路径无条件
-    `async for batch in store.replay(sid)`，core 既不问「你支不支持分页」也不备降级路
-    （那种能力探测曾经写在 core 里，一个坏设计生出两个分支和两种失败形态）；代价是缺了它
-    就会在**快照不可用的那次** `/resume` 里才炸——那是最罕见、最难复现的路径。
-    """
-    return getattr(type(store), "replay", None) is not None
+# **这里没有 `supports_replay`**（2026-09-21 随 `replay` 一起删）。它存在的唯一原因是「协议的
+# 默认实现只白送给显式继承的 store，鸭子类型拿不到」——判据还得写明「与
+# `supports_ordered_commit` 相反，这不是笔误」。`replay` 变成 core 的函数
+# （`reducers.replay_session`，只用 `read_range` + `committed_head`）之后，任何满足本协议的
+# store 都能被重放，这道门连带那条解释一起没有了。
+#
+# `supports_ordered_commit` 留着：它兜的是**抽象桩**（鸭子类型 store 压根没有那些方法），
+# 与「默认实现继承不到」是两回事。
 
 
 # ── Blob 存储（事件流的字节侧）─────────────────────────────────────────────────

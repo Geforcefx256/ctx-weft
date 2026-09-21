@@ -28,3 +28,17 @@ async def all_events(store: Any, session_id: str) -> "list[Event]":
     没有读者：`open_sqlite_event_store` 拒绝打开未回填的库，宿主侧 m020 在任何读之前回填完。
     """
     return [se.event for se in await store.read_range(session_id)]
+
+
+async def append_one(store: Any, event: Event) -> None:
+    """落一条事件——`store.append(event)` 的替代。
+
+    `EventStore.append` 在 2026-09-21 从协议删掉了：两个实现逐字相同
+    （`append_batch(event.session_id, event.id, [event])`），src 里只有一个调用者，而
+    `batch_id = event.id` 那一句是**策略**（确定性取值，好让原样重试撞上幂等账而不是写出第二
+    份），由每个实现各写一遍正是本仓被咬过的那个形状。理由写在协议里它原来的位置。
+
+    夹具里「落一条事件」仍然是最常见的动作，所以收成这个函数——**策略只写在这一处**，和
+    `all_events` 同一个理由、同一个位置。
+    """
+    await store.append_batch(event.session_id, event.id, [event])

@@ -35,7 +35,7 @@ from tests.integration.test_hitl_hot_reply_round_window_e2e import (
 from tests.integration.test_minimal_loop import (
     InlineAgentTemplateProvider, make_echo_template, make_runtime,
 )
-from tests._event_helpers import all_events
+from tests._event_helpers import all_events, append_one
 
 pytestmark = pytest.mark.asyncio
 
@@ -68,9 +68,9 @@ async def _seed(rt, status_event, *, status="ACTIVE"):
             "assigned_agent_id": AID, "creator_agent_id": AID, "user_prompt": PROMPT}),
         _ev(3, EventType.TASK_STARTED, task_id=TID, assigned_agent_id=AID),
     ]:
-        await rt.event_store.append(e)
+        await append_one(rt.event_store, e)
     if status_event is not None:
-        await rt.event_store.append(_ev(4, status_event, task_id=TID, hitl_id="",
+        await append_one(rt.event_store, _ev(4, status_event, task_id=TID, hitl_id="",
                                         reason="probe", retry_count=0))
 
 
@@ -100,6 +100,9 @@ async def test_recovery_keeps_exactly_one_prompt(status_event, record_id) -> Non
             kind=MemoryKind.CONVERSATION_TURN, scope=MemoryScope.TASK, address=scope,
             content=PROMPT, timestamp=TS, role="user", metadata={"task_id": TID}), pctx)
 
+    # 装填是调用方的责任（2026-09-21：`recover_agent` 对 registry miss 直接抛
+    # `AgentNotLoaded`，按 agent 扫全库的 sweep 已删）。只喂内存，不建 TM、不跑。
+    await rt.rebuild_session(SID)
     with mock.patch(
         "ctx_weft.core.loop.steps.background_observe.launch_background_observe",
         return_value=None,
@@ -131,13 +134,14 @@ async def test_requeued_task_with_revised_prompt_still_writes_it() -> None:
         _ev(4, EventType.TASK_REQUEUED, task_id=TID, reason="revise",
             user_prompt=revised),
     ]:
-        await rt.event_store.append(e)
+        await append_one(rt.event_store, e)
     scope, pctx = _scope_ctx()
     await mem.ingest(MemoryEvent(
         id=task_prompt_record_id(TID, PROMPT),
         kind=MemoryKind.CONVERSATION_TURN, scope=MemoryScope.TASK, address=scope,
         content=PROMPT, timestamp=TS, role="user", metadata={"task_id": TID}), pctx)
 
+    await rt.rebuild_session(SID)
     with mock.patch(
         "ctx_weft.core.loop.steps.background_observe.launch_background_observe",
         return_value=None,
@@ -211,7 +215,7 @@ async def test_truncated_recorded_result_is_not_backfilled() -> None:
             invocation_id="inv_1", capability_name="fs__read_file", outcome="success",
             result="TRUNCATED_HEAD", result_length=99999),
     ]:
-        await rt.event_store.append(e)
+        await append_one(rt.event_store, e)
 
     scope, pctx = _scope_ctx()
     await mem.ingest(MemoryEvent(
@@ -224,6 +228,7 @@ async def test_truncated_recorded_result_is_not_backfilled() -> None:
         metadata={"tool_calls": [{"id": tcid, "name": "fs__read_file",
                                   "input": {"path": "x"}}]}), pctx)
 
+    await rt.rebuild_session(SID)
     with mock.patch(
         "ctx_weft.core.loop.steps.background_observe.launch_background_observe",
         return_value=None,

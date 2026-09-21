@@ -39,6 +39,7 @@ from tests.integration.test_minimal_loop import (
     make_echo_template,
     make_runtime,
 )
+from tests._event_helpers import append_one
 
 pytestmark = pytest.mark.asyncio
 
@@ -60,7 +61,7 @@ async def _idle_agent():
     rt.providers.register_memory(mem)
 
     ts = datetime(2026, 6, 16, tzinfo=UTC)
-    await rt.event_store.append(Event(
+    await append_one(rt.event_store, Event(
         id="evt_0001", run_id="run_1", sequence=1, session_id=SID,
         type=EventType.SESSION_CREATED, timestamp=ts,
         payload={"template_id": f"agent:{tmpl.id}", "user_prompt": "x", "root_agent_id": AID,

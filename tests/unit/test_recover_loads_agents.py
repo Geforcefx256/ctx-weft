@@ -17,6 +17,7 @@ import pytest
 from ctx_weft.protocols.events import Event, EventType
 from tests.integration.test_minimal_loop import InlineAgentTemplateProvider, make_runtime
 from tests.unit._legacy_recover import rebuild_all_active
+from tests._event_helpers import append_one
 
 pytestmark = pytest.mark.asyncio
 
@@ -37,12 +38,12 @@ async def _seed_crashed_session(store, sid: str, root_agent_id: str) -> None:
     `HITL_REQUIRED`，让 root agent 折出来的 `waiting_human` 状态不是巧合：有一条真
     未决 HITL 挂着。
     """
-    await store.append(_ev(1, sid, EventType.SESSION_CREATED,
+    await append_one(store, _ev(1, sid, EventType.SESSION_CREATED,
                             template_id="tpl_x", root_agent_id=root_agent_id))
-    await store.append(_ev(2, sid, EventType.AGENT_INSTANTIATED, agent_id=root_agent_id,
+    await append_one(store, _ev(2, sid, EventType.AGENT_INSTANTIATED, agent_id=root_agent_id,
                             template_id="tpl_x"))
-    await store.append(_ev(3, sid, EventType.HITL_REQUIRED, hitl_id=f"h_{sid}", form="question"))
-    await store.append(_ev(4, sid, EventType.AGENT_WAITING_HUMAN, agent_id=root_agent_id))
+    await append_one(store, _ev(3, sid, EventType.HITL_REQUIRED, hitl_id=f"h_{sid}", form="question"))
+    await append_one(store, _ev(4, sid, EventType.AGENT_WAITING_HUMAN, agent_id=root_agent_id))
 
 
 async def test_recover_populates_agent_registry() -> None:
@@ -66,9 +67,9 @@ async def test_recover_returns_agent_count_not_session_count() -> None:
     store = rt.event_store
     await _seed_crashed_session(store, "S1", "agt_root_1")
     await _seed_crashed_session(store, "S2", "agt_root_2")
-    await store.append(_ev(5, "S2", EventType.AGENT_INSTANTIATED, agent_id="agt_child_2",
+    await append_one(store, _ev(5, "S2", EventType.AGENT_INSTANTIATED, agent_id="agt_child_2",
                             template_id="tpl_x"))
-    await store.append(_ev(6, "S2", EventType.AGENT_IDLE, agent_id="agt_child_2"))
+    await append_one(store, _ev(6, "S2", EventType.AGENT_IDLE, agent_id="agt_child_2"))
 
     n = await rebuild_all_active(rt)
 
@@ -138,12 +139,12 @@ async def test_crashed_running_is_settled_to_interrupted_and_terminated_stays_si
     await _seed_crashed_session(store, "S1", "agt_root")
     # 额外两个 agent：一个折成 running，一个折成 terminated——同一条 AGENT_INSTANTIATED
     # + 五态机状态事件的种法，只是换了状态事件类型（见 _seed_crashed_session 的折叠依据）。
-    await store.append(_ev(5, "S1", EventType.AGENT_INSTANTIATED, agent_id="agt_running",
+    await append_one(store, _ev(5, "S1", EventType.AGENT_INSTANTIATED, agent_id="agt_running",
                             template_id="tpl_x"))
-    await store.append(_ev(6, "S1", EventType.AGENT_RUNNING, agent_id="agt_running"))
-    await store.append(_ev(7, "S1", EventType.AGENT_INSTANTIATED, agent_id="agt_terminated",
+    await append_one(store, _ev(6, "S1", EventType.AGENT_RUNNING, agent_id="agt_running"))
+    await append_one(store, _ev(7, "S1", EventType.AGENT_INSTANTIATED, agent_id="agt_terminated",
                             template_id="tpl_x"))
-    await store.append(_ev(8, "S1", EventType.AGENT_TERMINATED, agent_id="agt_terminated"))
+    await append_one(store, _ev(8, "S1", EventType.AGENT_TERMINATED, agent_id="agt_terminated"))
 
     await rebuild_all_active(rt)
 

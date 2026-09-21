@@ -641,10 +641,7 @@ class CtxWeftRuntime:
         # 按 ID 排序的回落分支。这里做的是契约校验而非能力协商——Protocol 的
         # @abstractmethod 只拦得住显式继承的实现，鸭子类型 store 缺方法要到第一次
         # 提交才炸，那时错误已经离现场很远。
-        from ctx_weft.protocols.events import (
-            supports_ordered_commit,
-            supports_replay,
-        )
+        from ctx_weft.protocols.events import supports_ordered_commit
         if not supports_ordered_commit(self.event_store):
             raise ValueError(
                 f"EventStore {type(self.event_store).__name__} 未实现有序提交："
@@ -653,12 +650,10 @@ class CtxWeftRuntime:
                 "事件会永久落在快照游标之外，两条恢复路径给出不同的世界且不报错"
                 "（可靠性方案 H2）。内置 InMemoryEventStore / SqlEventStore 均已实现；"
                 "自定义 store 请参照 tests/unit/test_ordered_event_store_conformance.py。")
-        if not supports_replay(self.event_store):
-            raise ValueError(
-                f"EventStore {type(self.event_store).__name__} 没有 replay："
-                "快照不可用时的全量重放由 store 分批产出（EventStore.replay），core 只"
-                "`async for` 折叠，不做能力探测也不备降级路。显式继承 EventStore 即可白拿"
-                "默认实现（按 position 区间切，真分批）；鸭子类型 store 请自己写一个。")
+        # 这里从前还有一道 `supports_replay` 门：协议上的 `replay` 是「能用的默认实现」，
+        # 鸭子类型 store 继承不到，所以要在构造期兜一把。2026-09-21 `replay` 搬进 core
+        # （`reducers.replay_session`，只用 read_range + committed_head 两个必需原语）之后，
+        # 那道门没有存在的理由了——上面那道校验已经保证这两个原语齐全。
         # 存储不可用健康表（spec: event-commit）：session_id → 原因。CommitGate 失败时
         # **先标记后抛**；公开查询走 storage_health()。内存态——崩溃后由持久日志重建。
         self._storage_unavailable: dict[str, str] = {}
@@ -2184,10 +2179,14 @@ class CtxWeftRuntime:
 
         **这是唯一的按需装填入口。** 从前另有一个 `recover()`：进程启动时扫「全部 active
         session」各装填一遍。它于 2026-09-09 删除——两个理由。其一，它的循环体逐字就是本
-        方法，同一件事写两处。其二更要命：「active」的判据（`providers/events/_lifecycle`）
-        只会 add、不会 discard——两条 discard 依据 `SessionFinished` / `SessionStatusChanged`
-        早已随会话状态机退役而停发，于是「active 集」= 这台机器历史上跑过的**全部**会话，
+        方法，同一件事写两处。其二更要命：那个「active」判据是 core 从事件流反推的，而它
+        只会 add、不会 discard（两条 discard 依据 `SessionFinished` / `SessionStatusChanged`
+        早已随会话状态机退役而停发），于是「active 集」= 这台机器历史上跑过的**全部**会话，
         启动开销与历史会话数线性增长且永不收敛。恢复因此整体改成用户驱动：用到哪条装哪条。
+
+        判据连同 `EventStore.list_active_session_ids` 已于 2026-09-21 整个删除——**「有哪些
+        会话」是 host 自己的数据**，不该由 core 从事件流重新推一遍。host 拿自己的清单（它的
+        会话表 + 状态列，一条带索引的查询）逐条调本方法即可。
 
         **绝不抛**：`_load_agents_of` 自己就是绝不抛的，`rebuild_hitl` 的失败也只记日志。
         装不出来（session 在事件日志里压根不存在）返回 0，由调用方决定这算不算错。
@@ -4242,6 +4241,7 @@ class CtxWeftRuntime:
         """
         from ctx_weft.core.control.reducers import (
             REPLAY_EXCLUDE_TYPES,
+            replay_session,
             settled_memory_floor,
         )
         from ctx_weft.core.utils.content import (
@@ -4257,15 +4257,11 @@ class CtxWeftRuntime:
         # 与 SnapshotWriter 重锚同源（实测 20 万事件 604.9MB），所以这里同样按区间切。
         # 收集的只是命中类型的那几条——注入消息的条数与会话长度无关。
         events: "list[Event]" = []
-        cursor = floor
-        while cursor < head:
-            upper = min(cursor + EventStore.REPLAY_BATCH, head)
-            events.extend(
-                se.event for se in await self.event_store.read_range(
-                    session.id, after_position=cursor, through_position=upper,
-                    exclude_types=REPLAY_EXCLUDE_TYPES)
-                if se.event.type == EventType.TASK_MESSAGE_APPENDED)
-            cursor = upper
+        async for batch in replay_session(
+                self.event_store, session.id, after_position=floor,
+                through_position=head, exclude_types=REPLAY_EXCLUDE_TYPES):
+            events.extend(e for e in batch
+                          if e.type == EventType.TASK_MESSAGE_APPENDED)
         if not events:
             return
         memory = self.providers.get_memory()
@@ -4647,24 +4643,6 @@ class CtxWeftRuntime:
                 except Exception:                       # pragma: no cover — 纯函数，防御性
                     logger.exception("HITL 恢复：降级占位也失败 (key=%s)", key)
 
-    async def rebuild_all_pending_hitl(self) -> int:
-        """据事件重建**所有 active session** 的内存 pending HITL（不发中断、不 drain）,返回总条数。
-
-        供只带 hitl_id 的应答入口（`/hitl/{id}/*`）自愈:重启后内存 registry 为空、又无 session_id
-        可定位时,重建全部 active pending 后即可按 id 命中。仅在 miss 时调用,成本有界（spec/07 §9）。
-        """
-        try:
-            session_ids = await self.event_store.list_active_session_ids()
-        except NotImplementedError:
-            return 0
-        total = 0
-        for sid in session_ids:
-            try:
-                total += await self.rebuild_hitl(sid)
-            except Exception:
-                logger.exception("rebuild_all_pending_hitl: failed for session %s", sid)
-        return total
-
     # 这里从前有 `rebuild_agent(agent_id)` 与 `rebuild_all_agents()`——「只有 agent_id、
     # 不知道 session」时扫**全部** active session 逐个装填，直到撞见那个 agent。
     # 2026-09-21 删，两个理由：
@@ -4684,10 +4662,25 @@ class CtxWeftRuntime:
     # 子类，宿主既有的 except 照样接住）。手握 session_id 的 miss 仍然精确自愈，那是
     # 一次定址装填、成本有界，见 `_hydrate_agent_for_send` / `_hydrate_agent_for_cold_resume`。
     #
-    # ⚠️ `rebuild_all_pending_hitl`（上面那个）**刻意留着**：`/hitl/{id}/*` 端点真的只有
-    # hitl_id，而 HITL 状态没有第二个存储（宿主也没有 hitl 表），它无从定址。那条要治得先
-    # 给 core 一个 hitl_id → session_id 的定址读，是独立一件事。在它之前
-    # `list_active_session_ids` 仍有这一个消费者，故协议与 `_lifecycle` 状态机都还不能删。
+    # 同日删掉的还有 `rebuild_all_pending_hitl()`——「把所有 active session 的未决 HITL 都
+    # 装填一遍」，供只带 hitl_id 的应答入口（`/hitl/{id}/*`）自愈。它枚举会话用的也是
+    # `EventStore.list_active_session_ids`（该方法连同 `providers/events/_lifecycle` 那台
+    # 状态机一并删除，见协议里的墓碑）。
+    #
+    # **删它的理由跟上面两条不同，是职责划界**：「有哪些会话」是 host 自己的数据——会话是
+    # 它建的，它有自己的会话表和状态列。core 从事件流把这份清单重新推一遍是职责倒置，而且
+    # 推得更差：那台状态机的两条 discard 依据（`SessionFinished` / `SessionStatusChanged`）
+    # 在 src 下没有任何 emit 调用点，判据恒真，返回的实际是「这个库里出现过的全部会话」。
+    # host 侧同样的问题是一条带索引的 status 查询（`PAUSED_HITL` / `PAUSED` 正是「等着人
+    # 回话」那一档），既精确又便宜。
+    #
+    # 顺带解掉一个陷阱：既然判据恒真，谁去「修」它、让 discard 真的生效，
+    # `rebuild_all_pending_hitl` 就会开始**漏** HITL——`TERMINAL_STATUSES` 含 `INTERRUPTED`，
+    # 而一条被打断的会话完全可能正停在那儿等人回答。一个看起来在修 bug 的改动会静默制造
+    # 一个更坏的。判据本身没了，这个反向依赖也就不存在了。
+    #
+    # host 要按会话装填，拿自己的清单逐条调 `rebuild_hitl(session_id)` /
+    # `rebuild_session(session_id)`——两条都走 `rebuild_view` 的快照 + 增量，O(delta)。
 
     # ── Internal execution ───────────────────────────────────────────────────
 

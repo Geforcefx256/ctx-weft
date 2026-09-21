@@ -18,6 +18,7 @@ from tests.integration.test_minimal_loop import (
     make_echo_template,
     make_runtime,
 )
+from tests._event_helpers import append_one
 
 pytestmark = pytest.mark.asyncio
 
@@ -206,7 +207,7 @@ async def test_resume_session_without_jsonable_falls_back_to_the_text_prompt():
 
     bus = _CapturingBus()
     store = InMemoryEventStore()
-    await store.append(Event(
+    await append_one(store, Event(
         id=generate_id("evt"), run_id=None, sequence=1, session_id="ses-resume",
         type="SessionCreated", timestamp=now_utc(), tenant_id="default",
         payload={"template_id": "tpl", "user_prompt": "第一轮",

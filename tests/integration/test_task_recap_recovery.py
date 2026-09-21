@@ -51,6 +51,7 @@ from ctx_weft.providers.llm.mock import MockLLMAdapter, MockResponse
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from tests.integration.test_minimal_loop import InlineAgentTemplateProvider, make_echo_template, make_runtime
 from tests._snapshot_helpers import seed_snapshot
+from tests._event_helpers import append_one
 
 pytestmark = pytest.mark.asyncio
 
@@ -119,7 +120,7 @@ async def test_stuck_finish_session_recovers_and_finalizes(monkeypatch) -> None:
         _ev(7, EventType.TASK_RECAP_STARTED, task_id=tid, boundary="finish", agent_id=aid),
     ]
     for e in seed:
-        await runtime.event_store.append(e)
+        await append_one(runtime.event_store, e)
 
     # Pre-crash state: session projection is still RUNNING (no SESSION_FINISHED).
     view_before = await rebuild_view(runtime.event_store, sid)
@@ -160,6 +161,9 @@ async def test_stuck_finish_session_recovers_and_finalizes(monkeypatch) -> None:
     monkeypatch.setattr(TaskManager, "finalize_idle_session", _spy_finalize)
 
     # ── Recover ────────────────────────────────────────────────────────────────
+    # 装填是调用方的责任（2026-09-21：`recover_agent` 对 registry miss 直接抛
+    # `AgentNotLoaded`，按 agent 扫全库的 sweep 已删）。只喂内存，不建 TM、不跑。
+    await runtime.rebuild_session(sid)
     await runtime.recover_agent(aid)
 
     # finalize_idle_session awaits the relaunched recap before finalizing the session,
@@ -219,7 +223,7 @@ async def test_stuck_failed_session_recovers_and_finalizes_failed(monkeypatch) -
         _ev(8, EventType.TASK_RECAP_STARTED, task_id=tid, boundary="finish", agent_id=aid),
     ]
     for e in seed:
-        await runtime.event_store.append(e)
+        await append_one(runtime.event_store, e)
 
     # Pre-crash state: task FAILED, session projection failure_counter > 0, still RUNNING.
     view_before = await rebuild_view(runtime.event_store, sid)
@@ -259,6 +263,7 @@ async def test_stuck_failed_session_recovers_and_finalizes_failed(monkeypatch) -
     monkeypatch.setattr(TaskManager, "finalize_idle_session", _spy_finalize)
 
     # ── Recover ────────────────────────────────────────────────────────────────
+    await runtime.rebuild_session(sid)
     await runtime.recover_agent(aid)
 
     tm = runtime._task_managers.get(sid)
@@ -345,7 +350,7 @@ async def test_suspended_task_with_pending_interrupt_recap_recovers() -> None:
         _ev(6, EventType.TASK_RECAP_STARTED, task_id=tid, boundary="interrupt", agent_id=aid),
     ]
     for e in seed:
-        await runtime.event_store.append(e)
+        await append_one(runtime.event_store, e)
 
     # Route the routing-aware mock LLM in for this test (the module-level _make_runtime
     # builds a plain MockLLMAdapter; swap it for one that separates the two concurrent
@@ -376,6 +381,7 @@ async def test_suspended_task_with_pending_interrupt_recap_recovers() -> None:
     ), pctx)
 
     # ── Recover ────────────────────────────────────────────────────────────────
+    await runtime.rebuild_session(sid)
     await runtime.recover_agent(aid)
 
     # Drive to quiescence: repeatedly gather whatever background tasks the TM is
@@ -433,10 +439,11 @@ async def test_no_tasks_at_all_still_raises() -> None:
     runtime, _mem, _seen = _make_runtime()
     aid = "agt_root"
 
-    await runtime.event_store.append(_ev(
+    await append_one(runtime.event_store, _ev(
         1, EventType.SESSION_CREATED, user_prompt="do it",
         template_id="agent:tpl_echo", root_agent_id=aid))
 
+    await runtime.rebuild_session("ses_recap")
     with pytest.raises(RuntimeError, match="no resumable tasks"):
         await runtime.recover_agent(aid)
 
@@ -468,7 +475,7 @@ async def test_all_tasks_terminal_with_a_pruned_snapshot_does_not_raise() -> Non
             summary="done", outputs={"result": "ok"}),
     ]
     for e in seed:
-        await runtime.event_store.append(e)
+        await append_one(runtime.event_store, e)
 
     # 按生产口径写一张**裁过的**快照，并让它成为可用基底
     head = await runtime.event_store.committed_head(sid)
@@ -481,6 +488,7 @@ async def test_all_tasks_terminal_with_a_pruned_snapshot_does_not_raise() -> Non
     view = await rebuild_view(runtime.event_store, sid)
     assert view.tasks == {} and view.tasks_total == 1
 
+    await runtime.rebuild_session(sid)
     await runtime.recover_agent(aid)   # 不抛即通过（没有活可重排，但会话是好的）
 
 
@@ -505,7 +513,6 @@ async def test_resume_does_not_read_the_whole_event_stream() -> None:
     full_reads = [0]
     typed_reads: list[tuple[str, ...]] = []
     orig_range = store.read_range
-    orig_typed = store.read_session_events_of_types
 
     # 从前这里数 `read_by_session`。那个方法 2026-09-21 从协议删了，而「不存在的方法被调
     # 0 次」由语言保证。改数**无界的 read_range**（after=0 且无上界 = 整条会话）——那是删掉
@@ -513,14 +520,12 @@ async def test_resume_does_not_read_the_whole_event_stream() -> None:
     async def _counting(session_id, **k):
         if k.get("after_position", 0) == 0 and k.get("through_position") is None:
             full_reads[0] += 1
+        if k.get("include_types"):
+            # 「按类型收窄的那种读」2026-09-21 并进了 read_range，两笔账都从这里收。
+            typed_reads.append(tuple(str(t) for t in k["include_types"]))
         return await orig_range(session_id, **k)
 
-    async def _counting_typed(session_id, types, *, task_id: str = ""):
-        typed_reads.append(tuple(str(t) for t in types))
-        return await orig_typed(session_id, types, task_id=task_id)
-
     store.read_range = _counting               # type: ignore[method-assign]
-    store.read_session_events_of_types = _counting_typed   # type: ignore[method-assign]
 
     sid, tid, aid = "ses_recap", "tsk_recap", "agt_root"
     for e in [
@@ -533,8 +538,9 @@ async def test_resume_does_not_read_the_whole_event_stream() -> None:
         _ev(4, EventType.TASK_FINISHED, task_id=tid, outcome="success", summary="done"),
         _ev(5, EventType.TASK_RECAP_STARTED, task_id=tid, boundary="finish", agent_id=aid),
     ]:
-        await store.append(e)
+        await append_one(store, e)
 
+    await runtime.rebuild_session(sid)
     await runtime.recover_agent(aid)
 
     assert full_reads[0] == 0, (

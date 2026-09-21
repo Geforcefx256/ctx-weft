@@ -96,7 +96,7 @@ from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from tests.integration.test_minimal_loop import (
     InlineAgentTemplateProvider, make_echo_template, make_runtime,
 )
-from tests._event_helpers import all_events
+from tests._event_helpers import all_events, append_one
 
 
 class _RouterLLM(MockLLMAdapter):
@@ -311,7 +311,7 @@ async def test_compact_agent_run_events_have_runtime_origin():
 
     sid, aid = "ses_origin", "agt_root"
     ts = datetime(2026, 9, 3, tzinfo=UTC)
-    await rt.event_store.append(Event(
+    await append_one(rt.event_store, Event(
         id="evt_0001", run_id="run_1", sequence=1, session_id=sid,
         type=EventType.SESSION_CREATED, timestamp=ts,
         payload={"template_id": "agent:tpl_echo", "user_prompt": "x", "root_agent_id": aid,
@@ -352,7 +352,7 @@ async def test_sql_event_store_round_trips_origin(tmp_path):
 
     async with open_sqlite_event_store(tmp_path / "events.db") as store:
         ev = _ev(id="evt_a", type="TaskStarted", origin=EventOrigin.LOOP_ACT)
-        await store.append(ev)
+        await append_one(store, ev)
         loaded = await all_events(store, "s1")
         assert len(loaded) == 1
         assert loaded[0].origin == "loop.act"
@@ -363,7 +363,7 @@ async def test_sql_event_store_round_trips_blank_origin(tmp_path):
 
     async with open_sqlite_event_store(tmp_path / "events.db") as store:
         ev = _ev(id="evt_b", type="TaskStarted")  # origin 默认 ""
-        await store.append(ev)
+        await append_one(store, ev)
         loaded = await all_events(store, "s1")
         assert len(loaded) == 1
         assert loaded[0].origin == ""

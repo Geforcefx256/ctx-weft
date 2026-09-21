@@ -17,6 +17,7 @@ import pytest
 from ctx_weft.protocols import BLOB_REF_PREFIX, ImagePart, ProviderContext
 from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.protocols.hitl import ToolResultDelivery, UserTurnDelivery
+from tests._event_helpers import append_one
 
 pytestmark = pytest.mark.asyncio
 
@@ -245,7 +246,13 @@ async def _runtime_with_events(events, *, event_blob_store=None):
         store.blobs[PNG_REF] = (PNG, "image/png")
     rt.providers.register_event_blob_store(store)
     for e in events:
-        await rt.event_store.append(e)
+        await append_one(rt.event_store, e)
+    # 装填是调用方的责任（2026-09-21：`recover_agent` 对 registry miss 直接抛
+    # `AgentNotLoaded`，从前那条「按 agent 扫全部 active session」的 sweep 已删）。
+    # 这里补的正是宿主的真实第一步（`ensure_core_warm` → `rebuild_session`），结果与
+    # 从前 core 替调用方扫出来的等价，只是明说了是哪条会话。**只喂内存，不建 TM、
+    # 不跑任何东西**，所以下面每条用例要验的恢复语义一点没被提前执行。
+    await rt.rebuild_session(SID)
     rt._test_llm = llm
     return rt
 

@@ -36,6 +36,7 @@ from ctx_weft.protocols import (
 from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.providers.events import InMemoryEventStore
 from tests._snapshot_helpers import seed_snapshot
+from tests._event_helpers import append_one
 
 _T0 = datetime(2026, 9, 20, tzinfo=UTC)
 
@@ -48,10 +49,10 @@ def _ev(seq: int, type_: str = "TaskMessageAppended", **payload) -> Event:
 
 async def _store_with(n: int) -> InMemoryEventStore:
     store = InMemoryEventStore()
-    await store.append(_ev(1, EventType.SESSION_CREATED,
+    await append_one(store, _ev(1, EventType.SESSION_CREATED,
                            template_id="t", root_agent_id="a"))
     for i in range(2, n + 1):
-        await store.append(_ev(i, task_id="tsk_1", memory_id=f"mem_{i}"))
+        await append_one(store, _ev(i, task_id="tsk_1", memory_id=f"mem_{i}"))
     return store
 
 
@@ -185,9 +186,9 @@ async def _restore_and_collect(store, session_id="s1"):
 async def test_restores_a_message_that_never_made_it_into_memory() -> None:
     """崩溃窗口的正路：事件在、memory 里没有 → 补回来。"""
     store = InMemoryEventStore()
-    await store.append(_ev(1, EventType.SESSION_CREATED,
+    await append_one(store, _ev(1, EventType.SESSION_CREATED,
                            template_id="t", root_agent_id="agt_1"))
-    await store.append(await _appended(2, mem_id="mem_lost"))
+    await append_one(store, await _appended(2, mem_id="mem_lost"))
 
     assert "mem_lost" in await _restore_and_collect(store)
 
@@ -206,12 +207,12 @@ async def test_restores_the_message_sitting_exactly_at_the_floor_plus_one() -> N
     而并发 append 完全可以在「取 head」与「append 快照事件」之间插进来。
     """
     store = InMemoryEventStore()
-    await store.append(_ev(1, EventType.SESSION_CREATED,
+    await append_one(store, _ev(1, EventType.SESSION_CREATED,
                            template_id="t", root_agent_id="agt_1"))
-    await store.append(await _appended(2, mem_id="mem_old"))
-    await store.append(await _appended(3, mem_id="mem_at_cut"))
-    await store.append(await _appended(4, mem_id="mem_floor_plus_one"))
-    await store.append(await _appended(5, mem_id="mem_later"))
+    await append_one(store, await _appended(2, mem_id="mem_old"))
+    await append_one(store, await _appended(3, mem_id="mem_at_cut"))
+    await append_one(store, await _appended(4, mem_id="mem_floor_plus_one"))
+    await append_one(store, await _appended(5, mem_id="mem_later"))
     view = reduce_events(
         [se.event for se in await store.read_range("s1", through_position=3)],
         run_id="s1")
@@ -231,10 +232,10 @@ async def test_does_not_reread_what_the_snapshot_already_guarantees() -> None:
     只能看实际读了哪个区间。
     """
     store = InMemoryEventStore()
-    await store.append(_ev(1, EventType.SESSION_CREATED,
+    await append_one(store, _ev(1, EventType.SESSION_CREATED,
                            template_id="t", root_agent_id="agt_1"))
     for i in range(2, 12):
-        await store.append(await _appended(i, mem_id=f"mem_{i}"))
+        await append_one(store, await _appended(i, mem_id=f"mem_{i}"))
     view = reduce_events(
         [se.event for se in await store.read_range("s1")], run_id="s1")
     await seed_snapshot(store, "s1", view, cut=11)
@@ -262,11 +263,14 @@ def test_the_restore_reads_from_the_floor_not_the_whole_session() -> None:
 
     src = inspect.getsource(CtxWeftRuntime._restore_appended_messages)
     assert "settled_memory_floor" in src, "补写又读全会话了"
-    # 起点是 floor，然后按区间往前走（`cursor = floor` + while 循环）。分批是必要的：
-    # floor==0 时（首张快照之前 / 存量库 / projection_version 刚 bump）区间就是整条会话，
-    # 一次性物化那一段的代价与重锚同源（实测 20 万事件 604.9MB）。
-    assert "cursor = floor" in src, src
-    assert "while cursor < head" in src, "没有分批——floor==0 时会一次读完整条会话"
+    # 起点是 floor、上界是自己取的 head，中间分批走 `reducers.replay_session`
+    # （2026-09-21 从协议搬进 core 的那个函数）。分批是必要的：floor==0 时（首张快照之前 /
+    # 存量库 / projection_version 刚 bump）区间就是整条会话，一次性物化那一段的代价与重锚
+    # 同源（实测 20 万事件 604.9MB）。
+    assert "replay_session" in src, "没有分批——floor==0 时会一次读完整条会话"
+    assert "after_position=floor" in src, src
+    assert "through_position=head" in src, (
+        "没有显式上界：replay_session 会自己取 committed_head，读进补写开始之后才提交的事件")
     assert "load_events_of_types" not in src, (
         "`load_events_of_types` 没有下界参数——用它就是又读全会话")
     # 刻意**不**断言 `exclude_types=REPLAY_EXCLUDE_TYPES`。代码里传了它，但那纯粹是省

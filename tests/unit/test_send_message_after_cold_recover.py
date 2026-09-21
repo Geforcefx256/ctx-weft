@@ -23,6 +23,7 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 from tests.unit._legacy_recover import rebuild_all_active
+from tests._event_helpers import append_one
 
 pytestmark = pytest.mark.asyncio
 
@@ -59,11 +60,11 @@ async def test_send_message_self_heals_a_cold_recovered_agents_missing_task_mana
 
     rt = _runtime_with_registered_template()
     sid, aid = "A", "agt_1"
-    await rt.event_store.append(_ev(1, sid, EventType.SESSION_CREATED,
+    await append_one(rt.event_store, _ev(1, sid, EventType.SESSION_CREATED,
                                      template_id="agent:tpl_echo", root_agent_id=aid))
-    await rt.event_store.append(_ev(2, sid, EventType.AGENT_INSTANTIATED, agent_id=aid,
+    await append_one(rt.event_store, _ev(2, sid, EventType.AGENT_INSTANTIATED, agent_id=aid,
                                      template_id="agent:tpl_echo"))
-    await rt.event_store.append(_ev(3, sid, EventType.AGENT_IDLE, agent_id=aid))
+    await append_one(rt.event_store, _ev(3, sid, EventType.AGENT_IDLE, agent_id=aid))
 
     n = await rebuild_all_active(rt)
     assert n == 1
@@ -91,11 +92,11 @@ async def test_send_message_fast_path_does_not_rebuild_when_session_already_live
 
     rt = _runtime_with_registered_template()
     sid, aid = "A", "agt_1"
-    await rt.event_store.append(_ev(1, sid, EventType.SESSION_CREATED,
+    await append_one(rt.event_store, _ev(1, sid, EventType.SESSION_CREATED,
                                      template_id="agent:tpl_echo", root_agent_id=aid))
-    await rt.event_store.append(_ev(2, sid, EventType.AGENT_INSTANTIATED, agent_id=aid,
+    await append_one(rt.event_store, _ev(2, sid, EventType.AGENT_INSTANTIATED, agent_id=aid,
                                      template_id="agent:tpl_echo"))
-    await rt.event_store.append(_ev(3, sid, EventType.AGENT_IDLE, agent_id=aid))
+    await append_one(rt.event_store, _ev(3, sid, EventType.AGENT_IDLE, agent_id=aid))
     await rebuild_all_active(rt)
 
     # 先自愈一次，把 TM 建起来、留活。

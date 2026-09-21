@@ -41,6 +41,7 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 from tests.unit._legacy_recover import rebuild_all_active
+from tests._event_helpers import append_one
 
 pytestmark = pytest.mark.asyncio
 
@@ -86,28 +87,28 @@ async def test_recover_routes_by_pending_hitl(monkeypatch) -> None:
 
     # A: 有未解决 pending HITL，agent 崩溃前停在 waiting_human → 只装填 HitlRegistry，
     #    恢复后重发 AGENT_WAITING_HUMAN。
-    await store.append(_ev(1, "A", EventType.SESSION_CREATED, template_id="t",
+    await append_one(store, _ev(1, "A", EventType.SESSION_CREATED, template_id="t",
                             root_agent_id="agtA"))
-    await store.append(_ev(2, "A", EventType.AGENT_INSTANTIATED, agent_id="agtA",
+    await append_one(store, _ev(2, "A", EventType.AGENT_INSTANTIATED, agent_id="agtA",
                             template_id="t"))
-    await store.append(_ev(3, "A", EventType.HITL_REQUIRED, hitl_id="hA", form="question",
+    await append_one(store, _ev(3, "A", EventType.HITL_REQUIRED, hitl_id="hA", form="question",
                             tool_call_id="tcA"))
-    await store.append(_ev(4, "A", EventType.AGENT_WAITING_HUMAN, agent_id="agtA"))
+    await append_one(store, _ev(4, "A", EventType.AGENT_WAITING_HUMAN, agent_id="agtA"))
     # B: HITL 已答复 → 无 pending，agent 应完之后又被进程重启打断 → 恢复后重发
     #    AGENT_INTERRUPTED。
-    await store.append(_ev(1, "B", EventType.SESSION_CREATED, template_id="t",
+    await append_one(store, _ev(1, "B", EventType.SESSION_CREATED, template_id="t",
                             root_agent_id="agtB"))
-    await store.append(_ev(2, "B", EventType.AGENT_INSTANTIATED, agent_id="agtB",
+    await append_one(store, _ev(2, "B", EventType.AGENT_INSTANTIATED, agent_id="agtB",
                             template_id="t"))
-    await store.append(_ev(3, "B", EventType.HITL_REQUIRED, hitl_id="hB", form="question"))
-    await store.append(_ev(4, "B", EventType.HITL_ANSWERED, hitl_id="hB"))
-    await store.append(_ev(5, "B", EventType.AGENT_INTERRUPTED, agent_id="agtB"))
+    await append_one(store, _ev(3, "B", EventType.HITL_REQUIRED, hitl_id="hB", form="question"))
+    await append_one(store, _ev(4, "B", EventType.HITL_ANSWERED, hitl_id="hB"))
+    await append_one(store, _ev(5, "B", EventType.AGENT_INTERRUPTED, agent_id="agtB"))
     # C: 从无 HITL、直接被进程重启打断 → 恢复后重发 AGENT_INTERRUPTED。
-    await store.append(_ev(1, "C", EventType.SESSION_CREATED, template_id="t",
+    await append_one(store, _ev(1, "C", EventType.SESSION_CREATED, template_id="t",
                             root_agent_id="agtC"))
-    await store.append(_ev(2, "C", EventType.AGENT_INSTANTIATED, agent_id="agtC",
+    await append_one(store, _ev(2, "C", EventType.AGENT_INSTANTIATED, agent_id="agtC",
                             template_id="t"))
-    await store.append(_ev(3, "C", EventType.AGENT_INTERRUPTED, agent_id="agtC"))
+    await append_one(store, _ev(3, "C", EventType.AGENT_INTERRUPTED, agent_id="agtC"))
 
     # 启动不应调 recover_agent（task 重建推迟到应答）
     called: list[str] = []
@@ -143,14 +144,14 @@ async def test_recover_multi_hitl_partial_resolve_still_pending() -> None:
     """两个 pending、只解决一个 → 仍 pending → 重建剩余、重发 AGENT_WAITING_HUMAN 而非 interrupted。"""
     runtime = make_runtime(agent_provider=InlineAgentTemplateProvider())
     store = runtime.event_store
-    await store.append(_ev(1, "M", EventType.SESSION_CREATED, template_id="t",
+    await append_one(store, _ev(1, "M", EventType.SESSION_CREATED, template_id="t",
                             root_agent_id="agtM"))
-    await store.append(_ev(2, "M", EventType.AGENT_INSTANTIATED, agent_id="agtM",
+    await append_one(store, _ev(2, "M", EventType.AGENT_INSTANTIATED, agent_id="agtM",
                             template_id="t"))
-    await store.append(_ev(3, "M", EventType.HITL_REQUIRED, hitl_id="h1", form="question"))
-    await store.append(_ev(4, "M", EventType.HITL_REQUIRED, hitl_id="h2", form="approval"))
-    await store.append(_ev(5, "M", EventType.HITL_ANSWERED, hitl_id="h1"))
-    await store.append(_ev(6, "M", EventType.AGENT_WAITING_HUMAN, agent_id="agtM"))
+    await append_one(store, _ev(3, "M", EventType.HITL_REQUIRED, hitl_id="h1", form="question"))
+    await append_one(store, _ev(4, "M", EventType.HITL_REQUIRED, hitl_id="h2", form="approval"))
+    await append_one(store, _ev(5, "M", EventType.HITL_ANSWERED, hitl_id="h1"))
+    await append_one(store, _ev(6, "M", EventType.AGENT_WAITING_HUMAN, agent_id="agtM"))
 
     waiting_human = _capture_waiting_human_broadcast(runtime)
     interrupted = _capture_interrupted_broadcast(runtime)
@@ -199,7 +200,7 @@ async def _crashed_session(rt: CtxWeftRuntime) -> tuple[str, str]:
         ev(6, EventType.TASK_SUSPENDED, task_id="tsk_1"),
     ]
     for e in seed:
-        await rt.event_store.append(e)
+        await append_one(rt.event_store, e)
     return sid, aid
 
 
@@ -303,9 +304,9 @@ async def test_cold_hitl_reply_hydrates_only_its_own_session_not_a_sweep() -> No
         return Event(id=f"evt_s1_{seq:04d}", run_id="r1", sequence=seq, session_id=sid1,
                      type=type_, timestamp=_TS, task_id=task_id, payload=payload)
 
-    await rt.event_store.append(ev1(1, EventType.SESSION_CREATED, user_prompt="do it",
+    await append_one(rt.event_store, ev1(1, EventType.SESSION_CREATED, user_prompt="do it",
                                      template_id="agent:tpl_echo", root_agent_id=aid1))
-    await rt.event_store.append(ev1(2, EventType.TASK_CREATED, task={
+    await append_one(rt.event_store, ev1(2, EventType.TASK_CREATED, task={
         "id": tid1, "status": "PENDING", "title": "T1",
         "assigned_agent_id": aid1, "creator_agent_id": aid1}))
 
@@ -321,7 +322,7 @@ async def test_cold_hitl_reply_hydrates_only_its_own_session_not_a_sweep() -> No
     # S2：另一个真实 active 的 session——事件库里有它自己的 agent。任何「按 agent 找
     # session 就扫全库」的写法回来，它都会被顺带扫进 ALM，下面那条断言就红。
     sid2, aid2 = "ses_2", "agt_2"
-    await rt.event_store.append(Event(
+    await append_one(rt.event_store, Event(
         id="evt_s2_0001", run_id="r2", sequence=1, session_id=sid2,
         type=EventType.SESSION_CREATED, timestamp=_TS,
         payload={"user_prompt": "hi", "template_id": "agent:tpl_echo", "root_agent_id": aid2},

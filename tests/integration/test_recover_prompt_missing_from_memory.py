@@ -28,6 +28,7 @@ from tests.integration.test_minimal_loop import (
     make_echo_template,
     make_runtime,
 )
+from tests._event_helpers import append_one
 
 pytestmark = pytest.mark.asyncio
 
@@ -60,7 +61,7 @@ async def test_recovery_restores_a_started_tasks_prompt_from_the_event_log(promp
             "assigned_agent_id": aid, "creator_agent_id": aid, "user_prompt": PROMPT}),
         ev(4, EventType.TASK_STARTED, task_id=tid, assigned_agent_id=aid),
     ]:
-        await runtime.event_store.append(e)
+        await append_one(runtime.event_store, e)
 
     scope = MemoryAddress(session_id=sid, task_id=tid, agent_id=aid)
     pctx = ProviderContext(session_id=sid, tenant_id="default", task_id=tid, agent_id=aid)
@@ -69,6 +70,9 @@ async def test_recovery_restores_a_started_tasks_prompt_from_the_event_log(promp
             kind=MemoryKind.CONVERSATION_TURN, scope=MemoryScope.TASK, address=scope,
             content=PROMPT, timestamp=ts, role="user", metadata={"task_id": tid}), pctx)
 
+    # 装填是调用方的责任（2026-09-21：`recover_agent` 对 registry miss 直接抛
+    # `AgentNotLoaded`，按 agent 扫全库的 sweep 已删）。只喂内存，不建 TM、不跑。
+    await runtime.rebuild_session(sid)
     with mock.patch(
         "ctx_weft.core.loop.steps.background_observe.launch_background_observe",
         return_value=None,

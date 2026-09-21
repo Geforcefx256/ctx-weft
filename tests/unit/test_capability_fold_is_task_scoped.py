@@ -20,6 +20,7 @@ import pytest
 
 from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.providers.events import InMemoryEventStore
+from tests._event_helpers import append_one
 
 pytestmark = pytest.mark.asyncio
 
@@ -44,11 +45,11 @@ _TYPES = (EventType.CAPABILITY_INVOKED, EventType.CAPABILITY_FINISHED)
 
 async def _store() -> InMemoryEventStore:
     store = InMemoryEventStore()
-    await store.append(_cap(1, "c_mine", task_id="t_mine"))
-    await store.append(_cap(2, "c_mine", task_id="t_mine", finished=True))
-    await store.append(_cap(3, "c_other", task_id="t_other"))
-    await store.append(_cap(4, "c_other", task_id="t_other", finished=True))
-    await store.append(_cap(5, "c_orphan", task_id=None))      # 无从归属（存量）
+    await append_one(store, _cap(1, "c_mine", task_id="t_mine"))
+    await append_one(store, _cap(2, "c_mine", task_id="t_mine", finished=True))
+    await append_one(store, _cap(3, "c_other", task_id="t_other"))
+    await append_one(store, _cap(4, "c_other", task_id="t_other", finished=True))
+    await append_one(store, _cap(5, "c_orphan", task_id=None))      # 无从归属（存量）
     return store
 
 
@@ -96,7 +97,7 @@ async def test_sql_store_agrees_with_the_in_memory_one(tmp_path) -> None:
     async with open_sqlite_event_store(tmp_path / "events.sqlite") as sql:
         for n, (tcid, tid) in enumerate(
                 [("c_mine", "t_mine"), ("c_other", "t_other"), ("c_orphan", None)], start=1):
-            await sql.append(_cap(n, tcid, task_id=tid))
+            await append_one(sql, _cap(n, tcid, task_id=tid))
 
         got = await load_events_of_types(sql, _SID, _TYPES, task_id="t_mine")
 

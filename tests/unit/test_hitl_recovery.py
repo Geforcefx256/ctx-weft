@@ -13,6 +13,7 @@ from ctx_weft.core.orchestrator.task.hooks import TaskManagerHooks
 from ctx_weft.core.orchestrator.task.disposition import RunOutcome, RunOutcomeKind
 from tests.unit._stub_runner import StubRunner
 from tests.unit._legacy_recover import rebuild_all_active
+from tests._event_helpers import append_one
 
 pytestmark = pytest.mark.asyncio
 
@@ -80,8 +81,11 @@ async def test_recover_agent_rebuilds_pending_hitl_and_parks() -> None:
         ev(6, EventType.TASK_SUSPENDED, task_id="tsk_1"),
     ]
     for e in seed:
-        await runtime.event_store.append(e)
+        await append_one(runtime.event_store, e)
 
+    # 装填是调用方的责任（2026-09-21：`recover_agent` 对 registry miss 直接抛
+    # `AgentNotLoaded`，按 agent 扫全库的 sweep 已删）。只喂内存，不建 TM、不跑。
+    await runtime.rebuild_session("ses_1")
     await runtime.recover_agent("agt_root")
     await asyncio.sleep(0)
 
@@ -204,7 +208,7 @@ async def test_recover_emits_paused_hitl_for_pending_session() -> None:
                capability_id="fs:bash_exec", tool_call_id="tc1", question="ok?"),
     ]
     for e in seed:
-        await runtime.event_store.append(e)
+        await append_one(runtime.event_store, e)
 
     await rebuild_all_active(runtime)
     assert signals == [], f"已退役的 SessionStatusChanged 不应重新出现: {signals}"
@@ -268,7 +272,7 @@ async def test_recover_emits_paused_for_wait_only_pending() -> None:
                capability_id="control:wait_for_user", tool_call_id="tc1"),
     ]
     for e in seed:
-        await runtime.event_store.append(e)
+        await append_one(runtime.event_store, e)
 
     await rebuild_all_active(runtime)
     assert signals == [], f"已退役的 SessionStatusChanged 不应重新出现: {signals}"
@@ -295,7 +299,7 @@ async def test_recover_emits_paused_hitl_when_wait_mixed_with_question() -> None
                capability_id="control:ask_user", tool_call_id="tc2", question="which?"),
     ]
     for e in seed:
-        await runtime.event_store.append(e)
+        await append_one(runtime.event_store, e)
 
     await rebuild_all_active(runtime)
     assert signals == [], f"已退役的 SessionStatusChanged 不应重新出现: {signals}"
@@ -356,8 +360,9 @@ async def test_recover_does_not_redispatch_task_running_in_live_tm() -> None:
         ev(4, EventType.TASK_STARTED, task_id="tsk_X", assigned_agent_id="agt_root"),
     ]
     for e in seed:
-        await runtime.event_store.append(e)
+        await append_one(runtime.event_store, e)
 
+    await runtime.rebuild_session("ses_1")
     await runtime.recover_agent("agt_root")
     await asyncio.sleep(0)
 

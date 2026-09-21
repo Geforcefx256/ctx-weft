@@ -17,7 +17,7 @@ from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.providers.events import InMemoryEventStore
 from ctx_weft.providers.events import EventPersister
 from tests._snapshot_helpers import latest_snapshot, seed_snapshot
-from tests._event_helpers import all_events
+from tests._event_helpers import all_events, append_one
 
 
 def _ts() -> datetime:
@@ -88,7 +88,7 @@ async def test_rebuild_view_snapshot_plus_delta_matches_full_replay() -> None:
     events = _session_events()
     store = InMemoryEventStore()
     for ev in events:
-        await store.append(ev)
+        await append_one(store, ev)
 
     full = reduce_events(events, run_id="s1")
 
@@ -124,8 +124,6 @@ async def test_inmemory_store_drops_transient_token_events() -> None:
 
     types = [e.type for e in await all_events(store, "s1")]
     assert types == [EventType.SESSION_CREATED, EventType.LLM_RESPONSE_FINISHED]
-    # 非瞬态事件仍正常入库并参与 active 追踪
-    assert "s1" in await store.list_active_session_ids()
 
 
 async def test_detach_stops_receiving_events() -> None:
@@ -153,7 +151,7 @@ async def test_rebuild_view_without_snapshot_falls_back_to_full_replay() -> None
     events = _session_events()
     store = InMemoryEventStore()
     for ev in events:
-        await store.append(ev)
+        await append_one(store, ev)
 
     rebuilt = await rebuild_view(store, "s1")
     full = reduce_events(events, run_id="s1")

@@ -39,7 +39,7 @@ from tests.integration.test_hitl_hot_reply_round_window_e2e import (
 from tests.integration.test_minimal_loop import (
     InlineAgentTemplateProvider, make_echo_template, make_runtime,
 )
-from tests._event_helpers import all_events
+from tests._event_helpers import all_events, append_one
 
 pytestmark = pytest.mark.asyncio
 
@@ -191,7 +191,7 @@ async def test_recovery_restores_an_appended_message_from_the_event_log(message_
         ev(4, EventType.TASK_MESSAGE_APPENDED, task_id=tid, memory_id="mem_appended",
            agent_id=aid, content=MESSAGE, source="send_message", timestamp=msg_ts.isoformat()),
     ]:
-        await rt.event_store.append(e)
+        await append_one(rt.event_store, e)
 
     scope = MemoryAddress(session_id=sid, task_id=tid, agent_id=aid)
     pctx = ProviderContext(session_id=sid, tenant_id="default", task_id=tid, agent_id=aid)
@@ -204,6 +204,9 @@ async def test_recovery_restores_an_appended_message_from_the_event_log(message_
             address=scope, content=MESSAGE, timestamp=msg_ts, role="user",
             metadata={"task_id": tid, "source": "send_message"}), pctx)
 
+    # 装填是调用方的责任（2026-09-21：`recover_agent` 对 registry miss 直接抛
+    # `AgentNotLoaded`，按 agent 扫全库的 sweep 已删）。只喂内存，不建 TM、不跑。
+    await rt.rebuild_session(sid)
     with mock.patch(
         "ctx_weft.core.loop.steps.background_observe.launch_background_observe",
         return_value=None,

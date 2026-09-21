@@ -28,6 +28,7 @@ from ctx_weft.protocols import MemoryScope as _MS
 from ctx_weft.protocols.memory import MemoryKind as _MK
 _MEM_TASK_SCOPE = _MS.TASK
 from tests.integration.test_minimal_loop import InlineAgentTemplateProvider, make_echo_template, make_runtime
+from tests._event_helpers import append_one
 
 pytestmark = pytest.mark.asyncio
 
@@ -92,7 +93,7 @@ async def test_crash_mid_tool_reinvokes_dangling_via_reconcile() -> None:
         ev(4, EventType.TASK_STARTED, task_id=tid, assigned_agent_id=aid),
     ]
     for e in seed:
-        await runtime.event_store.append(e)
+        await append_one(runtime.event_store, e)
 
     # memory:崩在工具批次中途 —— assistant turn 含 dangling tool_call "web",无 TOOL_RESULT。
     scope = MemoryAddress(session_id=sid, task_id=tid, agent_id=aid)
@@ -108,12 +109,15 @@ async def test_crash_mid_tool_reinvokes_dangling_via_reconcile() -> None:
     from ctx_weft.core.utils.clock import now_utc as _now
     from ctx_weft.protocols.events import Event as _Ev, EventType as _ET
 
-    await runtime.event_store.append(_Ev(
+    await append_one(runtime.event_store, _Ev(
         id="evt_seed_invoked", type=_ET.CAPABILITY_INVOKED, session_id=sid,
         run_id="r_seed", sequence=1, timestamp=_now(),
         payload={"tool_call_id": tcid, "invocation_id": "inv_first",
                  "capability_name": "test__web", "capability_id": "test:web"}))
 
+    # 装填是调用方的责任（2026-09-21：`recover_agent` 对 registry miss 直接抛
+    # `AgentNotLoaded`，按 agent 扫全库的 sweep 已删）。只喂内存，不建 TM、不跑。
+    await runtime.rebuild_session(sid)
     with mock.patch(
         "ctx_weft.core.loop.steps.background_observe.launch_background_observe",
         return_value=None,

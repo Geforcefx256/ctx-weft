@@ -290,8 +290,10 @@ class AgentLifecycleManager:
         **纯机制**：同 `forget_agent`，本方法不判断这条会话该不该被忘掉——那要看 task
         队列、未决 HITL 这些 ALM 不认识的东西。判据在 `CtxWeftRuntime.forget_session`。
 
-        真相源始终是事件日志：逐出之后任何入口都能用 `rebuild_session` /
-        `rebuild_agent` 把它装填回来，所以这里删得干净不必手软。
+        真相源始终是事件日志：逐出之后用 `rebuild_session(session_id)` 就能装填回来，
+        所以这里删得干净不必手软。**装填要调用方自己发起**——按 agent 反查会话那条路
+        （`rebuild_agent` → 扫全部 active session）已于 2026-09-21 删除，`recover_agent`
+        与不带 `session_id` 的 `send_message` 现在对 registry miss 直接抛 `AgentNotLoaded`。
         """
         n = self._drop(set(self.agent_ids_of_session(session_id)))
         self._sessions.pop(session_id, None)

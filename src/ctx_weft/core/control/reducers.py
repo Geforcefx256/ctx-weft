@@ -7,18 +7,19 @@ RunStateView.sessions / .tasks 包含完整的 Session/Task 投影。
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
-from ctx_weft.core.utils.content import (
-    content_from_jsonable,
-    content_to_jsonable,
-)
 from ctx_weft.core.control.types import AgentView, RunStateView, SessionView, TaskView
 from ctx_weft.core.hitl.registry import HITL_STAGE_AUTHZ, HITL_STAGE_TOOL, PendingHitl
 from ctx_weft.core.hitl.snapshot import HitlSnapshot
 from ctx_weft.core.models.status import TERMINAL_TASK_STATUSES, WAITING, TaskStatus
+from ctx_weft.core.utils.content import (
+    content_from_jsonable,
+    content_to_jsonable,
+)
 from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.protocols.hitl import (
     HITL_FORM_QUESTION,
@@ -513,6 +514,22 @@ _PROJECTION_VERSION = 4
 #: 命名、传给 `read_range` / `replay` 的通用 `exclude_types`——协议不认识这个类型。
 REPLAY_EXCLUDE_TYPES: "tuple[EventType, ...]" = (EventType.STATE_SNAPSHOT,)
 
+#: 按 position 区间分批重放时，一批取多少条。
+#:
+#: **这是 core 的决定，不是 store 的。** 判据是「内存是硬约束、耗时是软约束」：一次性把整条
+#: 流变成 list 实测 3 万事件 121.5MB / 3.75s，而并发恢复几个会话就会叠成几百 MB ~ GB，那是会
+#: 崩的；分批多花的那一秒用户等得起。实测权衡点（3 万事件，SQLite 本地文件）：
+#:
+#:     批大小    查询次数    耗时      内存峰值
+#:     一次性        1      3.75s    121.5 MB
+#:      1000       30      6.10s      6.3 MB
+#:      2000       15      5.09s     12.3 MB     ← 取这档
+#:      5000        6      4.58s     30.2 MB
+#:     10000        3      4.47s     60.1 MB
+#:
+#: 数字来自 SQLite 本地文件——Postgres 每次查询多一个 RTT，真要调就在目标库上照这个方法重测。
+REPLAY_BATCH = 2000
+
 #: 快照事件 payload 的键。单独列出来是因为**写侧与读侧必须用同一组**：各写一遍字面量正是
 #: 「写侧盖 1、读侧要 2」那类静默失效的来源（`_PROJECTION_VERSION` 的注释里记着那次）。
 _SNAP_BLOB = "state_blob"
@@ -651,6 +668,64 @@ async def settled_memory_floor(event_store: Any, session_id: str) -> int:
     return int(snapshot.last_commit_position or 0)
 
 
+async def replay_session(
+    event_store: Any,
+    session_id: str,
+    *,
+    after_position: int = 0,
+    through_position: "int | None" = None,
+    exclude_types: "tuple[EventType, ...]" = (),
+) -> "AsyncIterator[list[Event]]":
+    """按 position 区间**分批**产出 `(after_position, through_position]` 的已提交事件。
+
+    只用两个必需读原语（`read_range` / `committed_head`），所以任何满足协议的 store 都能被
+    重放——**不需要任何能力探测**。
+
+    `after_position`：下界（不含），默认 0 = 从头。恢复期的补写用它把读的起点抬到「已知
+    memory 都落了」的那个位置（见 `settled_memory_floor`）。
+
+    `through_position`：切面上界（含）。`None` 则取进来这一刻的 `committed_head`，整趟重放锚
+    在同一个位点上，期间的新提交不会掺进来（一致切面）。**写快照的调用方必须显式传它**：
+    快照声明的切面是它自己先取的那个 head，让这里再取一次就可能多折进 (C, head'] 那一段，
+    blob 就领先于它声明的切面，恢复时那段会被重复 apply（`events_total` 双计，不幂等）。
+
+    分批与整批逐字段等价：重放是左折叠（`reduce_events(evts)` 就是 `apply_events(evts, 空
+    view)`，本文件里两段循环体逐字相同），而 apply 是 for 循环、可结合。
+
+    ## 为什么这个函数在 core，而不是 `EventStore` 的一个方法（2026-09-21 搬）
+
+    它从前是协议上的一个**能用的默认实现**，用意是挡掉 core 里的能力探测（「这个 store 支不
+    支持分页」曾经写在恢复路径里，一个坏设计生出两个分支和两种失败形态）。用意是对的，但那个
+    位置三点都站不住：
+
+    1. **没有任何 store 覆盖过它。** 它给 store 的那份自由（「怎么分批是 store 的私事」）一次
+       都没被行使，而那是它待在协议里的唯一理由——默认实现只调两个必需方法，没给协议增加任何
+       能力。
+    2. **它反而重新引入了一次能力探测。** 协议的默认实现只白送给显式继承的 store，鸭子类型
+       拿不到，于是有了 `supports_replay` 这道构造期门，判据还得写明「与
+       `supports_ordered_commit` 相反，这不是笔误」。为消掉一次运行时探测，换来一次构造期探测
+       加一条「判据相反」的解释。
+    3. **那层抽象在两天内失效了两次。** 重锚（`snapshot_writer`）与注入消息补写
+       （`runtime._restore_appended_messages`）都需要显式截断到自己的切面，而协议版锚在它自己
+       取的 head，于是两处各自把同一个循环抄了一遍——`min(cursor + REPLAY_BATCH, head)` 一度
+       有三份，分散在两个层里，必须手动保持批大小/排除集合/切面语义一致。
+
+    搬进 core 之后：协议面少一个方法、`supports_replay` 连带那条解释一起删、三份循环收成一份，
+    而 `through_position` 正是后两处需要、协议版给不了的那个参数。
+    """
+    head = (await event_store.committed_head(session_id)
+            if through_position is None else through_position)
+    cursor = after_position
+    while cursor < head:
+        upper = min(cursor + REPLAY_BATCH, head)
+        stored = await event_store.read_range(
+            session_id, after_position=cursor, through_position=upper,
+            exclude_types=exclude_types)
+        if stored:
+            yield [se.event for se in stored]
+        cursor = upper
+
+
 async def rebuild_view(event_store: Any, session_id: str) -> RunStateView:
     """按快照+增量或全量回放重建 RunStateView（spec: snapshot-recovery，wp4 改造）。
 
@@ -694,15 +769,11 @@ async def rebuild_view(event_store: Any, session_id: str) -> RunStateView:
         return apply_events([se.event for se in delta], view)
     # 全量：忽略快照（存量/损坏/超前），按提交序重放；重造快照由 writer 负责。
     #
-    # **分批由 store 产出**（`EventStore.replay`），这里只管折叠。从前这段自己算 position
-    # 区间、还先探一次「这个 store 支不支持分页」再选路——那是把 store 的知识和能力判断
-    # 漏进了 core，一个坏设计生出两个分支与两种失败形态。现在 core 不问、不选、不降级。
-    #
-    # 分批与整批逐字段等价：重放是左折叠（`reduce_events` 就是 `apply_events` 在空 view
-    # 上的调用，本文件里两段循环体逐字相同），而 apply 是 for 循环、可结合。
+    # 分批走 `replay_session`（同一文件，见那里为什么它在 core 而不在协议上）。这里不传
+    # `through_position`：恢复要的就是「现在」的全部，锚在进去那一刻的 head。
     view = RunStateView(run_id=session_id, session_id="", task_id="", agent_id="")
-    async for batch in event_store.replay(
-            session_id, exclude_types=REPLAY_EXCLUDE_TYPES):
+    async for batch in replay_session(
+            event_store, session_id, exclude_types=REPLAY_EXCLUDE_TYPES):
         apply_events(batch, view)
     return view
 
@@ -1445,21 +1516,33 @@ def fold_hitl_snapshot(
 # 未决集则由 `HitlRegistry` 持有，投影里不另存一份。
 
 async def load_events_of_types(
-    store, session_id: str, types: "tuple[EventType, ...]", *, task_id: str = "",
+    store, session_id: str, types: "tuple[EventType, ...]", *,
+    task_id: str = "", after_position: int = 0,
 ) -> list[Event]:
     """按类型取该会话的事件——**本文件这些折叠的统一数据入口**。
 
-    `read_session_events_of_types` 是 `EventStore` 的**必需**方法，所以这里不再有「未实现就
-    退化为全量读 + 内存过滤」那条降级——那是 core 里最后一处能力探测，而它通往的正是「把整条
-    流读进内存」。本函数因此只剩透传，留着是因为它是本文件这些折叠的统一数据入口（`task_id`
-    的收窄口径写在这里一处，不让每个调用方各记一遍）。
+    走 `read_range(include_types=...)`：协议里那个单独的 `read_session_events_of_types`
+    2026-09-21 并进了区间读（理由见协议里 `read_range` 的 docstring）。本函数因此是一层薄转发，
+    留着是因为收窄口径写在这一处，不让每个调用方各记一遍。
 
     `task_id` 非空时再按 task 收窄。capability 折叠**必须**传它：那个折叠的量随会话的工具调用
     总数增长（实测 4000 次调用的会话取回 8000 条 / 779ms / 24.4MB），而它真正要回答的只是「正在
     reconcile 的那个 task 里那几个 dangling tool_call 跑过没有」。按 task 收窄是**精确**的界，
     不是猜——dangling 调用必定属于那个 task，而 capability 事件确实带着它。
+
+    `after_position` 是合并带来的新能力：从前这条读没有位置下界，于是「无从归属」那条安全阀
+    （`task_id` 为 NULL/空串的行照样取回，见协议）让上界始终留着一项随会话长度增长的成分。
+    需要那个界的调用方现在传得出来了。
     """
-    return await store.read_session_events_of_types(session_id, types, task_id=task_id)
+    if not types:
+        # **空类型 → 空结果，不是「不过滤」。** `read_range` 那层的 `include_types=()` 语义是
+        # 「不启用这个过滤器」（与 `exclude_types=()` 对称，原语该是正交的）；但在这个入口上
+        # 那个语义是危险的——调用方的意图是「按类型收窄」，类型列表却空了，于是静默退化成整条
+        # 会话读，正是这一整轮在清的东西。安全阀放在调用方这一处，原语保持正交。
+        return []
+    return [se.event for se in await store.read_range(
+        session_id, after_position=after_position,
+        include_types=tuple(str(t) for t in types), task_id=task_id)]
 
 
 #: 折叠所需的事件类型。供事件库按类型过滤读取，无需全量回放。

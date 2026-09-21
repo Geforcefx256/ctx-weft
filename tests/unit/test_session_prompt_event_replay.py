@@ -25,6 +25,7 @@ from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.providers.events import InMemoryEventStore
 from ctx_weft.protocols import ImagePart, TextPart
 from tests.unit.test_event_blob_store import _ctx, _Stub
+from tests._event_helpers import append_one
 
 # blob-store 解耦 Task 2 后 content_to_event_jsonable 拒收外来 ref part（降级为占位）；
 # 这里改用 base64 图片喂入，走真实的「event 侧独立 put」路径产出 ref，而不是像旧版那样
@@ -40,7 +41,7 @@ def _b64_image_part() -> ImagePart:
 
 async def _store_with(payload_prompt: object) -> InMemoryEventStore:
     store = InMemoryEventStore()
-    await store.append(Event(
+    await append_one(store, Event(
         id="evt_0001", run_id="run_1", sequence=1, session_id="ses_1",
         tenant_id="default", type=EventType.SESSION_CREATED,
         timestamp=datetime(2026, 8, 27, tzinfo=timezone.utc),

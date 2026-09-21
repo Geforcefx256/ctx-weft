@@ -43,7 +43,10 @@ class EventPersister:
         if event.type in TRANSIENT_EVENT_TYPES:
             return
         try:
-            await self._store.append(event)
+            # `append_batch` 而不是 `append`：后者 2026-09-21 从协议删了。`batch_id` 取
+            # `event.id` 是**策略**（确定性取值，好让原样重试撞上幂等账而不是写出第二份），
+            # 由每个 store 各写一遍正是本仓被咬过的形状，所以写在调用方这一处。
+            await self._store.append_batch(event.session_id, event.id, [event])
         except Exception:
             logger.exception(
                 "EventPersister: failed to append event %s (%s)", event.id, event.type

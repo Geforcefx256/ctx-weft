@@ -13,7 +13,7 @@ def test_no_component_emits_session_status_changed_any_more():
     offenders = [
         str(p) for p in src.rglob("*.py")
         if "SESSION_STATUS_CHANGED" in p.read_text(encoding="utf-8")
-        and p.name not in ("reducers.py", "events.py", "_lifecycle.py")
+        and p.name not in ("reducers.py", "events.py")
     ]
     assert offenders == []
 

@@ -223,9 +223,12 @@ def test_the_exclusion_set_is_named_in_core() -> None:
     from ctx_weft.protocols.events import EventStore
 
     assert REPLAY_EXCLUDE_TYPES == (EventType.STATE_SNAPSHOT,)
-    for name in ("replay", "read_range", "read_last_of_type"):
+    for name in ("read_range", "read_last_of_type"):
         src = inspect.getsource(getattr(EventStore, name))
         assert "STATE_SNAPSHOT" not in src, f"{name} 里焊进了快照类型"
+    # `replay` 从前也在这个列表里；它 2026-09-21 搬进 core 成了 `reducers.replay_session`，
+    # 而 core **本来就该**认识这个类型（那个集合就是它命名的），所以不再对它设这条断言。
+    assert not hasattr(EventStore, "replay")
 
 
 def test_snapshot_type_is_persisted_and_not_legacy() -> None:
@@ -310,6 +313,7 @@ async def test_writer_and_recovery_exclude_the_same_types() -> None:
         REPLAY_EXCLUDE_TYPES,
         RunStateView,
         apply_events,
+        replay_session,
     )
     from ctx_weft.core.utils.event import new_event
     from ctx_weft.protocols.events import EventOrigin
@@ -340,7 +344,7 @@ async def test_writer_and_recovery_exclude_the_same_types() -> None:
 
     # 恢复侧的全量重放
     rec = RunStateView(run_id=_SID, session_id="", task_id="", agent_id="")
-    async for batch in store.replay(_SID, exclude_types=REPLAY_EXCLUDE_TYPES):
+    async for batch in replay_session(store, _SID, exclude_types=REPLAY_EXCLUDE_TYPES):
         apply_events(batch, rec)
 
     assert writer_view.events_total == rec.events_total == 2
@@ -352,12 +356,13 @@ async def test_writer_and_recovery_exclude_the_same_types() -> None:
     assert src.count("exclude_types=REPLAY_EXCLUDE_TYPES") == 2, (
         "writer 的两条读（增量 / 重锚）都必须排除，且引那个共享集合"
     )
-    # 读路径仍是两条（增量一条、重锚一条），但重锚那条现在在 while 循环里分批调
-    # （2026-09-20：一次读完整条流实测 20 万事件 604.9MB 峰值，而它跑在 emit() 内联路径上）。
-    # 所以这里钉的是「源码里恰好两处**调用**」，不是运行时次数——分批意味着运行时调 n/batch
-    # 次。数 `await self._store.read_range(` 而不是 `read_range(`：后者会把注释里提到这个名字
-    # 的地方也数进去（踩过）。
-    assert src.count("await self._store.read_range(") == 2, (
-        "读路径数变了，这条守卫要跟着更新")
+    # 读路径仍是两条，但形态不同了：增量那条直接 `read_range`，重锚那条走
+    # `reducers.replay_session`（2026-09-21 从协议搬进 core 的分批函数）。两条都必须带排除，
+    # 所以这里钉「恰好一处 read_range + 一处 replay_session，且 exclude_types 出现两次」。
+    #
+    # 数带前缀的调用形式而不是裸名字：注释里提到这些名字的地方会被裸名字数进去（踩过两次）。
+    assert src.count("await self._store.read_range(") == 1, (
+        f"直接 read_range 的处数变了：{src.count('await self._store.read_range(')}")
+    assert src.count("replay_session(") == 1, "重锚没走 replay_session"
     # 不钉「源码里不出现 STATE_SNAPSHOT」——writer 发那条事件时必须指名它。要钉的是**读**用
     # 的是共享集合而不是各写一遍字面量，上面那条计数就够了。

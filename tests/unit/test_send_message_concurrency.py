@@ -28,6 +28,7 @@ from tests.integration.test_minimal_loop import (
     InlineAgentTemplateProvider, make_echo_template, make_runtime,
 )
 from tests.unit._legacy_recover import rebuild_all_active
+from tests._event_helpers import append_one
 
 pytestmark = pytest.mark.asyncio
 _TS = datetime(2026, 6, 13, tzinfo=UTC)
@@ -45,11 +46,11 @@ async def _seed_idle_agent(rt, sid: str, aid: str) -> None:
     """最小事件集 + `recover()`：装填 ALM 但**不建 TM**（`recover()` 自己的纪律：
     "startup runs nothing"）——即「agent 在、TM 不在」这个状态，与会话跑完被
     `_release_session` 回收后的状态同形。"""
-    await rt.event_store.append(_ev(1, sid, EventType.SESSION_CREATED,
+    await append_one(rt.event_store, _ev(1, sid, EventType.SESSION_CREATED,
                                     template_id="agent:tpl_echo", root_agent_id=aid))
-    await rt.event_store.append(_ev(2, sid, EventType.AGENT_INSTANTIATED, agent_id=aid,
+    await append_one(rt.event_store, _ev(2, sid, EventType.AGENT_INSTANTIATED, agent_id=aid,
                                     template_id="agent:tpl_echo"))
-    await rt.event_store.append(_ev(3, sid, EventType.AGENT_IDLE, agent_id=aid))
+    await append_one(rt.event_store, _ev(3, sid, EventType.AGENT_IDLE, agent_id=aid))
     await rebuild_all_active(rt)
     assert sid not in rt._task_managers, "前提条件：recover() 不该建 TM"
 

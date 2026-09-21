@@ -18,7 +18,7 @@ from ctx_weft.providers.events import (
     InProcessEventBus,
     )
 from tests._snapshot_helpers import latest_snapshot
-from tests._event_helpers import all_events
+from tests._event_helpers import all_events, append_one
 
 
 def _ev(type_: str, seq: int = 1, session: str = "s1") -> Event:
@@ -42,7 +42,7 @@ async def test_store_append_no_longer_filters_transient():
     """行为变化（spec §6.4）：过滤是订阅策略，归 persister。"""
     transient = next(iter(TRANSIENT_EVENT_TYPES))
     store = InMemoryEventStore()
-    await store.append(_ev(transient))
+    await append_one(store, _ev(transient))
     assert len(await all_events(store, "s1")) == 1
 
 

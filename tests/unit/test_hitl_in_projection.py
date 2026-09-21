@@ -23,6 +23,7 @@ from ctx_weft.core.control.reducers import (
 )
 from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.providers.events import InMemoryEventStore
+from tests._event_helpers import append_one
 
 pytestmark = pytest.mark.asyncio
 
@@ -57,41 +58,45 @@ class _CountingStore(InMemoryEventStore):
     def __init__(self) -> None:
         super().__init__()
         self.typed_reads: list[tuple[str, ...]] = []
-        self.ranges: list[tuple[int, int | None]] = []
+        #: (after_position, through_position, 是否按类型收窄)
+        self.ranges: list[tuple[int, "int | None", bool]] = []
 
     async def read_range(self, session_id: str, **k):
-        self.ranges.append((k.get("after_position", 0), k.get("through_position")))
+        self.ranges.append((k.get("after_position", 0), k.get("through_position"),
+                            bool(k.get("include_types"))))
+        if k.get("include_types"):
+            # 「按类型收窄的那种读」现在也是 read_range（2026-09-21 合并），所以这两笔账都记
+            # 在这里。分别记是因为断言要区分「有没有按类型收窄」与「有没有无界地读」。
+            self.typed_reads.append(tuple(str(t) for t in k["include_types"]))
         return await super().read_range(session_id, **k)
-
-    async def read_session_events_of_types(self, session_id: str, types, *, task_id: str = ""):
-        self.typed_reads.append(tuple(str(t) for t in types))
-        return await super().read_session_events_of_types(
-            session_id, types, task_id=task_id)
 
     @property
     def full_reads(self) -> int:
-        """无界的 read_range 次数（after=0 且无上界 = 整条会话）。
+        """**无界且不收窄**的 read_range 次数（after=0、无上界、无类型过滤 = 整条会话）。
+
+        「按类型收窄」的读 2026-09-21 也并进了 `read_range`，而那种读正是这条守卫要的**替代
+        品**，不是它要防的东西——所以判据里必须把它排掉，否则一条正确的收窄读会被当成全量读。
 
         从前这里数的是 `read_by_session` 的调用次数。那个方法 2026-09-21 从协议删了
         （src 零调用者），而「方法不存在时调用 0 次」由语言保证、不需要测试。改数
         `read_range` 里无界的那一形状——那是删掉它之后**仅剩**的整条会话读法。
         """
-        return sum(1 for after, through in self.ranges
-                   if after == 0 and through is None)
+        return sum(1 for after, through, narrowed in self.ranges
+                   if after == 0 and through is None and not narrowed)
 
 
 async def _seed(store: InMemoryEventStore, n_noise: int) -> None:
-    await store.append(_ev(0, EventType.SESSION_CREATED, user_prompt="go",
+    await append_one(store, _ev(0, EventType.SESSION_CREATED, user_prompt="go",
                            template_id="agent:tpl", root_agent_id="ag1"))
     for i in range(1, n_noise + 1):
-        await store.append(_ev(i, EventType.RUN_FINISHED, outcome="completed"))
+        await append_one(store, _ev(i, EventType.RUN_FINISHED, outcome="completed"))
     # 一条答了又了结的（该销账）+ 一条仍未决的（必须留着）
-    await store.append(_opened(n_noise + 1, "h_done"))
-    await store.append(_ev(n_noise + 2, EventType.HITL_RESOLVED,
+    await append_one(store, _opened(n_noise + 1, "h_done"))
+    await append_one(store, _ev(n_noise + 2, EventType.HITL_RESOLVED,
                            hitl_id="h_done", outcome="accepted", claimed=False,
                            message="ok"))
-    await store.append(_ev(n_noise + 3, EventType.HITL_CLOSED, hitl_id="h_done"))
-    await store.append(_opened(n_noise + 4, "h_open"))
+    await append_one(store, _ev(n_noise + 3, EventType.HITL_CLOSED, hitl_id="h_done"))
+    await append_one(store, _opened(n_noise + 4, "h_open"))
 
 
 # ── 1. 折进投影，且不发 HITL 查询 ────────────────────────────────────────────

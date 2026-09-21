@@ -75,12 +75,11 @@ def test_legacy_read_only_members_still_exist():
 _KNOWN_READ_ONLY_MODULES = frozenset({
     "protocols/events.py",              # EventType 定义 + TRANSIENT_EVENT_TYPES 等只读集合
     "core/control/reducers.py",         # 主 reducer：折叠存量日志，读这 13 个类型的分支都在这
-    "providers/events/_lifecycle.py",   # 会话活跃性重放（apply_lifecycle/replay_lifecycle）
 })
 
 #: 已知的死分支引用：某个模块在**活总线**上消费某个 L 档字符串，但那条分支已经永久
 #: 不可达（判据恒假，不抛错、不误写）。与 `_KNOWN_READ_ONLY_MODULES` 语义不同——那张表
-#: 是给 `reducers.py`/`_lifecycle.py` 这类**离线重放存量日志**的模块用的（不构造新
+#: 是给 `reducers.py` 这类**离线重放存量日志**的模块用的（不构造新
 #: 事件，只读已落盘的 `event.type` 做折叠）；这里登记的模块恰恰相反，是挂在
 #: `EventBus` 上的实时订阅者（`event_bus.subscribe(None, ...)`），只是判据字符串命中
 #: 的那个类型停发了。**按 (模块, 取值) 对认，不按整个文件豁免**——避免该模块里除这条

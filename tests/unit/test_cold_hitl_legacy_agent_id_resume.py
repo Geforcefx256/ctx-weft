@@ -24,6 +24,7 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 from tests.unit._legacy_recover import rebuild_all_active
+from tests._event_helpers import append_one
 
 pytestmark = pytest.mark.asyncio
 
@@ -51,17 +52,17 @@ async def _seed_legacy_wait_for_user_session(rt, sid: str, aid: str, tid: str, h
         return Event(id=f"evt_{sid}_{seq:04d}", run_id="r1", sequence=seq, session_id=sid,
                      type=type_, timestamp=_TS, task_id=tid, agent_id=agent_id, payload=payload)
 
-    await rt.event_store.append(ev(1, EventType.SESSION_CREATED, task_id=None,
+    await append_one(rt.event_store, ev(1, EventType.SESSION_CREATED, task_id=None,
                                     template_id="agent:tpl_echo", root_agent_id=aid,
                                     user_prompt="do it"))
-    await rt.event_store.append(ev(2, EventType.TASK_CREATED, task={
+    await append_one(rt.event_store, ev(2, EventType.TASK_CREATED, task={
         "id": tid, "status": "PENDING", "title": "T1",
         "assigned_agent_id": aid, "creator_agent_id": aid}))
-    await rt.event_store.append(ev(3, EventType.TASK_STARTED, assigned_agent_id=aid))
+    await append_one(rt.event_store, ev(3, EventType.TASK_STARTED, assigned_agent_id=aid))
     # legacy：无 agent_id，既不在信封上也不在 payload 里。
-    await rt.event_store.append(ev(4, EventType.HITL_REQUIRED, hitl_id=hid, form="wait",
+    await append_one(rt.event_store, ev(4, EventType.HITL_REQUIRED, hitl_id=hid, form="wait",
                                     context="plain_text"))
-    await rt.event_store.append(ev(5, EventType.TASK_SUSPENDED))
+    await append_one(rt.event_store, ev(5, EventType.TASK_SUSPENDED))
 
 
 async def test_legacy_cold_hitl_reply_resumes_via_session_id_fallback() -> None:

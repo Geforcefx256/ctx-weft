@@ -76,17 +76,17 @@ async def test_last_of_type_returns_the_highest_position(store) -> None:
 async def test_last_of_type_reads_exactly_one(store) -> None:
     """只读一条——这是它存在的理由。
 
-    用 `read_session_events_of_types` 会把全部同类事件连载荷一起捞回来。对状态快照那种
-    一条一条攒下来的类型，那就是 O(快照张数) 的浪费，而要的只是最后一张。
+    用 `read_range(include_types=...)` 会把全部同类事件连载荷一起捞回来。对状态快照那种一条
+    一条攒下来的类型，那就是 O(快照张数) 的浪费，而要的只是最后一张。
     """
     await _seed(store)
 
-    all_of_type = await store.read_session_events_of_types(
-        _SID, (EventType.MEMORY_COMPACTED,))
+    all_of_type = await store.read_range(
+        _SID, include_types=(EventType.MEMORY_COMPACTED,))
     assert len(all_of_type) == 2, "前提：日志里有两条"
 
     got = await store.read_last_of_type(_SID, EventType.MEMORY_COMPACTED)
-    assert got is not None and got.event.id == all_of_type[-1].id
+    assert got is not None and got.event.id == all_of_type[-1].event.id
 
 
 async def test_last_of_type_is_none_when_absent(store) -> None:

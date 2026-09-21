@@ -14,8 +14,9 @@
 工厂签名 `(tmp_path) -> AsyncIterator[EventStore]`（asynccontextmanager）。
 ═════════════════════════════════════════════════════════════════════════════
 
-本套存在的直接理由：`list_active_session_ids` 的判据决定崩溃恢复捞哪些会话，两个实现
-分叉的表现是「重启后某些会话不弹恢复」或「已结束的会话反复被恢复」——生产里极难归因。
+本套存在的直接理由：两个 store 实现必须在同一份契约上逐字等价。分叉的表现（某条读法在
+in_memory 上对、在 SQL 上差一条，或排序口径不同）只会在生产里以「恢复出来的世界不一样」
+浮现，极难归因。
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ import pytest
 
 from ctx_weft.protocols.events import Event, EventStore
 from ctx_weft.providers.events import InMemoryEventStore
-from tests._event_helpers import all_events
+from tests._event_helpers import all_events, append_one
 
 
 @asynccontextmanager
@@ -100,7 +101,7 @@ async def test_append_read_roundtrip_preserves_every_field(store):
         causation_id="evt_0000",
         schema_version=3,
     )
-    await store.append(ev)
+    await append_one(store, ev)
     (got,) = await all_events(store, "s1")
     for field in (
         "id", "run_id", "sequence", "session_id", "type", "tenant_id",
@@ -123,13 +124,13 @@ async def test_reading_a_session_is_ordered_by_commit(store):
     方案 E5），按 id 排会让延迟提交的旧 ID 在全量回放里错位。
     """
     for seq in (3, 1, 2):
-        await store.append(_ev(seq))
+        await append_one(store, _ev(seq))
     assert [e.sequence for e in await all_events(store, "s1")] == [3, 1, 2]
 
 
 async def test_reading_a_session_isolates_sessions(store):
-    await store.append(_ev(1, session="s1"))
-    await store.append(_ev(2, session="s2"))
+    await append_one(store, _ev(1, session="s1"))
+    await append_one(store, _ev(2, session="s2"))
     assert [e.session_id for e in await all_events(store, "s1")] == ["s1"]
 
 
@@ -137,20 +138,32 @@ async def test_reading_an_unknown_session_returns_empty(store):
     assert await all_events(store, "nope") == []
 
 
-# ── read_session_events_of_types ─────────────────────────────────────────────
+# ── read_range(include_types=) ───────────────────────────────────────────────
+#
+# 从前是独立的 `read_session_events_of_types`。2026-09-21 并进区间读——同一个查询换过滤
+# 条件，而它缺的那一样（位置区间）正是它的问题所在（见协议 `read_range` 的 docstring）。
 
 
 async def test_read_of_types_filters(store):
-    await store.append(_ev(1, "RunStarted"))
-    await store.append(_ev(2, "RunFinished"))
-    await store.append(_ev(3, "SessionFinished"))
-    got = await store.read_session_events_of_types("s1", ("RunFinished", "SessionFinished"))
+    await append_one(store, _ev(1, "RunStarted"))
+    await append_one(store, _ev(2, "RunFinished"))
+    await append_one(store, _ev(3, "SessionFinished"))
+    got = [se.event for se in await store.read_range(
+        "s1", include_types=("RunFinished", "SessionFinished"))]
     assert [e.type for e in got] == ["RunFinished", "SessionFinished"]
 
 
 async def test_read_of_types_empty_tuple(store):
-    await store.append(_ev(1))
-    assert await store.read_session_events_of_types("s1", ()) == []
+    await append_one(store, _ev(1))
+    await append_one(store, _ev(2, "RunFinished"))
+    # 原语层面 `include_types=()` = **不启用这个过滤器**（与 `exclude_types=()` 对称——原语
+    # 该是正交的），所以它读回全部两条。
+    assert len(await store.read_range("s1", include_types=())) == 2
+    # 而 core 的入口 `load_events_of_types` 在这里**反着来**：空类型 → 空结果。那不是不一致，
+    # 是安全阀放在了该放的那一层——调用方的意图是「按类型收窄」，类型列表却空了，用原语的
+    # 正交语义就会静默退化成整条会话读。
+    from ctx_weft.core.control.reducers import load_events_of_types
+    assert await load_events_of_types(store, "s1", ()) == []
 
 
 # ── 快照 ──────────────────────────────────────────────────────────────────────
@@ -167,57 +180,14 @@ async def test_read_of_types_empty_tuple(store):
 
 
 
-async def test_active_after_session_created(store):
-    await store.append(_ev(1, "SessionCreated"))
-    assert set(await store.list_active_session_ids()) == {"s1"}
-
-
-async def test_inactive_after_session_finished(store):
-    await store.append(_ev(1, "SessionCreated"))
-    await store.append(_ev(2, "SessionFinished"))
-    assert set(await store.list_active_session_ids()) == set()
-
-
-async def test_reactivated_by_session_resumed(store):
-    """多轮会话：每轮结束发 SessionFinished，下一条消息发 SessionResumed。
-    不重新计入的话崩溃恢复会漏掉所有已对话过的会话。"""
-    await store.append(_ev(1, "SessionCreated"))
-    await store.append(_ev(2, "SessionFinished"))
-    await store.append(_ev(3, "SessionResumed"))
-    assert set(await store.list_active_session_ids()) == {"s1"}
-
-
-async def test_inactive_after_terminal_status_changed(store):
-    """参考实现的纯 SQL 判据完全忽略 SessionStatusChanged——这条钉住它。"""
-    await store.append(_ev(1, "SessionCreated"))
-    await store.append(_ev(2, "SessionStatusChanged", payload={"new_status": "FAILED"}))
-    assert set(await store.list_active_session_ids()) == set()
-
-
-async def test_non_terminal_status_changed_keeps_active(store):
-    await store.append(_ev(1, "SessionCreated"))
-    await store.append(_ev(2, "SessionStatusChanged", payload={"new_status": "RUNNING"}))
-    assert set(await store.list_active_session_ids()) == {"s1"}
-
-
-async def test_non_terminal_status_does_not_resurrect(store):
-    """已 finished 的会话不该被一条非终态状态事件重新拉活。"""
-    await store.append(_ev(1, "SessionCreated"))
-    await store.append(_ev(2, "SessionFinished"))
-    await store.append(_ev(3, "SessionStatusChanged", payload={"new_status": "RUNNING"}))
-    assert set(await store.list_active_session_ids()) == set()
-
-
-async def test_ordinary_event_does_not_resurrect(store):
-    """普通事件既不激活也不停用——只有四类生命周期事件改变活跃性。"""
-    await store.append(_ev(1, "SessionCreated"))
-    await store.append(_ev(2, "SessionFinished"))
-    await store.append(_ev(3, "RunStarted"))
-    assert set(await store.list_active_session_ids()) == set()
-
-
-async def test_active_sessions_are_independent(store):
-    await store.append(_ev(1, "SessionCreated", session="s1"))
-    await store.append(_ev(2, "SessionCreated", session="s2"))
-    await store.append(_ev(3, "SessionFinished", session="s1"))
-    assert set(await store.list_active_session_ids()) == {"s2"}
+# 这里从前有 8 条会话活跃性用例（`list_active_session_ids` 的判据：SessionCreated 置活、
+# SessionFinished/终态 SessionStatusChanged 置停、SessionResumed 复活、普通事件不动、
+# 多会话互不干扰）。它们连同被测方法一起于 2026-09-21 删除。
+#
+# **主题消失了，不是覆盖变少**：那个判据不该存在于 core。「有哪些会话」是 host 自己的
+# 数据（它建的会话、它的会话表和状态列），core 从事件流反推是职责倒置——而且推得更差，
+# 两条 discard 依据（`SessionFinished` / `SessionStatusChanged`）在 src 下没有任何 emit
+# 调用点，判据恒真，返回的实际是「这个库里出现过的全部会话」。这 8 条用例钉的正是一台
+# 永远走不到 discard 分支的状态机。
+#
+# host 要按会话装填，拿自己的清单逐条调 `Runtime.rebuild_hitl` / `rebuild_session`。

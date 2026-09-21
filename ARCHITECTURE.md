@@ -78,7 +78,7 @@
 | `CapabilityCache` | `core/capabilities/cache.py:28` | **per-session 共享**能力缓存（含 pin / clear_pins / available `:140`-`:170`）；run 结束 `evict`（`core/runtime.py:3907`），pin 清理挂 task 终态（`core/runtime.py:1548`） |
 | `StepDriver` | `core/loop/driver.py:253` | 按 `initial_step` 起步，`run` `:270` 循环执行 Step，发 StepStarted/Completed/Failed |
 | `EventBus` / `InProcessEventBus` | `protocols/events.py:320` / `providers/events/bus/in_process/bus.py:41` | `emit` `:53`、`subscribe` `:115`（支持 provisional）、未提交窗口 `begin/commit/discard_provisional` `:141`-`:155`、`stream` `:157`。进程内 emit **同步 drain**、不跨进程 |
-| `EventStore` / `InMemory` + SQL | `protocols/events.py:477` / `providers/events/store/in_memory/store.py:29` / `providers/events/store/sql/` | `append` `:107`、`append_batch` `:46`、`read_range` `:118`、`committed_head` `:134`、`list_active_session_ids` `:138`、快照读写 `:148` / `:161` |
+| `EventStore` / `InMemory` + SQL | `protocols/events.py:477` / `providers/events/store/in_memory/store.py:29` / `providers/events/store/sql/` | `append_batch`、`read_range`、`committed_head`、`read_last_of_type`——**四个方法全必需，没有可选扩展档** |
 | HITL 三件套 | `core/hitl/registry.py:183`（决定缓存）、`core/hitl/service.py:80`（`open` `:96` / `resolve` `:158` / `cancel` `:179`）、`core/hitl/reply_intake.py:29`（人类答复入核） | 人工介入请求/应答；等待协程栈在 `core/loop/hitl_waiter.py` |
 
 **构造期自动注册的内置 Capability**（`CtxWeftRuntime.__init__`，`core/runtime.py:575`-`590`）：
@@ -381,8 +381,10 @@ v2 里「子任务结果怎么到父」有三条，全部落在 memory、由 `Ag
 
 旧 `recover()` / `recover_session()` 已删除；现在的面：
 
-- `rebuild_session`（`core/runtime.py:2173`，**唯一的按需装填入口**）/ `rebuild_hitl`（`:4540`）/ `rebuild_all_pending_hitl`（`:4647`）。
-- 按 agent 的 sweep（`rebuild_agent` / `rebuild_all_agents`）已于 2026-09-21 删除：registry miss 且没有 `session_id` 时抛 `AgentNotLoaded`，装填是调用方的责任。`providers/events/_lifecycle.py` 的 `apply_lifecycle` / `replay_lifecycle` 因此只剩 `rebuild_all_pending_hitl` 一个消费者（`/hitl/{id}/*` 端点真的只有 hitl_id，无从定址）。⚠️ 那台状态机的两条 discard 依据（`SessionFinished` / `SessionStatusChanged`）目前**没有任何 emit 调用点**，判据恒真 = 历史全部会话；要治得先给 core 一个 hitl_id → session_id 的定址读。
+- `rebuild_session(session_id)`（`core/runtime.py:2173`，**唯一的按需装填入口**）/ `rebuild_hitl(session_id)`（`:4540`）。两条都走 `rebuild_view` 的快照 + 增量，O(delta)。
+- **「有哪些会话」不是 core 的问题**（2026-09-21）。host 建的会话、host 的会话表和状态列，它自己就有清单；core 从事件流反推是职责倒置。于是同日删掉三件互相支撑的东西：按 agent 的 sweep（`rebuild_agent` / `rebuild_all_agents`）、按会话枚举的 `rebuild_all_pending_hitl`、以及它们共用的 `EventStore.list_active_session_ids` 与 `providers/events/_lifecycle` 那台判据状态机。
+- 现在 registry miss 的行为：给了 `session_id` 就精确装填那一条，没给就抛 `AgentNotLoaded`（`AgentNotFound` 的子类）。host 要按会话装填，拿自己的清单逐条调上面两个方法。
+- 附带解掉的坑：那台状态机的两条 discard 依据（`SessionFinished` / `SessionStatusChanged`）在 src 下**没有任何 emit 调用点**，判据恒真 = 历史全部会话。谁去「修」它让 discard 生效，`rebuild_all_pending_hitl` 就会开始漏 HITL（`TERMINAL_STATUSES` 含 `INTERRUPTED`，而被打断的会话完全可能正停在那儿等人回答）。判据没了，这个反向依赖也没了。
 - `recover_agent(agent_id, ...)`（`core/runtime.py:2130`；per-session resume 锁 `:719`）→ `_recover_session_locked`（`:2210`），**单 owner 架构**（session 的 TaskManager 是单例：`_bind_task_manager` 是唯一写 `_task_managers` 的地方，已有别的 TM 在册即抛）：
   - 内存里有活 owner TM → `_recover_in_existing_tm`（`:2528`）就地续跑、**绝不重建**：冷 HITL 应答走 `_resume_in_existing_tm`（`:2579`）重排被应答的 task；`/resume` 走 `TaskManager.requeue_resumable`（判据同 `restore()`，读内存）；
   - 内存里没有 TM（进程重启 / 从未建过 / 已被 forget·purge 逐出）→ `rebuild_view`（`core/control/reducers.py:351`，快照+增量 `read_range`）→ converters 转 dataclass（`core/control/converters.py:21` / `:41`）→ `TaskManager.restore(all_tasks, terminal_ids, parked_task_ids)`（`core/orchestrator/task/manager.py:156`，跳过已废弃的 compact/metadata ephemeral task `:197`）→ `_load_agents_of` 装填 ALM（`:3644`）→ set_runner + `_register_and_drain` 续跑。

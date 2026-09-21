@@ -1,16 +1,14 @@
 """SqlEventStore：SQLAlchemy async 的 EventStore 实现（默认 SQLite，postgres 同源）。
 
-协议面七个方法齐备。与 `providers/events/store/in_memory` 是同一套契约的两个实现，
+协议面六个方法齐备。与 `providers/events/store/in_memory` 是同一套契约的两个实现，
 `tests/unit/test_event_store_conformance.py` 对两者跑同一套用例。
 
 设计要点：
 
-- **活跃判据不自己写。** `list_active_session_ids` 把生命周期事件捞出来，交给
-  `providers/events/_lifecycle` 那台**两个实现共用**的状态机重放——见该方法 docstring。
 - **`append` 不过滤瞬态事件**（spec 2026-08-29 §6.4）：那是订阅策略，归 `EventPersister`。
   与 `InMemoryEventStore` 同口径，否则一致性套没法用同一份用例跑两边。
 - **一切排序按 position（提交序），不按 `id`**。`id` 是 ULID 铸造序；两者在并发提交下会
-  分叉，而按 `id` 当序正是 H2 那一类 bug 的根因。见 `list_active_session_ids`。
+  分叉，而按 `id` 当序正是 H2 那一类 bug 的根因。
 """
 
 from __future__ import annotations
@@ -33,10 +31,6 @@ from ctx_weft.protocols.events import (
     StoredEvent,
 )
 from ctx_weft.providers._sqlalchemy import make_session_factory
-from ctx_weft.providers.events._lifecycle import (
-    LIFECYCLE_EVENT_TYPES,
-    replay_lifecycle,
-)
 from ctx_weft.providers.events.store.sql.models import (
     Base,
     EventBatchModel,
@@ -191,10 +185,6 @@ class SqlEventStore(EventStore):
             timestamp=event.timestamp,
         )
 
-    async def append(self, event: Event) -> None:
-        """单事件 = 单事件批次（batch_id 确定性取 event.id；spec: event-log 兼容要求）。"""
-        await self.append_batch(event.session_id, event.id, [event])
-
     # ── 读 ────────────────────────────────────────────────────────────────────
 
     async def read_range(
@@ -203,9 +193,15 @@ class SqlEventStore(EventStore):
         *,
         after_position: int = 0,
         through_position: int | None = None,
+        include_types: tuple[str, ...] = (),
         exclude_types: tuple[str, ...] = (),
+        task_id: str = "",
     ) -> list[StoredEvent]:
-        """按 position 升序读 (after, through]；只含已提交（position 非空）的事件。"""
+        """按 position 升序读 (after, through]；只含已提交（position 非空）的事件。
+
+        四个过滤器的语义见协议。`task_id` 那条的 OR-NULL 安全阀是**故意**的，改动前先看那边
+        的说明与 `test_read_primitives_conformance.py`。
+        """
         conds = [
             EventModel.session_id == session_id,
             EventModel.position.isnot(None),
@@ -213,8 +209,16 @@ class SqlEventStore(EventStore):
         ]
         if through_position is not None:
             conds.append(EventModel.position <= through_position)
+        if include_types:
+            conds.append(EventModel.type.in_(tuple(str(t) for t in include_types)))
         if exclude_types:
             conds.append(EventModel.type.not_in(tuple(str(t) for t in exclude_types)))
+        if task_id:
+            conds.append(or_(
+                EventModel.task_id == task_id,
+                EventModel.task_id.is_(None),
+                EventModel.task_id == "",
+            ))
         async with self._factory() as db:
             result = await db.execute(
                 select(EventModel).where(*conds).order_by(EventModel.position))
@@ -246,100 +250,6 @@ class SqlEventStore(EventStore):
         async with self._factory() as db:
             head = await db.get(SessionHeadModel, session_id)
             return head.next_position if head else 0
-
-    async def read_session_events_of_types(
-        self, session_id: str, types: "tuple[str, ...]", *, task_id: str = "",
-    ) -> list[Event]:
-        if not types:
-            return []
-        conds = [
-            EventModel.session_id == session_id,
-            EventModel.type.in_(tuple(str(t) for t in types)),
-        ]
-        if task_id:
-            # **只排除明确属于别的 task 的**。`task_id` 为 NULL / 空串的照样取回——那一档是
-            # 「无从归属」，不是「属于别人」。判错方向的代价不对称：把一条没归属的
-            # `CapabilityInvoked` 漏掉，gateway 就以为那次调用没跑过 → 静默重跑一个有副作用
-            # 的工具；而多取回几条只是多折几下。
-            conds.append(or_(
-                EventModel.task_id == task_id,
-                EventModel.task_id.is_(None),
-                EventModel.task_id == "",
-            ))
-        async with self._factory() as db:
-            result = await db.execute(
-                select(EventModel)
-                .where(*conds)
-                .order_by(
-                    text("CASE WHEN events.position IS NULL THEN 0 ELSE 1 END"),
-                    EventModel.position,
-                    EventModel.id,
-                )
-            )
-            return [_row_to_event(r) for r in result.scalars().all()]
-
-    async def list_active_session_ids(self) -> list[str]:
-        """有开启边界、未被终结的 session（崩溃恢复用）。
-
-        **判据不在这里，在 `providers/events/_lifecycle`** ——与 `InMemoryEventStore`
-        共用同一台状态机。各写一遍必然分叉，而分叉表现为「重启后某些会话不弹恢复」或
-        「已结束的会话反复被恢复」，生产里极难归因。
-
-        **为什么不做成纯 SQL 表达式。** 终态判据藏在 `payload` JSON 里
-        （`SessionStatusChanged.payload["new_status"]`），提取要方言分叉
-        （SQLite `json_extract` vs Postgres `->>`）。参考宿主那版纯 SQL 判据
-        （`max(opened.id) > max(finished.id)`）**完全忽略了 `SessionStatusChanged`**——
-        经它终结的会话会被永远报成 active。
-
-        **两步查询的等价性**：先 `SELECT DISTINCT session_id` 把所有出现过的 session 置
-        为 active（种子），再按提交序重放生命周期事件。`InMemoryEventStore` 是在每个
-        session 的**首次出现**处 add 的；由于操作只有 add/discard 且逐 session 独立，
-        「在 -∞ 处 add」与「在首个事件处 add」结果完全一致——首个事件必然先于该 session
-        的其余事件。
-
-        **为什么第二步按 position 而不按 `id`（2026-09-20 改）。** 两个理由指向同一处：
-
-        1. 正确性。`id` 是 ULID 铸造序，`position` 是提交序，并发提交下两者分叉——按铸造序
-           重放，`SessionResumed` 与 `SessionFinished` 的先后就可能反，表现为「已结束的会话
-           反复被恢复」或反之。`InMemoryEventStore` 维护的是增量 `_active`，用的就是到达
-           （= 提交）序，所以按 position 才是与它同口径；按 `id` 是这两个实现之间仅剩的
-           一处判据分叉。
-        2. 代价，**但有前提**。`ORDER BY id` 让 SQLite 为了免排序改走主键 id 索引扫全表；
-           按 position 排它才肯用 `ix_events_type` 收窄，只对命中的那几行做 temp b-tree。
-           实测 3 万事件 / 50 会话（生命周期事件 150 条 = 0.5%，真 schema）：
-
-               跑过 ANALYZE：
-                 ORDER BY id        -> SCAN events USING sqlite_autoindex_events_1  24.3ms
-                 ORDER BY position  -> SEARCH events USING ix_events_type (type=?)   1.2ms
-               没跑过 ANALYZE（新库的实际状态，SQLite 不会自动统计）：
-                 两者计划完全相同，1.3ms vs 1.2ms
-
-           所以这 20x 只在有统计信息时兑现，**不能当成本次改动的主要理由**——主要理由是
-           上面那条正确性。附带一条负面结果：试过给它建部分索引
-           （`... WHERE type IN (...)`），SQLite 不采用，等值列压过部分索引。
-
-        仍然要记的是：这两步都**不按会话收窄**，行数随整库事件总数增长（第一步是覆盖索引
-        全扫，3 万条 0.7ms），只在启动时各调一次。真的大到不能接受时，正确的下一步是加一张
-        session 状态投影表，**而不是**把判据塞回 SQL 表达式。
-        """
-        async with self._factory() as db:
-            seen = await db.execute(select(EventModel.session_id).distinct())
-            session_ids = list(seen.scalars().all())
-            lifecycle = await db.execute(
-                select(EventModel)
-                .where(EventModel.type.in_(LIFECYCLE_EVENT_TYPES))
-                .order_by(
-                    # 与 read_session_events_of_types 同一口径：
-                    # 存量 NULL position 行排前，再按 position，最后 id 兜底确定性。
-                    text("CASE WHEN events.position IS NULL THEN 0 ELSE 1 END"),
-                    EventModel.position,
-                    EventModel.id,
-                )
-            )
-            # 在 session 内就物化成 Event：ORM 行出了 session 就是 detached 实例，
-            # 靠「属性已加载所以还能读」是脆的，且与 memory/sql provider 的既有写法不一致。
-            events = [_row_to_event(r) for r in lifecycle.scalars().all()]
-        return list(replay_lifecycle(session_ids, events))
 
     # ── 快照 ──────────────────────────────────────────────────────────────────
 

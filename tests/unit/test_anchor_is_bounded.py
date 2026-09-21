@@ -21,16 +21,19 @@ import inspect
 from datetime import UTC, datetime
 
 from ctx_weft.core.control.reducers import (
+    REPLAY_BATCH,
     REPLAY_EXCLUDE_TYPES,
     apply_events,
     rebuild_view,
     reduce_events,
+    replay_session,
 )
 from ctx_weft.core.control.snapshot_writer import SnapshotWriter
 from ctx_weft.core.control.types import RunStateView
-from ctx_weft.protocols.events import Event, EventStore, EventType
+from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.providers.events import InMemoryEventStore
 from tests._snapshot_helpers import latest_snapshot, seed_snapshot
+from tests._event_helpers import append_one
 
 _T0 = datetime(2026, 9, 20, tzinfo=UTC)
 _TYPES = ("LLMResponseFinished", "CapabilityInvoked", "TaskMessageAppended",
@@ -50,7 +53,7 @@ def _ev(seq: int, type_: str | None = None) -> Event:
 async def _seeded(n: int) -> InMemoryEventStore:
     store = InMemoryEventStore()
     for i in range(1, n + 1):
-        await store.append(_ev(i))
+        await append_one(store, _ev(i))
     return store
 
 
@@ -63,7 +66,7 @@ async def test_the_anchor_reads_in_batches_not_all_at_once() -> None:
     钉「每批的量」而不是「峰值内存」：内存峰值要靠 tracemalloc，而那东西会把耗时放大近一个
     数量级、在 CI 上也不稳。单批上界是那 62 倍差距的直接成因，钉它就够。
     """
-    n = EventStore.REPLAY_BATCH * 2 + 137          # 跨三批，且最后一批不满
+    n = REPLAY_BATCH * 2 + 137          # 跨三批，且最后一批不满
     store = await _seeded(n)
     writer = SnapshotWriter(store, None, every_n_events=1)
 
@@ -79,8 +82,8 @@ async def test_the_anchor_reads_in_batches_not_all_at_once() -> None:
     await writer._write("s1", _ev(n), reason="anchor")
 
     assert len(sizes) >= 3, f"没有分批，一次读完了：{sizes}"
-    assert max(sizes) <= EventStore.REPLAY_BATCH, (
-        f"有一批超过了 REPLAY_BATCH={EventStore.REPLAY_BATCH}：{sizes}")
+    assert max(sizes) <= REPLAY_BATCH, (
+        f"有一批超过了 REPLAY_BATCH={REPLAY_BATCH}：{sizes}")
     assert sum(sizes) == n, f"分批把事件读漏或读重了：sum={sum(sizes)} != {n}"
 
 
@@ -88,7 +91,7 @@ async def test_the_batched_anchor_folds_to_the_same_view() -> None:
     """分批重锚写出的 blob 与一次折完全一致——左折叠可结合。"""
     from ctx_weft.core.control.reducers import deserialize_view
 
-    n = EventStore.REPLAY_BATCH + 50
+    n = REPLAY_BATCH + 50
     store = await _seeded(n)
     writer = SnapshotWriter(store, None, every_n_events=1)
     await writer._write("s1", _ev(n), reason="anchor")
@@ -110,29 +113,38 @@ async def test_the_batched_anchor_folds_to_the_same_view() -> None:
 async def test_the_anchor_stops_at_the_declared_cut() -> None:
     """重锚只折到它声明的那个切面，一条不多。
 
-    这是不用 `store.replay()` 的原因：`replay` 锚在它自己进去那一刻的 `committed_head`，
-    而切面 C 是 `_write` 开头取的那个 head。两者之间若又提交了新事件，replay 会把
-    (C, head'] 也折进去——blob 就领先于它声明的切面，恢复时那段被重复 apply，而 apply
-    不是幂等的（`events_total` 会双计）。
+    这是 `replay_session` 必须收 `through_position` 的原因：不传的话它自己去取
+    `committed_head`，而切面 C 是 `_write` 开头取的那个 head。两者之间若又提交了新事件，就会
+    把 (C, head'] 也折进去——blob 领先于它声明的切面，恢复时那段被重复 apply，而 apply 不是
+    幂等的（`events_total` 会双计）。
     """
-    n = EventStore.REPLAY_BATCH + 10
+    n = REPLAY_BATCH + 10
     store = await _seeded(n)
     writer = SnapshotWriter(store, None, every_n_events=1)
 
-    # 在 writer 取完 head 之后、折叠过程中再塞新事件进去
-    real = store.read_range
+    # 注入点必须落在**真正的危险窗口**里：`_write` 取完自己的 head 之后、`replay_session` 若
+    # 自作主张再取一次 head 之前。所以钩 `committed_head`——第一次调用是 `_write` 自己的，返回
+    # 之后立刻塞 25 条新事件；此时若 `replay_session` 没收到 `through_position`，它取到的就是
+    # n+25，多折进去的那 25 条会让 blob 领先于声明的切面。
+    #
+    # ⚠️ 第一版钩的是 `read_range`（在折叠途中注入）。那个位置钉不住：不传
+    # `through_position` 时 `replay_session` 取 head 发生在第一次 `read_range` **之前**，于是
+    # 注入永远在窗口之外，去掉参数测试照样绿。反向验证时发现的。
+    real_head = store.committed_head
     injected = False
 
-    async def spy(session_id, **k):
+    async def spy(session_id):
         nonlocal injected
+        got = await real_head(session_id)
         if not injected:
             injected = True
             for i in range(n + 1, n + 26):
-                await store.append(_ev(i))
-        return await real(session_id, **k)
+                await append_one(store, _ev(i))
+        return got
 
-    store.read_range = spy                          # type: ignore[method-assign]
+    store.committed_head = spy                      # type: ignore[method-assign]
     await writer._write("s1", _ev(n), reason="anchor")
+    store.committed_head = real_head                # type: ignore[method-assign]
 
     snap = await latest_snapshot(store, "s1")
     from ctx_weft.core.control.reducers import deserialize_view
@@ -143,7 +155,8 @@ async def test_the_anchor_stops_at_the_declared_cut() -> None:
 
     # 恢复照常：快照 + 增量 == 全量
     full = RunStateView(run_id="s1", session_id="", task_id="", agent_id="")
-    async for batch in store.replay("s1", exclude_types=REPLAY_EXCLUDE_TYPES):
+    async for batch in replay_session(store, "s1",
+                                      exclude_types=REPLAY_EXCLUDE_TYPES):
         apply_events(batch, full)
     assert (await rebuild_view(store, "s1")).events_total == full.events_total == n + 25
 
@@ -169,9 +182,10 @@ def test_the_anchor_does_not_use_reduce_events() -> None:
     assert "reduce_events" not in called, (
         "重锚又变成一次折了：reduce_events 收整个 list，而这里跑在 emit() 内联路径上")
     assert "apply_events" in called, "分批折叠用的就是它"
-
-    loops = [n for n in ast.walk(tree) if isinstance(n, ast.While)]
-    assert loops, "分批循环不见了"
+    # 分批本身现在由 `reducers.replay_session` 提供（2026-09-21 从协议搬进 core，并加上
+    # `through_position`——重锚需要显式截断到自己的切面，协议版给不了那个参数，所以这个循环
+    # 一度是就地抄的）。钉「调了它」而不是「有个 while 循环」：形状换了，约束没换。
+    assert "replay_session" in called, "重锚没走 replay_session——又把分批循环抄了一遍？"
 
 
 # ── 2. 不再每次重启都重锚 ────────────────────────────────────────────────────
@@ -202,7 +216,7 @@ async def test_a_fresh_writer_still_writes_an_incremental_snapshot() -> None:
     assert (await latest_snapshot(store, "s1")).chain_depth == 0
 
     for i in range(41, 51):
-        await store.append(_ev(i))
+        await append_one(store, _ev(i))
     reborn = SnapshotWriter(store, None, every_n_events=1)  # 新进程
     await reborn._write("s1", _ev(50), reason="periodic")
 

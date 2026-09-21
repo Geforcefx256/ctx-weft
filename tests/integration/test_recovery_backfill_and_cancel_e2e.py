@@ -32,7 +32,7 @@ from tests.integration.test_hitl_hot_reply_round_window_e2e import (
 from tests.integration.test_minimal_loop import (
     InlineAgentTemplateProvider, make_echo_template, make_runtime,
 )
-from tests._event_helpers import all_events
+from tests._event_helpers import all_events, append_one
 
 pytestmark = pytest.mark.asyncio
 
@@ -83,8 +83,11 @@ async def test_answered_reply_is_injected_even_while_another_question_is_pending
             tool_call_id="call_9", stage="tool", agent_id=AID, prompt="which db?"),
         _ev(7, EventType.TASK_AWAITING_HUMAN, task_id=TID, hitl_id="hit_2"),
     ]:
-        await rt.event_store.append(e)
+        await append_one(rt.event_store, e)
 
+    # 装填是调用方的责任（2026-09-21：`recover_agent` 对 registry miss 直接抛
+    # `AgentNotLoaded`，按 agent 扫全库的 sweep 已删）。只喂内存，不建 TM、不跑。
+    await rt.rebuild_session(SID)
     with mock.patch(
         "ctx_weft.core.loop.steps.background_observe.launch_background_observe",
         return_value=None,

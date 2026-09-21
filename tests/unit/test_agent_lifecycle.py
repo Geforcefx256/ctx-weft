@@ -522,10 +522,6 @@ class _MemStore(EventStore):
             if after_position < i <= end
         ]
 
-    async def read_session_events_of_types(self, session_id, types, *, task_id=""):
-        type_set = {str(t) for t in types}
-        return [e for e in self._events if e.type in type_set]
-
     async def read_last_of_type(self, session_id, type_):
         """没有快照——恢复因此走全量重放。那是合法配置（正确，只是慢）。"""
         return None

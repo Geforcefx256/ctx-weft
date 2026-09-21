@@ -47,6 +47,7 @@ from tests.integration.test_minimal_loop import (
     make_echo_template,
     make_runtime,
 )
+from tests._event_helpers import append_one
 
 pytestmark = pytest.mark.asyncio
 
@@ -146,7 +147,7 @@ async def test_ot06_finished_but_memory_write_crashed_backfills(tmp_path):
                                          "result": "finished-result-from-event",
                                          "result_length": len("finished-result-from-event")}),
     ), start=1):
-        await event_store.append(Event(
+        await append_one(event_store, Event(
             id=f"evt_seed_{i}", type=etype, session_id="s1", run_id="r0", sequence=i,
             timestamp=datetime.now(UTC), payload=payload))
 

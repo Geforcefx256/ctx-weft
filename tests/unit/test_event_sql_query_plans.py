@@ -1,8 +1,9 @@
 """SqlEventStore 的 SQL 形态：排序口径、索引命中、以及已删掉的快照表（2026-09-20 审查）。
 
 这一批钉的是**查询计划**，不是返回值。返回值有一致性套盯着，而「同样的结果用什么代价拿到」
-没人盯——本轮审查就是在这儿翻出两处：`list_active_session_ids` 按 `id` 排（既错又慢）、
-`read_last_of_type` 缺一列索引（temp b-tree 的行数随会话累积的快照张数线性增长）。
+没人盯——本轮审查就是在这儿翻出两处：`list_active_session_ids` 按 `id` 排（既错又慢；该方法
+已于 2026-09-21 删除，见下方 §1 的墓碑）、`read_last_of_type` 缺一列索引（temp b-tree 的行数
+随会话累积的快照张数线性增长）。
 
 计划断言是拿**实际发出的 SQL** 去 EXPLAIN 的（`before_cursor_execute` 抓语句），不是照抄一份
 SQL 字面量——照抄的那种断言在查询改写后会继续绿，而它要防的恰恰是查询改写。
@@ -20,6 +21,7 @@ from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.providers._sqlalchemy import make_session_factory
 from ctx_weft.providers.events.store.sql.models import Base
 from ctx_weft.providers.events.store.sql.store import SqlEventStore
+from tests._event_helpers import append_one
 
 _T0 = datetime(2026, 9, 20, tzinfo=UTC)
 
@@ -68,45 +70,13 @@ def _plan(db, statement: str, params) -> list[str]:
         con.close()
 
 
-# ── 1. 排序口径：提交序，不是铸造序 ─────────────────────────────────────────
-
-
-async def test_active_sessions_replay_in_commit_order_not_mint_order(sqlite_store):
-    """活跃判据必须按 position 重放。本例里两种序给出**相反**的答案。
-
-    构造：`SessionResumed` 的 id 大、`SessionFinished` 的 id 小，但提交序相反。
-    真实来源是 ULID 铸造 ≠ 提交——一条事件在内存里造好后可能晚几十毫秒才落库，期间别的
-    事件先提交了。
-
-    - 按 `id` 排 → Finished(evt_a) 先、Resumed(evt_z) 后 → 判成**仍活跃**。
-    - 按 position 排 → Resumed 先、Finished 后 → 判成**已结束**。
-
-    后者才对：真正后发生的是 Finished。判错的表现是「已结束的会话每次重启都被捞起来恢复」。
-    """
-    store, _cap, _db = sqlite_store
-    await store.append(_ev("evt_m", session="s1", type_=EventType.SESSION_CREATED))
-    # 先提交 Resumed（id 大），后提交 Finished（id 小）
-    await store.append(_ev("evt_z_resumed", session="s1", type_="SessionResumed", seq=2))
-    await store.append(_ev("evt_a_finished", session="s1", type_="SessionFinished", seq=3))
-
-    assert "s1" not in await store.list_active_session_ids(), (
-        "按 id 序重放会把 s1 判成仍活跃——生命周期事件必须按 position 重放")
-
-
-async def test_lifecycle_query_orders_by_position(sqlite_store):
-    """发出的 SQL 里，生命周期查询的 ORDER BY 不含裸 events.id 作首键。"""
-    store, cap, _db = sqlite_store
-    await store.append(_ev("evt_1", session="s1", type_=EventType.SESSION_CREATED))
-    cap.rows.clear()
-    await store.list_active_session_ids()
-
-    lifecycle = [s for s, _p in cap.rows if "ORDER BY" in s and "events.type IN" in s]
-    assert lifecycle, f"没抓到生命周期查询：{[s for s, _ in cap.rows]}"
-    stmt = lifecycle[-1]
-    order = stmt[stmt.index("ORDER BY"):]
-    assert "events.position" in order, f"ORDER BY 里没有 position：{order}"
-    assert not order.strip().startswith("ORDER BY events.id"), (
-        f"又按铸造序排了：{order}")
+# 这里从前是 §1「排序口径：提交序，不是铸造序」，两条用例钉 `list_active_session_ids`
+# 的生命周期查询必须按 `position` 重放（按 `id` 是 ULID 铸造序，并发提交下与提交序分叉，
+# 表现为「已结束的会话每次重启都被捞起来恢复」）。2026-09-21 连同被测方法一起删除——
+# 「有哪些会话」是 host 自己的数据，core 不该从事件流反推，详见协议里的墓碑。
+#
+# 排序口径本身仍然有人盯：`read_range` / `read_last_of_type` 的 position 序由一致性套
+# （`test_ordered_event_store_conformance.py`）钉返回值，下面 §2 钉它们的计划。
 
 
 # ── 2. 索引命中 ────────────────────────────────────────────────────────────
@@ -129,7 +99,7 @@ async def test_read_last_of_type_needs_no_temp_btree(sqlite_store):
     """
     store, cap, db = sqlite_store
     for i in range(1, 31):
-        await store.append(_ev(f"evt_{i:04d}", session="s1", seq=i, type_=(
+        await append_one(store, _ev(f"evt_{i:04d}", session="s1", seq=i, type_=(
             EventType.STATE_SNAPSHOT if i % 3 == 0 else "TaskMessageAppended")))
     cap.rows.clear()
     got = await store.read_last_of_type("s1", EventType.STATE_SNAPSHOT)
@@ -146,7 +116,7 @@ async def test_read_range_is_a_single_index_hit(sqlite_store):
     """恢复增量（真正的热路径）：等值 + 范围 + 有序全由 uq_events_session_position 吃掉。"""
     store, cap, db = sqlite_store
     for i in range(1, 21):
-        await store.append(_ev(f"evt_{i:04d}", session="s1", seq=i,
+        await append_one(store, _ev(f"evt_{i:04d}", session="s1", seq=i,
                                type_="TaskMessageAppended"))
     cap.rows.clear()
     await store.read_range("s1", after_position=5,

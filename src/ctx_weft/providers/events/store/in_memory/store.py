@@ -19,7 +19,6 @@ from ctx_weft.protocols.events import (
     EventStore,
     StoredEvent,
 )
-from ctx_weft.providers.events._lifecycle import apply_lifecycle
 
 
 # ── InMemoryEventStore ────────────────────────────────────────────────────────
@@ -33,7 +32,6 @@ class InMemoryEventStore(EventStore):
 
     def __init__(self) -> None:
         self._stored: dict[str, list[StoredEvent]] = {}   # session → 按提交序
-        self._active: set[str] = set()
         self._lock = asyncio.Lock()
         self._next_position: dict[str, int] = {}          # session → 下一个 position
         self._batches: dict[str, CommitReceipt] = {}      # batch_id → receipt
@@ -81,16 +79,12 @@ class InMemoryEventStore(EventStore):
                 raise EventConflictError(
                     f"event {e.id!r} already committed in batch {prior!r}")
         base = self._next_position.get(session_id, 0)
-        is_new = session_id not in self._stored
         stored = self._stored.setdefault(session_id, [])
-        if is_new:
-            self._active.add(session_id)   # 种子：仅首次出现时置 active（终态后不复活）
         records = []
         for i, e in enumerate(events):
             stored.append(StoredEvent(event=e, position=base + i + 1))
             records.append(stored[-1])
             self._event_batch[e.id] = batch_id
-            apply_lifecycle(self._active, e)
         self._next_position[session_id] = base + len(events)
         receipt = CommitReceipt(batch_id=batch_id, records=tuple(records))
         self._batches[batch_id] = receipt
@@ -102,10 +96,6 @@ class InMemoryEventStore(EventStore):
             return False
         return all(r.event == e for r, e in zip(receipt.records, events))
 
-    async def append(self, event: Event) -> None:
-        """单事件 = 单事件批次（batch_id 确定性取 event.id；spec: event-log 兼容要求）。"""
-        await self.append_batch(event.session_id, event.id, [event])
-
     # ── 读 ────────────────────────────────────────────────────────────────────
 
     async def read_range(
@@ -114,8 +104,12 @@ class InMemoryEventStore(EventStore):
         *,
         after_position: int = 0,
         through_position: int | None = None,
+        include_types: tuple[str, ...] = (),
         exclude_types: tuple[str, ...] = (),
+        task_id: str = "",
     ) -> list[StoredEvent]:
+        """四个过滤器的语义见协议；`task_id` 的 OR-NULL 安全阀与 SQL 侧逐字同口径。"""
+        want = {str(t) for t in include_types}
         skip = {str(t) for t in exclude_types}
         out = []
         for se in self._stored.get(session_id, []):
@@ -123,7 +117,12 @@ class InMemoryEventStore(EventStore):
                 continue
             if through_position is not None and se.position > through_position:
                 continue
+            if want and se.event.type not in want:
+                continue
             if skip and se.event.type in skip:
+                continue
+            # 只排除**明确属于别的 task** 的：无归属（None / 空串）的照样取回。
+            if task_id and se.event.task_id and se.event.task_id != task_id:
                 continue
             out.append(se)
         return out
@@ -141,19 +140,6 @@ class InMemoryEventStore(EventStore):
     async def committed_head(self, session_id: str) -> int:
         # _next_position 存的是「最后已分配的 position」（0 = 无提交），即 head 本身
         return self._next_position.get(session_id, 0)
-
-    async def list_active_session_ids(self) -> list[str]:
-        return list(self._active)
-
-    async def read_session_events_of_types(
-        self, session_id: str, types: tuple[str, ...], *, task_id: str = "",
-    ) -> list[Event]:
-        type_set = set(types)
-        return [se.event for se in self._stored.get(session_id, [])
-                if se.event.type in type_set
-                # 与 SQL 同口径：只排除明确属于别的 task 的（见那边的说明）
-                and (not task_id or not se.event.task_id
-                     or se.event.task_id == task_id)]
 
     # 快照不在这里：它是日志里的一条 `EventType.STATE_SNAPSHOT` 事件，跟别的事件一样经
     # `append_batch` 进来、经 `read_last_of_type` 出去。从前这里有 `save_snapshot` /

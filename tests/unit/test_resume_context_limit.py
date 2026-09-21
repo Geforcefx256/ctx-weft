@@ -21,6 +21,7 @@ from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.core.orchestrator.lifecycle.session_registry import SessionRegistry
 from ctx_weft.providers.events import InMemoryEventStore
 from ctx_weft.providers.events import EventPersister
+from tests._event_helpers import append_one
 
 pytestmark = pytest.mark.asyncio
 
@@ -50,7 +51,7 @@ async def test_resume_session_preserves_context_limit() -> None:
     sid = "ses_resume_ctx"
 
     # Seed the store with a SESSION_CREATED event that carries a custom context_limit.
-    await store.append(_ev(1, sid, EventType.SESSION_CREATED,
+    await append_one(store, _ev(1, sid, EventType.SESSION_CREATED,
                            template_id="tpl_echo",
                            user_prompt="hello",
                            root_agent_id="agt_root",
