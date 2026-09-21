@@ -603,23 +603,29 @@ async def _pending_with_tenant(rt, *, session_id: str, tenant_id: str) -> str:
 
 
 def _count_event_reads(rt) -> list[str]:
-    """给两条读事件库的路都装计数。
+    """给**所有**读事件库的路装计数。
 
     应答内容管线**不该**为任何理由回头读事件流（tenant 随请求带着走，2026-09-19 起 core
-    里连解析入口都没有了）。两条都装上，免得将来有人换一条路读、断言还以为是绿的。
+    里连解析入口都没有了）。每条路都装上，免得将来有人换一条路读、断言还以为是绿的。
+
+    ⚠️ 这个函数从前装的是 `rt._read_session_events_of_types` 与 `read_by_session`。前者
+    2026-09-20 删了（src 里零调用者，而它正是「按类型读整条会话」那个要清的形状），于是那
+    一条计数器守的是一个不存在的方法——**负向断言在这种情况下不会红，只会变得空洞**。现在
+    改成装 store 的三个读原语，覆盖面反而更全。
     """
     hits: list[str] = []
-    orig_typed = rt._read_session_events_of_types
-    orig_full = rt.event_store.read_by_session
+    store = rt.event_store
+    originals = {
+        name: getattr(store, name)
+        for name in ("read_by_session", "read_range", "read_session_events_of_types")
+    }
 
-    async def typed(session_id, types):
-        hits.append("typed")
-        return await orig_typed(session_id, types)
+    def _wrap(name, fn):
+        async def spy(*a, **k):
+            hits.append(name)
+            return await fn(*a, **k)
+        return spy
 
-    async def full(session_id):
-        hits.append("full")
-        return await orig_full(session_id)
-
-    rt._read_session_events_of_types = typed          # type: ignore[method-assign]
-    rt.event_store.read_by_session = full            # type: ignore[method-assign]
+    for name, fn in originals.items():
+        setattr(store, name, _wrap(name, fn))         # type: ignore[method-assign]
     return hits

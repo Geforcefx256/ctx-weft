@@ -262,7 +262,11 @@ def test_the_restore_reads_from_the_floor_not_the_whole_session() -> None:
 
     src = inspect.getsource(CtxWeftRuntime._restore_appended_messages)
     assert "settled_memory_floor" in src, "补写又读全会话了"
-    assert "after_position=floor" in src, src
+    # 起点是 floor，然后按区间往前走（`cursor = floor` + while 循环）。分批是必要的：
+    # floor==0 时（首张快照之前 / 存量库 / projection_version 刚 bump）区间就是整条会话，
+    # 一次性物化那一段的代价与重锚同源（实测 20 万事件 604.9MB）。
+    assert "cursor = floor" in src, src
+    assert "while cursor < head" in src, "没有分批——floor==0 时会一次读完整条会话"
     assert "load_events_of_types" not in src, (
         "`load_events_of_types` 没有下界参数——用它就是又读全会话")
     # 刻意**不**断言 `exclude_types=REPLAY_EXCLUDE_TYPES`。代码里传了它，但那纯粹是省

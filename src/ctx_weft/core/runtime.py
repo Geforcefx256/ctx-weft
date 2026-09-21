@@ -37,7 +37,7 @@ from ctx_weft.core.assembler.sources import (
 from ctx_weft.protocols.capability import Authorizer
 from ctx_weft.core.control.tokens import CancelToken, PauseToken, RunTokens
 from ctx_weft.core.models.discriminators import CancelReason, InterruptReason
-from ctx_weft.protocols.events import Event, EventOrigin, EventType
+from ctx_weft.protocols.events import Event, EventOrigin, EventStore, EventType
 from ctx_weft.core.utils.event import emit_event
 from ctx_weft.core.hitl.registry import (
     HITL_STAGE_AUTHZ,
@@ -4248,12 +4248,21 @@ class CtxWeftRuntime:
         from ctx_weft.protocols import MemoryEvent
 
         floor = await settled_memory_floor(self.event_store, session.id)
-        events = [
-            se.event for se in await self.event_store.read_range(
-                session.id, after_position=floor,
-                exclude_types=REPLAY_EXCLUDE_TYPES)
-            if se.event.type == EventType.TASK_MESSAGE_APPENDED
-        ]
+        head = await self.event_store.committed_head(session.id)
+        # **分批读**：floor 通常离 head 只有一个快照间隔，但 floor==0（首张快照之前 /
+        # 存量库 / projection_version 刚 bump）时区间就是整条会话。一次性物化那一段的代价
+        # 与 SnapshotWriter 重锚同源（实测 20 万事件 604.9MB），所以这里同样按区间切。
+        # 收集的只是命中类型的那几条——注入消息的条数与会话长度无关。
+        events: "list[Event]" = []
+        cursor = floor
+        while cursor < head:
+            upper = min(cursor + EventStore.REPLAY_BATCH, head)
+            events.extend(
+                se.event for se in await self.event_store.read_range(
+                    session.id, after_position=cursor, through_position=upper,
+                    exclude_types=REPLAY_EXCLUDE_TYPES)
+                if se.event.type == EventType.TASK_MESSAGE_APPENDED)
+            cursor = upper
         if not events:
             return
         memory = self.providers.get_memory()
@@ -4562,13 +4571,12 @@ class CtxWeftRuntime:
         await self._hydrate_snapshot_messages(snapshot, session_id)
         return self.hitl_registry.load_snapshot(snapshot)
 
-    async def _read_session_events_of_types(
-        self, session_id: str, types: "tuple[EventType, ...]",
-    ) -> "list[Event]":
-        """轻查询取该 session 的指定类型事件（降级逻辑与 capability 折叠共用一份）。"""
-        from ctx_weft.core.control.reducers import load_events_of_types
-
-        return await load_events_of_types(self.event_store, session_id, types)
+    # 这里从前有个 `_read_session_events_of_types(session_id, types)`——按类型取整条会话的
+    # 事件，**不带 task 收窄、不带位置下界**。2026-09-20 删：src 里零调用者（唯一的引用是
+    # 一条负向断言测试给它装计数器）。留着的代价不是那几行代码，是它是本轮一直在清的那个
+    # 形状的现成模板——下一个要「按类型查一下」的人会照它写，而那条读随会话长度线性增长。
+    # 真要按类型读：`reducers.load_events_of_types(store, sid, types, task_id=...)` 带 task
+    # 收窄，或者像 `_restore_appended_messages` 那样按 position 区间分批。
 
     async def _hydrate_snapshot_messages(self, snapshot, session_id: str) -> None:
         """把 `decisions_for` 里的 **event 侧** 内容还原成 memory 侧可用的形态。
