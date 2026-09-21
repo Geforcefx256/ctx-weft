@@ -352,6 +352,12 @@ async def test_writer_and_recovery_exclude_the_same_types() -> None:
     assert src.count("exclude_types=REPLAY_EXCLUDE_TYPES") == 2, (
         "writer 的两条读（增量 / 重锚）都必须排除，且引那个共享集合"
     )
-    assert src.count("read_range(") == 2, "读路径数变了，这条守卫要跟着更新"
+    # 读路径仍是两条（增量一条、重锚一条），但重锚那条现在在 while 循环里分批调
+    # （2026-09-20：一次读完整条流实测 20 万事件 604.9MB 峰值，而它跑在 emit() 内联路径上）。
+    # 所以这里钉的是「源码里恰好两处**调用**」，不是运行时次数——分批意味着运行时调 n/batch
+    # 次。数 `await self._store.read_range(` 而不是 `read_range(`：后者会把注释里提到这个名字
+    # 的地方也数进去（踩过）。
+    assert src.count("await self._store.read_range(") == 2, (
+        "读路径数变了，这条守卫要跟着更新")
     # 不钉「源码里不出现 STATE_SNAPSHOT」——writer 发那条事件时必须指名它。要钉的是**读**用
     # 的是共享集合而不是各写一遍字面量，上面那条计数就够了。

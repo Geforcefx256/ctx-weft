@@ -64,15 +64,16 @@ from ctx_weft.core.control.reducers import (
     apply_events,
     deserialize_view,
     prune_view_for_snapshot,
-    reduce_events,
     snapshot_event_payload,
     snapshot_facts_from_event,
     snapshot_is_usable,
 )
+from ctx_weft.core.control.types import RunStateView
 from ctx_weft.core.utils.event import new_event
 from ctx_weft.protocols.events import (
     TRANSIENT_EVENT_TYPES,
     EventOrigin,
+    EventStore,
     EventType,
 )
 
@@ -112,9 +113,8 @@ class SnapshotWriter:
         #: （无 TaskManager 的极简接线 / 单测）。
         self._memory_settled = memory_settled
         self._since_snapshot: dict[str, int] = {}
-        # 本进程内已写过快照的 session（spec: snapshot-recovery）：空集意味着「服务刚
-        # 起来」，第一张快照走全量重锚，纠正上一个进程可能留下的偏差。
-        self._anchored: set[str] = set()
+        # 这里从前还有一个 `_anchored: set[str]`（本进程已写过快照的 session），用来强制
+        # 「服务每次起来的第一张快照走全量重锚」。2026-09-20 删——理由见 `_usable_base`。
         self._subscription = event_bus.subscribe(None, self.on_event) if event_bus else None
 
     async def detach(self) -> None:
@@ -204,11 +204,23 @@ class SnapshotWriter:
         """取可作增量基底的最新快照；取不到返回 None（调用方全量重锚）。
 
         判据与恢复路径共用 `snapshot_is_usable`，额外叠一层写入侧专属的链深上限。
-        另加一条：**本进程内还没为这个 session 写过快照时不认基底**——服务每次起来的
-        第一张快照都是全量重锚，让「上一进程留下的快照有误」在启动后被纠正一次。
+
+        **从前还有一条「本进程内没为这个 session 写过快照就不认基底」**（服务每次起来的第
+        一张快照都全量重锚），2026-09-20 去掉。它的理由是「让上一进程留下的快照有误在启动
+        后被纠正一次」，三点都站不住：
+
+        1. 偏差的来源是 `serialize`/`deserialize` 往返有损，而限制这个累积本来就是
+           `MAX_CHAIN_DEPTH` 的职责——那才是为它设计的闸。
+        2. **恢复侧本来就信任上一个进程的快照**（`rebuild_view` 直接拿它当增量基底）。
+           读侧信、写侧不信，这个不对称说不通：那张快照真不可信的话，恢复已经错了，事后
+           重锚一次救不回已经读出去的状态。
+        3. 代价是**每次重启、每个会话一次 O(n)**，压在 `EventBus.emit()` 的内联路径上
+           （见本类 ⚠️ 注释）。实测 20 万事件的会话一次重锚 604.9MB 峰值——正是这个类自己
+           的 docstring 要防的形状。
+
+        去掉之后重锚只在真正需要时发生：无快照 / 载荷畸形 / 版本不匹配 / 位置超前 /
+        链深到顶。
         """
-        if session_id not in self._anchored:
-            return None
         stored = await self._store.read_last_of_type(
             session_id, EventType.STATE_SNAPSHOT)
         snapshot = snapshot_facts_from_event(stored.event if stored else None)
@@ -244,14 +256,37 @@ class SnapshotWriter:
                 [se.event for se in delta], deserialize_view(base.state_blob))
             folded, depth, anchored = len(delta), base.chain_depth + 1, False
         else:
-            # ── 重锚：全量，O(n)──────────────────────────────────────────
-            # 无可用基底（首张 / 存量快照 / 版本不匹配 / 位置超前 / 链深到顶 /
-            # 本进程首次），从日志重新推导一张——这是纠正历史快照偏差的地方。
-            stored = await self._store.read_range(
-                session_id, after_position=0, through_position=head,
-                exclude_types=REPLAY_EXCLUDE_TYPES)
-            view = reduce_events([se.event for se in stored], run_id=session_id)
-            folded, depth, anchored = len(stored), 0, True
+            # ── 重锚：全量折，但**分批读**─────────────────────────────────
+            # 无可用基底（首张 / 存量快照 / 版本不匹配 / 位置超前 / 链深到顶），从日志重新
+            # 推导一张——这是纠正历史快照偏差的地方。
+            #
+            # **分批，和恢复侧同一条路**（2026-09-20）。从前这里是一次
+            # `read_range(0..head)` 再 `reduce_events`，于是整条流同时在内存里：实测 20 万
+            # 事件的会话峰值 604.9MB，而同一段日志分批折是 9.6MB（62 倍）。那 600MB 压在
+            # `EventBus.emit()` 的内联路径上，并发几个会话就是会崩的量级——正是本类开头那条
+            # ⚠️ 要防的东西，只不过它当时只管住了增量分支。
+            #
+            # 折叠结果逐字段不变：`reduce_events(evts)` 就是 `apply_events(evts, 空 view)`
+            # （reducers.py 里两段循环体逐字相同），而 apply 是 for 循环左折叠、可结合，所以
+            # 「一次折 n 条」与「分 k 批各折 n/k 条」等价。
+            #
+            # ⚠️ **为什么不直接用 `store.replay()`**（恢复侧用的就是它）：`replay` 锚在它自己
+            # 进去那一刻的 `committed_head`，而切面 C 是上面那个 `head`。两者之间可能又提交了
+            # 新事件，于是 replay 会多折进 (head, head'] 那一段——blob 就**领先于它声明的切面**,
+            # 恢复时那段会被重复 apply（`events_total` 双计，不是幂等的）。所以这里自己按 C
+            # 截断分批。批大小仍取协议那个常量，不另起一个数。
+            view = RunStateView(
+                run_id=session_id, session_id="", task_id="", agent_id="")
+            folded, cursor = 0, 0
+            while cursor < head:
+                upper = min(cursor + EventStore.REPLAY_BATCH, head)
+                batch = await self._store.read_range(
+                    session_id, after_position=cursor, through_position=upper,
+                    exclude_types=REPLAY_EXCLUDE_TYPES)
+                apply_events([se.event for se in batch], view)
+                folded += len(batch)
+                cursor = upper
+            depth, anchored = 0, True
 
         if not view.session_id:
             return  # 该 session 尚无任何已提交事件，跳过（不记 anchored，下次仍重锚）
@@ -280,7 +315,6 @@ class SnapshotWriter:
         )
         await self._store.append_batch(
             session_id, f"snapshot:{session_id}:{head}", [snap_event])
-        self._anchored.add(session_id)
         logger.info(
             "SnapshotWriter: snapshot event %s for session %s (reason=%s, cut=%d, "
             "folded=%d events, mode=%s, chain_depth=%d)",

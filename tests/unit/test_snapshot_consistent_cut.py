@@ -277,8 +277,6 @@ async def test_unusable_base_rejected_so_writer_reanchors(env):
     head = await store.committed_head("s1")
 
     writer = SnapshotWriter(store, None, every_n_events=1)
-    writer._anchored.add("s1")                       # 装成「本进程已重锚过」
-
     assert await writer._usable_base("s1", head) is not None, "健康基底应被接受"
 
     good_view = await rebuild_view(store, "s1")
@@ -291,6 +289,12 @@ async def test_unusable_base_rejected_so_writer_reanchors(env):
         await seed_snapshot(store, "s1", good_view, cut=head, overrides=over)
         assert await writer._usable_base("s1", head) is None, f"{why} 的基底必须被拒"
 
-    # 未在本进程重锚过的 session 同样不认基底（服务刚起来那一张必须是全量）
+    # 从前这里还有一条：「未在本进程重锚过的 session 同样不认基底」（服务刚起来那一张必须
+    # 全量）。2026-09-20 去掉了那条策略，所以反过来钉：**刚构造的 writer 就认健康基底**。
+    # 理由见 `_usable_base` 的 docstring——恢复侧本来就信任上一个进程的快照，写侧不信是个
+    # 说不通的不对称，而代价是每次重启每个会话一次 O(n)（20 万事件实测 604.9MB 峰值，且在
+    # EventBus.emit() 的内联路径上）。
+    await seed_snapshot(store, "s1", good_view, cut=head)   # 放回一张健康的
     fresh = SnapshotWriter(store, None, every_n_events=1)
-    assert await fresh._usable_base("s1", head) is None
+    assert await fresh._usable_base("s1", head) is not None, (
+        "刚起来的 writer 应当直接认上一个进程留下的健康快照，不再强制全量重锚")
