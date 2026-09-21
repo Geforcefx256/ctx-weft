@@ -46,7 +46,11 @@ from typing import TYPE_CHECKING
 from collections.abc import Callable
 
 from ctx_weft.core.control.reducers import _PROJECTION_VERSION
-from ctx_weft.protocols.events import TRANSIENT_EVENT_TYPES
+from ctx_weft.protocols.events import (
+    TRANSIENT_EVENT_TYPES,
+    EventOrigin,
+    EventType,
+)
 
 if TYPE_CHECKING:
     from ctx_weft.protocols.events import Event, EventBus, EventStore
@@ -176,14 +180,16 @@ class SnapshotWriter:
         另加一条：**本进程内还没为这个 session 写过快照时不认基底**——服务每次起来的
         第一张快照都是全量重锚，让「上一进程留下的快照有误」在启动后被纠正一次。
         """
-        from ctx_weft.core.control.reducers import snapshot_is_usable
+        from ctx_weft.core.control.reducers import (
+            snapshot_facts_from_event,
+            snapshot_is_usable,
+        )
 
         if session_id not in self._anchored:
             return None
-        try:
-            snapshot = await self._store.load_latest_snapshot(session_id)
-        except NotImplementedError:
-            return None
+        stored = await self._store.read_last_of_type(
+            session_id, EventType.STATE_SNAPSHOT)
+        snapshot = snapshot_facts_from_event(stored.event if stored else None)
         if not snapshot_is_usable(snapshot, head, max_chain_depth=self.MAX_CHAIN_DEPTH):
             return None
         return snapshot
@@ -196,9 +202,6 @@ class SnapshotWriter:
             reduce_events,
             serialize_view,
         )
-        from ctx_weft.core.utils.clock import now_utc
-        from ctx_weft.core.utils.ids import generate_id
-        from ctx_weft.protocols.events import RunSnapshot
 
         # ── 一致切面（spec: snapshot-recovery，reliability-wp4）───────────────
         # 边界 C = committed_head，**与折叠策略无关**：触发事件只是「现在写一张」的
@@ -238,24 +241,33 @@ class SnapshotWriter:
         # 裁剪是快照写入侧的策略，显式一步、可单独测。契约因此是
         # `blob == serialize_view(prune(fold(0..C)))`，见 `prune_view_for_snapshot`。
         view = prune_view_for_snapshot(view)
-        snapshot = RunSnapshot(
-            id=generate_id("snp"),
-            run_id=event.run_id or "",
+        # ── 落盘：一条 `StateSnapshot` 事件 ──────────────────────────────────
+        # **不经 EventBus，直接 `append_batch`**：走 bus 会投给 SSE 转译 / 投影更新器 /
+        # 分析订阅者（它们都没理由看见一张快照），而且**本类自己就是 bus 订阅者**——走 bus
+        # 会递归调回 `on_event`。
+        #
+        # `batch_id` 按切面定，所以**重试幂等**：同一切面重复写只会撞 batch 表的主键、被
+        # 有序提交机制判为已提交，不会在日志里留下两张同切面的快照。
+        from ctx_weft.core.control.reducers import snapshot_event_payload
+        from ctx_weft.core.utils.event import new_event
+
+        snap_event = new_event(
+            EventType.STATE_SNAPSHOT,
             session_id=session_id,
-            last_event_id=event.id,
-            last_event_sequence=event.sequence,
-            state_blob=serialize_view(view),
-            snapshot_reason=reason,
-            snapshot_at=now_utc(),
-            last_commit_position=head,
-            projection_version=self.PROJECTION_VERSION,
-            chain_depth=depth,
+            tenant_id=event.tenant_id,
+            origin=EventOrigin.RUNTIME,
+            run_id=event.run_id,
+            # `view` 在上面第 243 行已经裁过（`prune_view_for_snapshot`）——裁剪是写入策略，
+            # 编码器不碰它。
+            payload=snapshot_event_payload(
+                view, cut=head, chain_depth=depth, reason=reason),
         )
-        await self._store.save_snapshot(snapshot)
+        await self._store.append_batch(
+            session_id, f"snapshot:{session_id}:{head}", [snap_event])
         self._anchored.add(session_id)
         logger.info(
-            "SnapshotWriter: snapshot %s for session %s (reason=%s, cut=%d, "
+            "SnapshotWriter: snapshot event %s for session %s (reason=%s, cut=%d, "
             "folded=%d events, mode=%s, chain_depth=%d)",
-            snapshot.id, session_id, reason, head, folded,
+            snap_event.id, session_id, reason, head, folded,
             "anchor" if anchored else "incremental", depth,
         )

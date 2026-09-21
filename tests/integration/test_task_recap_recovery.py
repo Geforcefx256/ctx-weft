@@ -50,6 +50,7 @@ from ctx_weft.protocols.capability import qualify
 from ctx_weft.providers.llm.mock import MockLLMAdapter, MockResponse
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from tests.integration.test_minimal_loop import InlineAgentTemplateProvider, make_echo_template, make_runtime
+from tests._snapshot_helpers import seed_snapshot
 
 pytestmark = pytest.mark.asyncio
 
@@ -477,13 +478,7 @@ async def test_all_tasks_terminal_with_a_pruned_snapshot_does_not_raise() -> Non
     pruned = prune_view_for_snapshot(await rebuild_view(runtime.event_store, sid))
     assert pruned.tasks == {}, "前置条件：唯一的 task 已终态，活闭包为空"
     assert pruned.tasks_total == 1
-    await runtime.event_store.save_snapshot(RunSnapshot(
-        id="snp_pruned", run_id="run_1", session_id=sid,
-        last_event_id="evt_0004", last_event_sequence=4,
-        state_blob=serialize_view(pruned), snapshot_reason="test",
-        snapshot_at=_TS, last_commit_position=head,
-        projection_version=_PROJECTION_VERSION, chain_depth=0,
-    ))
+    await seed_snapshot(runtime.event_store, sid, pruned, cut=head, reason="test")
 
     # 恢复读到的就是那份空 tasks —— 闸门必须靠 tasks_total 认出「这不是坏投影」
     view = await rebuild_view(runtime.event_store, sid)

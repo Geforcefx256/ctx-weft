@@ -122,6 +122,7 @@ async def test_no_double_write_via_attach_persistence_single_entry_point(
 
 
 from ctx_weft.core.models.config import RuntimeConfig
+from tests._snapshot_helpers import latest_snapshot
 
 
 async def test_snapshot_every_n_zero_means_no_snapshot_writer(tmp_path) -> None:
@@ -141,9 +142,9 @@ async def test_snapshot_every_n_positive_attaches_and_writes_snapshot(tmp_path) 
         await runtime.event_bus.emit(_ev(2, "RunStarted"))
         await runtime.event_bus.emit(_ev(3, "RunFinished"))  # 触发快照边界
 
-        snap = await store.load_latest_snapshot("s1")
+        snap = await latest_snapshot(store, "s1")
         assert snap is not None
-        assert snap.last_event_id == "evt_0003"
+        assert snap.last_commit_position == 3      # 切面 = 写那一刻的 committed_head
 
 
 # ── detach 之后事件不再落库 ────────────────────────────────────────────────────

@@ -507,6 +507,83 @@ def deserialize_view(data: dict[str, Any]) -> RunStateView:
 _PROJECTION_VERSION = 4
 
 
+#: 全量重放要排掉的类型：状态快照事件本身。
+#:
+#: 它们的存在是为了**省**重放，把它们读回来反而更贵（每条 2.2 KB 的 blob）。由 core 在这里
+#: 命名、传给 `read_range` / `replay` 的通用 `exclude_types`——协议不认识这个类型。
+REPLAY_EXCLUDE_TYPES: "tuple[EventType, ...]" = (EventType.STATE_SNAPSHOT,)
+
+#: 快照事件 payload 的键。单独列出来是因为**写侧与读侧必须用同一组**：各写一遍字面量正是
+#: 「写侧盖 1、读侧要 2」那类静默失效的来源（`_PROJECTION_VERSION` 的注释里记着那次）。
+_SNAP_BLOB = "state_blob"
+_SNAP_CUT = "cut_position"
+_SNAP_VERSION = "projection_version"
+_SNAP_DEPTH = "chain_depth"
+_SNAP_REASON = "reason"
+
+
+@dataclass(frozen=True)
+class SnapshotFacts:
+    """一条 `StateSnapshot` 事件折出来的东西。
+
+    **属性名与 `snapshot_is_usable` 的判据对齐**（它全用 `getattr` 取值），所以那套判据一行
+    都不用改——恢复侧与写入侧继续共用同一份判据，不产生第二套。
+    """
+
+    state_blob: dict[str, Any]
+    last_commit_position: int | None
+    projection_version: int
+    chain_depth: int
+    snapshot_reason: str
+    #: 那条快照事件自己的 id，只用于日志归因。**不是**游标（游标是 `last_commit_position`）。
+    event_id: str = ""
+
+
+def snapshot_event_payload(
+    view: RunStateView, *, cut: int, chain_depth: int, reason: str,
+) -> dict[str, Any]:
+    """把一张快照打成 `StateSnapshot` 事件的 payload。
+
+    `cut` **必须显式**传，不能靠「事件自己的 position 减一」推——并发追加时这条事件拿到的是
+    `head+k`，k 不定。
+
+    **不裁剪**：`prune_view_for_snapshot` 是写入**策略**（决定 blob 里留什么），由调用方在喂进来
+    之前自己裁。编解码器只管把给它的东西打成载荷——混进策略之后，任何想「原样存一张 view」的
+    调用方（测试、工具）都会被悄悄改掉内容。
+    """
+    return {
+        _SNAP_BLOB: serialize_view(view),
+        _SNAP_CUT: cut,
+        _SNAP_VERSION: _PROJECTION_VERSION,
+        _SNAP_DEPTH: chain_depth,
+        _SNAP_REASON: reason,
+    }
+
+
+def snapshot_facts_from_event(ev: "Event | None") -> "SnapshotFacts | None":
+    """从一条 `StateSnapshot` 事件折出 `SnapshotFacts`；不是那个类型 / 载荷畸形 → None。
+
+    畸形一律判 None 而不是抛：载荷是别人写的（存量、外部导入、手工修过的库），而「这张不可用」
+    的后果只是全量重放——正确，只是慢。抛出去会把一次慢恢复变成一次恢复失败。
+    """
+    if ev is None or ev.type != EventType.STATE_SNAPSHOT:
+        return None
+    p = ev.payload or {}
+    blob = p.get(_SNAP_BLOB)
+    if not isinstance(blob, dict):
+        return None
+    cut = p.get(_SNAP_CUT)
+    return SnapshotFacts(
+        state_blob=blob,
+        # 不是 int 就当缺失 → `snapshot_is_usable` 判不可用（它要求这项非 None）。
+        last_commit_position=cut if isinstance(cut, int) else None,
+        projection_version=p.get(_SNAP_VERSION, 1),
+        chain_depth=p.get(_SNAP_DEPTH, 0),
+        snapshot_reason=p.get(_SNAP_REASON, ""),
+        event_id=ev.id,
+    )
+
+
 def snapshot_is_usable(
     snapshot: Any, head: int, *, max_chain_depth: int | None = None,
 ) -> bool:
@@ -548,28 +625,37 @@ async def rebuild_view(event_store: Any, session_id: str) -> RunStateView:
 
     路径选择（按序）：
 
-    1. **快照 + 增量**（快照有效）：快照携带 ``last_commit_position``、
+    1. **快照 + 增量**（快照有效）：日志里最后一条 ``StateSnapshot`` 事件带着切面位置、
        ``projection_version`` 匹配、且位置不超前于 ``committed_head``
        → ``read_range((cursor, head])`` 增量 apply。
-    2. **全量回放**：无快照 / 快照缺 position（改造前的存量快照）/ 版本不匹配 /
-       引用未来位置（数据异常）→ ``read_range(0..head)`` 全量折。
+    2. **全量回放**：无快照 / 载荷畸形 / 缺切面位置（改造前的存量快照）/ 版本不匹配 /
+       引用未来位置（数据异常）→ 分批全量折。
        忽略坏快照是性能降级不是数据丢失（日志是真相）。
+
+    两条路都**排掉 `StateSnapshot` 本身**（`REPLAY_EXCLUDE_TYPES`）：那些事件的存在是为了省
+    重放，把它们读回来反而更贵。
 
     「按事件 ID 取增量」这种读法已从 `EventStore` 彻底移除：ID 铸造序 ≠ 提交序，
     按 ID 当游标正是 H2 的根因。
     """
-    try:
-        snapshot = await event_store.load_latest_snapshot(session_id)
-    except NotImplementedError:
-        snapshot = None
+    # 快照 = 日志里最后一条 `StateSnapshot` 事件。「最新」= position 最大，与 `read_range` /
+    # `committed_head` 同一个序——不再需要快照专属的那套 `snapshot_at` + `id` tie-break
+    # （写入序 ≠ 时间序，所以那套口径当初是必须的）。`read_last_of_type` 只读**一条**：按
+    # 类型全取会把历史上每一张快照连 blob 一起捞回来。
+    stored = await event_store.read_last_of_type(
+        session_id, EventType.STATE_SNAPSHOT)
+    snapshot = snapshot_facts_from_event(stored.event if stored else None)
 
     head = await event_store.committed_head(session_id)
     if snapshot_is_usable(snapshot, head):
         view = deserialize_view(snapshot.state_blob)
+        # 增量同样排掉快照事件：这一段里可能还有别的快照（比如这张之后又写过一张、而它
+        # 因为链深或版本不可用）。折它们没有意义，读它们要付 blob 的钱。
         delta = await event_store.read_range(
             session_id,
             after_position=snapshot.last_commit_position,
             through_position=head,
+            exclude_types=REPLAY_EXCLUDE_TYPES,
         )
         return apply_events([se.event for se in delta], view)
     # 全量：忽略快照（存量/损坏/超前），按提交序重放；重造快照由 writer 负责。
@@ -581,7 +667,8 @@ async def rebuild_view(event_store: Any, session_id: str) -> RunStateView:
     # 分批与整批逐字段等价：重放是左折叠（`reduce_events` 就是 `apply_events` 在空 view
     # 上的调用，本文件里两段循环体逐字相同），而 apply 是 for 循环、可结合。
     view = RunStateView(run_id=session_id, session_id="", task_id="", agent_id="")
-    async for batch in event_store.replay(session_id):
+    async for batch in event_store.replay(
+            session_id, exclude_types=REPLAY_EXCLUDE_TYPES):
         apply_events(batch, view)
     return view
 

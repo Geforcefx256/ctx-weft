@@ -293,6 +293,7 @@ def test_supports_replay_asks_only_whether_it_exists():
         async def append_batch(self, session_id, batch_id, events): ...
         async def read_range(self, session_id, **kw): return []
         async def committed_head(self, session_id): return 0
+        async def read_last_of_type(self, session_id, type_): return None
 
     assert supports_replay(Inheriting()), "继承来的默认实现算有"
 

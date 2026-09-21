@@ -68,10 +68,12 @@ class _CountingStore(InMemoryEventStore):
         return await super().read_session_events_of_types(
             session_id, types, task_id=task_id)
 
-    async def read_range(self, session_id: str, *, after_position=0, through_position=None):
+    async def read_range(self, session_id: str, *, after_position=0,
+                         through_position=None, exclude_types=()):
         self.ranges.append((after_position, through_position))
         return await super().read_range(
-            session_id, after_position=after_position, through_position=through_position)
+            session_id, after_position=after_position,
+            through_position=through_position, exclude_types=exclude_types)
 
 
 async def _seed(store: InMemoryEventStore, n_noise: int) -> None:

@@ -229,6 +229,31 @@ class EventType(StrEnum):
     HITL_CLOSED = "HitlClosed"                    # payload: {hitl_id}
     HITL_OPENED = "HitlOpened"
     HITL_RESOLVED = "HitlResolved"
+    # ── 状态快照 ──
+    # 一张状态快照**就是一条事件**，载荷里直接带 blob（裁剪后实测 2.2 KB——
+    # `prune_view_for_snapshot` 只留活闭包，946 KB → 2.2 KB，436×）。
+    #
+    # 换来两件事：
+    #
+    #   · **「哪张最新」= position 最大。** 从前要靠协议规定一套快照专属口径
+    #     （`snapshot_at` 最大、相同则 `id` 最大，因为写入序 ≠ 时间序）。现在和其它一切
+    #     共用同一个序，不存在第二种「最新」，也就不存在两种口径不一致。
+    #   · **那三个「必须原样往返」的字段进了 payload**（切面位置 / `projection_version` /
+    #     `chain_depth`），而 payload 对 store 是**整体**不透明的——它没法只丢其中一个。
+    #     从前它们是列，store 可能忘了存：m020 补的就是那几列，而丢了它们
+    #     `snapshot_is_usable` 恒判不可用，恢复永远全量回放且**不报错**。
+    #
+    # ⚠️ 切面位置仍要**显式**写进 payload，不能用「这条事件自己的 position 减一」——并发追加
+    # 时快照事件拿到的是 `head+k`，k 不定。
+    #
+    # ⚠️ **store 对这个类型不做任何特殊处理**：它是 core 的词表，不是存储契约的一部分。
+    # 需要「排除快照」的地方（全量重放）由 core 把类型传给 `read_range(exclude_types=...)` /
+    # `replay(exclude_types=...)`，不写死在协议的默认实现里。
+    #
+    # ⚠️ **不经 EventBus，由写入侧直接 `append_batch`。** 三个理由，第三个是决定性的：它不是
+    # 任何人该反应的领域事实；走 bus 会投给 SSE 转译 / 投影更新器 / 分析订阅者，那些都没理由
+    # 看见它；而**写入者自己就是 bus 订阅者**，走 bus 会递归调回它自己。
+    STATE_SNAPSHOT = "StateSnapshot"
     # ── Guard 域 ──
     FAILURE_THRESHOLD_HIT = "FailureThresholdHit"
     # ── RecognizeIntent 域 ──
@@ -598,7 +623,7 @@ class EventStore(Protocol):
         *,
         after_position: int = 0,
         through_position: int | None = None,
-        exclude_types: "tuple[str, ...] = ()",
+        exclude_types: "tuple[str, ...]" = (),
     ) -> "list[StoredEvent]":
         """按 position 升序读取 (after_position, through_position] 的已提交事件。
 
@@ -616,7 +641,9 @@ class EventStore(Protocol):
     #: `replay` 每批多少条。见 `replay` 的 docstring。
     REPLAY_BATCH: int = 2000
 
-    async def replay(self, session_id: str) -> "AsyncIterator[list[Event]]":
+    async def replay(
+        self, session_id: str, *, exclude_types: "tuple[str, ...]" = (),
+    ) -> "AsyncIterator[list[Event]]":
         """按提交序**分批**产出该会话的全部已提交事件。
 
         给「快照不可用、必须从头重放」那条路用。调用方只管
@@ -658,7 +685,8 @@ class EventStore(Protocol):
         while cursor < head:
             upper = min(cursor + self.REPLAY_BATCH, head)
             stored = await self.read_range(
-                session_id, after_position=cursor, through_position=upper)
+                session_id, after_position=cursor, through_position=upper,
+                exclude_types=exclude_types)
             if stored:
                 yield [se.event for se in stored]
             cursor = upper
@@ -670,6 +698,7 @@ class EventStore(Protocol):
         """返回有 SessionCreated 但无终态事件的 session ID 列表（用于启动时 crash recovery）。"""
         raise NotImplementedError
 
+    @abstractmethod
     async def read_last_of_type(
         self, session_id: str, type_: str,
     ) -> "StoredEvent | None":
@@ -682,8 +711,13 @@ class EventStore(Protocol):
         「最后一条」= position 最大。与 `read_range` / `committed_head` 同一个序，不引入
         第二种「最新」口径（从前快照那条口径要靠 `snapshot_at` + `id` 兜，因为写入序 ≠
         时间序）。
+
+        **必需**，不是可选扩展：恢复路径无条件靠它取快照（`rebuild_view`）。做成可选就又要在
+        core 里探一次「这个 store 支不支持」，那是同一个坏设计的第三次——`replay` 那次已经
+        证过，一个能力探测生出两个分支与两种失败形态。想不做快照的 store 返回 None 即可，
+        那是合法配置（恢复退化为全量重放，仍然正确）。
         """
-        raise NotImplementedError
+        ...
 
     async def read_session_events_of_types(
         self, session_id: str, types: "tuple[str, ...]", *, task_id: str = "",

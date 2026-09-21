@@ -18,6 +18,7 @@ from ctx_weft.core.control.reducers import rebuild_view, reduce_events
 from ctx_weft.protocols.events import Event
 from ctx_weft.providers.events import InMemoryEventStore, InProcessEventBus
 from ctx_weft.providers.events.persister import attach_persistence
+from tests._snapshot_helpers import latest_snapshot
 
 pytestmark = pytest.mark.asyncio
 
@@ -49,8 +50,14 @@ async def test_late_committed_event_is_skipped_by_snapshot_recovery():
     await bus.emit(_event(3, "TaskCreated", task_id="b",
                           payload={"task": {"id": "b", "assigned_agent_id": "agent_b"}}))
     await bus.emit(_event(4, "RunFinished", task_id="b", payload={"outcome": "completed"}))
-    snapshot = await store.load_latest_snapshot("s")
-    assert snapshot is not None and snapshot.last_event_id == "evt_0004"
+    snapshot = await latest_snapshot(store, "s")
+    assert snapshot is not None
+    # 游标是 **position**，而且快照表示里**根本没有 ID 游标**——这是 H2 修复最硬的形态：
+    # 不是「我们选择不用 ID」，是那个字段不存在。迟到的 evt_0002 的 id 小于 evt_0004，按 ID
+    # 当游标会把它永久跳过；而它的 position 大于这个切面，所以它落在增量里。
+    # position 3 = SessionCreated + b 的两条；a 的 evt_0002 还在缓冲里、还没拿到 position
+    assert snapshot.last_commit_position == 3
+    assert not hasattr(snapshot, "last_event_id")
 
     # a 的窗口此刻才提交：evt_0002 迟到落库（ID < 快照游标）
     await bus.commit_provisional("a")
@@ -68,7 +75,7 @@ async def test_late_committed_event_is_skipped_by_snapshot_recovery():
         f"snapshot recovery must match full replay after WP4 consistent cut; "
         f"got {sorted(restored.tasks)}"
     )
-    snap = await store.load_latest_snapshot("s")
+    snap = await latest_snapshot(store, "s")
     assert snap is not None and snap.last_commit_position is not None
     # 断言的是「writer 给新快照盖了当前版本的章」，不是某个具体数字——所以引常量而不写
     # 字面量：`_PROJECTION_VERSION` 每次因投影语义变化而 bump 时，这条不该跟着红。

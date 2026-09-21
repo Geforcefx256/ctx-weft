@@ -515,7 +515,8 @@ class _MemStore(EventStore):
     async def committed_head(self, session_id):
         return len(self._events)
 
-    async def read_range(self, session_id, *, after_position=0, through_position=None):
+    async def read_range(self, session_id, *, after_position=0,
+                         through_position=None, exclude_types=()):
         from ctx_weft.protocols.events import StoredEvent
         end = len(self._events) if through_position is None else through_position
         return [
@@ -523,6 +524,10 @@ class _MemStore(EventStore):
             for i, e in enumerate(self._events, start=1)
             if after_position < i <= end
         ]
+
+    async def read_last_of_type(self, session_id, type_):
+        """没有快照——恢复因此走全量重放。那是合法配置（正确，只是慢）。"""
+        return None
 
     async def append_batch(self, session_id, batch_id, events):  # pragma: no cover - 只读 fake
         raise NotImplementedError

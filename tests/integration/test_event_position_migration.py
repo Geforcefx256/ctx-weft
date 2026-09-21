@@ -17,6 +17,7 @@ from ctx_weft.protocols.events import Event
 from ctx_weft.providers.events import InProcessEventBus
 from ctx_weft.providers.events.persister import attach_persistence
 from ctx_weft.providers.events.store.sql.store import open_sqlite_event_store
+from tests._snapshot_helpers import latest_snapshot
 
 _SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "migrate_event_positions.py"
 _T0 = datetime(2026, 9, 11, tzinfo=UTC)
@@ -82,7 +83,7 @@ async def test_migrated_db_recovers_via_position_and_ignores_legacy_snapshot(tmp
         await bus.emit(Event(id="evt_new_1", run_id="r", sequence=10, session_id="s1",
                              type=EventType.RUN_FINISHED, timestamp=_T0,
                              payload={"outcome": "completed"}))
-        snap = await store.load_latest_snapshot("s1")
+        snap = await latest_snapshot(store, "s1")
         assert snap is not None
         assert snap.last_commit_position == 4            # position 游标（非事件 ID）
         # 同上：引常量，不写字面量（投影语义变化时 bump，这条不该跟着红）。

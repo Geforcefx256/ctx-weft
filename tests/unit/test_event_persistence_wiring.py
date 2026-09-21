@@ -17,6 +17,7 @@ from ctx_weft.providers.events import (
     InProcessEventBus,
     attach_persistence,
 )
+from tests._snapshot_helpers import latest_snapshot
 
 
 def _ev(type_: str, seq: int = 1, session: str = "s1") -> Event:
@@ -102,10 +103,12 @@ async def test_snapshot_written_on_session_finished():
     attach_persistence(bus, store, snapshot_every_n=1)
     await bus.emit(_ev("SessionCreated", 1))
     await bus.emit(_ev("SessionFinished", 2))
-    snap = await store.load_latest_snapshot("s1")
+    snap = await latest_snapshot(store, "s1")
     assert snap is not None
     assert snap.snapshot_reason == "session_finished"
-    assert snap.last_event_id == "evt_0002"
+    # 切面位置，不是「最后那条事件的 id」——后者从前是 position 旁边的第二个游标，而按 ID
+    # 当游标正是 H2 的根因，所以新表示里刻意没有它。
+    assert snap.last_commit_position == 2
 
 
 async def test_snapshot_periodic_on_run_finished():
@@ -113,7 +116,7 @@ async def test_snapshot_periodic_on_run_finished():
     attach_persistence(bus, store, snapshot_every_n=2)
     await bus.emit(_ev("SessionCreated", 1))
     await bus.emit(_ev("RunFinished", 2))       # n=2 达阈值
-    snap = await store.load_latest_snapshot("s1")
+    snap = await latest_snapshot(store, "s1")
     assert snap is not None
     assert snap.snapshot_reason == "periodic"
 
@@ -123,27 +126,24 @@ async def test_snapshot_not_written_before_threshold():
     attach_persistence(bus, store, snapshot_every_n=50)
     await bus.emit(_ev("SessionCreated", 1))
     await bus.emit(_ev("RunFinished", 2))
-    assert await store.load_latest_snapshot("s1") is None
+    assert await latest_snapshot(store, "s1") is None
 
 
 async def test_snapshot_sees_the_triggering_event():
     """顺序契约：persister 必须先落库，snapshot 才折得到这条事件（spec §6.5）。
 
-    `last_event_id` / `last_event_sequence` 是 `_write` 直接从触发事件对象上取的，
-    跟 `store.read_by_session("s1")[-1]` 同源、恒等——单独断言这两个字段验不出订阅
-    顺序对不对（顺序反了它们照样相等）。真正对顺序敏感的是 `state_blob`：它是
-    `rebuild_view` 的产物，若 SnapshotWriter 抢在 EventPersister 之前跑，store 里
-    还只有 1 条事件，`events_total` 就会是 1 而非 2。所以顺序契约靠 `events_total`
-    断言钉住，`last_event_id` / `last_event_sequence` 两条另验「快照记的是哪条事件」。
+    切面位置（`last_commit_position`）验不出订阅顺序对不对——它取的是写那一刻的
+    `committed_head`，顺序反了它照样等于 2。真正对顺序敏感的是 `state_blob`：它是
+    `rebuild_view` 的产物，若 SnapshotWriter 抢在 EventPersister 之前跑，store 里还只有
+    1 条事件，`events_total` 就会是 1 而非 2。所以顺序契约靠 `events_total` 钉住，切面位置
+    另验「这张快照切在哪」。
     """
     bus, store = InProcessEventBus(), InMemoryEventStore()
     attach_persistence(bus, store, snapshot_every_n=1)
     await bus.emit(_ev("SessionCreated", 1))
     await bus.emit(_ev("SessionFinished", 2))
-    snap = await store.load_latest_snapshot("s1")
-    stored = await store.read_by_session("s1")
-    assert snap.last_event_id == stored[-1].id
-    assert snap.last_event_sequence == stored[-1].sequence
+    snap = await latest_snapshot(store, "s1")
+    assert snap.last_commit_position == 2
     assert snap.state_blob["events_total"] == 2
 
 
@@ -153,7 +153,7 @@ async def test_snapshot_writer_not_attached_by_default():
     assert handle.snapshot_writer is None
     await bus.emit(_ev("SessionCreated", 1))
     await bus.emit(_ev("SessionFinished", 2))
-    assert await store.load_latest_snapshot("s1") is None
+    assert await latest_snapshot(store, "s1") is None
 
 
 async def test_snapshot_writer_swallows_errors():

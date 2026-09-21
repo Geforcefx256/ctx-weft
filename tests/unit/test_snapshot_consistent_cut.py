@@ -16,6 +16,7 @@ from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.providers.events import InMemoryEventStore, InProcessEventBus
 from ctx_weft.providers.events.persister import attach_persistence
 from ctx_weft.providers.events.snapshot import SnapshotWriter
+from tests._snapshot_helpers import latest_snapshot, seed_snapshot
 
 _T0 = datetime(2026, 9, 11, tzinfo=UTC)
 
@@ -88,14 +89,17 @@ async def test_concurrent_commit_after_cut_not_in_blob(env):
     await _emit_run_finished(bus, 2)          # 快照 #1：cut = head(1)，blob 只含 a
 
     # 触发事件（RunFinished）本身已提交（persister 先于 writer），cut 含它：head=2
-    snap1 = await store.load_latest_snapshot("s1")
+    snap1 = await latest_snapshot(store, "s1")
     assert snap1.last_commit_position == 2
 
     await bus.emit(_ev(3, task_id="c"))       # cut 后新提交
-    await _emit_run_finished(bus, 4)          # 快照 #2：cut=4（含 evt_0003/4）
+    await _emit_run_finished(bus, 4)          # 快照 #2
 
-    snap2 = await store.load_latest_snapshot("s1")
-    assert snap2.last_commit_position == 4
+    # cut = 5，不是 4：**快照 #1 自己也是一条事件、占了 position 3**。这是「快照是日志里的
+    # 一种事件」的直接后果，而它对折叠无影响——增量读排除 `StateSnapshot`
+    # （`REPLAY_EXCLUDE_TYPES`），所以被跳过的那个 position 不会少折任何东西。
+    snap2 = await latest_snapshot(store, "s1")
+    assert snap2.last_commit_position == 5
     restored = await rebuild_view(store, "s1")
     assert sorted(restored.tasks) == ["a", "c"]
 
@@ -138,19 +142,21 @@ async def test_legacy_and_corrupt_snapshots_ignored():
     bus = _make_bus(store)
     await bus.emit(_ev(1, task_id="a"))
     await _emit_run_finished(bus, 2)
-    good = await store.load_latest_snapshot("s1")
+    good = await latest_snapshot(store, "s1")
     assert good.last_commit_position == 2
 
     # 三种坏形态各自覆盖
     import dataclasses
     base_view = serialize_view(await rebuild_view(store, "s1"))
 
-    for bad_snap in (
-        dataclasses.replace(good, last_commit_position=None),                       # legacy
-        dataclasses.replace(good, projection_version=99),                           # 版本
-        dataclasses.replace(good, last_commit_position=999),                        # 超前
+    good_view = await rebuild_view(store, "s1")
+    for bad_over in (
+        {"cut_position": None},          # legacy：存量快照无切面位置
+        {"projection_version": 99},      # 版本不匹配
+        {"cut_position": 999},           # 位置超前
     ):
-        await store.save_snapshot(bad_snap)
+        await seed_snapshot(store, "s1", good_view, cut=2, overrides=bad_over)
+        bad_snap = await latest_snapshot(store, "s1")
         restored = await rebuild_view(store, "s1")
         assert sorted(restored.tasks) == ["a"], (
             f"bad snapshot must be ignored: pos={bad_snap.last_commit_position} "
@@ -169,7 +175,7 @@ async def test_first_write_in_process_is_anchor(env):
     bus = _make_bus(store)
     await bus.emit(_ev(1, task_id="a"))
     await _emit_run_finished(bus, 2)
-    snap = await store.load_latest_snapshot("s1")
+    snap = await latest_snapshot(store, "s1")
     assert snap.chain_depth == 0, "本进程首张快照必须是重锚"
 
 
@@ -183,7 +189,7 @@ async def test_steady_state_writes_are_incremental(env):
     for n in (3, 5, 7):
         await bus.emit(_ev(n, task_id=f"t{n}"))
         await _emit_run_finished(bus, n + 1)
-        depths.append((await store.load_latest_snapshot("s1")).chain_depth)
+        depths.append((await latest_snapshot(store, "s1")).chain_depth)
     assert depths == [1, 2, 3], f"后续写入应为增量链，实得 {depths}"
 
 
@@ -197,7 +203,7 @@ async def test_incremental_blob_equals_full_fold(env):
         await bus.emit(_ev(n, task_id=f"t{n}"))
         await _emit_run_finished(bus, n + 1)
 
-    snap = await store.load_latest_snapshot("s1")
+    snap = await latest_snapshot(store, "s1")
     assert snap.chain_depth > 0, "本例要覆盖的是增量路径"
     incremental = deserialize_view(snap.state_blob)
     full = reduce_events(
@@ -244,7 +250,7 @@ async def test_chain_depth_cap_forces_reanchor(env, monkeypatch):
     for n in (3, 5, 7, 9, 11):
         await bus.emit(_ev(n, task_id=f"t{n}"))
         await _emit_run_finished(bus, n + 1)
-        seen.append((await store.load_latest_snapshot("s1")).chain_depth)
+        seen.append((await latest_snapshot(store, "s1")).chain_depth)
     # 0,1,2,3 之后基底达上限 → 下一张重锚回 0，再继续增量
     assert seen == [0, 1, 2, 3, 0, 1], f"链深上限未生效：{seen}"
 
@@ -261,7 +267,7 @@ async def test_unusable_base_rejected_so_writer_reanchors(env):
     bus = _make_bus(store)
     await bus.emit(_ev(1, task_id="a"))
     await _emit_run_finished(bus, 2)
-    good = await store.load_latest_snapshot("s1")
+    good = await latest_snapshot(store, "s1")
     head = await store.committed_head("s1")
 
     writer = SnapshotWriter(store, None, every_n_events=1)
@@ -269,13 +275,14 @@ async def test_unusable_base_rejected_so_writer_reanchors(env):
 
     assert await writer._usable_base("s1", head) is not None, "健康基底应被接受"
 
-    for bad, why in (
-        (dataclasses.replace(good, projection_version=99), "版本不匹配"),
-        (dataclasses.replace(good, last_commit_position=head + 999), "位置超前"),
-        (dataclasses.replace(good, last_commit_position=None), "存量快照无 position"),
-        (dataclasses.replace(good, chain_depth=SnapshotWriter.MAX_CHAIN_DEPTH), "链深到顶"),
+    good_view = await rebuild_view(store, "s1")
+    for over, why in (
+        ({"projection_version": 99}, "版本不匹配"),
+        ({"cut_position": head + 999}, "位置超前"),
+        ({"cut_position": None}, "存量快照无切面位置"),
+        ({"chain_depth": SnapshotWriter.MAX_CHAIN_DEPTH}, "链深到顶"),
     ):
-        await store.save_snapshot(dataclasses.replace(bad, id=generate_id("snp")))
+        await seed_snapshot(store, "s1", good_view, cut=head, overrides=over)
         assert await writer._usable_base("s1", head) is None, f"{why} 的基底必须被拒"
 
     # 未在本进程重锚过的 session 同样不认基底（服务刚起来那一张必须是全量）

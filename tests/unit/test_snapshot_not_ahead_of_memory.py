@@ -28,6 +28,7 @@ import pytest
 
 from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.providers.events import InMemoryEventStore
+from tests._snapshot_helpers import latest_snapshot
 
 pytestmark = pytest.mark.asyncio
 
@@ -142,11 +143,11 @@ async def test_writer_skips_while_memory_is_unsettled() -> None:
 
     await store.append(_ev(1, EventType.SESSION_CREATED))
     await w.on_event(_ev(2, EventType.RUN_FINISHED))
-    assert await store.load_latest_snapshot(_SID) is None, "没落定就不该写"
+    assert await latest_snapshot(store, _SID) is None, "没落定就不该写"
 
     settled["v"] = True
     await w.on_event(_ev(3, EventType.RUN_FINISHED))
-    assert await store.load_latest_snapshot(_SID) is not None, "落定之后要写得出来"
+    assert await latest_snapshot(store, _SID) is not None, "落定之后要写得出来"
 
 
 async def test_skipping_still_counts_toward_the_threshold() -> None:
@@ -165,11 +166,11 @@ async def test_skipping_still_counts_toward_the_threshold() -> None:
     await store.append(_ev(1, EventType.SESSION_CREATED))
     for n in (2, 3, 4):                       # 三条，但都在「没落定」期间
         await w.on_event(_ev(n, EventType.RUN_FINISHED))
-    assert await store.load_latest_snapshot(_SID) is None
+    assert await latest_snapshot(store, _SID) is None
 
     settled["v"] = True
     await w.on_event(_ev(5, EventType.RUN_FINISHED))   # 第一个安全边界
-    assert await store.load_latest_snapshot(_SID) is not None, (
+    assert await latest_snapshot(store, _SID) is not None, (
         "跳过期间的计数没累加 → 安全边界到了也不写 → 重放窗口被拖长"
     )
 
@@ -187,7 +188,7 @@ async def test_a_throwing_predicate_blocks_the_write() -> None:
     await store.append(_ev(1, EventType.SESSION_CREATED))
     await w.on_event(_ev(2, EventType.RUN_FINISHED))    # 不抛
 
-    assert await store.load_latest_snapshot(_SID) is None
+    assert await latest_snapshot(store, _SID) is None
 
 
 async def test_no_predicate_means_no_gate() -> None:
@@ -200,7 +201,7 @@ async def test_no_predicate_means_no_gate() -> None:
     await store.append(_ev(1, EventType.SESSION_CREATED))
     await w.on_event(_ev(2, EventType.RUN_FINISHED))
 
-    assert await store.load_latest_snapshot(_SID) is not None
+    assert await latest_snapshot(store, _SID) is not None
 
 
 def test_the_predicate_comes_from_core_not_the_provider() -> None:

@@ -17,6 +17,7 @@ from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.protocols.events import RunSnapshot
 from ctx_weft.providers.events import InMemoryEventStore
 from ctx_weft.providers.events import EventPersister
+from tests._snapshot_helpers import latest_snapshot, seed_snapshot
 
 
 def _ts() -> datetime:
@@ -60,26 +61,27 @@ def _session_events() -> list[Event]:
     ]
 
 
-async def test_inmemory_snapshot_roundtrip_keeps_latest() -> None:
+async def test_latest_snapshot_is_the_one_with_the_highest_position() -> None:
+    """「最新」= position 最大，会话之间互不干扰。
+
+    从前这条测的是存储 API「留哪一张」（`snapshot_at` 最大、相同则 `id` 最大——写入序 ≠ 时间序
+    所以那套 tie-break 当初是必须的）。快照变成日志里的事件之后，那套口径整个消失：和
+    `read_range` / `committed_head` 共用同一个序。
+    """
     store = InMemoryEventStore()
-    assert await store.load_latest_snapshot("s1") is None
+    assert await latest_snapshot(store, "s1") is None
 
-    snap1 = RunSnapshot(
-        id="snp_1", run_id="run_1", session_id="s1",
-        last_event_id="evt_0003", last_event_sequence=3, state_blob={"v": 1},
-    )
-    await store.save_snapshot(snap1)
-    assert (await store.load_latest_snapshot("s1")).id == "snp_1"
+    v1 = reduce_events([_ev(1, EventType.SESSION_CREATED, user_prompt="a",
+                            template_id="agent:tpl", root_agent_id="agt_root")],
+                       run_id="s1")
+    await seed_snapshot(store, "s1", v1, cut=3, reason="first")
+    assert (await latest_snapshot(store, "s1")).snapshot_reason == "first"
 
-    snap2 = RunSnapshot(
-        id="snp_2", run_id="run_1", session_id="s1",
-        last_event_id="evt_0006", last_event_sequence=6, state_blob={"v": 2},
-    )
-    await store.save_snapshot(snap2)
-    got = await store.load_latest_snapshot("s1")
-    assert got.id == "snp_2" and got.state_blob == {"v": 2}
+    await seed_snapshot(store, "s1", v1, cut=6, reason="second")
+    got = await latest_snapshot(store, "s1")
+    assert got.snapshot_reason == "second" and got.last_commit_position == 6
     # 其它 session 不受影响
-    assert await store.load_latest_snapshot("s2") is None
+    assert await latest_snapshot(store, "s2") is None
 
 
 async def test_rebuild_view_snapshot_plus_delta_matches_full_replay() -> None:
@@ -93,11 +95,7 @@ async def test_rebuild_view_snapshot_plus_delta_matches_full_replay() -> None:
     # 在第 6 条（RunFinished）处建快照，模拟 SnapshotWriter 的定期写入。
     head = events[:6]
     view_at_6 = reduce_events(head, run_id="s1")
-    await store.save_snapshot(RunSnapshot(
-        id="snp_mid", run_id="run_1", session_id="s1",
-        last_event_id=head[-1].id, last_event_sequence=head[-1].sequence,
-        state_blob=serialize_view(view_at_6),
-    ))
+    await seed_snapshot(store, "s1", view_at_6, cut=6, reason="periodic")
 
     rebuilt = await rebuild_view(store, "s1")
 

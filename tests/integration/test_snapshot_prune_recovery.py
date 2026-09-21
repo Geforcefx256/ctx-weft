@@ -27,6 +27,7 @@ from ctx_weft.core.control.reducers import rebuild_view, snapshot_is_usable
 from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.providers.events import InMemoryEventStore, InProcessEventBus
 from ctx_weft.providers.events.persister import attach_persistence
+from tests._snapshot_helpers import latest_snapshot
 
 _T0 = datetime(2026, 9, 19, tzinfo=timezone.utc)
 _SID = "s_pruned"
@@ -71,7 +72,7 @@ async def _finished_session() -> tuple[InMemoryEventStore, InProcessEventBus]:
 async def test_writer_really_prunes_terminal_tasks_out_of_the_blob() -> None:
     store, _bus = await _finished_session()
 
-    snap = await store.load_latest_snapshot(_SID)
+    snap = await latest_snapshot(store, _SID)
     assert snap is not None, "SnapshotWriter 应当在 RunFinished 上写了一张"
     assert snapshot_is_usable(snap, await store.committed_head(_SID)), (
         "这张快照必须是可用基底，否则下面的断言测不到增量路径")
@@ -110,7 +111,7 @@ async def test_live_task_survives_pruning_through_the_writer() -> None:
     await bus.emit(_created(4, "alive"))
     await bus.emit(_ev(5, EventType.RUN_FINISHED, outcome="completed"))
 
-    snap = await store.load_latest_snapshot(_SID)
+    snap = await latest_snapshot(store, _SID)
     assert snap is not None
     tasks = snap.state_blob["tasks"]
     assert sorted(tasks) == ["alive"], "只有活 task 该留下"
