@@ -17,7 +17,7 @@ import pytest
 from ctx_weft.core.control.reducers import rebuild_view, reduce_events
 from ctx_weft.protocols.events import Event
 from ctx_weft.providers.events import InMemoryEventStore, InProcessEventBus
-from ctx_weft.providers.events.persister import attach_persistence
+from ctx_weft.core.control.snapshot_writer import attach_snapshotting
 from tests._snapshot_helpers import latest_snapshot
 
 pytestmark = pytest.mark.asyncio
@@ -36,7 +36,7 @@ async def test_late_committed_event_is_skipped_by_snapshot_recovery():
     """旧契约锚：B 触发快照后 A 才提交 → 快照恢复只见 b，全量回放见 a、b。"""
     bus = InProcessEventBus()
     store = InMemoryEventStore()
-    attach_persistence(bus, store, snapshot_every_n=1)
+    attach_snapshotting(bus, store, every_n=1)
 
     # 会话基线（已提交）
     await bus.emit(_event(1, "SessionCreated", payload={"root_agent_id": "root"}))
@@ -45,7 +45,7 @@ async def test_late_committed_event_is_skipped_by_snapshot_recovery():
     bus.begin_provisional("a")
     await bus.emit(_event(2, "TaskCreated", task_id="a",
                           payload={"task": {"id": "a", "assigned_agent_id": "agent_a"}}))
-    # task b 无窗口：事件即时提交；RunFinished 触发快照（snapshot_every_n=1）
+    # task b 无窗口：事件即时提交；RunFinished 触发快照（every_n=1）
     # ——此刻 store 里没有 evt_0002，快照内容只含 b，游标 = evt_0004
     await bus.emit(_event(3, "TaskCreated", task_id="b",
                           payload={"task": {"id": "b", "assigned_agent_id": "agent_b"}}))

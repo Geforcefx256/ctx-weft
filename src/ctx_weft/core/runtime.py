@@ -631,7 +631,6 @@ class CtxWeftRuntime:
             reply_intake=ReplyIntake(self._normalize_hitl_content),
         )
         self._hitl_timeout_sec = self._config.hitl_timeout_sec
-        from ctx_weft.providers.events import attach_persistence
         if event_store is None:
             from ctx_weft.providers.events import InMemoryEventStore
             event_store = InMemoryEventStore()
@@ -665,7 +664,7 @@ class CtxWeftRuntime:
         # 提交策略分岔（spec: event-commit，change reliability-wp3）：
         # - required（默认）：CommitGate 接进 emit 路径（提交确认先于通知）；persister
         #   不再接线；SnapshotWriter（若启用）单独接——它消费的已是确认提交流。
-        # - best_effort：旧 attach_persistence 路径（吞存储错误），启动告警、不可靠恢复。
+        # - best_effort：旧 attach_snapshotting 路径（吞存储错误），启动告警、不可靠恢复。
         policy = self._config.event_commit_policy
         if policy not in ("required", "best_effort"):
             raise ValueError(
@@ -684,7 +683,7 @@ class CtxWeftRuntime:
             from ctx_weft.providers.events import PersistenceHandle
             writer = None
             if snapshot_every_n > 0:
-                from ctx_weft.providers.events.snapshot import SnapshotWriter
+                from ctx_weft.core.control.snapshot_writer import SnapshotWriter
                 writer = SnapshotWriter(self.event_store, self._event_bus,
                                         every_n_events=snapshot_every_n,
                                         memory_settled=self._memory_settled)
@@ -696,8 +695,9 @@ class CtxWeftRuntime:
                 "仅建议显式接受丢事件的观测用途。")
             # 旧路径（spec 2026-08-29 §6.4 + final review R15）：persister 必须先于
             # snapshot writer 订阅；handle 存公开属性 persistence 供宿主 detach。
-            self.persistence = attach_persistence(
-                self._event_bus, self.event_store, snapshot_every_n=snapshot_every_n,
+            from ctx_weft.core.control.snapshot_writer import attach_snapshotting
+            self.persistence = attach_snapshotting(
+                self._event_bus, self.event_store, every_n=snapshot_every_n,
                 memory_settled=self._memory_settled)
 
         # Auto-register 内置 providers（与用户注册的 providers 无关）

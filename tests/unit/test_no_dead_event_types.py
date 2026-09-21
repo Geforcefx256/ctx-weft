@@ -96,7 +96,7 @@ _KNOWN_DEAD_BRANCH_REFS: frozenset[tuple[str, str]] = frozenset({
     # 终态信号，不能直接顶替。换成任何真正的终态信号都需要同时改写 6 个既有快照测试
     # 对「触发事件是什么」的契约断言（`test_event_persistence_wiring.py`），仍然超出
     # 本次任务范围，留给后续任务——见 task-16-report.md。
-    ("providers/events/snapshot.py", "SessionFinished"),
+    ("core/control/snapshot_writer.py", "SessionFinished"),
 })
 
 

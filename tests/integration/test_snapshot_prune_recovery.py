@@ -26,7 +26,7 @@ import pytest
 from ctx_weft.core.control.reducers import rebuild_view, snapshot_is_usable
 from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.providers.events import InMemoryEventStore, InProcessEventBus
-from ctx_weft.providers.events.persister import attach_persistence
+from ctx_weft.core.control.snapshot_writer import attach_snapshotting
 from tests._snapshot_helpers import latest_snapshot
 
 _T0 = datetime(2026, 9, 19, tzinfo=timezone.utc)
@@ -53,7 +53,7 @@ async def _finished_session() -> tuple[InMemoryEventStore, InProcessEventBus]:
     """一个「全部 task 已终态」的会话，并让 SnapshotWriter 真写一张快照。"""
     store = InMemoryEventStore()
     bus = InProcessEventBus()
-    attach_persistence(bus, store, snapshot_every_n=1)   # 每条 RunFinished 都写
+    attach_snapshotting(bus, store, every_n=1)   # 每条 RunFinished 都写
 
     await bus.emit(_ev(1, EventType.SESSION_CREATED, user_prompt="go",
                        template_id="agent:tpl_echo", root_agent_id="agt_root"))
@@ -102,7 +102,7 @@ async def test_live_task_survives_pruning_through_the_writer() -> None:
     而同会话里那些纯历史 task 仍被裁掉。"""
     store = InMemoryEventStore()
     bus = InProcessEventBus()
-    attach_persistence(bus, store, snapshot_every_n=1)
+    attach_snapshotting(bus, store, every_n=1)
 
     await bus.emit(_ev(1, EventType.SESSION_CREATED, user_prompt="go",
                        template_id="agent:tpl_echo", root_agent_id="agt_root"))

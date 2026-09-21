@@ -254,7 +254,7 @@ def test_the_writer_appends_directly_instead_of_going_through_the_bus() -> None:
     """
     import inspect
 
-    from ctx_weft.providers.events.snapshot import SnapshotWriter
+    from ctx_weft.core.control.snapshot_writer import SnapshotWriter
 
     src = inspect.getsource(SnapshotWriter._write)
     assert "append_batch" in src
@@ -313,7 +313,7 @@ async def test_writer_and_recovery_exclude_the_same_types() -> None:
     )
     from ctx_weft.core.utils.event import new_event
     from ctx_weft.protocols.events import EventOrigin
-    from ctx_weft.providers.events import SnapshotWriter
+    from ctx_weft.core.control.snapshot_writer import SnapshotWriter
 
     store = InMemoryEventStore()
     base = [

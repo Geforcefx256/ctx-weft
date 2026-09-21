@@ -84,9 +84,9 @@ async def test_snapshot_writer_is_a_rest_subscriber() -> None:
     """
     import inspect
 
-    from ctx_weft.providers.events import persister
+    from ctx_weft.core.control import snapshot_writer as sw
 
-    src = inspect.getsource(persister.attach_persistence)
+    src = inspect.getsource(sw.attach_snapshotting)
     i = src.index("SnapshotWriter")
     wiring = src[i:i + 400]
     assert "provisional=True" not in wiring, (
@@ -134,7 +134,7 @@ async def test_writer_skips_while_memory_is_unsettled() -> None:
     跳过的代价在**安全的那一侧**：这一刻不写，下一个安全边界再写；快照偏旧只意味着恢复多
     重放一段、多做一次幂等写。而快照偏新是不可挽回的。
     """
-    from ctx_weft.providers.events.snapshot import SnapshotWriter
+    from ctx_weft.core.control.snapshot_writer import SnapshotWriter
 
     store = InMemoryEventStore()
     settled = {"v": False}
@@ -156,7 +156,7 @@ async def test_skipping_still_counts_toward_the_threshold() -> None:
     计数不累加的话，一条一直开着窗的会话会把「每 N 事件一张」拖成「从不写」，恢复退回
     O(全部事件)。跳过只该延后这一张，不该取消它。
     """
-    from ctx_weft.providers.events.snapshot import SnapshotWriter
+    from ctx_weft.core.control.snapshot_writer import SnapshotWriter
 
     store = InMemoryEventStore()
     settled = {"v": False}
@@ -177,7 +177,7 @@ async def test_skipping_still_counts_toward_the_threshold() -> None:
 
 async def test_a_throwing_predicate_blocks_the_write() -> None:
     """谓词自己炸了 → 当作「不安全」。宁可少写一张，不可写一张领先的。"""
-    from ctx_weft.providers.events.snapshot import SnapshotWriter
+    from ctx_weft.core.control.snapshot_writer import SnapshotWriter
 
     def _boom(_sid: str) -> bool:
         raise RuntimeError("no task manager")
@@ -193,7 +193,7 @@ async def test_a_throwing_predicate_blocks_the_write() -> None:
 
 async def test_no_predicate_means_no_gate() -> None:
     """不注入谓词 → 行为与从前逐字一致（极简接线 / 单测不因此挡住快照）。"""
-    from ctx_weft.providers.events.snapshot import SnapshotWriter
+    from ctx_weft.core.control.snapshot_writer import SnapshotWriter
 
     store = InMemoryEventStore()
     w = SnapshotWriter(store, None, every_n_events=1)
@@ -204,25 +204,35 @@ async def test_no_predicate_means_no_gate() -> None:
     assert await latest_snapshot(store, _SID) is not None
 
 
-def test_the_predicate_comes_from_core_not_the_provider() -> None:
-    """判据必须由 core 注入——provider 结构上无从知道。
+def test_every_wiring_site_passes_the_predicate() -> None:
+    """每个接线点都必须把判据传下去，一个都不能漏。
 
-    provider 只看得见 EventBus，而缓冲里的**每一条**事件都排在它自己的 memory 效果之前。
-    留在 provider 手里，它只能拿「收到某个事件」当代理，而那个代理恰好是错的。这条钉住
-    「core 真的接上了」，以及 core 的判据真的读了窗口状态。
+    判据只能来自未提交窗口的状态，不能来自事件——缓冲里的**每一条**事件都排在它自己的
+    memory 效果之前，所以拿「收到某个事件」当代理恰好是错的（见本文件开头那几条）。
+    漏传的那个接线点下，`memory_settled=None` 一律放行，快照又会领先于 memory。
+
+    ⚠️ 这条从前叫 `..._comes_from_core_not_the_provider`：那时 `SnapshotWriter` 还在
+    `providers/` 下，判据得跨层注入进去。2026-09-20 writer 整个搬进 `core/control/`
+    之后「跨层」这半没了，但「每个接线点都得传」这半没变——判据是构造参数，忘了传就是
+    静默放行。所以这条留着，只是理由换了。
     """
     import inspect
 
+    from ctx_weft.core.control import snapshot_writer as sw
     from ctx_weft.core.runtime import CtxWeftRuntime
 
     src = inspect.getsource(CtxWeftRuntime)
-    # **两个接线点都要传**：`required` 策略那条直接构造 SnapshotWriter，`best_effort` 那条
-    # 走 attach_persistence。只钉「出现过」护不住漏掉一个——漏掉的那条策略下快照又会领先。
-    sites = src.count("SnapshotWriter(") + src.count("attach_persistence(")
+    # 两条策略各一个接线点：`required` 直接构造 SnapshotWriter，`best_effort` 走
+    # attach_snapshotting。只钉「出现过」护不住漏掉一个。
+    sites = src.count("SnapshotWriter(") + src.count("attach_snapshotting(")
     assert sites >= 2, f"接线点数变了（{sites}），这条守卫要跟着更新"
     assert src.count("memory_settled=self._memory_settled") == sites, (
         f"{sites} 个接线点，只有 {src.count('memory_settled=self._memory_settled')} 个传了判据"
     )
+    # attach_snapshotting 自己也是一个接线点——它得把收到的判据转交下去，不能吞掉。
+    forwarding = inspect.getsource(sw.attach_snapshotting)
+    assert "memory_settled=memory_settled" in forwarding, (
+        "attach_snapshotting 收了判据却没往 SnapshotWriter 传")
 
     pred = inspect.getsource(CtxWeftRuntime._memory_settled)
     assert "any_round_open" in pred, "判据得读未提交窗口状态，那是它唯一的依据"

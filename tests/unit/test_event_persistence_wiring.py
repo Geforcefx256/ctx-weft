@@ -11,12 +11,12 @@ from datetime import UTC, datetime
 import pytest
 
 from ctx_weft.protocols.events import TRANSIENT_EVENT_TYPES, Event
+from ctx_weft.core.control.snapshot_writer import attach_snapshotting
 from ctx_weft.providers.events import (
     EventPersister,
     InMemoryEventStore,
     InProcessEventBus,
-    attach_persistence,
-)
+    )
 from tests._snapshot_helpers import latest_snapshot
 
 
@@ -85,7 +85,7 @@ async def test_detach_stops_receiving():
 async def test_attach_persistence_wires_persister():
     bus = InProcessEventBus()
     store = InMemoryEventStore()
-    handle = attach_persistence(bus, store)
+    handle = attach_snapshotting(bus, store)
     await bus.emit(_ev("SessionCreated"))
     assert len(await store.read_by_session("s1")) == 1
     await handle.detach()
@@ -97,10 +97,10 @@ async def test_attach_persistence_wires_persister():
 
 
 async def test_snapshot_written_on_session_finished():
-    from ctx_weft.providers.events import SnapshotWriter
+    from ctx_weft.core.control.snapshot_writer import SnapshotWriter
 
     bus, store = InProcessEventBus(), InMemoryEventStore()
-    attach_persistence(bus, store, snapshot_every_n=1)
+    attach_snapshotting(bus, store, every_n=1)
     await bus.emit(_ev("SessionCreated", 1))
     await bus.emit(_ev("SessionFinished", 2))
     snap = await latest_snapshot(store, "s1")
@@ -113,7 +113,7 @@ async def test_snapshot_written_on_session_finished():
 
 async def test_snapshot_periodic_on_run_finished():
     bus, store = InProcessEventBus(), InMemoryEventStore()
-    attach_persistence(bus, store, snapshot_every_n=2)
+    attach_snapshotting(bus, store, every_n=2)
     await bus.emit(_ev("SessionCreated", 1))
     await bus.emit(_ev("RunFinished", 2))       # n=2 达阈值
     snap = await latest_snapshot(store, "s1")
@@ -123,7 +123,7 @@ async def test_snapshot_periodic_on_run_finished():
 
 async def test_snapshot_not_written_before_threshold():
     bus, store = InProcessEventBus(), InMemoryEventStore()
-    attach_persistence(bus, store, snapshot_every_n=50)
+    attach_snapshotting(bus, store, every_n=50)
     await bus.emit(_ev("SessionCreated", 1))
     await bus.emit(_ev("RunFinished", 2))
     assert await latest_snapshot(store, "s1") is None
@@ -139,7 +139,7 @@ async def test_snapshot_sees_the_triggering_event():
     另验「这张快照切在哪」。
     """
     bus, store = InProcessEventBus(), InMemoryEventStore()
-    attach_persistence(bus, store, snapshot_every_n=1)
+    attach_snapshotting(bus, store, every_n=1)
     await bus.emit(_ev("SessionCreated", 1))
     await bus.emit(_ev("SessionFinished", 2))
     snap = await latest_snapshot(store, "s1")
@@ -149,7 +149,7 @@ async def test_snapshot_sees_the_triggering_event():
 
 async def test_snapshot_writer_not_attached_by_default():
     bus, store = InProcessEventBus(), InMemoryEventStore()
-    handle = attach_persistence(bus, store)          # snapshot_every_n 默认 0
+    handle = attach_snapshotting(bus, store)          # snapshot_every_n 默认 0
     assert handle.snapshot_writer is None
     await bus.emit(_ev("SessionCreated", 1))
     await bus.emit(_ev("SessionFinished", 2))
@@ -157,13 +157,13 @@ async def test_snapshot_writer_not_attached_by_default():
 
 
 async def test_snapshot_writer_swallows_errors():
-    from ctx_weft.providers.events import SnapshotWriter
+    from ctx_weft.core.control.snapshot_writer import SnapshotWriter
 
     class _Boom(InMemoryEventStore):
         async def save_snapshot(self, snapshot):
             raise RuntimeError("db down")
 
     bus, store = InProcessEventBus(), _Boom()
-    attach_persistence(bus, store, snapshot_every_n=1)
+    attach_snapshotting(bus, store, every_n=1)
     await bus.emit(_ev("SessionCreated", 1))
     await bus.emit(_ev("SessionFinished", 2))   # 不抛即通过

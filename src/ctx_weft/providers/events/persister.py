@@ -1,4 +1,4 @@
-"""把事件灌进 EventStore 的 EventBus 订阅者，以及按正确顺序接线的便利函数。
+"""把事件灌进 EventStore 的 EventBus 订阅者，以及接线的便利函数。
 
 抽出成独立组件（而不是像从前那样塞进 `InMemoryEventStore.__init__`）的理由：
 换掉内存 store 的宿主否则必须自己重写一遍订阅逻辑——参考宿主
@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from ctx_weft.protocols.events import TRANSIENT_EVENT_TYPES
@@ -76,24 +75,13 @@ class PersistenceHandle:
 def attach_persistence(
     event_bus: "EventBus",
     event_store: "EventStore",
-    *,
-    snapshot_every_n: int = 0,
-    memory_settled: "Callable[[str], bool] | None" = None,
 ) -> PersistenceHandle:
-    """按**正确顺序**接线 EventPersister（+ `snapshot_every_n > 0` 时的 SnapshotWriter）。
+    """接上 EventPersister，返回可一起 detach 的 handle。
 
-    顺序不是可选项：`SnapshotWriter` 要用 `rebuild_view` 折出当前状态，而那条事件必须
-    **已经**被 persister 落库，否则 view 里没有它、`last_event_id` 与 view 对不上。
-    把顺序封进本函数，接反从此不可达。
-
-    `snapshot_every_n=0`（默认）时不接 SnapshotWriter——`CtxWeftRuntime` 走的就是这条，
-    现有行为零变化。
+    **这里不再认识快照**（2026-09-20）。从前本函数收 `snapshot_every_n` 并顺手把
+    `SnapshotWriter` 也接上——那让 providers 反向 import `core.control`，而 writer 决定的
+    五件事（写在哪个边界、隔多久、安不安全、切面在哪、增量还是重锚）全是领域知识。
+    writer 因此搬去了 `core/control/snapshot_writer.py`，连同那条「persister 必须先订阅」
+    的顺序契约一起，由那边的 `attach_snapshotting` 承担——**契约仍然只有一处实现**。
     """
-    persister = EventPersister(event_store, event_bus)
-    writer = None
-    if snapshot_every_n > 0:
-        from ctx_weft.providers.events.snapshot import SnapshotWriter
-        writer = SnapshotWriter(event_store, event_bus,
-                                every_n_events=snapshot_every_n,
-                                memory_settled=memory_settled)
-    return PersistenceHandle(persister, writer)
+    return PersistenceHandle(EventPersister(event_store, event_bus))

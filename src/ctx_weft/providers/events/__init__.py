@@ -10,6 +10,10 @@
     store/sql/          ← SqlEventStore（需 ctx-weft[sql]，故不在此 re-export）
 
 本模块只 re-export 无可选依赖的名字。
+
+**这里没有 `SnapshotWriter`**：它是 core 的东西（`core/control/snapshot_writer.py`），
+2026-09-20 搬走。留一个兼容 re-export 会让本包重新 import `core.control`，而
+`tests/unit/test_provider_layer_boundary.py` 钉的正是那条边界——白搬。
 """
 
 from ctx_weft.providers.events.bus import InProcessEventBus
@@ -18,7 +22,6 @@ from ctx_weft.providers.events.persister import (
     PersistenceHandle,
     attach_persistence,
 )
-from ctx_weft.providers.events.snapshot import SnapshotWriter
 from ctx_weft.providers.events.store import InMemoryEventStore
 
 __all__ = [
@@ -26,6 +29,5 @@ __all__ = [
     "InMemoryEventStore",
     "InProcessEventBus",
     "PersistenceHandle",
-    "SnapshotWriter",
     "attach_persistence",
 ]

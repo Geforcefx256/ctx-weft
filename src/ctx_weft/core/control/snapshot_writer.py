@@ -1,4 +1,18 @@
-"""SnapshotWriter——会话存活期间定期写状态快照。
+"""SnapshotWriter——会话存活期间定期写状态快照，以及它的接线函数。
+
+**为什么在 core 而不在 providers**（2026-09-20 搬）。本类决定五件事：写在哪个边界、
+隔多少事件写一张、这一刻写安不安全、切面取在哪、增量还是全量重锚。逐条问「这是存储
+知识还是领域知识」，五条全是领域知识——唯一沾存储的是最后那行 `append_batch`，而那是
+在调协议，不是 provider 代码。
+
+它从前待在 `providers/events/` 下是历史原因：它是个 EventBus 订阅者，就接在
+`EventPersister` 旁边。但那个类干的是「把总线的流落库」（确实归 provider），本类干的是
+「从日志推导状态再写回去」，两者只是碰巧都订阅总线。
+
+这个错位咬过一次：`PROJECTION_VERSION` 从前在这里是个独立字面量，与
+`reducers._PROJECTION_VERSION` 两处各写一遍，漂移的后果是所有快照永远判不可用、
+O(delta) 退回 O(n)、且不报任何错（见下方那条注释）。`MAX_CHAIN_DEPTH` 与「本进程首张
+必重锚」当时也是同一形状——搬家之后它们自然回到判据所在的那个包里。
 
 崩溃恢复针对的是**没有终态**的 session。若快照只在 `SessionFinished` 写，恢复时永远
 没有快照可用，`rebuild_view` 只能 O(全部事件) 全量回放。定期写之后，恢复退化成
@@ -41,11 +55,21 @@ blob 里的 ``tasks`` 只有活闭包，而全量回放得到的是全部 task�
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from collections.abc import Callable
-
-from ctx_weft.core.control.reducers import _PROJECTION_VERSION
+from ctx_weft.core.control.reducers import (
+    _PROJECTION_VERSION,
+    REPLAY_EXCLUDE_TYPES,
+    apply_events,
+    deserialize_view,
+    prune_view_for_snapshot,
+    reduce_events,
+    snapshot_event_payload,
+    snapshot_facts_from_event,
+    snapshot_is_usable,
+)
+from ctx_weft.core.utils.event import new_event
 from ctx_weft.protocols.events import (
     TRANSIENT_EVENT_TYPES,
     EventOrigin,
@@ -53,11 +77,14 @@ from ctx_weft.protocols.events import (
 )
 
 if TYPE_CHECKING:
+    from typing import Any
+
     from ctx_weft.protocols.events import Event, EventBus, EventStore
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["DEFAULT_SNAPSHOT_EVERY_N_EVENTS", "SnapshotWriter"]
+__all__ = ["DEFAULT_SNAPSHOT_EVERY_N_EVENTS", "SnapshotWriter",
+           "attach_snapshotting"]
 
 #: RunFinished 边界上，距上次快照累计多少事件后写一张。
 DEFAULT_SNAPSHOT_EVERY_N_EVENTS = 50
@@ -180,11 +207,6 @@ class SnapshotWriter:
         另加一条：**本进程内还没为这个 session 写过快照时不认基底**——服务每次起来的
         第一张快照都是全量重锚，让「上一进程留下的快照有误」在启动后被纠正一次。
         """
-        from ctx_weft.core.control.reducers import (
-            snapshot_facts_from_event,
-            snapshot_is_usable,
-        )
-
         if session_id not in self._anchored:
             return None
         stored = await self._store.read_last_of_type(
@@ -195,15 +217,6 @@ class SnapshotWriter:
         return snapshot
 
     async def _write(self, session_id: str, event: "Event", reason: str) -> None:
-        from ctx_weft.core.control.reducers import (
-            apply_events,
-            deserialize_view,
-            REPLAY_EXCLUDE_TYPES,
-            prune_view_for_snapshot,
-            reduce_events,
-            serialize_view,
-        )
-
         # ── 一致切面（spec: snapshot-recovery，reliability-wp4）───────────────
         # 边界 C = committed_head，**与折叠策略无关**：触发事件只是「现在写一张」的
         # 信号，不是边界（WP3 后 writer 收到的都是已确认事件，C ≥ 触发事件 position）。
@@ -254,9 +267,6 @@ class SnapshotWriter:
         #
         # `batch_id` 按切面定，所以**重试幂等**：同一切面重复写只会撞 batch 表的主键、被
         # 有序提交机制判为已提交，不会在日志里留下两张同切面的快照。
-        from ctx_weft.core.control.reducers import snapshot_event_payload
-        from ctx_weft.core.utils.event import new_event
-
         snap_event = new_event(
             EventType.STATE_SNAPSHOT,
             session_id=session_id,
@@ -277,3 +287,33 @@ class SnapshotWriter:
             snap_event.id, session_id, reason, head, folded,
             "anchor" if anchored else "incremental", depth,
         )
+
+
+def attach_snapshotting(
+    event_bus: "EventBus",
+    event_store: "EventStore",
+    *,
+    every_n: int = 0,
+    memory_settled: "Callable[[str], bool] | None" = None,
+) -> "Any":
+    """按**正确顺序**接上 EventPersister 与 SnapshotWriter，返回 `PersistenceHandle`。
+
+    顺序不是可选项：writer 要从日志折出当前状态，而触发它的那条事件必须**已经**被
+    persister 落库，否则折出来的 view 里没有它。把顺序封进本函数，接反从此不可达。
+    （`event_commit_policy='required'` 的路径不靠订阅顺序——那条路上事件经 CommitGate
+    先提交再 fanout，故 `CtxWeftRuntime` 在那边只单独接 writer，不走本函数。）
+
+    `every_n=0`（默认）→ 不接 writer，只接 persister，行为与从前一致。
+
+    **为什么这个函数在 core**：它要决定「接不接快照、按什么节奏接」，那是领域决定；
+    `providers.attach_persistence` 只剩「接 persister」，不再认识快照。core → providers
+    这个方向本来就有（`runtime.py` 一直在 import providers），反过来那条边才是要断的。
+    """
+    from ctx_weft.providers.events.persister import attach_persistence
+
+    handle = attach_persistence(event_bus, event_store)
+    if every_n > 0:
+        handle.snapshot_writer = SnapshotWriter(
+            event_store, event_bus,
+            every_n_events=every_n, memory_settled=memory_settled)
+    return handle

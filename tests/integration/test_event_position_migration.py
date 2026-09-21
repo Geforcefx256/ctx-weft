@@ -15,7 +15,7 @@ from pathlib import Path
 from ctx_weft.core.control.reducers import reduce_events, rebuild_view
 from ctx_weft.protocols.events import Event
 from ctx_weft.providers.events import InProcessEventBus
-from ctx_weft.providers.events.persister import attach_persistence
+from ctx_weft.core.control.snapshot_writer import attach_snapshotting
 from ctx_weft.providers.events.store.sql.store import open_sqlite_event_store
 from tests._snapshot_helpers import latest_snapshot
 
@@ -81,7 +81,7 @@ async def test_migrated_db_recovers_via_position_and_ignores_legacy_snapshot(tmp
 
         # 新事件继续提交 + writer 按 position 写快照
         bus = InProcessEventBus()
-        attach_persistence(bus, store, snapshot_every_n=1)
+        attach_snapshotting(bus, store, every_n=1)
         from ctx_weft.protocols.events import EventType
         await bus.emit(Event(id="evt_new_1", run_id="r", sequence=10, session_id="s1",
                              type=EventType.RUN_FINISHED, timestamp=_T0,

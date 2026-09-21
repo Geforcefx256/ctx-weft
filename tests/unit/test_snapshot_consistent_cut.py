@@ -14,8 +14,8 @@ from ctx_weft.core.control.reducers import reduce_events, rebuild_view
 from ctx_weft.core.utils.ids import generate_id
 from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.providers.events import InMemoryEventStore, InProcessEventBus
-from ctx_weft.providers.events.persister import attach_persistence
-from ctx_weft.providers.events.snapshot import SnapshotWriter
+from ctx_weft.core.control.snapshot_writer import attach_snapshotting
+from ctx_weft.core.control.snapshot_writer import SnapshotWriter
 from tests._snapshot_helpers import latest_snapshot, seed_snapshot
 
 _T0 = datetime(2026, 9, 11, tzinfo=UTC)
@@ -51,7 +51,7 @@ async def _emit_run_finished(bus, n, session="s1"):
 def _make_bus(store) -> InProcessEventBus:
     """persister（落库）+ SnapshotWriter(every_n=1)——与 attach_persistence 同序。"""
     bus = InProcessEventBus()
-    attach_persistence(bus, store, snapshot_every_n=1)
+    attach_snapshotting(bus, store, every_n=1)
     return bus
 
 
