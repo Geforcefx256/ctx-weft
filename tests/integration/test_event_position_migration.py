@@ -43,7 +43,10 @@ def _legacy_db(db: Path) -> None:
             " VALUES (?,?,?,?,?,?,?)",
             (f"evt_old_{i:04d}", "r", "s1", "TaskCreated", i, f"old{i}",
              json.dumps({"task": {"id": f"old{i}", "assigned_agent_id": "ag"}})))
-    # 一张 legacy 快照（无 position）——恢复必须忽略它走全量
+    # 一张 legacy 快照。它现在被忽略的理由变了：不是「无 position 所以判不可用」，而是
+    # 恢复路径根本不看 event_snapshots 表了（快照是 events 里的一条 StateSnapshot 事件）。
+    # 这张表连带那三段加列的幂等 ALTER 一起在 2026-09-20 删了；留在这个 legacy 库里正好
+    # 钉住「存量库有这张表也不碍事」——open 路径不再碰它。
     conn.execute(
         "INSERT INTO event_snapshots (id, session_id, last_event_id, last_event_sequence, state_blob_json)"
         " VALUES ('snp_legacy','s1','evt_old_0001',1,'{\"bogus\": true}')")
@@ -69,7 +72,7 @@ async def test_migrated_db_recovers_via_position_and_ignores_legacy_snapshot(tmp
     done = _run_migrate(db, "--execute")
     assert done["migration"]["positions_assigned"] == 3
 
-    # 正式 open 路径起动（幂等 ALTER 补快照新列）+ 重建
+    # 正式 open 路径起动（补 position 列 + 两条 IF NOT EXISTS 索引）+ 重建
     async with open_sqlite_event_store(db) as store:
         assert await store.committed_head("s1") == 3
         restored = await rebuild_view(store, "s1")

@@ -1,4 +1,4 @@
-"""SQLAlchemy 表模型：``events`` / ``event_snapshots`` / ``event_session_head`` / ``event_batches``。
+"""SQLAlchemy 表模型：``events`` / ``event_session_head`` / ``event_batches``。
 
 **`Base` 与 `memory/sql` 的刻意不共用。** 共用会让只想建 events 表的宿主被迫连 memory
 表一起建，而两个包的可选依赖边界本就是分开的。单文件 SQLite 部署照样可以共享同一个
@@ -10,7 +10,12 @@ engine——各自跑一次 ``Base.metadata.create_all`` 即可。
 
 - ``events.schema_version`` —— `Event.schema_version` 是给 reducer 分支用的。不存的话
   第一次 bump 版本时会静默把新事件读成旧版本。
-- ``event_snapshots.run_id`` —— 参考实现的 ``load_latest_snapshot`` 硬编码 ``run_id=""``。
+
+**这里没有 ``event_snapshots``**（2026-09-20 删）。快照是日志里的一条
+``EventType.STATE_SNAPSHOT`` 事件，走 ``events`` 表。留着那张表的代价不是磁盘，是
+``create_all`` 会在每个宿主库里建一张没人读没人写的表——而一张存在的空表就是邀请：
+下一个人看到它，第一反应是「快照应该写这儿」。宿主侧若还有存量行（NetliveCoworkPy 就有，
+为把历史快照传云端），那张表由宿主自己的模型声明并冻结，与本包无关。
 
 有序提交扩展（spec: event-log，change reliability-wp2）：
 
@@ -25,7 +30,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Index, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import Index, Integer, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from ctx_weft.providers._sqlalchemy import UtcDateTime
@@ -62,8 +67,16 @@ class EventModel(Base):
     timestamp: Mapped[datetime] = mapped_column(UtcDateTime, server_default=func.now())
 
     __table_args__ = (
-        # list_active_session_ids 按 (session_id, type) 收窄，再按 id 升序重放。
+        # read_session_events_of_types 按 (session_id, type) 收窄。
         Index("ix_events_session_type", "session_id", "type"),
+        # `read_last_of_type`（恢复第一步：取最新快照）。没有第三列 position 时计划是
+        # 「搜出该会话该类型的**所有**行 → temp b-tree 排序 → 取 1 条」——排序行数随会话
+        # 累积的快照张数线性增长，跟我们一路在清的那族是同一个东西，只是长在排序上而不
+        # 在返回值上。带上 position 之后 temp b-tree 消失，SQLite 还顺手把
+        # `position IS NOT NULL` 用成第三列的范围条件：
+        #   SEARCH events USING INDEX ix_events_session_type_position
+        #                            (session_id=? AND type=? AND position>?)
+        Index("ix_events_session_type_position", "session_id", "type", "position"),
         # (session_id, position) 唯一——head 串行化分配之外的兜底不变式（SQL 默认
         # NULL 不参与唯一碰撞，存量行共存无碍）。
         Index("uq_events_session_position", "session_id", "position", unique=True),
@@ -88,21 +101,4 @@ class EventBatchModel(Base):
     session_id: Mapped[str] = mapped_column(String(64), index=True)
     first_position: Mapped[int] = mapped_column(Integer)
     event_count: Mapped[int] = mapped_column(Integer)
-    created_at: Mapped[datetime] = mapped_column(UtcDateTime, server_default=func.now())
-
-
-class SnapshotModel(Base):
-    __tablename__ = "event_snapshots"
-
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    session_id: Mapped[str] = mapped_column(String(64), index=True)
-    run_id: Mapped[str] = mapped_column(String(64), default="")
-    last_event_id: Mapped[str] = mapped_column(String(64))
-    last_event_sequence: Mapped[int] = mapped_column(Integer)
-    state_blob_json: Mapped[str] = mapped_column(Text, default="{}")
-    snapshot_reason: Mapped[str] = mapped_column(String(64), default="")
-    # spec: snapshot-recovery——存量行为 NULL/1 → 恢复忽略该快照走全量回放。
-    last_commit_position: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    chain_depth: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    projection_version: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, server_default=func.now())

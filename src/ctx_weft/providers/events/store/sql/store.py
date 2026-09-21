@@ -9,8 +9,8 @@
   `providers/events/_lifecycle` 那台**两个实现共用**的状态机重放——见该方法 docstring。
 - **`append` 不过滤瞬态事件**（spec 2026-08-29 §6.4）：那是订阅策略，归 `EventPersister`。
   与 `InMemoryEventStore` 同口径，否则一致性套没法用同一份用例跑两边。
-- **快照剪枝**：每个 session 只留最新 `keep_snapshots` 张。恢复只取最新一张，
-  定期写入会让旧快照无界累积。
+- **一切排序按 position（提交序），不按 `id`**。`id` 是 ULID 铸造序；两者在并发提交下会
+  分叉，而按 `id` 当序正是 H2 那一类 bug 的根因。见 `list_active_session_ids`。
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from sqlalchemy import delete, select, text, or_
+from sqlalchemy import or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -42,7 +42,6 @@ from ctx_weft.providers.events.store.sql.models import (
     EventBatchModel,
     EventModel,
     SessionHeadModel,
-    SnapshotModel,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,13 +53,12 @@ class SqlEventStore(EventStore):
     """SQLAlchemy-backed event store（含有序提交扩展，spec: event-log）。"""
 
     def __init__(
-        self,
-        session_factory: "async_sessionmaker[AsyncSession]",
-        *,
-        keep_snapshots: int = 3,
+        self, session_factory: "async_sessionmaker[AsyncSession]",
     ) -> None:
+        # 从前这里还有 `keep_snapshots=3`（「每 session 只留最新 N 张快照」）。那是**恢复
+        # 策略**，删错一张的后果是恢复退化甚至找不到可用基底——store 不该做这个决定。快照
+        # 变成事件之后，保留归入事件保留策略，这个参数连带整张 event_snapshots 表一起删了。
         self._factory = session_factory
-        self._keep_snapshots = max(1, keep_snapshots)
 
     # ── 写（有序提交扩展：原子批次）──────────────────────────────────────
 
@@ -100,11 +98,16 @@ class SqlEventStore(EventStore):
                     "UPDATE event_session_head SET next_position = next_position + :n "
                     "WHERE session_id = :sid"),
                     {"n": len(events), "sid": session_id})
-                # 3) 读回分配区间
-                head = (await db.execute(
-                    select(SessionHeadModel).where(
-                        SessionHeadModel.session_id == session_id))).scalar_one()
-                start = head.next_position - len(events)
+                # 3) 读回分配区间。**刻意用 text() 而不是 ORM select**：前两步是
+                #    `db.execute(text(...))`，它们不填 identity map，所以 ORM 查询「恰好」
+                #    是首次加载、因而拿到 UPDATE 后的新值。那是巧合不是保证——只要以后有人
+                #    在同一事务里先 `db.get(SessionHeadModel, sid)`（比如加行日志），
+                #    identity map 就会把陈旧的 next_position 交回来，后果是整批事件 position
+                #    算错：撞唯一索引，或悄悄覆盖已分配区间。直接取标量，没有这一层。
+                allocated = (await db.execute(text(
+                    "SELECT next_position FROM event_session_head WHERE session_id = :sid"),
+                    {"sid": session_id})).scalar_one()
+                start = allocated - len(events)
                 # 4) 整批事件（position 连续递增；(session_id,position) 唯一与 event.id
                 #    主键承担兜底不变式——重复提交的 id 在这里撞 IntegrityError）
                 for i, e in enumerate(events):
@@ -304,13 +307,35 @@ class SqlEventStore(EventStore):
         经它终结的会话会被永远报成 active。
 
         **两步查询的等价性**：先 `SELECT DISTINCT session_id` 把所有出现过的 session 置
-        为 active（种子），再按 id 升序重放生命周期事件。`InMemoryEventStore` 是在每个
+        为 active（种子），再按提交序重放生命周期事件。`InMemoryEventStore` 是在每个
         session 的**首次出现**处 add 的；由于操作只有 add/discard 且逐 session 独立，
         「在 -∞ 处 add」与「在首个事件处 add」结果完全一致——首个事件必然先于该 session
         的其余事件。
 
-        代价是行数 = 会话数 × 每会话几条生命周期事件，且只在启动时调一次。真的大到不能
-        接受时，正确的下一步是加一张 session 状态投影表，**而不是**把判据塞回 SQL 表达式。
+        **为什么第二步按 position 而不按 `id`（2026-09-20 改）。** 两个理由指向同一处：
+
+        1. 正确性。`id` 是 ULID 铸造序，`position` 是提交序，并发提交下两者分叉——按铸造序
+           重放，`SessionResumed` 与 `SessionFinished` 的先后就可能反，表现为「已结束的会话
+           反复被恢复」或反之。`InMemoryEventStore` 维护的是增量 `_active`，用的就是到达
+           （= 提交）序，所以按 position 才是与它同口径；按 `id` 是这两个实现之间仅剩的
+           一处判据分叉。
+        2. 代价，**但有前提**。`ORDER BY id` 让 SQLite 为了免排序改走主键 id 索引扫全表；
+           按 position 排它才肯用 `ix_events_type` 收窄，只对命中的那几行做 temp b-tree。
+           实测 3 万事件 / 50 会话（生命周期事件 150 条 = 0.5%，真 schema）：
+
+               跑过 ANALYZE：
+                 ORDER BY id        -> SCAN events USING sqlite_autoindex_events_1  24.3ms
+                 ORDER BY position  -> SEARCH events USING ix_events_type (type=?)   1.2ms
+               没跑过 ANALYZE（新库的实际状态，SQLite 不会自动统计）：
+                 两者计划完全相同，1.3ms vs 1.2ms
+
+           所以这 20x 只在有统计信息时兑现，**不能当成本次改动的主要理由**——主要理由是
+           上面那条正确性。附带一条负面结果：试过给它建部分索引
+           （`... WHERE type IN (...)`），SQLite 不采用，等值列压过部分索引。
+
+        仍然要记的是：这两步都**不按会话收窄**，行数随整库事件总数增长（第一步是覆盖索引
+        全扫，3 万条 0.7ms），只在启动时各调一次。真的大到不能接受时，正确的下一步是加一张
+        session 状态投影表，**而不是**把判据塞回 SQL 表达式。
         """
         async with self._factory() as db:
             seen = await db.execute(select(EventModel.session_id).distinct())
@@ -318,7 +343,13 @@ class SqlEventStore(EventStore):
             lifecycle = await db.execute(
                 select(EventModel)
                 .where(EventModel.type.in_(LIFECYCLE_EVENT_TYPES))
-                .order_by(EventModel.id)
+                .order_by(
+                    # 与 read_by_session / read_session_events_of_types 同一口径：
+                    # 存量 NULL position 行排前，再按 position，最后 id 兜底确定性。
+                    text("CASE WHEN events.position IS NULL THEN 0 ELSE 1 END"),
+                    EventModel.position,
+                    EventModel.id,
+                )
             )
             # 在 session 内就物化成 Event：ORM 行出了 session 就是 detached 实例，
             # 靠「属性已加载所以还能读」是脆的，且与 memory/sql provider 的既有写法不一致。
@@ -357,8 +388,6 @@ def _row_to_event(row: EventModel) -> Event:
 @asynccontextmanager
 async def open_sqlite_event_store(
     db_path: str | Path,
-    *,
-    keep_snapshots: int = 3,
 ) -> AsyncIterator[SqlEventStore]:
     """开一个 SQLite backed 的 event store（建表 → yield → dispose）。
 
@@ -366,9 +395,14 @@ async def open_sqlite_event_store(
     ``SqlEventStore(session_factory)`` 即可，不必走这里。
 
     存量库兼容（spec: event-log）：``create_all`` 只建缺失的表，不会给既有 ``events``
-    表加列/索引——这里显式补：``ALTER TABLE ADD COLUMN position``（幂等探测）+
-    ``CREATE UNIQUE INDEX IF NOT EXISTS uq_events_session_position``。NULL 不参与
-    唯一碰撞，迁移前新旧行共存无碍；回填归 ``scripts/migrate_event_positions.py``。
+    表加列/索引——这里显式补：``ALTER TABLE ADD COLUMN position``（幂等探测）+ 两条
+    ``CREATE [UNIQUE] INDEX IF NOT EXISTS``（``uq_events_session_position`` 与
+    ``ix_events_session_type_position``；新建库里 create_all 已建，IF NOT EXISTS 空转）。
+    NULL 不参与唯一碰撞，迁移前新旧行共存无碍；回填归
+    ``scripts/migrate_event_positions.py``。
+
+    **不再碰 ``event_snapshots``**：从前这里有三段给它加列的幂等 ALTER，而那张表 2026-09-20
+    随「快照变成事件」删了——给一张没人读没人写的表跑迁移，是最容易活过删除动作的那种死代码。
     连接带 ``timeout=15``（sqlite3 busy timeout）：双连接争用同会话 head 时等待而非
     立即报 database is locked。
     """
@@ -384,19 +418,11 @@ async def open_sqlite_event_store(
             await conn.execute(text(
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_events_session_position "
                 "ON events (session_id, position)"))
-            # spec: snapshot-recovery——既有 event_snapshots 表补两列（旧行 NULL/1 =
-            # legacy 快照，恢复路径据此忽略走全量重建）
-            snap_cols = {r[1] for r in await conn.execute(
-                text("PRAGMA table_info(event_snapshots)"))}
-            if "last_commit_position" not in snap_cols:
-                await conn.execute(text(
-                    "ALTER TABLE event_snapshots ADD COLUMN last_commit_position INTEGER"))
-            if "projection_version" not in snap_cols:
-                await conn.execute(text(
-                    "ALTER TABLE event_snapshots ADD COLUMN projection_version INTEGER"))
-            if "chain_depth" not in snap_cols:
-                await conn.execute(text(
-                    "ALTER TABLE event_snapshots ADD COLUMN chain_depth INTEGER"))
-        yield SqlEventStore(factory, keep_snapshots=keep_snapshots)
+            # read_last_of_type（恢复第一步：取最新快照）靠这条免掉 temp b-tree；存量库
+            # create_all 不会补，所以显式建。
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_events_session_type_position "
+                "ON events (session_id, type, position)"))
+        yield SqlEventStore(factory)
     finally:
         await engine.dispose()

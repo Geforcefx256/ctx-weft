@@ -4,6 +4,12 @@
 而分叉的表现是「重启后某些会话不弹恢复」或「已结束的会话反复被恢复」——都极难归因。
 故判据只此一份，`in_memory` 增量调用它，`sql` 把查出来的生命周期事件重放一遍。
 
+**重放顺序必须是提交序。** `in_memory` 用的是到达序（= 提交序，它就是在 append 里增量
+调用 `apply_lifecycle`），所以 `sql` 侧那条查询按 `position` 排。从前它按 `id` 排——那是
+ULID 铸造序，并发提交下与提交序分叉，于是同一台状态机在两个实现上吃到不同顺序的输入，
+`SessionResumed` 与 `SessionFinished` 的先后就可能反。把判据收成一份是为了不分叉，
+输入顺序不同口径等于把分叉从判据挪到了喂料口。
+
 **为什么 SQL 侧可以「先把所有 session 置为 active，再重放生命周期事件」**：
 `in_memory` 是在每个 session 的**首次出现**时把它加进 active 的。由于操作只有
 add/discard 且逐 session 独立，「在 -∞ 处 add」与「在该 session 首个事件处 add」
@@ -63,7 +69,10 @@ def apply_lifecycle(active: set[str], event: Any) -> None:
 
 
 def replay_lifecycle(session_ids: Iterable[str], events: Iterable[Any]) -> set[str]:
-    """种子（全部出现过的 session）+ 按 id 升序的生命周期事件 → 活跃集合。"""
+    """种子（全部出现过的 session）+ **按提交序**的生命周期事件 → 活跃集合。
+
+    `events` 必须按 position（提交序）给，不是 `id`（铸造序）——见模块 docstring。
+    """
     active = set(session_ids)
     for event in events:
         apply_lifecycle(active, event)

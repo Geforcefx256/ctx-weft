@@ -4,7 +4,7 @@
 装法 ``pip install ctx-weft[sql]``。没有任何上层包 eager import 本子包。
 """
 
-from ctx_weft.providers.events.store.sql.models import Base, EventModel, SnapshotModel
+from ctx_weft.providers.events.store.sql.models import Base, EventModel
 from ctx_weft.providers.events.store.sql.store import (
     SqlEventStore,
     open_sqlite_event_store,
@@ -13,7 +13,6 @@ from ctx_weft.providers.events.store.sql.store import (
 __all__ = [
     "Base",
     "EventModel",
-    "SnapshotModel",
     "SqlEventStore",
     "open_sqlite_event_store",
 ]
