@@ -45,7 +45,6 @@ from tests.integration.test_minimal_loop import (
 )
 from tests.runtime_helpers import wait_for_park
 
-pytestmark = pytest.mark.asyncio
 
 
 async def _poll(predicate, *, timeout: float = 5.0, interval: float = 0.02):
@@ -65,6 +64,7 @@ def _human_resolved_events(events, task_id: str):
     ]
 
 
+@pytest.mark.asyncio
 async def test_task_human_resolved_emitted_via_task_manager() -> None:
     """两条触发路径都只由 `TaskManager._emit` 发出 `TASK_HUMAN_RESOLVED`（Task 6）。
 

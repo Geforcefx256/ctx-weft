@@ -1,3 +1,4 @@
+
 """Process exits at committed observe handoff facts, including a second recovery."""
 
 import asyncio
@@ -5,9 +6,11 @@ import os
 import sys
 from pathlib import Path
 
-from tests._initialization import initialize_all
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from tests._recovery import recover_fixture_session
+from tests._initialization import initialize_all
 
 from ctx_weft.core.control.reducers import prune_view_for_snapshot, rebuild_view
 from ctx_weft.providers.events.store.sql import open_sqlite_event_store
@@ -46,7 +49,7 @@ async def worker(path, cut, short):
                 await rt.rebuild_session(SID, strict=True)
                 tm = rt._task_managers[SID]
                 tm._max_concurrent = 0
-                await rt.recover_agent(tm.session.root_agent_id, session_id=SID)
+                await recover_fixture_session(rt, tm.session.root_agent_id, session_id=SID)
                 if cut == "recover_handoff":
                     await asyncio.wait_for(llm.review_started.wait(), 10)
                     await rt.pause_agent(tm.session.root_agent_id)

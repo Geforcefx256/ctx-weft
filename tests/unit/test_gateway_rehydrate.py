@@ -16,7 +16,7 @@ import hashlib
 
 import pytest
 
-from ctx_weft.core.utils.content import rehydrate_content
+from ctx_weft.protocols.content import rehydrate_content
 from ctx_weft.core.loop.llm_gateway import stream_llm
 from ctx_weft.protocols import (
     BLOB_REF_PREFIX,

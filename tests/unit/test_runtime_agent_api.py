@@ -15,7 +15,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 _TERMINAL_TASK_STATUSES = {"FINISHED", "FAILED", "CANCELED"}
 
@@ -95,6 +94,7 @@ def _plant_live_task(rt, agent_id, task_id, *, task_status, agent_status, sessio
     return tm
 
 
+@pytest.mark.asyncio
 async def test_list_agents_returns_flat_list():
     rt = _rt()
     _plant(rt, "root", None)
@@ -108,6 +108,7 @@ async def test_list_agents_returns_flat_list():
     assert kid.parent_agent_id == "root"
 
 
+@pytest.mark.asyncio
 async def test_list_agents_filtered_by_parent():
     rt = _rt()
     _plant(rt, "root", None)
@@ -119,6 +120,7 @@ async def test_list_agents_filtered_by_parent():
     assert {a.agent_id for a in out} == {"kid1"}, "只返回直接子 agent"
 
 
+@pytest.mark.asyncio
 async def test_list_agents_excludes_terminated_by_default():
     rt = _rt()
     _plant(rt, "alive", None)
@@ -132,6 +134,7 @@ async def test_list_agents_excludes_terminated_by_default():
     }
 
 
+@pytest.mark.asyncio
 async def test_get_agent_returns_detail():
     rt = _rt()
     _plant(rt, "root", None)
@@ -142,6 +145,7 @@ async def test_get_agent_returns_detail():
     assert d.session_id == "s1"
 
 
+@pytest.mark.asyncio
 async def test_get_agent_unknown_raises():
     rt = _rt()
     with pytest.raises(AgentNotFound):
@@ -149,6 +153,7 @@ async def test_get_agent_unknown_raises():
         (await rt.get_agent("ghost")).data
 
 
+@pytest.mark.asyncio
 async def test_send_message_rejects_running_agent():
     """spec 4.1：忙碌直接报错，不排队。"""
     rt = _rt()
@@ -158,6 +163,7 @@ async def test_send_message_rejects_running_agent():
         await rt.send_message("a1", "hi")
 
 
+@pytest.mark.asyncio
 async def test_send_message_rejects_terminated_agent():
     rt = _rt()
     _plant(rt, "a1", None, status="terminated")
@@ -166,6 +172,7 @@ async def test_send_message_rejects_terminated_agent():
         await rt.send_message("a1", "hi")
 
 
+@pytest.mark.asyncio
 async def test_send_message_validates_session_id_when_given():
     rt = _rt()
     _plant(rt, "a1", None, session_id="s1")
@@ -174,6 +181,7 @@ async def test_send_message_validates_session_id_when_given():
         await rt.send_message("a1", "hi", session_id="s-other")
 
 
+@pytest.mark.asyncio
 async def test_send_message_reuses_live_task(monkeypatch):
     """current_task 未终态 -> 注入现有 task，不新建。"""
     rt = _rt()
@@ -195,6 +203,7 @@ async def test_send_message_reuses_live_task(monkeypatch):
     assert injected == [("t-live", "hello")]
 
 
+@pytest.mark.asyncio
 async def test_send_message_creates_new_task_when_current_is_terminal(monkeypatch):
     rt = _rt()
     _plant(rt, "a1", None)
@@ -218,6 +227,7 @@ async def test_send_message_creates_new_task_when_current_is_terminal(monkeypatc
 # ── coordinator fix: 注入分支不得借道 TaskHumanResolved（HITL 专属配对事件）──────
 
 
+@pytest.mark.asyncio
 async def test_inject_requeue_does_not_emit_task_human_resolved():
     """`_inject_user_turn` 的重排分支必须发 `TaskRequeued`，不是 `TaskHumanResolved`
     ——后者是 `TaskAwaitingHuman{hitl_id}` 的一对一配对解除事件，只属于 HITL 应答
@@ -245,6 +255,7 @@ async def test_inject_requeue_does_not_emit_task_human_resolved():
     assert EventType.TASK_REQUEUED in types, f"expected TaskRequeued, got {types}"
 
 
+@pytest.mark.asyncio
 async def test_inject_requeue_leaves_agent_idle_not_running():
     """入队 ≠ 已经在跑：`TaskRequeued` 必须让 agent 回 `idle`（ALM: SETTLED），不能
     像 `TaskHumanResolved` 那样提前把它翻成 `running`——真正的 `running` 要等
@@ -261,6 +272,7 @@ async def test_inject_requeue_leaves_agent_idle_not_running():
     )
 
 
+@pytest.mark.asyncio
 async def test_send_message_twice_in_a_row_is_not_rejected_as_busy():
     """连续两次 `send_message` 到同一个 agent（第一次注入后立刻第二次）不能被
     `AgentBusyError` 误拒——回归的正是"注入把 agent 提前翻成 running"那个 bug。
@@ -279,6 +291,7 @@ async def test_send_message_twice_in_a_row_is_not_rejected_as_busy():
     assert tid2 == "t1"
 
 
+@pytest.mark.asyncio
 async def test_start_session_agent_id_is_addressable_root_agent():
     """`TurnHandle.agent_id`（`start_session` 构造点，runtime.py:1330）契约钉入测试：
     调用方拿到 handle 后可以直接用 `handle.agent_id` 去 `get_agent()` / `send_message`，
@@ -313,6 +326,7 @@ async def test_start_session_agent_id_is_addressable_root_agent():
 # ── 2026-09-04 spec §5.4 / §8：created_at 与 list_agents 签名 ──────────────
 
 
+@pytest.mark.asyncio
 async def test_summary_carries_created_at_for_live_agents():
     """字段 2026-09-03 就声明了，一直是 None——运行期实例化的 agent 必须有值。
 
@@ -340,6 +354,7 @@ async def test_summary_carries_created_at_for_live_agents():
     assert summary.created_at is not None
 
 
+@pytest.mark.asyncio
 async def test_list_agents_without_session_id_spans_sessions():
     rt = _rt()
     _plant(rt, "agt_a", None, session_id="s1")
@@ -349,6 +364,7 @@ async def test_list_agents_without_session_id_spans_sessions():
     assert {"agt_a", "agt_b"} <= ids
 
 
+@pytest.mark.asyncio
 async def test_list_agents_session_id_still_filters():
     rt = _rt()
     _plant(rt, "agt_a", None, session_id="s1")
@@ -360,6 +376,7 @@ async def test_list_agents_session_id_still_filters():
 # ── 2026-09-04 spec §3.3：send_message 返回 TurnHandle ─────────────────────
 
 
+@pytest.mark.asyncio
 async def test_send_message_returns_turn_handle():
     """四个身份字段恒非空——用注入分支（`_plant_live_task` 搭一个真活着的
     TaskManager + task），不走 `start_session` 全流程。"""
@@ -378,6 +395,7 @@ async def test_send_message_returns_turn_handle():
     assert h.template_id        # 恒非空
 
 
+@pytest.mark.asyncio
 async def test_new_task_branch_yields_a_different_task_id():
     """上一轮已终态 → 新建 task。调用方比对 task_id 就知道是新一轮还是并进旧的。
 
@@ -400,6 +418,7 @@ async def test_new_task_branch_yields_a_different_task_id():
     assert h.agent_id == "a1"
 
 
+@pytest.mark.asyncio
 async def test_inject_branch_reuses_the_live_task_id():
     """注入分支：消息并进仍在活的那条 task，task_id 与它相同。"""
     rt = _rt()

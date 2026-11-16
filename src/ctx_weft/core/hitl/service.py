@@ -572,10 +572,10 @@ class HitlService:
                 n += 1
         return n
 
-    async def _emit(self, event_type: EventType, req: PendingHitl, payload: dict) -> None:
-        await self._bus.emit(self._make_event(event_type, req, payload))
+    async def _emit(self, event_type: EventType, req: PendingHitl, payload: dict, *, metadata=None) -> None:
+        await self._bus.emit(self._make_event(event_type, req, payload, metadata=metadata))
 
-    def _make_event(self, event_type, req, payload):
+    def _make_event(self, event_type, req, payload, *, metadata=None):
         return new_event(
             event_type,
             session_id=req.session_id,
@@ -584,6 +584,7 @@ class HitlService:
             task_id=req.task_id or None,
             agent_id=req.agent_id or None,
             payload=payload,
+            metadata=metadata,
             # **显式传**：HitlService 持有一个可注入的时钟（单测靠它冻结时间），
             # 丢掉它会让时间源静默换成 emit_event 内部的 now_utc()。
             timestamp=self._now(),

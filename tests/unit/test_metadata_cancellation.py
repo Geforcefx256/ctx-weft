@@ -10,9 +10,9 @@ from ctx_weft.core.loop.llm_stream import stream_until_cancel
 from ctx_weft.core.loop.steps.recognize_intent import RecognizeIntentStep
 from ctx_weft.protocols import LLMChunk
 
-pytestmark = pytest.mark.asyncio
 
 
+@pytest.mark.asyncio
 async def test_metadata_cancel_before_execute_emits_no_request_completion():
     token = CancelToken()
     token.cancel()
@@ -25,6 +25,7 @@ async def test_metadata_cancel_before_execute_emits_no_request_completion():
     assert emitted == []
 
 
+@pytest.mark.asyncio
 async def test_cancel_wins_over_a_ready_chunk_and_closes_the_source():
     token = CancelToken()
     closed = asyncio.Event()
@@ -40,6 +41,7 @@ async def test_cancel_wins_over_a_ready_chunk_and_closes_the_source():
     assert closed.is_set()
 
 
+@pytest.mark.asyncio
 async def test_stop_metadata_signals_all_live_runs_without_canceling_observe():
     registry = ExecutionRegistry()
     tokens = [CancelToken(), CancelToken()]
@@ -60,6 +62,7 @@ async def test_stop_metadata_signals_all_live_runs_without_canceling_observe():
     assert not registry.tasks and not registry.metadata_stops
 
 
+@pytest.mark.asyncio
 async def test_metadata_stop_does_not_signal_the_original_observe_token():
     original = CancelToken()
     report_release = asyncio.Event()

@@ -30,7 +30,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 _TS = datetime(2026, 6, 13, tzinfo=UTC)
 
 
@@ -53,6 +52,7 @@ async def _seed_idle_agent(rt, sid: str, aid: str) -> None:
     assert sid not in rt._task_managers
 
 
+@pytest.mark.asyncio
 async def test_concurrent_send_message_does_not_supersede_the_task_manager(monkeypatch):
     from ctx_weft.core.orchestrator.task.manager import TaskManager
     from ctx_weft.core.runtime import CtxWeftRuntime

@@ -91,7 +91,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from ctx_weft.core.utils.content import extract_blob_refs
+from ctx_weft.protocols.content import extract_blob_refs
 
 __all__ = [
     "DemotionPlan",

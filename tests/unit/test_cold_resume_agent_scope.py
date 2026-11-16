@@ -40,7 +40,6 @@ from ctx_weft.protocols.hitl import (
 )
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 
-pytestmark = pytest.mark.asyncio
 
 _TS = datetime(2026, 7, 13, tzinfo=UTC)
 
@@ -64,6 +63,7 @@ def _user_turn_req(
 # ── Layer 1: _inject_user_reply scope fallback ─────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_inject_user_reply_reply_visible_to_agent_recall(monkeypatch):
     """When the rebuilt request lost agent_id, the reply must still be recallable via
     recall_recent_by_agent (the actor's history path), which filters by scope.agent_id."""
@@ -104,6 +104,7 @@ async def test_inject_user_reply_reply_visible_to_agent_recall(monkeypatch):
 # ── Layer 2: HITL_REQUIRED projection preserves agent_id ───────────────────────
 
 
+@pytest.mark.asyncio
 async def test_hitl_required_projection_preserves_agent_id():
     """fold_hitl_snapshot must round-trip agent_id from the HITL_REQUIRED event so cold
     resume refills a request that still knows its agent scope."""

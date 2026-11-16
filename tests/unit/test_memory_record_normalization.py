@@ -13,7 +13,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from ctx_weft.core.utils.content import content_to_text, image_part_count
+from ctx_weft.core.utils.content import image_part_count
+from ctx_weft.protocols.content import content_to_text
 from ctx_weft.protocols import ImagePart, TextPart
 from ctx_weft.protocols.memory import MemoryEventType, MemoryRecord
 

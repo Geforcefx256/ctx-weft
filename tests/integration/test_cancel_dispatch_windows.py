@@ -11,7 +11,6 @@ from ctx_weft.providers.events.store.sql import open_sqlite_event_store
 from ctx_weft.providers.memory.sql.provider import open_sqlite_memory
 from tests.integration.test_cancel_task_tree_recovery import cancel_content, recover
 
-pytestmark = pytest.mark.asyncio
 WORKER = Path(__file__).with_name("_cancel_window_worker.py")
 BASELINES = {}
 
@@ -40,6 +39,7 @@ CASES += [(stage, "assembly_error", snapshot) for stage in ("assembly", "cross_a
           for snapshot in (False, True)]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("stage,fault,snapshot", CASES)
 async def test_cancel_dispatch_and_commit_windows(tmp_path, tmp_path_factory, stage, fault, snapshot):
     if stage not in BASELINES:

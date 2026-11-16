@@ -11,7 +11,7 @@ import hashlib
 import pytest
 
 from ctx_weft.core.models.errors import InvalidContentError
-from ctx_weft.core.utils.content import normalize_content, validate_content
+from ctx_weft.protocols.content import normalize_content, validate_content
 from ctx_weft.protocols import (
     BLOB_REF_PREFIX,
     ImagePart,
@@ -242,7 +242,7 @@ def _make_runtime_with_store(store):
     runtime.providers.register_memory_blob_store(store)
     runtime.providers.register_event_blob_store(_CountingEventStore())
 
-    def _client(account=None, model=None):
+    def _client(account=None, model=None, *, ctx):
         return _FixedModelClient(
             MockLLMAdapter(responses=[MockResponse(text="Hello!")]),
             model or "mock-model", 128_000, 8_192,

@@ -12,7 +12,6 @@ from ctx_weft.protocols import LLMMessage, LLMTool, MemoryScope, load_records
 from tests.assembler_testkit import compiled_test_inputs, scripted_inputs
 from tests.unit.test_compact_history_priority import capsule, setup
 
-pytestmark = pytest.mark.asyncio
 
 
 async def wait_started(bus):
@@ -21,6 +20,7 @@ async def wait_started(bus):
             await asyncio.sleep(0)
 
 
+@pytest.mark.asyncio
 async def test_registry_waits_for_all_tasks_but_only_this_agents_observes():
     registry = ExecutionRegistry()
     releases = [asyncio.Event() for _ in range(4)]
@@ -44,6 +44,7 @@ async def test_registry_waits_for_all_tasks_but_only_this_agents_observes():
         await asyncio.gather(*tasks)
 
 
+@pytest.mark.asyncio
 async def test_registry_includes_observes_registered_while_waiting():
     registry = ExecutionRegistry()
     release = asyncio.Event()
@@ -75,6 +76,7 @@ async def test_registry_includes_observes_registered_while_waiting():
         await asyncio.gather(first, *later, waiter, return_exceptions=True)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "force,incoming,grow", [(False, 90_000, False), (True, 90_000, False), (False, 1, True)]
 )
@@ -144,6 +146,7 @@ async def test_compact_rebuilds_budget_after_waiting(monkeypatch, force, incomin
         await asyncio.gather(observer, pending, return_exceptions=True)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("stop", ["cancel_token", "pause_token", "caller_cancel", "observe_error"])
 async def test_stopping_or_failing_the_wait_does_not_start_compression(monkeypatch, stop):
     state, ctx, bus = await setup(monkeypatch)

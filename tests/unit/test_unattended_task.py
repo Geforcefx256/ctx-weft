@@ -192,7 +192,7 @@ def _session_registry(bus) -> SessionRegistry:
     return SessionRegistry(
         agent_lifecycle_manager=AgentLifecycleManager(
             template_lookup=TemplateLookup(reg), event_bus=bus,
-            model_resolver=lambda a, m: _Client(),
+            model_resolver=lambda a, m, **_context: _Client(),
         ),
         event_bus=bus,
     )

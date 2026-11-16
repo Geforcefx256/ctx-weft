@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """Real runtime/SQLite regressions for submission, pruning and settlement repair."""
 
 import asyncio
@@ -24,7 +26,6 @@ from tests.integration.test_minimal_loop import (
 )
 from tests.integration.test_queued_session_cancel_recovery import content
 
-pytestmark = pytest.mark.asyncio
 
 
 async def setup_queue(store, memory, *, snapshots=False):
@@ -53,6 +54,7 @@ async def full_view(store):
     return reduce_events([r.event for r in await store.read_range(SID)], SID)
 
 
+@pytest.mark.asyncio
 async def test_automatic_snapshot_does_not_duplicate_pruned_cancellation(tmp_path):
     async with open_sqlite_event_store(tmp_path / "events.db") as store:
         async with open_sqlite_memory(tmp_path / "memory.db") as memory:
@@ -71,6 +73,7 @@ async def test_automatic_snapshot_does_not_duplicate_pruned_cancellation(tmp_pat
             assert await content(memory, (await full_view(store)).tasks.values()) == before
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("legacy", [False, True])
 @pytest.mark.parametrize("receipt_lost", [False, True])
 async def test_generic_cancel_finalization_recovers_across_old_snapshot(tmp_path, legacy, receipt_lost):
@@ -123,13 +126,13 @@ async def test_generic_cancel_finalization_recovers_across_old_snapshot(tmp_path
             store.append_batch = append
             if not receipt_lost:
                 with pytest.raises(PersistenceUnavailableError):
-                    await cold.recover_agent(first.agent_id, session_id=SID)
+                    await recover_fixture_session(cold, first.agent_id, session_id=SID)
                 cold.clear_storage_isolation(SID)
             store.append_batch = original
             cold2, _ = runtime(store, memory, recovering=True)
             await initialize_all(cold2)
             await cold2.rebuild_session(SID, strict=True)
-            await cold2.recover_agent(first.agent_id, session_id=SID)
+            await recover_fixture_session(cold2, first.agent_id, session_id=SID)
             await drain(cold2)
             rows = await store.read_range(SID)
             for task in (await full_view(store)).tasks.values():
@@ -143,6 +146,7 @@ async def test_generic_cancel_finalization_recovers_across_old_snapshot(tmp_path
             assert await store.committed_head(SID) == head
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("receipt_lost", [False, True])
 async def test_pause_commits_selected_queue_atomically_before_removal(tmp_path, receipt_lost):
     async with open_sqlite_event_store(tmp_path / "events.db") as store:
@@ -181,6 +185,7 @@ async def test_pause_commits_selected_queue_atomically_before_removal(tmp_path, 
             await drain(rt)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["FINISHED", "FAILED"])
 @pytest.mark.parametrize("receipt_lost", [False, True])
 @pytest.mark.parametrize("entry", ["recover", "cancel"])
@@ -225,7 +230,7 @@ async def test_terminal_receipt_repair_releases_slot_and_wakes_report(tmp_path, 
                     if entry == "cancel":
                         await rt.cancel_session(SID)
                     else:
-                        await rt.recover_agent(handle.agent_id, session_id=SID)
+                        await recover_fixture_session(rt, handle.agent_id, session_id=SID)
                 except PersistenceUnavailableError:
                     continue
                 break
@@ -245,12 +250,13 @@ async def test_terminal_receipt_repair_releases_slot_and_wakes_report(tmp_path, 
             cold, _ = make_lifecycle_runtime(store, memory, "mechanical")
             await initialize_all(cold)
             await cold.rebuild_session(SID, strict=True)
-            await cold.recover_agent(handle.agent_id, session_id=SID)
+            await recover_fixture_session(cold, handle.agent_id, session_id=SID)
             await drain(cold)
             assert await store.committed_head(SID) == head
             assert await content(memory, view.tasks.values()) == before
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("cut", ["before", "committed", "recover_finalized"])
 async def test_pause_batch_process_crash_preserves_entire_selection(tmp_path, cut):
     import subprocess
@@ -270,7 +276,7 @@ async def test_pause_batch_process_crash_preserves_entire_selection(tmp_path, cu
             history = await full_view(store)
             queued = [t for t in history.tasks.values() if str(t.user_prompt).startswith("QUEUED")]
             owner = queued[0].assigned_agent_id
-            await cold.recover_agent(owner, session_id=SID)
+            await recover_fixture_session(cold, owner, session_id=SID)
             tm = cold._task_managers[SID]
             if cut == "before":
                 assert all(tm.get_task(t.id).status not in {"CANCELED", "FINISHED", "FAILED"} for t in queued)
@@ -283,5 +289,5 @@ async def test_pause_batch_process_crash_preserves_entire_selection(tmp_path, cu
             assert not any(r.event.type == "AgentTerminated" for r in await store.read_range(SID))
             await wait_until(lambda: not tm._dispatch_tasks and not tm._background_asyncio_tasks)
             head = await store.committed_head(SID)
-            await cold.recover_agent(owner, session_id=SID)
+            await recover_fixture_session(cold, owner, session_id=SID)
             assert await store.committed_head(SID) == head

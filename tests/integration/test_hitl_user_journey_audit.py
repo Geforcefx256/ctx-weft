@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """Two real questions, withdraw one answer, finish, restart and send more work."""
 
 import asyncio
@@ -27,7 +29,6 @@ from tests.integration.test_minimal_loop import (
 from tests.integration.test_send_message_after_session_done import _FinishEveryTaskLLM
 from tests.integration.test_user_journey_audit import assert_event_contract
 
-pytestmark = pytest.mark.asyncio
 SID = "whole-hitl-journey"
 
 
@@ -40,6 +41,7 @@ def runtime(store, memory, llm, timeout):
     return rt
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("timeout", [None, 0], ids=["hot", "cold"])
 @pytest.mark.parametrize("long_answer", [False, True], ids=["short", "long"])
 @pytest.mark.parametrize("restart_after_retraction", [False, True], ids=["same_process", "restart_before_reanswer"])
@@ -102,7 +104,7 @@ async def test_two_questions_with_retraction_then_restart_and_new_task(tmp_path,
             cold = runtime(store, memory, _FinishEveryTaskLLM(), timeout)
             await initialize_all(cold)
             await cold.rebuild_session(SID, strict=True)
-            await cold.recover_agent(h.agent_id, session_id=SID)
+            await recover_fixture_session(cold, h.agent_id, session_id=SID)
             await wait_until(lambda: not cold._task_managers[SID]._background_asyncio_tasks)
             assert await store.committed_head(SID) == head and await content() == before
             nxt = await cold.send_message(h.agent_id, "NEW_REQUEST", session_id=SID, unattended=True)

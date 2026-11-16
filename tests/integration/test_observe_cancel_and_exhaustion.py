@@ -17,9 +17,9 @@ from tests.integration.test_observe_application_recovery import (
 from tests.integration.test_observe_lifecycle_crashes import assert_lifecycles
 from tests.integration.test_single_observe_recovery import baseline, stored_content
 
-pytestmark = pytest.mark.asyncio
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["parked_cancel_success", "parked_cancel_retry"])
 @pytest.mark.parametrize("snapshot", [False, True])
 @pytest.mark.parametrize("cut", ["none", "task_canceled", "cancel_closed", "observe_completed"])
@@ -57,6 +57,7 @@ async def test_cancel_parked_task_revokes_old_observer(tmp_path, tmp_path_factor
             assert await stored_content(store, memory) == actual
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot", [False, True])
 @pytest.mark.parametrize("mode", ["retry", "mechanical_retry"])
 @pytest.mark.parametrize("cut", ["observe_completed", "task_finalized", "task_requeued"])
@@ -84,6 +85,7 @@ async def test_continue_with_zero_exception_budget_recovers_without_failure(tmp_
             await assert_cold_recovery_is_noop(store, memory, "foreground", root)
 
 
+@pytest.mark.asyncio
 async def test_public_cancel_does_not_overwrite_an_already_committed_verdict(tmp_path, monkeypatch):
     import asyncio
 

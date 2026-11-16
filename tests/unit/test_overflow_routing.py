@@ -26,7 +26,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 
 class _OverflowLLM(MockLLMAdapter):
@@ -43,6 +42,7 @@ class _OverflowLLM(MockLLMAdapter):
         return _gen()
 
 
+@pytest.mark.asyncio
 async def test_overflow_marks_task_suspended_not_failed():
     resolver = InlineAgentTemplateProvider()
     resolver.register(make_echo_template())

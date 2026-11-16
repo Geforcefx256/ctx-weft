@@ -20,6 +20,7 @@ CANCELED。旧路径 `report_observation` 判 fail 时就地写 `task.status="FA
 
 from __future__ import annotations
 
+from ctx_weft.protocols.context import ProviderContext as _ProviderContext
 from tests.model_testkit import model_snapshot
 
 import asyncio
@@ -50,7 +51,9 @@ from tests.integration.test_minimal_loop import InlineAgentTemplateProvider, mak
 from tests.unit.observation_helpers import submit_and_apply
 from tests.unit.test_runtime_agent_api import _plant
 
-pytestmark = pytest.mark.asyncio
+
+_PROVIDER_CONTEXT = _ProviderContext(session_id="test")
+
 
 
 class _SpyBus:
@@ -137,7 +140,7 @@ class _LoopRunner:
         provider_ctx = ProviderContext(session_id=self._session.id, tenant_id="default",
                                        task_id=task.id, agent_id=self._agent.id)
         ctx = LoopContext(
-            assembler=None, llm=self._runtime._resolve_llm(),
+            assembler=None, llm=self._runtime._resolve_llm(ctx=_PROVIDER_CONTEXT),
             memory=self._runtime.providers.get_memory(), event_bus=self._bus,
             provider_ctx=provider_ctx, capability_cache=CapabilityCache(),
             cancel_token=self._token,
@@ -172,6 +175,7 @@ def _wire(*, report_verdict: bool) -> tuple[TaskManager, Task, Session, _SpyBus]
     return tm, task, session, bus
 
 
+@pytest.mark.asyncio
 async def test_cancel_seam_run_loop_to_task_manager() -> None:
     """R20：真 driver 的 step 边界取消 → 一次完整的 `_run_task` → 终态 CANCELED。"""
     tm, task, _session, bus = _wire(report_verdict=False)
@@ -197,6 +201,7 @@ async def test_cancel_seam_run_loop_to_task_manager() -> None:
     assert EventType.TASK_REQUEUED not in types
 
 
+@pytest.mark.asyncio
 async def test_observer_fail_then_boundary_cancel_lands_on_canceled() -> None:
     """R17：observer 判 fail 之后、finalize 之前被取消 → 终态 CANCELED，失败计数不动。"""
     tm, task, session, bus = _wire(report_verdict=True)
@@ -242,7 +247,7 @@ async def _run_loop_with(
     provider_ctx = ProviderContext(session_id=session.id, tenant_id="default",
                                    task_id=task.id, agent_id=agent.id)
     ctx = LoopContext(
-        assembler=None, llm=runtime._resolve_llm(), memory=runtime.providers.get_memory(),
+        assembler=None, llm=runtime._resolve_llm(ctx=_PROVIDER_CONTEXT), memory=runtime.providers.get_memory(),
         event_bus=bus, provider_ctx=provider_ctx, capability_cache=CapabilityCache(),
         cancel_token=token,
     )
@@ -291,6 +296,7 @@ async def _run_with_external_cancelled_error() -> tuple[LoopState, _SpyBus]:
     return state, bus
 
 
+@pytest.mark.asyncio
 async def test_token_cancel_is_labelled_token() -> None:
     """CancelToken 触发的取消，`RunCanceled` 的 payload 标 `source: token`。
 
@@ -304,6 +310,7 @@ async def test_token_cancel_is_labelled_token() -> None:
     assert bus.of(EventType.RUN_CANCELED).payload["source"] == "token"
 
 
+@pytest.mark.asyncio
 async def test_external_cancel_is_labelled_external() -> None:
     """非 token 来源的 CancelledError（如进程 shutdown），`RunCanceled` 标 `source: external`。"""
     state, bus = await _run_with_external_cancelled_error()
@@ -348,6 +355,7 @@ async def _wire_multi_agent_session(
     _plant(rt, child_id, root_id, session_id=session_id, status="idle")
 
 
+@pytest.mark.asyncio
 async def test_cancel_session_terminates_every_agent() -> None:
     """回归护栏：`cancel_session` 必须把每个 agent 都终态化（2026-09-04 spec §7.2）。
 
@@ -375,9 +383,9 @@ async def test_cancel_session_terminates_every_agent() -> None:
 
     # 取消 ≠ 逐出：record 还在，状态是终态。
     await initialize_all(rt)
-    assert (await rt.get_agent(root_id)).data.status == "terminated"
+    assert (await rt.get_agent(root_id)).data.state.status == "terminated"
     await initialize_all(rt)
-    assert (await rt.get_agent(child_id)).data.status == "terminated"
+    assert (await rt.get_agent(child_id)).data.state.status == "terminated"
     # 默认过滤掉终态 agent（避免列表随时间膨胀），显式要才给。
     await initialize_all(rt)
     assert [item.data for item in await rt.list_agents(session_id=session_id)] == []
@@ -392,6 +400,7 @@ async def test_cancel_session_terminates_every_agent() -> None:
         (await rt.get_agent(root_id)).data
 
 
+@pytest.mark.asyncio
 async def test_cancel_session_keeps_agent_termination_in_cancel_agent() -> None:
     """Early run stop signals do not move agent state ownership into runtime."""
     import inspect

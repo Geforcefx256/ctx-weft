@@ -19,7 +19,6 @@ from ctx_weft.protocols import MemoryAddress, MemoryEvent, MemoryEventType, Prov
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from tests.assembler_testkit import recalled_blocks
 
-pytestmark = pytest.mark.asyncio
 
 T = MemoryEventType
 _BASE = datetime(2026, 1, 1, tzinfo=UTC)
@@ -56,6 +55,7 @@ async def _recall_blocks(mem: InMemoryMemoryProvider, agent_scope: MemoryAddress
     return blocks
 
 
+@pytest.mark.asyncio
 async def test_legacy_mirrored_capsule_recalled_in_order() -> None:
     """G7：旧式镜像胶囊（AGENT_CONVERSATION_TURN 写入 agent scope）仍能被召回，
     且按 (timestamp, seq_no) 升序排列。
@@ -118,6 +118,7 @@ async def test_legacy_mirrored_capsule_recalled_in_order() -> None:
     )
 
 
+@pytest.mark.asyncio
 async def test_legacy_multi_task_mirrored_capsule_order() -> None:
     """G7 变体：多个旧式镜像任务（多 origin_task_id），按时间戳全局升序召回。
 

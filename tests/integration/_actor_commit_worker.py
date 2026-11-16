@@ -6,10 +6,11 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
-from tests._initialization import initialize_all
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
+
+from tests._initialization import initialize_all
 
 import ctx_weft.core.loop.steps.observe as observe
 from ctx_weft import SessionStartParams

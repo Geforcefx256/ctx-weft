@@ -52,7 +52,6 @@ from ctx_weft.providers.llm.tokenizer import HeuristicTokenizer
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from tests.assembler_testkit import history_messages, recalled_blocks
 
-pytestmark = pytest.mark.asyncio
 
 T = MemoryEventType
 SESSION = "s1"
@@ -215,6 +214,7 @@ async def _parent_agent_turns(mem):
 
 # ─── 对照组：不重启 → 胶囊正常 ────────────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_capsule_present_without_restart() -> None:
     mem = InMemoryMemoryProvider()
     await _run_dispatch_and_close(mem, restart=None)
@@ -223,6 +223,7 @@ async def test_capsule_present_without_restart() -> None:
 
 # ─── 重启后子任务 close，胶囊仍在 ─────────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_capsule_survives_restart_before_close() -> None:
     """已 start 的子任务经重启重建后 close：父的上下文里仍须有子任务胶囊。"""
     mem = InMemoryMemoryProvider()
@@ -230,6 +231,7 @@ async def test_capsule_survives_restart_before_close() -> None:
     _assert_capsule_present(await _compose_parent_messages(mem))
 
 
+@pytest.mark.asyncio
 async def test_capsule_survives_restart_before_start() -> None:
     """派发与 start 之间崩溃：重建后才铸框（配对 id 现生成），整对照样闭合。"""
     mem = InMemoryMemoryProvider()
@@ -237,6 +239,7 @@ async def test_capsule_survives_restart_before_start() -> None:
     _assert_capsule_present(await _compose_parent_messages(mem))
 
 
+@pytest.mark.asyncio
 async def test_single_active_ack_after_restart_close() -> None:
     """重启后 close 必须**替换**那条 running ack，而不是并列新增一条终态。"""
     mem = InMemoryMemoryProvider()
@@ -252,6 +255,7 @@ async def test_single_active_ack_after_restart_close() -> None:
 
 # ─── 新不变量：派发框/ack 自带 child_task_id ──────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_dispatch_pair_records_child_task_id() -> None:
     """框与 ack 都必须带 child_task_id——「这次派发对应哪个子任务」是 memory 里的一等事实，
     close 认框不再依赖任何进程内状态。"""
@@ -273,6 +277,7 @@ async def test_dispatch_pair_records_child_task_id() -> None:
 
 # ─── 根因：派发来源在投影/恢复链上丢失 ────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_dispatch_origin_survives_projection() -> None:
     """origin_tool_call_id/origin_tool_name 须跨 TASK_CREATED → TaskView → 恢复保留。
 

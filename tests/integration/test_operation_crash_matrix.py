@@ -51,7 +51,6 @@ from tests.integration.test_minimal_loop import (
 )
 from tests._event_helpers import append_one
 
-pytestmark = pytest.mark.asyncio
 
 _SCRIPT = Path(__file__).resolve().parents[2] / "tests" / "integration" / "_crash_worker.py"
 
@@ -63,6 +62,7 @@ def _count_effects(workdir: Path) -> int:
     return sum(1 for line in f.read_text(encoding="utf-8").splitlines() if line.startswith("EFFECT"))
 
 
+@pytest.mark.asyncio
 async def test_ot05_reviewed_started_real_exit_side_effect_once(tmp_path):
     """O-T05：reviewed started → worker 子进程硬杀 → 新实例 recover → 副作用 1 次。"""
     workdir = tmp_path / "ot05"
@@ -95,6 +95,7 @@ async def test_ot05_reviewed_started_real_exit_side_effect_once(tmp_path):
         f"(got {final_count})")
 
 
+@pytest.mark.asyncio
 async def test_ot06_finished_but_memory_write_crashed_backfills(tmp_path):
     """O-T06：`CapabilityFinished` 已发而 TOOL_RESULT 写前崩溃 → 从事件里那份补写。
 
@@ -175,6 +176,7 @@ async def test_ot06_finished_but_memory_write_crashed_backfills(tmp_path):
         "O-T06: FINISHED 已发 → 按确定性 id 从事件里那份补写 memory")
 
 
+@pytest.mark.asyncio
 async def test_ot14_delegate_completed_reentry_no_duplicate_children():
     """O-T14：delegate 的操作已 completed → 重入经 gateway 短路找回（不双建子任务）。
 

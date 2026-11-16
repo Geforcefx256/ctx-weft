@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """Slow metadata cannot hold cancellation hostage or cancel an independent report."""
 
 import asyncio
@@ -15,7 +17,6 @@ from tests.integration._metadata_cancel_worker import REPLY, SID, content
 from tests.integration._session_cancel_worker import runtime, wait_until
 from tests.integration.test_send_message_after_session_done import _FinishEveryTaskLLM
 
-pytestmark = pytest.mark.asyncio
 WORKER = Path(__file__).with_name("_metadata_cancel_worker.py")
 
 
@@ -38,6 +39,7 @@ def assert_order(events):
         assert events.index(cancel) < events.index(finalized)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["slow", "return", "detached", "report_short", "report_long"])
 async def test_cancel_exits_dispatch_without_waiting_for_auxiliary_results(tmp_path, mode):
     await run_worker(tmp_path, mode, "none")
@@ -45,6 +47,7 @@ async def test_cancel_exits_dispatch_without_waiting_for_auxiliary_results(tmp_p
         assert_order([r.event for r in await store.read_range(SID)])
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("cut", ["metadata_hot_receipt", "actor_hot_receipt", "response_hot_receipt"])
 async def test_cancellation_finish_receipt_loss_can_be_retried_hot(tmp_path, cut):
     await run_worker(tmp_path, "slow", cut)
@@ -52,6 +55,7 @@ async def test_cancellation_finish_receipt_loss_can_be_retried_hot(tmp_path, cut
         assert_order([r.event for r in await store.read_range(SID)])
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode,cut", [
     ("slow", "metadata_closed"), ("slow", "metadata_receipt"),
     ("slow", "response_receipt"),
@@ -70,7 +74,7 @@ async def test_cancel_recovery_keeps_run_order_and_report_handoff(tmp_path, mode
             await rt.rebuild_session(SID, strict=True)
             root = (await rebuild_view(store, SID)).sessions[SID].root_agent_id
             await rt.cancel_session(SID)
-            await rt.recover_agent(root, session_id=SID)
+            await recover_fixture_session(rt, root, session_id=SID)
             tm = rt._task_managers[SID]
             await wait_until(lambda: not tm.running_task_ids() and not tm._dispatch_tasks and not tm._background_asyncio_tasks)
             view = await rebuild_view(store, SID)
@@ -90,7 +94,7 @@ async def test_cancel_recovery_keeps_run_order_and_report_handoff(tmp_path, mode
             rt2 = runtime(store, memory, _FinishEveryTaskLLM(), recovering=True)
             await initialize_all(rt2)
             await rt2.rebuild_session(SID, strict=True)
-            await rt2.recover_agent(root, session_id=SID)
+            await recover_fixture_session(rt2, root, session_id=SID)
             await wait_until(lambda: not rt2._task_managers[SID]._background_asyncio_tasks)
             assert await store.committed_head(SID) == head
             assert await content(memory, task_id, root) == raw

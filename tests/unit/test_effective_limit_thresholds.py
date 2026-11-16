@@ -17,7 +17,6 @@ from ctx_weft.core.utils.estimate import effective_limit
 from ctx_weft.protocols import LLMUsage, MemoryAddress
 from ctx_weft.protocols.template import LoopConfig
 
-pytestmark = pytest.mark.asyncio
 
 
 class _FakeMemory:
@@ -44,6 +43,7 @@ def _ctx():
     return SimpleNamespace(memory=_FakeMemory(), provider_ctx=SimpleNamespace())
 
 
+@pytest.mark.asyncio
 async def test_act_stop_threshold_uses_effective_limit_not_context_limit():
     """reserve=8192 时 eff < context_limit：prompt_tokens 落在 [eff*r, context_limit*r)
     区间必须命中停止（旧口径按 context_limit*r 判会漏判，新口径按 eff*r 判会命中）。"""
@@ -59,6 +59,7 @@ async def test_act_stop_threshold_uses_effective_limit_not_context_limit():
     assert hit is True
 
 
+@pytest.mark.asyncio
 async def test_act_stop_threshold_below_effective_limit_does_not_trigger():
     ctx_limit, reserve = 100_000, 8192
     eff = effective_limit(ctx_limit, reserve)

@@ -17,7 +17,6 @@ from ctx_weft.providers.llm.adapters.mock import MockLLMAdapter, MockResponse
 from ctx_weft.providers.llm.tokenizer import HeuristicTokenizer
 from tests.integration.test_interactive_task import _act_state_ctx
 
-pytestmark = pytest.mark.asyncio
 
 
 class _PauseMidStream:
@@ -46,6 +45,7 @@ class _PauseMidStream:
         yield LLMChunk(kind="token", text=" MORE")   # should not be consumed
 
 
+@pytest.mark.asyncio
 async def test_interrupt_parks_instead_of_cancel():
     llm = MockLLMAdapter(responses=[MockResponse(text="hello")])
     state, ctx, task, hitl, _mem = _act_state_ctx(False, llm)
@@ -63,6 +63,7 @@ async def test_interrupt_parks_instead_of_cancel():
     assert pend and isinstance(pend[0].delivery, UserTurnDelivery)
 
 
+@pytest.mark.asyncio
 async def test_hard_cancel_raises_cancellederror():
     llm = MockLLMAdapter(responses=[MockResponse(text="hello")])
     state, ctx, task, hitl, _mem = _act_state_ctx(False, llm)
@@ -75,6 +76,7 @@ async def test_hard_cancel_raises_cancellederror():
     assert hitl.list_pending("s1") == []
 
 
+@pytest.mark.asyncio
 async def test_interrupt_midstream_commits_partial_marked():
     pause = PauseToken()
     llm = _PauseMidStream(pause, "partial reply")
@@ -106,6 +108,7 @@ def test_interrupt_edit_note_empty_prev_returns_new():
     assert interrupt_edit_note("", "only this") == "only this"
 
 
+@pytest.mark.asyncio
 async def test_interrupt_before_token_marks_edit_phase():
     # ① 未吐 token → preface = interrupt_edit（续接需补说明；旧字段名 context）。
     pause = PauseToken()
@@ -119,6 +122,7 @@ async def test_interrupt_before_token_marks_edit_phase():
     assert hitl.list_pending("s1")[0].delivery.preface == PREFACE_AFTER_INTERRUPT_EDIT
 
 
+@pytest.mark.asyncio
 async def test_interrupt_after_token_is_not_edit_phase():
     # ② 已吐 token → 非 edit（preface = interrupt）。
     pause = PauseToken()
@@ -131,6 +135,7 @@ async def test_interrupt_after_token_is_not_edit_phase():
     assert hitl.list_pending("s1")[0].delivery.preface == PREFACE_AFTER_INTERRUPT
 
 
+@pytest.mark.asyncio
 async def test_interrupt_before_any_token_does_not_persist_response():
     # No token streamed yet (phase ①) → nothing to commit, just park.
     pause = PauseToken()

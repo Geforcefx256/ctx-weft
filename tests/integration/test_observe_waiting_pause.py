@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """Reach foreground waiting through actual act context exhaustion, then pause/resume."""
 
 from dataclasses import replace
@@ -104,7 +106,7 @@ async def test_context_exhaustion_waiting_pause_resume_public_chain(recoveries, 
     if cold:
         rt = runtime(rt.event_store)
         await initialize_all(rt)
-        await rt.recover_agent(handle.agent_id, session_id=handle.session_id)
+        await recover_fixture_session(rt, handle.agent_id, session_id=handle.session_id)
         assert llm.actor_turns == turns
         assert len(rt.hitl_registry.list_pending(handle.session_id)) == 1
     llm.finish = True

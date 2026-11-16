@@ -12,7 +12,6 @@ from ctx_weft.core.loop.llm_gateway import stream_llm_resilient, _sleep_cancella
 from ctx_weft.core.control.tokens import CancelToken
 from ctx_weft.protocols.events import EventType
 
-pytestmark = pytest.mark.asyncio
 
 
 class _FakeLLM:
@@ -110,6 +109,7 @@ def _state():
     )
 
 
+@pytest.mark.asyncio
 async def test_self_heals_then_succeeds_no_duplicate():
     llm = _FakeLLM([
         {"kind": "fail_pre"},
@@ -126,6 +126,7 @@ async def test_self_heals_then_succeeds_no_duplicate():
     assert retries[0]["payload"]["attempt"] == 1
 
 
+@pytest.mark.asyncio
 async def test_exhaust_max_attempts_raises_outage():
     llm = _FakeLLM([{"kind": "fail_pre"}])  # always fails
     with pytest.raises(LLMOutageError):
@@ -134,6 +135,7 @@ async def test_exhaust_max_attempts_raises_outage():
     assert llm.calls == 3
 
 
+@pytest.mark.asyncio
 async def test_exhaust_max_duration_raises_outage(monkeypatch):
     clock = iter([0.0, 0.0, 0.0, 1000.0])
     monkeypatch.setattr(llm_gateway, "monotonic", lambda: next(clock))
@@ -144,6 +146,7 @@ async def test_exhaust_max_duration_raises_outage(monkeypatch):
     assert llm.calls == 1   # deadline already passed after first failure
 
 
+@pytest.mark.asyncio
 async def test_midflight_outage_retries_with_discard_boundary():
     llm = _FakeLLM([{"kind": "fail_mid"}, {"kind": "ok", "tokens": ["x"]}])
     got = []
@@ -156,6 +159,7 @@ async def test_midflight_outage_retries_with_discard_boundary():
     assert llm.calls == 2
 
 
+@pytest.mark.asyncio
 async def test_non_outage_retriable_passthrough():
     # _finalize-style truncation: retriable but NOT outage → re-raised as-is, not LLMOutageError
     llm = _FakeLLM([{"kind": "fail_pre", "outage": False, "retriable": True}])
@@ -165,6 +169,7 @@ async def test_non_outage_retriable_passthrough():
     assert llm.calls == 1
 
 
+@pytest.mark.asyncio
 async def test_permanent_error_passthrough():
     llm = _FakeLLM([{"kind": "fail_pre", "retriable": False, "outage": False, "code": 401}])
     with pytest.raises(LLMCallError) as ei:
@@ -174,6 +179,7 @@ async def test_permanent_error_passthrough():
     assert llm.calls == 1
 
 
+@pytest.mark.asyncio
 async def test_cancel_pierces_backoff():
     tok = CancelToken()
     tok.cancel()
@@ -187,11 +193,13 @@ async def test_cancel_pierces_backoff():
 # ── Direct _sleep_cancellable tests (use the real function, bypassing the autouse stub) ──
 
 
+@pytest.mark.asyncio
 async def test_sleep_cancellable_none_token_completes():
     """No cancel token — sleep completes normally."""
     await _real_sleep(0.01, None)
 
 
+@pytest.mark.asyncio
 async def test_sleep_cancellable_precancelled_raises_fast():
     """Pre-cancelled token — should raise CancelledError well before the 5s delay."""
     tok = CancelToken()
@@ -200,6 +208,7 @@ async def test_sleep_cancellable_precancelled_raises_fast():
         await asyncio.wait_for(_real_sleep(5.0, tok), timeout=1.0)
 
 
+@pytest.mark.asyncio
 async def test_sleep_cancellable_cancel_midsleep_wakes():
     """Cancel fires mid-sleep — task wakes promptly and raises CancelledError."""
     tok = CancelToken()
@@ -210,6 +219,7 @@ async def test_sleep_cancellable_cancel_midsleep_wakes():
         await task
 
 
+@pytest.mark.asyncio
 async def test_sleep_cancellable_not_cancelled_completes():
     """Fresh non-cancelled token — short sleep completes without raising."""
     tok = CancelToken()

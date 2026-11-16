@@ -9,6 +9,7 @@ task 侧的同一守卫在 `TaskManager.apply_run_outcome`（终态已坐实 →
 
 from __future__ import annotations
 
+from ctx_weft.protocols.context import ProviderContext as _ProviderContext
 from tests.model_testkit import model_snapshot
 
 from types import SimpleNamespace
@@ -30,7 +31,9 @@ from ctx_weft.providers.llm.adapters.mock import MockLLMAdapter
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from tests.integration.test_minimal_loop import InlineAgentTemplateProvider, make_runtime
 
-pytestmark = pytest.mark.asyncio
+
+_PROVIDER_CONTEXT = _ProviderContext(session_id="test")
+
 
 
 class _CancelingDriver:
@@ -55,7 +58,7 @@ def _build_state_and_ctx(runtime: CtxWeftRuntime, task: Task):
     state = LoopState(run_id=generate_id("run"), session=session, task=task, agent=agent, scope=scope, resolved_model=model_snapshot(model="mock", account=""))
     provider_ctx = ProviderContext(session_id="s1", tenant_id="default", task_id=task.id, agent_id="agt1")
     ctx = LoopContext(
-        assembler=None, llm=runtime._resolve_llm(), memory=runtime.providers.get_memory(),
+        assembler=None, llm=runtime._resolve_llm(ctx=_PROVIDER_CONTEXT), memory=runtime.providers.get_memory(),
         event_bus=runtime._event_bus, provider_ctx=provider_ctx,
         capability_cache=CapabilityCache(),
     )
@@ -82,6 +85,7 @@ async def _run_and_capture(runtime: CtxWeftRuntime, task: Task):
     return seen
 
 
+@pytest.mark.asyncio
 async def test_was_cancelled_and_task_failed_suppresses_cancel_events():
     """熔断已先手把 task 标 FAILED 后再协作取消：不发 RUN_CANCELED/TASK_CANCELED，RUN_FINISHED 照发。"""
     runtime = _runtime()
@@ -96,6 +100,7 @@ async def test_was_cancelled_and_task_failed_suppresses_cancel_events():
     assert task.status == "FAILED"  # run 侧不写状态；FAILED 是熔断先手写的，原样保留
 
 
+@pytest.mark.asyncio
 async def test_was_cancelled_and_task_not_terminal_emits_run_canceled():
     """回归：普通协作取消（task 未处于任何终态）→ RUN_CANCELED 照发。
 

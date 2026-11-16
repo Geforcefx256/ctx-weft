@@ -9,9 +9,9 @@ from tests.integration.test_observe_application_recovery import recover_and_drai
 from tests.integration.test_single_observe_recovery import baseline, stored_content
 from tests.integration.test_observe_lifecycle_crashes import assert_lifecycles
 
-pytestmark = pytest.mark.asyncio
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["parked_interrupt_success", "parked_interrupt_retry"])
 @pytest.mark.parametrize("snapshot", [False, True])
 @pytest.mark.parametrize("cut", ["none", "agent_terminated", "task_canceled", "cancel_closed", "observe_completed", "recovery_cancel_closed"])
@@ -41,6 +41,7 @@ async def test_cancellation_survives_every_cancel_boundary(tmp_path, tmp_path_fa
             assert await stored_content(store, memory) == expected
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot", [False, True])
 @pytest.mark.parametrize("cut", ["agent_terminated", "task_finalized"])
 async def test_accepted_verdict_remains_authoritative_after_cancellation(tmp_path, tmp_path_factory, snapshot, cut):

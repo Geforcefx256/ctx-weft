@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """cancel_agent cancels the current task tree without selecting unrelated tasks."""
 
 import asyncio
@@ -15,7 +17,6 @@ from tests._initialization import initialize_all
 from tests._snapshot_helpers import seed_snapshot
 from tests.integration._cancel_tree_worker import make_tree_runtime
 
-pytestmark = pytest.mark.asyncio
 WORKER = Path(__file__).with_name("_cancel_tree_worker.py")
 BASELINE = None
 
@@ -33,7 +34,7 @@ async def recover(store, memory, snapshot):
     rt, llm = make_tree_runtime(store, memory, recovering=True)
     await initialize_all(rt)
     root = (await rt.get_session("tree-session")).data.root_agent_id
-    await rt.recover_agent(root, session_id="tree-session")
+    await recover_fixture_session(rt, root, session_id="tree-session")
     tm = rt._task_managers["tree-session"]
     while tm._background_asyncio_tasks:
         await asyncio.gather(*list(tm._background_asyncio_tasks))
@@ -61,6 +62,7 @@ async def cancel_content(store, memory):
     return sorted(result)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot", [False, True])
 @pytest.mark.parametrize("cut", ["none", "agent_terminated", "root_canceled", "descendant_canceled", "cancel_slot", "finalized",
     "agent_commit_failed", "task_cancel_commit_failed", "task_cancel_commit_failed_crash",

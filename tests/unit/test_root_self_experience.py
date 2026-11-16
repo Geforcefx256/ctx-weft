@@ -22,7 +22,6 @@ from ctx_weft.core.models.task import NormalTaskSettings, Task
 from ctx_weft.protocols import MemoryEvent, MemoryEventType, MemoryAddress, ProviderContext
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 
-pytestmark = pytest.mark.asyncio
 T = MemoryEventType
 _BASE = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -60,6 +59,7 @@ async def _agent_turns(mem, agent_scope):
     return list(reversed(recs))
 
 
+@pytest.mark.asyncio
 async def test_synthesize_writes_only_finish_pair_no_body_mirror():
     """task-resident：task 层有 UP + 段摘要时，agent 层仍只写 finish 对（不镜像 body）。
     body（UP/段摘要）留 task 层、原样保留。
@@ -89,6 +89,7 @@ async def test_synthesize_writes_only_finish_pair_no_body_mirror():
     assert {r.content for r in body} == {"帮我转", "### 会话目标\n转 PDF"}
 
 
+@pytest.mark.asyncio
 async def test_no_task_layer_body_still_writes_finish_pair():
     """task 层无任何 body → agent 层仍写 finish 对（2 条）。"""
     mem = InMemoryMemoryProvider()
@@ -105,6 +106,7 @@ async def test_no_task_layer_body_still_writes_finish_pair():
     assert [task_record_kind(r) for r in turns] == ["recap", "finish"]
 
 
+@pytest.mark.asyncio
 async def test_finish_pair_marker_and_report():
     """finish 对（反转契约）：assistant.content = act_recap（过程复述，≠ 答复）、finish_task 无参标记；
     tool content = task_summary（过程报告）。答复由内联 body / blackboard 承载，不在 finish 对。"""

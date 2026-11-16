@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ctx_weft.protocols.context import ProviderContext as _ProviderContext
 from ctx_weft.protocols import ModelCallConfig
 
 import json
@@ -20,6 +21,9 @@ from ctx_weft.providers.llm import (
 )
 from ctx_weft.providers.llm.adapters.openai import OpenAIAdapter
 from ctx_weft.providers.llm.adapters.openai_compatible import OpenAICompatibleAdapter
+
+
+_PROVIDER_CONTEXT = _ProviderContext(session_id="test")
 
 
 def request(**kwargs):
@@ -265,12 +269,12 @@ async def test_protocols_coexist_and_legacy_config_stays_compatible():
         ModelConfig("compatible", "openai-compatible", ModelLimits(128_000)),
         ModelConfig("official", "openai-official", ModelLimits(128_000), ModelCapabilities(["text", "image"])),
     ]))
-    legacy, compatible, official = [provider.get_client("account", name) for name in ("legacy", "compatible", "official")]
+    legacy, compatible, official = [provider.get_client("account", name, ctx=_PROVIDER_CONTEXT) for name in ("legacy", "compatible", "official")]
     try:
         assert isinstance(legacy._adapter, OpenAICompatibleAdapter)
         assert isinstance(compatible._adapter, OpenAICompatibleAdapter)
         assert type(official._adapter) is OpenAIAdapter and official._adapter._image_input
-        assert provider.get_client().model == "legacy"
+        assert provider.get_client(ctx=_PROVIDER_CONTEXT).model == "legacy"
         assert [model.protocol for model in provider.get_account("account").models] == ["openai", "openai-compatible", "openai-official"]
     finally:
         await legacy._adapter._client.aclose()

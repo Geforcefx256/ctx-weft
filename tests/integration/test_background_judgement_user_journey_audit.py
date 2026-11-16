@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """Finish real work, crash its background judgement, then finish the user journey."""
 
 import pytest
@@ -11,10 +13,10 @@ from tests.integration._lifecycle_crash_worker import make_lifecycle_runtime
 from tests.integration._session_cancel_worker import wait_until
 from tests.integration.test_lifecycle_crash_boundaries import run_worker
 
-pytestmark = pytest.mark.asyncio
 SID = "crash-session"
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["plain_text", "finish_park"])
 @pytest.mark.parametrize("snapshot", [False, True])
 @pytest.mark.parametrize("cut", ["none", "hitl_opened", "observer_response", "observe_completed"])
@@ -32,12 +34,12 @@ async def test_finished_actor_background_judgement_preserves_result_and_allows_n
             history = await store.read_range(SID, include_types=["TaskCreated"])
             task_id = history[0].event.task_id
             aid = tm.session.root_agent_id
-            await rt.recover_agent(aid, session_id=SID)
+            await recover_fixture_session(rt, aid, session_id=SID)
             await wait_until(lambda: not tm._dispatch_tasks and not tm._background_asyncio_tasks)
             # /resume twice must not be necessary to rediscover an already
             # completed actor's deliverable, and must never silently change it.
             head = await store.committed_head(SID)
-            await rt.recover_agent(aid, session_id=SID)
+            await recover_fixture_session(rt, aid, session_id=SID)
             await wait_until(lambda: not tm._dispatch_tasks and not tm._background_asyncio_tasks)
             assert await store.committed_head(SID) == head
             rows = await store.read_range(SID)

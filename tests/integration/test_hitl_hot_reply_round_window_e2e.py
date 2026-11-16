@@ -22,7 +22,7 @@ import pytest
 
 from ctx_weft.core.models.config import RuntimeConfig
 from ctx_weft.core.runtime import SessionStartParams
-from ctx_weft.core.utils.content import content_to_text
+from ctx_weft.protocols.content import content_to_text
 from ctx_weft.protocols import LLMChunk, MemoryAddress, MemoryScope, ProviderContext, ToolCall, load_records
 from ctx_weft.protocols.events import EventFilter, EventType
 from ctx_weft.protocols.hitl import HitlReply
@@ -37,7 +37,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 #: act 回合的剧本项：卡在首个 chunk 之前（TTFT 窗口）/ 吐一个 token 之后卡住。
 STALL_BEFORE_CHUNK = "stall_before_chunk"
@@ -121,6 +120,7 @@ async def _ask_user_results(rt, sid, req) -> list[str]:
             if r.role == "tool" and r.metadata.get("tool_name") == "control__ask_user"]
 
 
+@pytest.mark.asyncio
 async def test_second_hot_question_is_visible_to_live_subscribers() -> None:
     llm = _ScriptedLLM([_ask("tc1", "Q1?"), _ask("tc2", "Q2?"), STALL_AFTER_CHUNK])
     rt = _runtime(llm, hitl_timeout_sec=None)            # 永不驱逐 = 恒走热路径
@@ -163,6 +163,7 @@ async def test_second_hot_question_is_visible_to_live_subscribers() -> None:
         sub.cancel()
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("hitl_timeout_sec", [None, 0], ids=["hot", "cold"])
 async def test_ask_user_reply_is_retracted_by_pause_before_first_chunk(hitl_timeout_sec) -> None:
     # 判定 `success`：末轮 `finish_task` 收尾如今也 park + 后台判定（S-b）。暂停那一段走的是
@@ -226,6 +227,7 @@ async def test_ask_user_reply_is_retracted_by_pause_before_first_chunk(hitl_time
     assert resolved_ids.count(q1.id) == 1, resolved_ids
 
 
+@pytest.mark.asyncio
 async def test_replying_to_an_already_resolved_request_opens_no_window() -> None:
     llm = _ScriptedLLM([_ask("tc1", "Q1?"), STALL_AFTER_CHUNK])
     rt = _runtime(llm, hitl_timeout_sec=None)
@@ -246,6 +248,7 @@ async def test_replying_to_an_already_resolved_request_opens_no_window() -> None
     assert not rt._task_managers[sid].open_round_task_ids
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("hitl_timeout_sec", [None, 0], ids=["hot", "cold"])
 async def test_reply_is_committed_when_the_round_ends_without_a_chunk(hitl_timeout_sec) -> None:
     """一轮没等到 LLM 开口、也不是被暂停，而是失败收场 → `_run_task` 兜底提交窗口。
@@ -292,6 +295,7 @@ class _MemoryIngestSpy:
         return await self._inner.ingest(event, ctx)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("hitl_timeout_sec", [None, 0], ids=["hot", "cold"])
 async def test_ask_user_reply_enters_memory_only_after_hitl_resolved(hitl_timeout_sec) -> None:
     llm = _ScriptedLLM([_ask("tc1", "Q1?"), STALL_AFTER_CHUNK])

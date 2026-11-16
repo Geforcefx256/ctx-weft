@@ -15,7 +15,6 @@ from tests._initialization import initialize_all
 from tests.integration._session_cancel_worker import RETRACTED, SID, runtime, wait_until
 from tests.integration.test_send_message_after_session_done import _FinishEveryTaskLLM
 
-pytestmark = pytest.mark.asyncio
 WORKER = Path(__file__).with_name("_session_cancel_worker.py")
 
 
@@ -41,6 +40,7 @@ def assert_order(events):
     return view
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["before", "arrival", "after", "hot", "unknown"])
 async def test_user_cancel_releases_stream_dispatch_and_slots(tmp_path, mode):
     await run_worker(tmp_path, mode, "none")
@@ -58,6 +58,7 @@ async def test_user_cancel_releases_stream_dispatch_and_slots(tmp_path, mode):
             assert await store.committed_head(SID) == head
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode,cut", [
     ("before", "stream_closed"), ("before", "round_discarded"),
     ("before", "agent_terminated"), ("hot", "stream_closed"),

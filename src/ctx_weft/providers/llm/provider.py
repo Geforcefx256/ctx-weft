@@ -9,6 +9,7 @@ import time
 from ctx_weft.core.utils.estimate import default_output_reserve
 from ctx_weft.protocols.llm import ModelCallConfig, OutputPolicy
 from ctx_weft.protocols import ImagePart, LLMClient, LLMMessage, LLMRequest, TextPart
+from ctx_weft.protocols.context import ProviderContext
 from ctx_weft.providers.llm.config import (
     LLMAccount,
     LLMModelNotFoundError,
@@ -90,13 +91,14 @@ class LLMProvider:
     """Resolve configured models; reuse adapters for each account/protocol/image combination."""
 
     def __init__(self, store: LLMAccountStoreProtocol) -> None:
-        self._accounts: dict[str, LLMAccount] = {}
-        self._adapters: dict[str, dict[tuple[str, bool], LLMClient]] = {}
-        self._adapter_settings: dict[str, tuple[str, str, int]] = {}
+        self._accounts: dict[tuple[str, str], LLMAccount] = {}
+        self._adapters: dict[tuple[str, str], dict[tuple[str, bool], LLMClient]] = {}
+        self._adapter_settings: dict[tuple[str, str], tuple[str, str, int]] = {}
         self._store = store
 
     def register_account(self, account: LLMAccount, *, persist: bool = True) -> None:
-        if account.name in self._accounts:
+        account.__post_init__()
+        if account.key in self._accounts or any(a.namespace == account.namespace and a.name == account.name for a in self._accounts.values()):
             raise KeyError(f"LLM account already registered: '{account.name}'")
         account.__post_init__()
         for model in account.models:
@@ -109,31 +111,48 @@ class LLMProvider:
             self._model_config(account, account.default_model)
         if persist:
             self._store.save(account)
-        self._accounts[account.name] = account
+        self._accounts[account.key] = account
         logger.info(
             "LLMProvider: registered account %r timeout_sec=%s", account.name, account.timeout_sec,
         )
 
-    def delete_account(self, name: str) -> None:
-        self.get_account(name)
-        self._store.delete(name)
-        del self._accounts[name]
-        self._adapters.pop(name, None)
-        self._adapter_settings.pop(name, None)
+    def _account_visible(self, account: LLMAccount, ctx: ProviderContext | None) -> bool:
+        """Generic provider exposes its public namespace; hosts interpret other scopes."""
+        return account.namespace == "global"
 
-    def get_account(self, name: str) -> LLMAccount:
-        if name not in self._accounts:
-            raise KeyError(f"LLM account not found: '{name}'")
-        return self._accounts[name]
-
-    def list_accounts(self) -> list[LLMAccount]:
+    def list_all_accounts(self) -> list[LLMAccount]:
+        """Explicit control-plane snapshot for registration and refresh."""
         return list(self._accounts.values())
 
-    def is_registered(self, name: str) -> bool:
-        return name in self._accounts
+    def list_accounts(self, *, ctx: ProviderContext | None = None) -> list[LLMAccount]:
+        return [a for a in self._accounts.values() if self._account_visible(a, ctx)]
 
-    def add_model(self, name: str, model: ModelConfig) -> LLMAccount:
-        account = self.get_account(name)
+    def get_account(self, name: str, *, ctx: ProviderContext | None = None) -> LLMAccount:
+        visible = self.list_accounts(ctx=ctx)
+        exact = [a for a in visible if a.resource_id == name]
+        matches = exact or [a for a in visible if a.name == name]
+        if not matches:
+            raise KeyError(f"LLM account not found: '{name}'")
+        if len(matches) != 1:
+            raise ValueError(f"Ambiguous LLM account: '{name}'; select its resource ID")
+        return matches[0]
+
+    def delete_account(self, name: str, *, ctx: ProviderContext | None = None) -> None:
+        account = self.get_account(name, ctx=ctx)
+        self._store.delete(account.resource_id, namespace=account.namespace)
+        del self._accounts[account.key]
+        self._adapters.pop(account.key, None)
+        self._adapter_settings.pop(account.key, None)
+
+    def is_registered(self, name: str, *, ctx: ProviderContext | None = None) -> bool:
+        try:
+            self.get_account(name, ctx=ctx)
+            return True
+        except KeyError:
+            return False
+
+    def add_model(self, name: str, model: ModelConfig, *, ctx: ProviderContext | None = None) -> LLMAccount:
+        account = self.get_account(name, ctx=ctx)
         model.__post_init__()
         if any(m.name == model.name for m in account.models):
             raise ValueError(f"Model '{model.name}' already exists in account '{name}'")
@@ -143,51 +162,46 @@ class LLMProvider:
             default_model=account.default_model or model.name,
         )
         self._store.save(updated)
-        self._accounts[name] = updated
+        self._accounts[account.key] = updated
         return updated
 
-    def update_model(self, name: str, model: ModelConfig) -> LLMAccount:
-        account = self.get_account(name)
+    def update_model(self, name: str, model: ModelConfig, *, ctx: ProviderContext | None = None) -> LLMAccount:
+        account = self.get_account(name, ctx=ctx)
         self._model_config(account, model.name)
         model.__post_init__()
         updated = dataclasses.replace(
             account, models=[model if m.name == model.name else m for m in account.models]
         )
         self._store.save(updated)
-        self._accounts[name] = updated
+        self._accounts[account.key] = updated
         return updated
 
-    def remove_model(self, name: str, model: str) -> LLMAccount:
-        account = self.get_account(name)
+    def remove_model(self, name: str, model: str, *, ctx: ProviderContext | None = None) -> LLMAccount:
+        account = self.get_account(name, ctx=ctx)
         models = [m for m in account.models if m.name != model]
         default = account.default_model
         if default == model:
             default = models[0].name if models else ""
         updated = dataclasses.replace(account, models=models, default_model=default)
         self._store.save(updated)
-        self._accounts[name] = updated
+        self._accounts[account.key] = updated
         return updated
 
-    def set_default_model(self, name: str, model: str) -> LLMAccount:
-        account = self.get_account(name)
+    def set_default_model(self, name: str, model: str, *, ctx: ProviderContext | None = None) -> LLMAccount:
+        account = self.get_account(name, ctx=ctx)
         self._model_config(account, model)
         updated = dataclasses.replace(account, default_model=model)
         self._store.save(updated)
-        self._accounts[name] = updated
+        self._accounts[account.key] = updated
         return updated
 
     def _resolve_account(
-        self, account: str | None, model: str | None
+        self, account: str | None, model: str | None, *, ctx: ProviderContext
     ) -> tuple[LLMAccount, str | None]:
-        if not self._accounts:
-            raise RuntimeError(
-                "No LLM accounts registered. Register one before resolving a client."
-            )
-        name = account or next(iter(self._accounts))
-        if name not in self._accounts:
-            logger.warning("LLM account '%s' not found; falling back to default account.", name)
-            name, model = next(iter(self._accounts)), None
-        return self.get_account(name), model
+        visible = self.list_accounts(ctx=ctx)
+        if not visible:
+            raise RuntimeError("No LLM accounts available in this context")
+        return self.get_account(account, ctx=ctx) if account else visible[0], model
 
     @staticmethod
     def _model_config(account: LLMAccount, model: str | None) -> ModelConfig:
@@ -197,13 +211,17 @@ class LLMProvider:
             raise LLMModelNotFoundError(f"Model '{selected}' not in account '{account.name}'")
         return config
 
-    def get_model_config(self, account: str | None = None, model: str | None = None) -> ModelConfig:
+    def get_model_config(
+        self, account: str | None = None, model: str | None = None, *, ctx: ProviderContext,
+    ) -> ModelConfig:
         """Pure configuration lookup; shares default resolution with get_client."""
-        acc, selected = self._resolve_account(account, model)
+        acc, selected = self._resolve_account(account, model, ctx=ctx)
         return self._model_config(acc, selected)
 
-    def get_client(self, account: str | None = None, model: str | None = None) -> LLMClient:
-        acc, selected = self._resolve_account(account, model)
+    def get_client(
+        self, account: str | None = None, model: str | None = None, *, ctx: ProviderContext,
+    ) -> LLMClient:
+        acc, selected = self._resolve_account(account, model, ctx=ctx)
         cfg = self._model_config(acc, selected)
         cfg.__post_init__()
         reserve = cfg.output_reserve
@@ -215,17 +233,17 @@ class LLMProvider:
             cfg.limit.context,
             reserve,
             cfg.limit.output,
-            account=acc.name,
+            account=acc.resource_id,
             output_policy=cfg.output_policy,
         )
 
     def _get_adapter(self, account: LLMAccount, model: ModelConfig) -> LLMClient:
         model.__post_init__()
         settings = (account.base_url, account.api_key, account.timeout_sec)
-        if self._adapter_settings.get(account.name) != settings:
-            self._adapters[account.name] = {}
-            self._adapter_settings[account.name] = settings
-        cache = self._adapters[account.name]
+        if self._adapter_settings.get(account.key) != settings:
+            self._adapters[account.key] = {}
+            self._adapter_settings[account.key] = settings
+        cache = self._adapters[account.key]
         key = (model.protocol, "image" in model.capabilities.input)
         if key not in cache:
             cache[key] = self._build_adapter(account, model)
@@ -272,8 +290,8 @@ class LLMProvider:
         finally:
             await _close_adapter(adapter)
 
-    async def fetch_models_for_account(self, name: str, *, protocol: str) -> list[str]:
-        account = self.get_account(name)
+    async def fetch_models_for_account(self, name: str, *, protocol: str, ctx: ProviderContext | None = None) -> list[str]:
+        account = self.get_account(name, ctx=ctx)
         cfg = ModelConfig("_probe", protocol, ModelLimits(128_000))
         return await self._get_adapter(account, cfg).list_models()
 
@@ -282,9 +300,9 @@ class LLMProvider:
         await self.fetch_models(protocol, api_key, base_url)
         return (time.perf_counter() - started) * 1000.0
 
-    async def ping_account(self, name: str, *, protocol: str) -> float:
+    async def ping_account(self, name: str, *, protocol: str, ctx: ProviderContext | None = None) -> float:
         started = time.perf_counter()
-        await self.fetch_models_for_account(name, protocol=protocol)
+        await self.fetch_models_for_account(name, protocol=protocol, ctx=ctx)
         return (time.perf_counter() - started) * 1000.0
 
     async def _probe_model(
@@ -327,17 +345,17 @@ class LLMProvider:
             await _close_adapter(adapter)
         return (time.perf_counter() - started) * 1000.0
 
-    async def verify_model_for_account(self, name: str, model: str | ModelConfig) -> float:
+    async def verify_model_for_account(self, name: str, model: str | ModelConfig, *, ctx: ProviderContext | None = None) -> float:
         """Accept a configured name, or a candidate config before it is saved."""
-        account = self.get_account(name)
+        account = self.get_account(name, ctx=ctx)
         cfg = model if isinstance(model, ModelConfig) else self._model_config(account, model)
         started = time.perf_counter()
         await self._probe_model(self._get_adapter(account, cfg), cfg)
         return (time.perf_counter() - started) * 1000.0
 
-    async def ping_model_for_account(self, name: str, model: str) -> float:
+    async def ping_model_for_account(self, name: str, model: str, *, ctx: ProviderContext | None = None) -> float:
         """Measure a configured model with text only; does not verify image support."""
-        account = self.get_account(name)
+        account = self.get_account(name, ctx=ctx)
         cfg = self._model_config(account, model)
         started = time.perf_counter()
         await self._probe_model(self._get_adapter(account, cfg), cfg, verify_modalities=False)
@@ -346,7 +364,7 @@ class LLMProvider:
     def load_from_store(self) -> int:
         count = 0
         for account in self._store.list_all():
-            if account.name in self._accounts:
+            if account.key in self._accounts:
                 continue
             try:
                 self.register_account(account, persist=False)

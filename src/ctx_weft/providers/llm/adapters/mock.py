@@ -8,7 +8,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
-from ctx_weft.core.utils.content import content_to_text
+from ctx_weft.protocols.content import content_to_text
 from ctx_weft.protocols import LLMChunk, LLMClient, LLMRequest, LLMUsage, ToolCall
 from ctx_weft.providers.llm.tokenizer import HeuristicTokenizer
 

@@ -27,9 +27,9 @@ from .test_capsule_golden import (
     InMemoryMemoryProvider,
 )
 
-pytestmark = pytest.mark.asyncio
 
 
+@pytest.mark.asyncio
 async def test_close_writes_finish_pair_keeps_body() -> None:
     mem = InMemoryMemoryProvider()
     tsc = _task_scope("t1")
@@ -59,6 +59,7 @@ async def test_close_writes_finish_pair_keeps_body() -> None:
 # ─── Task 2: 短任务 close → 全 raw 留（不 supersede 末段） ─────────────────────
 
 
+@pytest.mark.asyncio
 async def test_short_close_keeps_active_raw() -> None:
     """短叶子 task（1 轮 LLM、token 极小 → _is_short_leaf=True）close 后，task 层
     active LLM_RESPONSE/TOOL_RESULT 仍可 recall（全 raw 保留，Task 1 行为不变）。"""
@@ -83,6 +84,7 @@ async def test_short_close_keeps_active_raw() -> None:
 # ─── Task 2: 长任务 close → supersede 末 raw 段，留锚点 + finish 对 ─────────────
 
 
+@pytest.mark.asyncio
 async def test_long_close_supersedes_final_raw_keeps_anchors() -> None:
     """长 task（LLM_RESPONSE 轮次 > short_task_turn_cap=2 → _is_short_leaf=False）close 后：
     - task 层 active LLM_RESPONSE/TOOL_RESULT/TOOL_INVOCATION 被 supersede（不再 recall）

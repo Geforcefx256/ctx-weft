@@ -25,7 +25,6 @@ from tests.integration.test_minimal_loop import (
 from tests.unit.test_capability_event_integrity import TC, _harness, _Tool
 from tests.unit.test_storage_recovery import runtime
 
-pytestmark = pytest.mark.asyncio
 
 
 class _TaskLLM(MockLLMAdapter):
@@ -49,6 +48,7 @@ def harness(**config):
     return rt, gateway, store, tool, state, ctx
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", [EventType.CAPABILITY_INVOKED, EventType.CAPABILITY_FINISHED])
 @pytest.mark.parametrize("receipt_lost", [False, True])
 async def test_automatic_recovery_preserves_call_stack_and_executes_tool_once(kind, receipt_lost):
@@ -97,6 +97,7 @@ async def test_automatic_recovery_preserves_call_stack_and_executes_tool_once(ki
     assert rt.storage_health("s1") is None
 
 
+@pytest.mark.asyncio
 async def test_exhausted_recovery_retains_full_result_for_later_confirmation_without_tool_repeat():
     rt, gateway, store, tool, state, ctx = harness(storage_recovery_max_attempts=2)
     original = store.append_batch
@@ -125,6 +126,7 @@ async def test_exhausted_recovery_retains_full_result_for_later_confirmation_wit
     assert not rt._pending_tool_results
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", [EventType.LLM_RESPONSE_FINISHED,
     EventType.CAPABILITY_INVOKED, EventType.CAPABILITY_PROGRESS, EventType.CAPABILITY_FINISHED])
 @pytest.mark.parametrize("receipt_lost", [False, True])
@@ -181,6 +183,7 @@ async def test_running_session_auto_recovers_and_finishes_without_reexecuting_to
     assert rt.storage_health("s1") is None
 
 
+@pytest.mark.asyncio
 async def test_receipt_recovery_does_not_repeat_external_process_side_effect(tmp_path):
     from tests.integration.test_tool_outcome_not_rerun import _fixture, _read_effects
 
@@ -213,6 +216,7 @@ async def test_receipt_recovery_does_not_repeat_external_process_side_effect(tmp
     assert _read_effects(path) == 1 and len(tool.invocations) == 1
 
 
+@pytest.mark.asyncio
 async def test_stopped_real_task_can_recover_after_budget_exhaustion_without_tool_repeat():
     agents = InlineAgentTemplateProvider()
     template = make_echo_template()
@@ -254,6 +258,7 @@ async def test_stopped_real_task_can_recover_after_budget_exhaustion_without_too
     assert (await rt.get_task("s1", handle.task_id)).data.status == "FINISHED"
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", [EventType.CAPABILITY_INVOKED, EventType.CAPABILITY_PROGRESS])
 async def test_exhausted_recovery_distinguishes_never_started_from_interrupted_idempotent_tool(kind):
     rt, gateway, store, tool, state, ctx = harness(storage_recovery_max_attempts=1)
@@ -292,6 +297,7 @@ async def test_exhausted_recovery_distinguishes_never_started_from_interrupted_i
     assert len(rows) == 1
 
 
+@pytest.mark.asyncio
 async def test_cancel_during_storage_recovery_does_not_restart_cancelled_task():
     agents = InlineAgentTemplateProvider()
     template = make_echo_template()

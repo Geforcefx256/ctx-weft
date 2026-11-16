@@ -21,7 +21,6 @@ from ctx_weft.protocols import LLMCallError, LLMMessage, LLMRequest
 from ctx_weft.providers.llm.adapters.anthropic import AnthropicAdapter
 from ctx_weft.providers.llm.adapters.openai_compatible import OpenAICompatibleAdapter
 
-pytestmark = pytest.mark.asyncio
 
 # One SSE event that yields a visible token (-> produced=True) in each provider's
 # wire shape, then the handler stalls without sending anything else or closing.
@@ -80,6 +79,7 @@ async def _assert_stall_raises_outage(adapter):
         await adapter._client.aclose()
 
 
+@pytest.mark.asyncio
 async def test_anthropic_midstream_stall_raises_outage():
     server, port = await _stalling_server(_ANTHROPIC_TOKEN)
     try:
@@ -90,6 +90,7 @@ async def test_anthropic_midstream_stall_raises_outage():
         await server.wait_closed()
 
 
+@pytest.mark.asyncio
 async def test_openai_midstream_stall_raises_outage():
     server, port = await _stalling_server(_OPENAI_TOKEN)
     try:

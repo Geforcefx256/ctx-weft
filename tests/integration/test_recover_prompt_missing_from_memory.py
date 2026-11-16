@@ -11,6 +11,8 @@ task 是 ACTIVE，memory 里没有提问。`task_from_projection` 按状态推�
 
 from __future__ import annotations
 
+from tests._recovery import recover_fixture_session
+
 import asyncio
 from datetime import datetime, timezone
 from unittest import mock
@@ -18,7 +20,7 @@ from unittest import mock
 import pytest
 
 from ctx_weft import RuntimeConfig
-from ctx_weft.core.utils.content import content_to_text
+from ctx_weft.protocols.content import content_to_text
 from ctx_weft.protocols import MemoryAddress, MemoryEvent, MemoryKind, MemoryScope, ProviderContext, load_records
 from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.providers.llm.adapters.mock import MockResponse
@@ -33,11 +35,11 @@ from tests.integration.test_minimal_loop import (
 )
 from tests.step_helpers import suppress_observe_start
 
-pytestmark = pytest.mark.asyncio
 
 PROMPT = "summarize the quarterly report"
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("prompt_in_memory", [False, True], ids=["missing", "present"])
 async def test_recovery_restores_a_started_tasks_prompt_from_the_event_log(prompt_in_memory) -> None:
     resolver = InlineAgentTemplateProvider()
@@ -84,7 +86,7 @@ async def test_recovery_restores_a_started_tasks_prompt_from_the_event_log(promp
     await runtime.rebuild_session(sid)
     with suppress_observe_start():
         await initialize_all(runtime)
-        await runtime.recover_agent(aid)
+        await recover_fixture_session(runtime, aid)
         await _poll(lambda: llm.act_requests or None)
         await asyncio.sleep(0.2)
 

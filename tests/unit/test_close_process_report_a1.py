@@ -25,7 +25,6 @@ from ctx_weft.core.models.task import NormalTaskSettings, Task
 from ctx_weft.protocols import MemoryEvent, MemoryEventType, MemoryAddress, ProviderContext
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 
-pytestmark = pytest.mark.asyncio
 
 T = MemoryEventType
 _BASE = datetime(2026, 1, 1, tzinfo=UTC)
@@ -78,6 +77,7 @@ async def _get_finish_asst(mem: InMemoryMemoryProvider, scope: MemoryAddress) ->
     return asst_recs[0] if asst_recs else None
 
 
+@pytest.mark.asyncio
 async def test_a1_slot_hit_uses_background_report() -> None:
     """bg 先完成：_close_report[task.id] 预置 ("好报告_act", "好报告_sum")；
     _synthesize_dispatch_pair 合成后立即替换：finish tool == "好报告_sum"，assistant == "好报告_act"。
@@ -110,6 +110,7 @@ async def test_a1_slot_hit_uses_background_report() -> None:
         f"slot hit: finish assistant content must be act_recap '好报告_act'; got {finish_asst.content!r}"
     )
 
+@pytest.mark.asyncio
 async def test_a1_placeholder_then_async_replace() -> None:
     """槽空 → finalize 先合成用占位 + 登记 _close_synth；
     随后 bg 回调（直接调 _replace_finish_report）替换 finish 对（assistant + tool 两条）：
@@ -183,6 +184,7 @@ async def test_a1_placeholder_then_async_replace() -> None:
 
 # ─── TEST 3: no blocking await ────────────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_a1_no_await_blocking(monkeypatch) -> None:
     """_synthesize_dispatch_pair 不调 await_pending_observe（非阻塞）。"""
     called = []
@@ -219,6 +221,7 @@ async def _ingest_user_plus_raw(mem: InMemoryMemoryProvider, tsc: MemoryAddress)
     await mem.ingest(_ev(T.TOOL_RESULT, tsc, "目录内容…", 3, role="tool"), _pctx())
 
 
+@pytest.mark.asyncio
 async def test_slot_hit_replaces_report_no_raw_mirror() -> None:
     """task-resident：close 不镜像 body（无 final_segment_raw 镜像）；slot hit 时 finish tool
     用真实 report；user 锚点 + 最终段 raw 留 task 层（不进 agent 层）。
@@ -258,6 +261,7 @@ async def test_slot_hit_replaces_report_no_raw_mirror() -> None:
     assert len(body) == 3, "最终段 raw body 留 task 层（task-resident）"
 
 
+@pytest.mark.asyncio
 async def test_degraded_keeps_task_layer_raw_body() -> None:
     """task-resident：close 不镜像 body——降级（槽空）时 agent 层仍只 finish 对，
     最终段 raw body 留 task 层（不被 supersede）。"""
@@ -282,6 +286,7 @@ async def test_degraded_keeps_task_layer_raw_body() -> None:
 
 # ─── TDD: 两段化核心行为 ────────────────────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_synthesize_dispatch_pair_two_segments() -> None:
     """_synthesize_dispatch_pair 写两段化 finish 对（反转契约 spec 2026-07-01）：
     assistant content = act_recap（过程复述，≠ 答复），tool content = task_summary；
@@ -315,6 +320,7 @@ def test_empty_close_has_no_fabricated_report():
 
 
 
+@pytest.mark.asyncio
 async def test_partial_finish_is_not_ready_and_replay_is_idempotent(monkeypatch):
     mem = InMemoryMemoryProvider()
     task = _make_task()

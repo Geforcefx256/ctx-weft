@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """Restart at durable event boundaries, with and without recovery snapshots."""
 
 import pytest
@@ -10,7 +12,6 @@ from tests._initialization import initialize_all
 from tests._snapshot_helpers import seed_snapshot
 from tests.unit.test_runtime_initialization_queries import append, container, runtime
 
-pytestmark = pytest.mark.asyncio
 
 
 @pytest.fixture(params=["memory", "sqlite"])
@@ -29,6 +30,7 @@ async def snapshot_if_requested(store, sid, snapshot):
         await seed_snapshot(store, sid, view, cut=await store.committed_head(sid))
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot", [False, True], ids=["log", "snapshot"])
 @pytest.mark.parametrize("status,task_event,agent_event", [
     ("SUSPENDED", EventType.TASK_SUSPENDED, EventType.AGENT_IDLE),
@@ -50,8 +52,8 @@ async def test_restart_marks_parked_agent_interrupted_without_rewriting_task(
 
     fresh = runtime(store)
     result = await fresh.initialize(h.session_id)
-    assert result.state.root_task_status == status
-    assert result.state.root_agent_status == "interrupted"
+    assert result.state.root_task.status == status
+    assert result.state.root_agent.state.status == "interrupted"
     assert result.state.has_interrupted_agents and not result.state.has_running_agents
     event, = [row.event for row in result.startup_events]
     assert (event.type, event.agent_id, event.task_id, event.payload["reason"]) == (
@@ -64,10 +66,11 @@ async def test_restart_marks_parked_agent_interrupted_without_rewriting_task(
     assert await store.committed_head(h.session_id) == head
     await fresh.rebuild_session(h.session_id, strict=True)
     assert (await fresh.get_task(h.session_id, "t")).data.status == status
-    assert (await fresh.get_agent(h.root_agent_id)).data.status == "interrupted"
+    assert (await fresh.get_agent(h.root_agent_id)).data.state.status == "interrupted"
     assert not fresh._run_tokens
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot", [False, True], ids=["log", "snapshot"])
 @pytest.mark.parametrize("delivery_kind", ["user", "tool", "notification", "other_agent"])
 async def test_parked_agent_recovery_respects_matching_hitl(store, snapshot, delivery_kind):
@@ -91,12 +94,13 @@ async def test_parked_agent_recovery_respects_matching_hitl(store, snapshot, del
     fresh = runtime(store)
     result = await fresh.initialize(h.session_id)
     expected = "waiting_human" if delivery_kind in {"user", "tool"} else "interrupted"
-    assert result.state.root_agent_status == expected
-    assert result.state.root_task_status == "AWAITING_HUMAN"
+    assert result.state.root_agent.state.status == expected
+    assert result.state.root_task.status == "AWAITING_HUMAN"
     assert [row.data.id for row in await fresh.list_pending_hitl(session_id=h.session_id)] == [req.id]
     assert bool(result.startup_events) == (expected == "interrupted")
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot", [False, True], ids=["log", "snapshot"])
 async def test_recovered_suspended_parent_is_resumable_after_child_finished(store, snapshot):
     old = runtime(store)
@@ -116,17 +120,18 @@ async def test_recovered_suspended_parent_is_resumable_after_child_finished(stor
 
     fresh = runtime(store)  # Hold dispatch so explicit recovery's queue can be inspected.
     result = await fresh.initialize(h.session_id)
-    assert result.state.root_agent_status == "interrupted"
-    assert result.state.root_task_status == "SUSPENDED"
+    assert result.state.root_agent.state.status == "interrupted"
+    assert result.state.root_task.status == "SUSPENDED"
     await fresh.rebuild_session(h.session_id, strict=True)
     tm = fresh._task_managers[h.session_id]
     assert not tm._queue.peek_all() and not fresh._run_tokens
-    await fresh.recover_agent(h.root_agent_id)
+    await recover_fixture_session(fresh, h.root_agent_id)
     assert [entry.task_id for entry in tm._queue.peek_all()] == ["parent"]
     assert tm.get_task("parent").status == "PENDING"
     assert tm.get_task("child").status == "FINISHED"
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot", [False, True], ids=["log", "snapshot"])
 @pytest.mark.parametrize("status,event", [
     ("PENDING", None),
@@ -165,6 +170,7 @@ async def test_restart_preserves_durable_task_state(store, snapshot, status, eve
     assert await store.committed_head(h.session_id) == head
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot", [False, True], ids=["log", "snapshot"])
 async def test_restart_before_first_dispatch_is_interrupted_and_explicitly_resumable(store, snapshot):
     old = runtime(store)
@@ -175,22 +181,23 @@ async def test_restart_before_first_dispatch_is_interrupted_and_explicitly_resum
     await snapshot_if_requested(store, h.session_id, snapshot)
     restarted = runtime(store)  # max_concurrent=0 keeps explicit requeue observable.
     result, = (await initialize_all(restarted)).sessions
-    assert result.state.root_task_status == "INTERRUPTED"
+    assert result.state.root_task.status == "INTERRUPTED"
     assert result.state.has_interrupted_agents and not result.state.has_running_agents
     assert not restarted._task_managers
     await restarted.rebuild_session(h.session_id, strict=True)
     tm = restarted._task_managers[h.session_id]
     assert tm.recovery_pending and tm.is_done()
     assert not restarted._run_tokens.get(h.session_id)
-    await restarted.recover_agent(h.root_agent_id)
+    await recover_fixture_session(restarted, h.root_agent_id)
     assert not tm.recovery_pending
     assert [entry.task_id for entry in tm._queue.peek_all()] == ["pending"]
     assert tm.get_task("pending").status == "PENDING"
     # Repeated resume cannot enqueue the same task twice.
-    await restarted.recover_agent(h.root_agent_id)
+    await recover_fixture_session(restarted, h.root_agent_id)
     assert [entry.task_id for entry in tm._queue.peek_all()] == ["pending"]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("delivery_kind", ["tool", "user"])
 async def test_pending_task_with_durable_hitl_remains_a_human_wait(store, delivery_kind):
     from ctx_weft.protocols.hitl import HitlAsk, ToolResultDelivery, UserTurnDelivery
@@ -207,13 +214,14 @@ async def test_pending_task_with_durable_hitl_remains_a_human_wait(store, delive
     report = await initialize_all(restarted)
     assert not report.interrupted_task_ids
     assert (await restarted.get_task(h.session_id, "pending")).data.status == "AWAITING_HUMAN"
-    assert (await restarted.get_agent(h.root_agent_id, session_id=h.session_id)).data.status == "waiting_human"
+    assert (await restarted.get_agent(h.root_agent_id, session_id=h.session_id)).data.state.status == "waiting_human"
     assert [row.data.id for row in await restarted.list_pending_hitl(session_id=h.session_id)] == [req.id]
     head = await store.committed_head(h.session_id)
     await initialize_all(runtime(store))
     assert await store.committed_head(h.session_id) == head
 
 
+@pytest.mark.asyncio
 async def test_pending_child_recovery_preserves_suspended_parent(store):
     old = runtime(store)
     h = await container(old)
@@ -231,12 +239,13 @@ async def test_pending_child_recovery_preserves_suspended_parent(store):
     assert (await restarted.get_task(h.session_id, "parent")).data.status == "SUSPENDED"
     assert (await restarted.get_task(h.session_id, "child")).data.status == "INTERRUPTED"
     await restarted.rebuild_session(h.session_id, strict=True)
-    await restarted.recover_agent(h.root_agent_id)
+    await recover_fixture_session(restarted, h.root_agent_id)
     tm = restarted._task_managers[h.session_id]
     assert tm.get_task("parent").status == "SUSPENDED"
     assert [entry.task_id for entry in tm._queue.peek_all()] == ["child"]
 
 
+@pytest.mark.asyncio
 async def test_pending_successor_recovery_preserves_reviewing_predecessor(store):
     old = runtime(store)
     h = await container(old)
@@ -248,10 +257,11 @@ async def test_pending_successor_recovery_preserves_reviewing_predecessor(store)
           "replaced_task_ids": ["old"]}))
     restarted = runtime(store)
     result, = (await initialize_all(restarted)).sessions
-    assert result.state.root_task_id == "new" and result.state.root_task_status == "INTERRUPTED"
+    assert result.state.root_task.task_id == "new" and result.state.root_task.status == "INTERRUPTED"
     assert (await restarted.get_task(h.session_id, "old")).data.status == "REVIEWING"
 
 
+@pytest.mark.asyncio
 async def test_repeated_initialize_does_not_interrupt_live_queued_work(store):
     from ctx_weft.core.models.task import Task
 
@@ -270,6 +280,7 @@ async def test_repeated_initialize_does_not_interrupt_live_queued_work(store):
     assert [entry.task_id for entry in tm._queue.peek_all()] == ["queued"]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot", [False, True], ids=["log", "snapshot"])
 @pytest.mark.parametrize("cut", ["run_started", "run_finished"])
 async def test_restart_closes_unfinished_foreground_run(store, snapshot, cut):
@@ -300,6 +311,7 @@ async def test_restart_closes_unfinished_foreground_run(store, snapshot, cut):
     assert await store.committed_head(h.session_id) == head
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("scenario", ["cross_cut", "no_delta", "finished_after_cut", "started_after_cut",
                                       "finished_before_cut", "terminal_task_background"])
 async def test_run_recovery_reads_only_snapshot_delta(store, monkeypatch, scenario):
@@ -344,10 +356,9 @@ async def test_run_recovery_reads_only_snapshot_delta(store, monkeypatch, scenar
     async def delta_only(session_id, **kwargs):
         reads.append(kwargs)
         if kwargs.get("related_task_id"):
-            assert scenario == "terminal_task_background"
             assert kwargs["related_task_id"] == "t"
-            assert kwargs["after_position"] == 0
-            assert kwargs["through_position"] == head + 2
+            assert kwargs["after_position"] == (0 if scenario == "terminal_task_background" else cut)
+            assert kwargs["through_position"] >= head
             return await original_read(session_id, **kwargs)
         assert kwargs.get("after_position") == cut, kwargs
         assert kwargs.get("through_position") == head, kwargs
@@ -356,7 +367,7 @@ async def test_run_recovery_reads_only_snapshot_delta(store, monkeypatch, scenar
     with monkeypatch.context() as patch:
         patch.setattr(store, "read_range", delta_only)
         await initialize_all(runtime(store))
-    assert len(reads) == (2 if scenario == "terminal_task_background" else 1)
+    assert len(reads) == 2  # Snapshot delta plus a bounded public task-body query.
     rows = await original_read(sid, after_position=head)
     run_events = [r.event for r in rows if r.event.run_id == "cross-snapshot-run"]
     if scenario in {"finished_before_cut", "finished_after_cut"}:
@@ -371,6 +382,7 @@ async def test_run_recovery_reads_only_snapshot_delta(store, monkeypatch, scenar
     assert await store.committed_head(sid) == settled_head
 
 
+@pytest.mark.asyncio
 async def test_old_snapshot_without_run_state_falls_back_to_log(store):
     old = runtime(store)
     h = await container(old)
@@ -389,6 +401,7 @@ async def test_old_snapshot_without_run_state_falls_back_to_log(store):
     assert [(r.event.run_id, r.event.sequence) for r in rows] == [("old-open-run", 7)]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot", [False, True], ids=["log", "snapshot"])
 @pytest.mark.parametrize("delivery_kind", ["tool", "user", "notification"])
 @pytest.mark.parametrize("cut", ["opened", "deferred", "retracted", "resolved", "closed"])

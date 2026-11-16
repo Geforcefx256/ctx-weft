@@ -26,6 +26,8 @@ Task 14 起由 host 直接从 `list_pending_hitl(...)` 的 `delivery` 字段自�
 
 from __future__ import annotations
 
+from tests._recovery import recover_fixture_session
+
 from datetime import datetime, timezone
 
 import pytest
@@ -45,7 +47,6 @@ from tests.integration.test_minimal_loop import (
 )
 from tests.unit._legacy_recover import rebuild_all_active
 
-pytestmark = pytest.mark.asyncio
 
 _TS = datetime(2026, 6, 13, tzinfo=timezone.utc)
 
@@ -117,7 +118,7 @@ async def test_recover_routes_by_pending_hitl(monkeypatch) -> None:
     called: list[str] = []
     async def fail_recover_agent(aid, **kw):
         called.append(aid)
-    monkeypatch.setattr(runtime, "recover_agent", fail_recover_agent)
+    monkeypatch.setattr(runtime, "recover_session", fail_recover_agent)
     waiting_human = _capture_waiting_human_broadcast(runtime)
     interrupted = _capture_interrupted_broadcast(runtime)
 
@@ -170,8 +171,9 @@ async def test_recover_multi_hitl_partial_resolve_still_pending() -> None:
 # ── 2026-09-04 spec §6.2：恢复入口换轴 ─────────────────────────────────────
 
 
-def test_recover_session_is_gone():
-    assert not hasattr(CtxWeftRuntime, "recover_session")
+def test_session_recovery_is_public_and_agent_recovery_is_removed():
+    assert hasattr(CtxWeftRuntime, "recover_session")
+    assert not hasattr(CtxWeftRuntime, "recover_agent")
 
 
 async def _crashed_session(rt: CtxWeftRuntime) -> tuple[str, str]:
@@ -225,7 +227,7 @@ async def test_recover_agent_resolves_session_from_the_record() -> None:
     session_id, root_agent_id = await _crashed_session(rt)
     await rebuild_all_active(rt)
     await initialize_all(rt)
-    await rt.recover_agent(root_agent_id)          # 不传 session_id 也能跑通
+    await recover_fixture_session(rt, root_agent_id)          # 不传 session_id 也能跑通
     await initialize_all(rt)
     assert (await rt.get_agent(root_agent_id)).data.session_id == session_id
 
@@ -241,52 +243,15 @@ async def test_recover_agent_unknown_raises() -> None:
     rt = _runtime_for_recover_agent()
     with pytest.raises(AgentNotFound):
         await initialize_all(rt)
-        await rt.recover_agent("agt_nope")
+        await recover_fixture_session(rt, "agt_nope")
 
 
-async def test_recover_agent_refuses_a_cold_registry_then_works_after_rebuild_session() -> None:
-    """`recover_agent` 对未装填的 registry **抛 `AgentNotLoaded`，不自己去找**
-    （2026-09-21）。
-
-    从前它对 miss 会先扫全部 active session 把记录找出来（`rebuild_agent` →
-    `rebuild_all_agents`）。那条 sweep 已删：它拿 O(会话数) 换一个调用方本来就知道的
-    值，而且扫的集合是坏的（`list_active_session_ids` 的 discard 依据从不 emit，判据
-    恒真 = 历史全部会话）。装填改由调用方负责，与 `rebuild_session` 定下的用户驱动
-    模型一致（「用到哪条装哪条」）。
-
-    **冷 HITL 应答不受影响**，那是从前留着自愈的唯一理由（`reply_to_hitl` 把 HITL 判成
-    终局后没有第二次机会，续跑摔了会话就永久卡住）：那条路由 `_resume_after_hitl` 在调
-    `recover_agent` **之前**的 `_hydrate_agent_for_cold_resume(req)` 用 `req.session_id`
-    精确装填接住，由下面那条 `test_cold_hitl_reply_hydrates_only_its_own_session_not_a_sweep`
-    走一次真实的 `reply_to_hitl` 钉住。
-
-    本条钉两件事：① 冷 registry 直接抛，错误类型可诊断；② 先 `rebuild_session` 再调就
-    照常跑通——即「装填是前提」而不是「这条路没了」。
-    """
-    from ctx_weft.core.models.errors import AgentNotFound, AgentNotLoaded
-
+async def test_recover_session_addresses_a_cold_partition_without_an_agent_lookup():
     rt = _runtime_for_recover_agent()
     session_id, root_agent_id = await _crashed_session(rt)
-
-    # 冷启动断言：这个进程从没装填过，registry 应确实是空的。
     assert rt._agent_lifecycle_manager.record_of(root_agent_id) is None
-
-    with pytest.raises(AgentNotLoaded) as exc:
-        await initialize_all(rt)
-        await rt.recover_agent(root_agent_id)
-    # 宿主既有的 `except AgentNotFound` 必须照样接住（子类，不是新的顶层类型）。
-    assert isinstance(exc.value, AgentNotFound)
-    assert "rebuild_session" in str(exc.value), "报错要告诉调用方下一步做什么"
-
-    # 装填之后同一句调用照常跑通——被推翻的是「core 替你找」，不是这条路径本身。
-    await initialize_all(rt)
-    await rt.rebuild_session(session_id)
-    await initialize_all(rt)
-    await rt.recover_agent(root_agent_id)
-
-    await initialize_all(rt)
-    assert (await rt.get_agent(root_agent_id)).data.session_id == session_id
-    assert [r.id for r in rt.hitl_registry.list_pending(session_id=session_id)] == ["hit_1"]
+    await rt.recover_session(session_id)
+    assert rt._agent_lifecycle_manager.record_of(root_agent_id).session_id == session_id
 
 
 async def test_cold_hitl_reply_hydrates_only_its_own_session_not_a_sweep() -> None:

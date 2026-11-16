@@ -1,5 +1,6 @@
 """Runtime wires a PauseToken into LoopContext and tracks task managers."""
 
+from ctx_weft.protocols.context import ProviderContext as _ProviderContext
 import pytest
 
 from ctx_weft.core import CtxWeftRuntime
@@ -17,6 +18,9 @@ from tests.integration.test_minimal_loop import InlineAgentTemplateProvider, mak
 from tests.unit.test_runtime_agent_api import _plant
 
 
+_PROVIDER_CONTEXT = _ProviderContext(session_id="test")
+
+
 def _rt():
     return make_runtime(llm=MockLLMAdapter(responses=[]),
                            agent_provider=InlineAgentTemplateProvider())
@@ -32,7 +36,7 @@ def test_build_loop_ctx_wires_pause_token():
     rt = _rt()
     pause = PauseToken()
     ctx = rt._build_loop_ctx(
-        assembler=None, llm=rt._resolve_llm(None, None), memory=None,
+        assembler=None, llm=rt._resolve_llm(None, None, ctx=_PROVIDER_CONTEXT), memory=None,
         provider_ctx=ProviderContext(session_id="session"), gateway=None,
         cancel_token=CancelToken(), task_manager=None, pause_token=pause,
     )
@@ -44,7 +48,7 @@ def test_step_execution_registry_is_shared_only_within_a_session():
 
     def build(session_id):
         return rt._build_loop_ctx(
-            assembler=None, llm=rt._resolve_llm(None, None), memory=None,
+            assembler=None, llm=rt._resolve_llm(None, None, ctx=_PROVIDER_CONTEXT), memory=None,
             provider_ctx=ProviderContext(session_id=session_id),
             gateway=None, cancel_token=None, task_manager=None)
 
@@ -115,7 +119,7 @@ async def test_pause_session_leaves_non_root_agents_alive():
     assert child_tokens.cancel.is_cancelled is True
     assert reg.status_of(child_id) == "running"          # 没被直接拍成 terminated
     await initialize_all(rt)
-    assert (await rt.get_agent(child_id)).data.status != "terminated"
+    assert (await rt.get_agent(child_id)).data.state.status != "terminated"
 
     # 真实世界里这条被 cancel 的 run 会在自己的收尾点发一条 TASK_CANCELED，经 ALM
     # （_INPUT_BY_EVENT[TASK_CANCELED] = SETTLED）落回 idle——这里补一条同形的事件，

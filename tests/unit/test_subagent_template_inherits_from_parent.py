@@ -40,7 +40,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 SID = "ses_1"
 ROOT, SUB = "agt_root", "agt_sub"
@@ -76,7 +75,7 @@ def _reg(*, fallback_ref: str = "") -> AgentLifecycleManager:
     reg = AgentLifecycleManager(
         template_lookup=TemplateLookup(providers=providers, fallback_ref=fallback_ref),
         event_bus=_Bus(),
-        model_resolver=lambda a, m: _Client(),
+        model_resolver=lambda a, m, **_context: _Client(),
     )
     reg.register_session(SID, tenant_id="default")
     return reg
@@ -91,6 +90,7 @@ async def _parent(reg: AgentLifecycleManager, *, template_id: str = PARENT_REF):
 # ── instantiate 那一层的规则 ──────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_an_empty_template_id_inherits_the_parents():
     """规则本体：没说要造什么型号 → 造一个和派生它的那个 agent 同型号的。"""
     reg = _reg()
@@ -106,6 +106,7 @@ async def test_an_empty_template_id_inherits_the_parents():
     assert template.id == PARENT_REF                # 解出来的也是父那份
 
 
+@pytest.mark.asyncio
 async def test_an_explicit_template_id_is_not_overwritten_by_inheritance():
     """反向那一半：显式说了要造什么，继承不许插手。"""
     reg = _reg()
@@ -120,6 +121,7 @@ async def test_an_explicit_template_id_is_not_overwritten_by_inheritance():
     assert template.id == OTHER_REF
 
 
+@pytest.mark.asyncio
 async def test_inheritance_needs_a_parent_so_a_root_still_falls_back():
     """无父（root）时空值没有可继承的东西 → 原样落 host 声明的母版。"""
     reg = _reg(fallback_ref=OTHER_REF)
@@ -131,6 +133,7 @@ async def test_inheritance_needs_a_parent_so_a_root_still_falls_back():
     assert agent.parent_agent_id is None
 
 
+@pytest.mark.asyncio
 async def test_without_a_fallback_a_parentless_empty_template_id_still_raises():
     """同上但没配母版 → 照旧抛。继承不是一条新的兜底，它只搬了「有父」那一格。"""
     reg = _reg()
@@ -139,6 +142,7 @@ async def test_without_a_fallback_a_parentless_empty_template_id_still_raises():
         await reg.instantiate(template_id="", session_id=SID, tenant_id="default")
 
 
+@pytest.mark.asyncio
 async def test_a_parent_that_does_not_know_its_own_template_hands_down_nothing():
     """父自己的 `template_id` 为空（恢复期缺口补出来的占位 record）→ 继承到空，落母版。
 
@@ -163,6 +167,7 @@ async def test_a_parent_that_does_not_know_its_own_template_hands_down_nothing()
     assert ":" in child.template_id                 # 没有任何一处还该看见裸 id
 
 
+@pytest.mark.asyncio
 async def test_inheritance_does_not_disturb_the_llm_rule_next_door():
     """同一处的两条继承规则互不干扰：模板继承了，`llm` 也还是照父继承。"""
     from ctx_weft.core.orchestrator.model import ModelChoice
@@ -217,6 +222,7 @@ async def _runner(rt, task: Task) -> _SessionTaskRunner:
     )
 
 
+@pytest.mark.asyncio
 async def test_a_delegated_task_without_a_template_runs_on_the_parents_template():
     """`delegate_task(use_subagent=True)` 留空 `subagent_template` 的那条链路。
 

@@ -22,7 +22,6 @@ from ctx_weft.core.models.session import Session
 from ctx_weft.core.models.task import NormalTaskSettings, Task
 from ctx_weft.protocols import MemoryAddress
 
-pytestmark = pytest.mark.asyncio
 
 
 class _FakeBus:
@@ -58,12 +57,14 @@ def _make_state_and_task():
 
 def _fake_runtime_self():
     return SimpleNamespace(
+        _closing=False,
         _event_bus=_FakeBus(),
         _pending_actor_runs={},
         _capability_cache=SimpleNamespace(evict=lambda agent_id: None),
     )
 
 
+@pytest.mark.asyncio
 async def test_run_start_does_not_wait_for_pending_observe():
     """有在途 recap：driver 首步**照常先跑**，不为它等一次后台 LLM 往返。"""
     order: list = []
@@ -88,6 +89,7 @@ async def test_run_start_does_not_wait_for_pending_observe():
 
 
 
+@pytest.mark.asyncio
 async def test_run_start_passthrough_without_pending():
     """无 pending：直通，driver 正常执行。"""
     order: list = []
@@ -102,6 +104,7 @@ async def test_run_start_passthrough_without_pending():
     assert order == ["driver_started"]
 
 
+@pytest.mark.asyncio
 async def test_run_start_unaffected_by_errored_recap():
     """在途 recap 以异常终结：run 压根不看它，driver 照常执行（段保 raw 降级）。
 

@@ -26,7 +26,6 @@ from tests._initialization import initialize_all
 from tests.integration.test_minimal_loop import InlineAgentTemplateProvider, make_runtime
 from tests.unit.test_runtime_agent_api import _plant
 
-pytestmark = pytest.mark.asyncio
 
 
 def _runtime():
@@ -49,6 +48,7 @@ def _user_turn_req(
     return req
 
 
+@pytest.mark.asyncio
 async def test_pause_session_without_tm_cancels_all_runs():
     # 无 TM（纯 registry 残留）：无法辨认 root agent → 全部按"其余"cancel，返回 True
     rt = _runtime()
@@ -59,6 +59,7 @@ async def test_pause_session_without_tm_cancels_all_runs():
     assert a.cancel.is_cancelled and b.cancel.is_cancelled
 
 
+@pytest.mark.asyncio
 async def test_cancel_session_cancels_all_run_tokens_and_drains_queue():
     """Session stop signals precede round cleanup and queue cancellation."""
     rt = _runtime()
@@ -96,6 +97,7 @@ async def test_cancel_session_cancels_all_run_tokens_and_drains_queue():
     assert drained["called"] is True
 
 
+@pytest.mark.asyncio
 async def test_unknown_session_returns_false():
     rt = _runtime()
     await initialize_all(rt)
@@ -181,6 +183,7 @@ def _tm_with_children(parent, children):
     )
 
 
+@pytest.mark.asyncio
 async def test_inject_user_reply_leaves_a_parent_suspended_on_live_children_alone():
     """SUSPENDED + 尚有活子任务 = `restore` 刻意不重排的那一种形状。
 
@@ -210,6 +213,7 @@ async def test_inject_user_reply_leaves_a_parent_suspended_on_live_children_alon
     )
 
 
+@pytest.mark.asyncio
 async def test_inject_user_reply_still_resets_a_parent_whose_children_are_done():
     """子任务全终态 ⟹ 不是那种形状 ⟹ 照旧掰回 PENDING（`restore` 也会重排它）。"""
     rt = _runtime()
@@ -226,6 +230,7 @@ async def test_inject_user_reply_still_resets_a_parent_whose_children_are_done()
 # ── I6：恢复期补写的界 ────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_inject_resolved_user_turns_skips_replies_already_in_the_conversation():
     """已经注入过的答复不再重走一次写入（复审 I6 的界）。
 

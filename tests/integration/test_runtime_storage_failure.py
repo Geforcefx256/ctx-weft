@@ -31,7 +31,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 
 class _FinishLLM(MockLLMAdapter):
@@ -62,6 +61,7 @@ class FailingEventStore(InMemoryEventStore):
         raise OSError("simulated storage unavailable")
 
 
+@pytest.mark.asyncio
 async def test_storage_failure_isolates_session_no_fake_success():
     """required（默认，WP3 翻转后）：存储失败 → 隔离、显式抛错、无 committed 通知。"""
     resolver = InlineAgentTemplateProvider()
@@ -93,6 +93,7 @@ async def test_storage_failure_isolates_session_no_fake_success():
     )
 
 
+@pytest.mark.asyncio
 async def test_sql_drop_table_isolates_and_stops_scheduling(tmp_path):
     """真 SQLite DROP TABLE（无桩 H1 场景）在 required 下的新契约：隔离 + 停推进。"""
     db = tmp_path / "events.sqlite"
@@ -128,6 +129,7 @@ async def test_sql_drop_table_isolates_and_stops_scheduling(tmp_path):
         assert "TaskFinished" not in after
 
 
+@pytest.mark.asyncio
 async def test_best_effort_keeps_old_swallow_contract():
     """best_effort：旧契约锚（兼容路径）——存储失败被吞、会话照常跑完、落库为零。"""
     resolver = InlineAgentTemplateProvider()

@@ -207,6 +207,8 @@ class Task:
     priority: int = 5
     error: str | None = None
     error_code: str | None = None
+    failure_retry_count: int | None = None
+    blocked_by_task_id: str | None = None
     actor_done: bool = False
     # 本轮 act 里 actor 调了 delegate_task / delegate_plan：**这一次 run 该停在
     # 「等子任务」**。纯瞬态、纯 loop 内路由用（ActStep 据它路由到 SuspendStep 并

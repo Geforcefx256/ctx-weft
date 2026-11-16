@@ -46,7 +46,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 TS = datetime(2026, 9, 18, tzinfo=timezone.utc)
 
 
@@ -69,6 +68,7 @@ def test_audit_and_result_ids_are_derived_from_the_same_call() -> None:
     assert tool_audit_record_id("call_1") is None, "裸 wire id 不存在确定性派生"
 
 
+@pytest.mark.asyncio
 async def test_staged_records_sort_after_everything_already_in_memory() -> None:
     """L7：暂存记录的排序键要和落盘后可比——取视图里的最大序号往后排。"""
     llm = _ScriptedLLM([_ask("tc1", "Q1?"), STALL_BEFORE_CHUNK])
@@ -116,6 +116,7 @@ async def test_staged_records_sort_after_everything_already_in_memory() -> None:
     assert staged_seq == sorted(staged_seq)
 
 
+@pytest.mark.asyncio
 async def test_compact_refuses_while_a_round_is_open() -> None:
     """L2：有开着的窗（这一轮的内容还在暂存区里）时，压缩必须拒绝——它只折 memory。
 
@@ -151,6 +152,7 @@ async def test_compact_refuses_while_a_round_is_open() -> None:
         await rt.compact_agent(aid)
 
 
+@pytest.mark.asyncio
 async def test_only_the_same_tasks_bubble_follows_the_round() -> None:
     """L8：注入消息时，别的 task 上的气泡必须立即收口，不能跟着这一轮走。
 

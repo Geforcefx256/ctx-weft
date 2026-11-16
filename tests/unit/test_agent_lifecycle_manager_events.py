@@ -20,7 +20,6 @@ from tests.integration.test_minimal_loop import (
     make_echo_template,
 )
 
-pytestmark = pytest.mark.asyncio
 
 TPL = "agent:tpl_echo"
 
@@ -58,12 +57,13 @@ def _lm(bus, *, max_depth=3):
     providers.register_capability(provider)
     lm = AgentLifecycleManager(
         template_lookup=TemplateLookup(providers=providers), event_bus=bus,
-        model_resolver=lambda a, m: _Client(),
+        model_resolver=lambda a, m, **_context: _Client(),
     )
     lm.register_session("s1", tenant_id="default")
     return lm
 
 
+@pytest.mark.asyncio
 async def test_root_emits_only_instantiated():
     bus = _Bus()
     lm = _lm(bus)
@@ -71,6 +71,7 @@ async def test_root_emits_only_instantiated():
     assert bus.types() == [EventType.AGENT_INSTANTIATED]
 
 
+@pytest.mark.asyncio
 async def test_child_emits_spawned_then_instantiated():
     """因果顺序：先记「这次 spawn 被准了」，再记「诞生的 agent 长这样」。"""
     bus = _Bus()
@@ -84,6 +85,7 @@ async def test_child_emits_spawned_then_instantiated():
     assert bus.types() == [EventType.AGENT_SPAWNED, EventType.AGENT_INSTANTIATED]
 
 
+@pytest.mark.asyncio
 async def test_depth_exceeded_emits_spawn_rejected_and_raises():
     """SpawnRejected 的 envelope agent_id 填**父**——子 agent 没诞生，没有 id 可填。"""
     bus = _Bus()
@@ -99,6 +101,7 @@ async def test_depth_exceeded_emits_spawn_rejected_and_raises():
     assert bus.events[0].agent_id == root.id
 
 
+@pytest.mark.asyncio
 async def test_materialize_emits_nothing():
     bus = _Bus()
     lm = _lm(bus)

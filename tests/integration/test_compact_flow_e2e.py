@@ -46,7 +46,6 @@ from tests._initialization import initialize_all
 from tests.integration.test_minimal_loop import InlineAgentTemplateProvider, make_runtime
 from tests.step_helpers import patch_observe_start
 
-pytestmark = pytest.mark.asyncio
 _BASE = datetime(2026, 7, 1, tzinfo=UTC)
 
 
@@ -134,6 +133,7 @@ class _UsageInflatingMock(MockLLMAdapter):
             yield chunk
 
 
+@pytest.mark.asyncio
 async def test_context_limit_retry_without_recap_keeps_raw_and_defers_to_background_e2e(
         monkeypatch):
     """机械退出 retry 且**无可用 LLM observer** → 判决无摘要 → 段折降级保 raw，摘要交后台。
@@ -195,6 +195,7 @@ async def test_context_limit_retry_without_recap_keeps_raw_and_defers_to_backgro
     assert n_raw >= 1, "降级 = 段保 raw，信息不丢"
 
 
+@pytest.mark.asyncio
 async def test_normal_finish_still_works_e2e():
     """正常收尾回归：整条 loop 仍跑通到 FINISHED（Task 3 去 process_report 渲染不破主流程）。"""
     resolver = InlineAgentTemplateProvider()
@@ -218,6 +219,7 @@ async def test_normal_finish_still_works_e2e():
     assert state.verdict.task_outcome == "success"
 
 
+@pytest.mark.asyncio
 async def test_multiround_retry_accumulates_then_l3_collapses_e2e(monkeypatch):
     """真 runtime 多轮 retry：每轮 context_limit 命中 → observe 折段（累积，不替换）→ 下一轮
     prepare 预算门开 → 段摘要攒够(> collapse_keep_last) → L3 坍缩出带 COLLAPSE_DELIM 的 USER_PROMPT。
@@ -304,6 +306,7 @@ async def test_multiround_retry_accumulates_then_l3_collapses_e2e(monkeypatch):
     assert 1 <= len(segs) <= 3, "L3 把累积段摘要控在 collapse_keep_last 量级"
 
 
+@pytest.mark.asyncio
 async def test_escalating_compact_shrinks_real_memory(monkeypatch):
     """预算升级 compact 对真实 memory：seed 多个结束胶囊 → escalating_compact 至少折 agent 层，
     活跃记忆 token 下降；summarize_for_compact 打桩免真实 LLM。"""

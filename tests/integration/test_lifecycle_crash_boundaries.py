@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """Crash real scheduling and trip paths; assert durable ordering after restart."""
 
 import asyncio
@@ -18,7 +20,6 @@ from tests._initialization import initialize_all
 from tests._snapshot_helpers import seed_snapshot
 from tests.integration._lifecycle_crash_worker import make_lifecycle_runtime
 
-pytestmark = pytest.mark.asyncio
 WORKER = Path(__file__).with_name("_lifecycle_crash_worker.py")
 
 
@@ -44,6 +45,7 @@ async def restart(store, memory, mode, snapshot):
     return rt
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot", [False, True])
 @pytest.mark.parametrize("mode", ["plain_text", "finish_park", "interrupt"])
 @pytest.mark.parametrize("cut", ["hitl_opened", "background_run_started", "recap_started", "recap_done",
@@ -63,7 +65,7 @@ async def test_observe_real_process_crash(tmp_path, snapshot, mode, cut):
             rt = await restart(store, memory, mode, snapshot)
             view = await rebuild_view(store, "crash-session")
             root = view.sessions["crash-session"].root_agent_id
-            await rt.recover_agent(root, session_id="crash-session")
+            await recover_fixture_session(rt, root, session_id="crash-session")
             tm = rt._task_managers["crash-session"]
             if tm._background_asyncio_tasks:
                 await asyncio.gather(*list(tm._background_asyncio_tasks))
@@ -105,14 +107,15 @@ async def test_observe_real_process_crash(tmp_path, snapshot, mode, cut):
                     if row.event.type == EventType.OBSERVE_APPLIED]
             assert len(done) == 1 and done[0]
             head = await store.committed_head("crash-session")
-            await rt.recover_agent(root)
+            await recover_fixture_session(rt, root)
             assert await store.committed_head("crash-session") == head
             again, _ = make_lifecycle_runtime(store, memory, mode)
             await initialize_all(again)
-            await again.recover_agent(root, session_id="crash-session")
+            await recover_fixture_session(again, root, session_id="crash-session")
             assert await store.committed_head("crash-session") == head
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot", [False, True])
 @pytest.mark.parametrize("cut", ["background_run_started", "recap_started", "observer_response",
                                 "task_finished", "task_finalized", "recap_done"])
@@ -123,7 +126,7 @@ async def test_crash_again_during_observe_recovery(tmp_path, snapshot, cut):
         async with open_sqlite_memory(tmp_path / "memory.db") as memory:
             rt = await restart(store, memory, "finish_park", snapshot)
             root = (await rt.get_session("crash-session")).data.root_agent_id
-            await rt.recover_agent(root, session_id="crash-session")
+            await recover_fixture_session(rt, root, session_id="crash-session")
             tm = rt._task_managers.get("crash-session")
             if tm and tm._background_asyncio_tasks:
                 await asyncio.gather(*list(tm._background_asyncio_tasks))
@@ -140,10 +143,11 @@ async def test_crash_again_during_observe_recovery(tmp_path, snapshot, cut):
             head = await store.committed_head("crash-session")
             again, _ = make_lifecycle_runtime(store, memory, "finish_park")
             await initialize_all(again)
-            await again.recover_agent(root, session_id="crash-session")
+            await recover_fixture_session(again, root, session_id="crash-session")
             assert await store.committed_head("crash-session") == head
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot", [False, True])
 async def test_finalized_success_survives_changed_observer_on_restart(tmp_path, snapshot):
     """A committed successful close must not become a fresh verdict after restart."""
@@ -153,7 +157,7 @@ async def test_finalized_success_survives_changed_observer_on_restart(tmp_path, 
             # The same actor output is now judged as fail by the mock observer.
             rt = await restart(store, memory, "threshold", snapshot)
             root = (await rt.get_session("crash-session")).data.root_agent_id
-            await rt.recover_agent(root, session_id="crash-session")
+            await recover_fixture_session(rt, root, session_id="crash-session")
             tm = rt._task_managers["crash-session"]
             if tm._background_asyncio_tasks:
                 await asyncio.gather(*list(tm._background_asyncio_tasks))
@@ -161,6 +165,7 @@ async def test_finalized_success_survives_changed_observer_on_restart(tmp_path, 
             assert [t.data.status for t in tasks] == ["FINISHED"]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot", [False, True])
 @pytest.mark.parametrize("cut", ["trip_decision", "root_run_finished", "root_task_failed", "none"])
 async def test_threshold_real_process_crash(tmp_path, snapshot, cut):
@@ -188,4 +193,4 @@ async def test_threshold_real_process_crash(tmp_path, snapshot, cut):
             assert task.data.error_code == TaskErrorCode.BY_THRESHOLD
             assert not any(row.event.type == EventType.SESSION_STATUS_CHANGED for row in rows)
             root_agent = (await rt.get_session("crash-session")).data.root_agent_id
-            assert (await rt.get_agent(root_agent, session_id="crash-session")).data.status == "idle"
+            assert (await rt.get_agent(root_agent, session_id="crash-session")).data.state.status == "idle"

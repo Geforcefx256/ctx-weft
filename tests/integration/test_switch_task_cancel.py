@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """Public goal replacement and cancellation must settle on either side of commit."""
 
 import asyncio
@@ -148,12 +150,12 @@ async def test_user_changes_goal_then_cancels_around_switch_commit(tmp_path, mon
                 assert canceled.position < finalized.position < applied.position
             if phase != "normal":
                 await rt.cancel_agent(handle.agent_id)
-                await rt.recover_agent(handle.agent_id, session_id=handle.session_id)
+                await recover_fixture_session(rt, handle.agent_id, session_id=handle.session_id)
                 await _drained(tm, timeout=5)
                 if backend == "sqlite":
                     rt = _runtime(llm, memory, rt.event_store)
                     await initialize_all(rt)
-                    await rt.recover_agent(handle.agent_id, session_id=handle.session_id)
+                    await recover_fixture_session(rt, handle.agent_id, session_id=handle.session_id)
                     await _drained(rt._task_managers[handle.session_id], timeout=5)
                 assert llm.actors == 2
                 final = await rebuild_view(rt.event_store, handle.session_id)

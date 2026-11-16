@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """Interrupt an actual foreground review, then deliver a replacement user turn."""
 
 import asyncio
@@ -19,7 +21,6 @@ from tests.integration.test_minimal_loop import (
 )
 from tests.integration.test_send_message_after_session_done import _FinishEveryTaskLLM
 
-pytestmark = pytest.mark.asyncio
 SID = "foreground-observe-interrupt"
 
 
@@ -58,6 +59,7 @@ def runtime(store, memory, llm, short):
     return rt
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("short", [False, True])
 @pytest.mark.parametrize("cold", [False, True])
 async def test_observe_pause_closes_stream_and_replaces_prompt(tmp_path, short, cold):
@@ -97,8 +99,8 @@ async def test_observe_pause_closes_stream_and_replaces_prompt(tmp_path, short, 
                 head = await store.committed_head(SID)
                 await initialize_all(rt)
                 await rt.rebuild_session(SID, strict=True)
-                await rt.recover_agent(handle.agent_id, session_id=SID)
-                await rt.recover_agent(handle.agent_id, session_id=SID)
+                await recover_fixture_session(rt, handle.agent_id, session_id=SID)
+                await recover_fixture_session(rt, handle.agent_id, session_id=SID)
                 assert await store.committed_head(SID) == head
             await rt.send_message(handle.agent_id, "NEW REQUEST", session_id=SID, unattended=True)
             tm = rt._task_managers[SID]
@@ -114,6 +116,7 @@ async def test_observe_pause_closes_stream_and_replaces_prompt(tmp_path, short, 
             assert not view.pending_observe and not view.open_runs
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("second_crash", [None, "ObserveCompleted", "ObserveApplied"])
 async def test_interrupt_handoff_survives_process_and_recovery_crashes(tmp_path, second_crash):
     import subprocess
@@ -134,7 +137,7 @@ async def test_interrupt_handoff_survives_process_and_recovery_crashes(tmp_path,
             await rt.rebuild_session(SID, strict=True)
             tm = rt._task_managers[SID]
             agent_id = tm.session.root_agent_id
-            await rt.recover_agent(agent_id, session_id=SID)
+            await recover_fixture_session(rt, agent_id, session_id=SID)
             await wait_until(lambda: not tm._dispatch_tasks and not tm._background_asyncio_tasks)
             view = await rebuild_view(store, SID)
             assert len(view.hitl.pending) == 1
@@ -142,7 +145,7 @@ async def test_interrupt_handoff_survives_process_and_recovery_crashes(tmp_path,
             assert not tm.running_task_ids()
             head = await store.committed_head(SID)
             before = await content(memory, view.tasks.values())
-            await rt.recover_agent(agent_id, session_id=SID)
+            await recover_fixture_session(rt, agent_id, session_id=SID)
             assert await store.committed_head(SID) == head
             assert await content(memory, view.tasks.values()) == before
             rows = await store.read_range(SID)

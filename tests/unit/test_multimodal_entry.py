@@ -8,7 +8,7 @@ from ctx_weft.core.models.session import Session
 from ctx_weft.core.orchestrator.lifecycle.session_registry import SessionRegistry
 from ctx_weft.core.runtime import SessionStartParams
 from ctx_weft.core.utils.clock import now_utc
-from ctx_weft.core.utils.content import content_to_text
+from ctx_weft.protocols.content import content_to_text
 from ctx_weft.protocols import ImagePart, ProviderContext, TextPart
 from ctx_weft.protocols.events import EventBlobStore
 from ctx_weft.providers.llm.adapters.mock import MockLLMAdapter
@@ -22,7 +22,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 
 class _StubEventBlobStore(EventBlobStore):
@@ -49,6 +48,7 @@ def _content():
     return [TextPart(text="看这张图"), ImagePart(data="ZGF0YQ==", media_type="image/png")]
 
 
+@pytest.mark.asyncio
 async def test_session_start_params_accepts_parts():
     p = SessionStartParams.create(
         template_id="t", user_prompt=_content(),
@@ -56,6 +56,7 @@ async def test_session_start_params_accepts_parts():
     assert p.user_prompt == _content()
 
 
+@pytest.mark.asyncio
 async def test_session_start_params_still_accepts_str():
     p = SessionStartParams.create(
         template_id="t", user_prompt="纯文本",
@@ -63,6 +64,7 @@ async def test_session_start_params_still_accepts_str():
     assert p.user_prompt == "纯文本"
 
 
+@pytest.mark.asyncio
 async def test_root_task_carries_full_content_session_carries_summary():
     sm = SessionRegistry(
         agent_lifecycle_manager=SimpleNamespace(),
@@ -86,6 +88,7 @@ async def test_root_task_carries_full_content_session_carries_summary():
         "description 必须是 str——对 list 切片会静默产出截断的 part 列表"
 
 
+@pytest.mark.asyncio
 async def test_run_single_task_root_task_description_is_text_not_truncated_parts():
     """run_single_task 内 description=user_prompt[:200] 是本任务点名的陷阱：对 list
     切片不报错，会得到截断的 part 列表。必须改走 content_to_text(user_prompt)[:200]。
@@ -101,7 +104,7 @@ async def test_run_single_task_root_task_description_is_text_not_truncated_parts
     runtime.providers.register_event_blob_store(_StubEventBlobStore())
     runtime.providers.register_llm_provider(
         SimpleNamespace(
-            get_client=lambda account=None, model=None: _FixedModelClient(
+            get_client=lambda account=None, model=None, *, ctx: _FixedModelClient(
                 MockLLMAdapter(responses=[]), model or "mock-model", 128_000, 8_192,
                 account=account or "acct-main",
             ),
@@ -157,13 +160,14 @@ def _session_registry(bus) -> SessionRegistry:
     return SessionRegistry(
         agent_lifecycle_manager=AgentLifecycleManager(
             template_lookup=TemplateLookup(reg), event_bus=bus,
-            model_resolver=lambda a, m: _FixedModelClient(
+            model_resolver=lambda a, m, **_context: _FixedModelClient(
                 MockLLMAdapter(responses=[]), "mdl_default", 200_000, 8192, account="acct_default"),
         ),
         event_bus=bus,
     )
 
 
+@pytest.mark.asyncio
 async def test_create_session_without_jsonable_falls_back_to_the_text_prompt():
     """纯文本 prompt 漏传载荷 → 事件里仍是那段文本，不得变成 None。"""
     bus = _CapturingBus()
@@ -179,6 +183,7 @@ async def test_create_session_without_jsonable_falls_back_to_the_text_prompt():
     assert task_created.payload["task"]["user_prompt"] == "你好"
 
 
+@pytest.mark.asyncio
 async def test_create_session_without_jsonable_raises_on_multimodal_prompt():
     """携图 prompt 漏传载荷 → 响亮 raise，绝不静默把 prompt 抹成 None。
 
@@ -200,6 +205,7 @@ async def test_create_session_without_jsonable_raises_on_multimodal_prompt():
     )
 
 
+@pytest.mark.asyncio
 async def test_resume_session_without_jsonable_falls_back_to_the_text_prompt():
     """resume 分支与 create 同一判据——两处都写事件，不能只加固一处。"""
     from unittest.mock import MagicMock
@@ -220,7 +226,7 @@ async def test_resume_session_without_jsonable_falls_back_to_the_text_prompt():
     # tests/unit/test_resume_context_limit.py 的既有做法）。
     sm = SessionRegistry(agent_lifecycle_manager=MagicMock(), event_bus=bus)
 
-    await sm.resume_session(
+    await sm.start_next_turn(
         session_id="ses-resume", event_store=store, user_prompt="第二轮",
         task_manager=sm._new_task_manager(Session(id="ses-resume", user_prompt="")),
     )

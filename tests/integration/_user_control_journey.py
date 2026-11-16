@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """Providers and process phases for public user-control journeys.
 
 Only provider responses/latency and the external tool are controlled. No events,
@@ -9,7 +11,7 @@ import re
 
 from ctx_weft import RuntimeConfig, SessionStartParams
 from ctx_weft.core.control.reducers import rebuild_view
-from ctx_weft.core.utils.content import content_to_text
+from ctx_weft.protocols.content import content_to_text
 from ctx_weft.protocols import (
     LLMChunk,
     MemoryAddress,
@@ -153,7 +155,7 @@ class ModelProvider:
     def __init__(self, a, b):
         self.a, self.b = a, b
 
-    def get_client(self, account=None, model=None):
+    def get_client(self, account=None, model=None, *, ctx):
         return self.b if model == "model-b" else self.a
 
 
@@ -411,9 +413,9 @@ async def verify_restart(rt, a, b, store, memory, data, scenario):
     assert not await rt.list_pending_hitl(session_id=SID)
     # Actual reconstruction and activation are deliberately repeated, without
     # replacing recovery or filling any missing state in the test.
-    await rt.recover_agent(root, session_id=SID)
+    await recover_fixture_session(rt, root, session_id=SID)
     await drained(rt)
-    await rt.recover_agent(root, session_id=SID)
+    await recover_fixture_session(rt, root, session_id=SID)
     await drained(rt)
     assert await store.committed_head(SID) == data["head"]
     assert await memory_state(memory, data["agents"]) == data["memory"]

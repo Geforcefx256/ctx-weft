@@ -6,9 +6,10 @@ import os
 import sys
 from pathlib import Path
 
-from tests._initialization import initialize_all
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from tests._initialization import initialize_all
 
 from ctx_weft.providers.events.store.sql import open_sqlite_event_store
 from ctx_weft.providers.memory.sql.provider import open_sqlite_memory

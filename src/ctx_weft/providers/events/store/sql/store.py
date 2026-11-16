@@ -17,6 +17,7 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import overload
 
@@ -110,6 +111,7 @@ class SqlEventStore(EventStore):
                     f"append_batch: event {e.id} session {e.session_id!r} != batch session "
                     f"{session_id!r}（批内事件必须同属一个 session）")
 
+        events = [replace(event) for event in events]
         # 快路径：已提交过的 batch 直接比对（确认丢失后的原样重试，无写放大）
         async with self._factory() as db:
             row = await db.get(EventBatchModel, batch_id)

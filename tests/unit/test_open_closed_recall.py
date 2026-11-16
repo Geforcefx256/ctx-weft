@@ -26,7 +26,6 @@ from ctx_weft.providers.llm.tokenizer import HeuristicTokenizer
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from tests.assembler_testkit import recalled_blocks
 
-pytestmark = pytest.mark.asyncio
 
 T = MemoryEventType
 _BASE = datetime(2026, 1, 1, tzinfo=UTC)
@@ -109,6 +108,7 @@ def _type(block):
 
 # ─── (a) 已结束 root task：召回含 body + finish 对 ─────────────────────────────
 
+@pytest.mark.asyncio
 async def test_finished_root_task_recall_yields_body_and_finish_pair() -> None:
     """(a) G6：已结束 task close 后，AgentRecallSource 召回：
     task 层 body（USER_PROMPT + TASK_COMPACT_SUMMARY）AND agent 层 finish 对（2 条 AGENT_CONVERSATION_TURN）。
@@ -158,6 +158,7 @@ async def test_finished_root_task_recall_yields_body_and_finish_pair() -> None:
 
 # ─── (b) 运行中/暂停 task：召回含 body，无 finish 对 ────────────────────────────
 
+@pytest.mark.asyncio
 async def test_running_task_recall_yields_body_no_finish_pair() -> None:
     """(b) G6：运行中 task（status=RUNNING，未 close，无 finish 对）：
     AgentRecallSource 召回含 task 层 body（USER_PROMPT + LLM_RESPONSE），无 AGENT_CONVERSATION_TURN。
@@ -188,6 +189,7 @@ async def test_running_task_recall_yields_body_no_finish_pair() -> None:
     )
 
 
+@pytest.mark.asyncio
 async def test_paused_task_recall_yields_body_no_finish_pair() -> None:
     """(b) 变体：SUSPENDED/暂停 task（wait_for_user，status≠FINISHED）：
     召回含 body，无 finish 对——活对话，not finished。
@@ -213,6 +215,7 @@ async def test_paused_task_recall_yields_body_no_finish_pair() -> None:
 
 # ─── (c) 跨 agent 子任务隔离：父 agent 召回不到子 body ──────────────────────────
 
+@pytest.mark.asyncio
 async def test_cross_agent_child_body_isolated_from_parent() -> None:
     """(c) G4/G6：跨 agent 子任务 body 在子 agent 的 task 层（不同 agent_id）；
     父 agent AgentRecallSource 召回按 agent_id 过滤：看不到子 body（只见 dispatch result 黑盒）。

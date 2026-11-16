@@ -6,16 +6,19 @@
 """
 from __future__ import annotations
 
+
 import asyncio
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
-from tests._initialization import initialize_all
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+from tests._recovery import recover_fixture_session
+from tests._initialization import initialize_all
 
 from ctx_weft.core import CtxWeftRuntime  # noqa: E402
 from ctx_weft.core.runtime import SessionStartParams  # noqa: E402
@@ -181,7 +184,7 @@ async def ot05_recover(workdir: Path) -> dict:
         rt.providers.register_memory(memory)
         try:
             await initialize_all(rt)
-            await rt.recover_agent(ids["agent_id"])
+            await recover_fixture_session(rt, ids["agent_id"])
         except Exception:
             pass  # 恢复期异常不影响判据：O-T05 只看外部副作用计数是否仍为 1
         await asyncio.sleep(1.0)

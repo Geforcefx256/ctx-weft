@@ -20,7 +20,6 @@ from ctx_weft.protocols.events import (
     EventType,
 )
 
-pytestmark = pytest.mark.asyncio
 
 _NEW_AGENT_TYPES = {
     EventType.AGENT_RUNNING,
@@ -43,6 +42,7 @@ class _SpyBus:
         pass
 
 
+@pytest.mark.asyncio
 async def test_task_events_carry_agent_id_on_envelope():
     """V2 §0：envelope 管身份。ALM 靠 ev.agent_id 定位 agent。"""
     bus = _SpyBus()
@@ -55,6 +55,7 @@ async def test_task_events_carry_agent_id_on_envelope():
     assert created[0].agent_id == "a1"
 
 
+@pytest.mark.asyncio
 async def test_task_event_agent_id_prefers_running_agent_over_assigned():
     """在跑登记（真实执行者）优先于 task 自己的 assigned_agent_id。"""
     bus = _SpyBus()
@@ -71,6 +72,7 @@ async def test_task_event_agent_id_prefers_running_agent_over_assigned():
     assert started[-1].agent_id == "a2"
 
 
+@pytest.mark.asyncio
 async def test_queue_level_event_has_no_agent_id():
     """无 task_id 的事件不应乱填 agent_id——`_emit` 的通用规则，与事件类型本身无关。
 
@@ -109,7 +111,7 @@ def test_agent_event_wire_values_are_pascal_case():
 
 def _reg() -> AgentLifecycleManager:
     return AgentLifecycleManager(
-        template_lookup=None, event_bus=_SpyBus(), model_resolver=lambda a, m: None
+        template_lookup=None, event_bus=_SpyBus(), model_resolver=lambda a, m, **_context: None
     )
 
 
@@ -226,6 +228,7 @@ def test_forget_agent_is_pure_mechanism_and_does_not_judge_status():
     assert not reg.has("busy")
 
 
+@pytest.mark.asyncio
 async def test_load_rebuilds_children_index_for_cold_recovery():
     """冷恢复（load）必须在没有任何 instantiate() 调用的情况下重建 _children。
 
@@ -249,6 +252,7 @@ async def test_load_rebuilds_children_index_for_cold_recovery():
     assert reg.descendants_of("grandkid") == []
 
 
+@pytest.mark.asyncio
 async def test_load_tolerates_parent_outside_batch():
     """view.parent_agent_id 指向本次 load() 批次之外的 id（幽灵父/另一 session
     尚未加载）——不该崩，也不该让 descendants_of 在真实 agent 上查出脏结果。
@@ -264,6 +268,7 @@ async def test_load_tolerates_parent_outside_batch():
     assert reg.descendants_of("orphan") == []
 
 
+@pytest.mark.asyncio
 async def test_load_is_idempotent_for_children_index():
     """load() 对同一批 views 重复调用（比如 recover() 内部的重试路径），
     _children 不应重复计数或产生副本——set 语义天然幂等。
@@ -290,6 +295,7 @@ def _task_ev(t: str, agent_id: str, payload: dict | None = None) -> Event:
     )
 
 
+@pytest.mark.asyncio
 async def test_task_started_drives_agent_to_running_and_emits():
     reg = _reg()
     _plant(reg, "a1", None)
@@ -303,6 +309,7 @@ async def test_task_started_drives_agent_to_running_and_emits():
     assert emitted[0].payload["trigger"] == "task_started"
 
 
+@pytest.mark.asyncio
 async def test_awaiting_human_then_resolved():
     reg = _reg()
     _plant(reg, "a1", None)
@@ -314,6 +321,7 @@ async def test_awaiting_human_then_resolved():
     assert reg.status_of("a1") == "running"
 
 
+@pytest.mark.asyncio
 async def test_task_terminal_returns_to_idle_not_terminated():
     """spec 3.1：task 终态不是 agent 终态。"""
     for t in (
@@ -331,12 +339,14 @@ async def test_task_terminal_returns_to_idle_not_terminated():
         assert reg.status_of("a1") == "idle", f"{t} 应回 idle"
 
 
+@pytest.mark.asyncio
 async def test_unknown_agent_id_is_ignored():
     reg = _reg()
     await reg.handle_event(_task_ev(EventType.TASK_STARTED, "ghost"))
     assert reg.event_bus.events == []
 
 
+@pytest.mark.asyncio
 async def test_current_task_id_tracked():
     reg = _reg()
     _plant(reg, "a1", None)
@@ -344,6 +354,7 @@ async def test_current_task_id_tracked():
     assert reg._agents["a1"].current_task_id == "t1"
 
 
+@pytest.mark.asyncio
 async def test_no_duplicate_event_on_same_state_input():
     reg = _reg()
     _plant(reg, "a1", None)
@@ -353,6 +364,7 @@ async def test_no_duplicate_event_on_same_state_input():
     assert len(running) == 1
 
 
+@pytest.mark.asyncio
 async def test_apply_input_is_direct_entry_point_not_only_via_events():
     """apply_input 是独立可调用的转移入口——Task 19/20 的 cancel/pause 要走它，
     不经由 handle_event/事件总线也必须能驱动转移并发事件。"""
@@ -365,6 +377,7 @@ async def test_apply_input_is_direct_entry_point_not_only_via_events():
     assert changed_again is False  # 同态输入，不转移
 
 
+@pytest.mark.asyncio
 async def test_handle_event_does_not_recurse_on_its_own_agent_events():
     """同步 drain 下，ALM 在 handle_event 里发出的 AGENT_* 事件会在 emit() 返回前
     回流给全部订阅者（包括 ALM 自己，因为 attach_to_bus 用 subscribe(None, ...)
@@ -393,6 +406,7 @@ async def test_handle_event_does_not_recurse_on_its_own_agent_events():
     assert len(running) == 1
 
 
+@pytest.mark.asyncio
 async def test_attach_to_bus_registers_one_handler():
     """对等 SessionRegistry 的同名先例（test_session_registry_state.py 的
     test_attach_to_bus_registers_one_handler，Task 16 起该测试从
@@ -404,11 +418,12 @@ async def test_attach_to_bus_registers_one_handler():
     from tests.unit._session_helpers import RecordingBus
 
     bus = RecordingBus()
-    reg = AgentLifecycleManager(template_lookup=None, event_bus=bus, model_resolver=lambda a, m: None)
+    reg = AgentLifecycleManager(template_lookup=None, event_bus=bus, model_resolver=lambda a, m, **_context: None)
     reg.attach_to_bus()
     assert len(bus.handlers) == 1
 
 
+@pytest.mark.asyncio
 async def test_attach_to_bus_with_real_event_bus_drives_transition_without_recursion():
     """走真实 `InProcessEventBus`（而不是简化 mock）的集成验证（review Important #2）：
     `emit()` 内同步 drain——handler 在同一次 `emit()` 调用里被直接 await，不经调度器
@@ -419,7 +434,7 @@ async def test_attach_to_bus_with_real_event_bus_drives_transition_without_recur
     from ctx_weft.providers.events import InProcessEventBus
 
     bus = InProcessEventBus()
-    reg = AgentLifecycleManager(template_lookup=None, event_bus=bus, model_resolver=lambda a, m: None)
+    reg = AgentLifecycleManager(template_lookup=None, event_bus=bus, model_resolver=lambda a, m, **_context: None)
     _plant(reg, "a1", None)
     reg.attach_to_bus()
 
@@ -536,6 +551,7 @@ class _MemStore(EventStore):
         raise NotImplementedError
 
 
+@pytest.mark.asyncio
 async def test_rebuild_view_folds_agent_status():
     """不变式 3：S 档事件必须被 reducer 折叠，冷重建与内存态等价。"""
     evs = [
@@ -547,6 +563,7 @@ async def test_rebuild_view_folds_agent_status():
     assert view.agents["a1"].status == "waiting_human"
 
 
+@pytest.mark.asyncio
 async def test_rebuild_view_terminated_is_sticky():
     evs = [
         _task_ev(EventType.AGENT_INSTANTIATED, "a1", {"template_id": "tpl"}),
@@ -557,6 +574,7 @@ async def test_rebuild_view_terminated_is_sticky():
     assert view.agents["a1"].status == "terminated"
 
 
+@pytest.mark.asyncio
 async def test_rebuild_view_terminated_freezes_current_task_id():
     """粘滞的反向验证，且比 `test_rebuild_view_terminated_is_sticky` 多钉一维：
     迟到事件换了个不同的 task_id 也不能挪动 current_task_id——不只是 status 冻结，
@@ -578,6 +596,7 @@ async def test_rebuild_view_terminated_freezes_current_task_id():
     assert view.agents["a1"].current_task_id == "t1"
 
 
+@pytest.mark.asyncio
 async def test_rebuild_view_and_load_agree_on_status():
     """端到端：钉住「冷重建与运行时内存态等价」这个核心性质。
 

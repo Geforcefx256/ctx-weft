@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from ctx_weft.core.utils.content import normalize_content_parts
+from ctx_weft.protocols.content import normalize_content_parts
 from ctx_weft.protocols import ImagePart, LLMMessage, TextPart
 from ctx_weft.protocols.memory import (
     MemoryAddress,
@@ -193,13 +193,12 @@ def test_memory_event_validation_still_runs():
 
 
 def test_three_boundaries_call_the_one_shared_implementation(monkeypatch):
-    """三处都必须走 ``core.content.normalize_content_parts``——三份复制粘贴的实现
+    """三处都必须走 ``protocols.content.normalize_content_parts``——三份复制粘贴的实现
     在这里必然漏网（spec §3① 要防的正是这种散点）。
 
-    能这样断言的前提是三处都用**函数级** import（Task E 已定的手法：protocols 是比
-    core 低的层，模块级导入会把依赖反向）——patch 模块属性才对调用生效。
+    三处通过协议模块调用，替换模块属性可以检查是否共享同一实现。
     """
-    import ctx_weft.core.utils.content as content_mod
+    import ctx_weft.protocols.content as content_mod
 
     calls: list = []
     real = content_mod.normalize_content_parts

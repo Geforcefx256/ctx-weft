@@ -23,13 +23,13 @@ from tests.unit.test_runtime_agent_api import (
     _reach_commit_point,
 )
 
-pytestmark = pytest.mark.asyncio
 
 
 def _rt():
     return make_runtime(agent_provider=InlineAgentTemplateProvider())
 
 
+@pytest.mark.asyncio
 async def test_cancel_does_not_terminate_descendant_agents():
     rt = _rt()
     _plant(rt, "root", None)
@@ -45,6 +45,7 @@ async def test_cancel_does_not_terminate_descendant_agents():
         assert rt._agent_lifecycle_manager.status_of(aid) == "idle"
 
 
+@pytest.mark.asyncio
 async def test_cancel_emits_termination_only_for_the_target_agent():
     rt = _rt()
     _plant(rt, "root", None)
@@ -63,6 +64,7 @@ async def _noop():
     return None
 
 
+@pytest.mark.asyncio
 async def test_cancel_finalizes_pending_hitl(monkeypatch):
     """waiting_human 的 agent：先终局未决 ask_user，再终态化。"""
     rt = _rt()
@@ -88,12 +90,14 @@ async def test_cancel_finalizes_pending_hitl(monkeypatch):
     assert canceled == ["h1"]
 
 
+@pytest.mark.asyncio
 async def test_cancel_unknown_agent_is_noop():
     rt = _rt()
     await initialize_all(rt)
     assert await rt.cancel_agent("ghost") == []
 
 
+@pytest.mark.asyncio
 async def test_cancel_only_finalizes_hitl_of_target_agent(monkeypatch):
     """同 session 下 a1、a2 各自都有未决 HITL；只 cancel a1 时，a2 的未决提问不受影响。"""
     rt = _rt()
@@ -126,6 +130,7 @@ async def test_cancel_only_finalizes_hitl_of_target_agent(monkeypatch):
     assert rt._agent_lifecycle_manager.status_of("a2") == "waiting_human"
 
 
+@pytest.mark.asyncio
 async def test_cancel_finalizes_hitl_before_agent_terminated_event(monkeypatch):
     """事件流顺序：未决 HITL 的终局必须先于该 agent 的 AgentTerminated。"""
     rt = _rt()
@@ -161,6 +166,7 @@ async def test_cancel_finalizes_hitl_before_agent_terminated_event(monkeypatch):
 # ── pause_agent（Task 20, R22：建在既有的 _pause_task 之上）──────────────────────
 
 
+@pytest.mark.asyncio
 async def test_pause_agent_signals_running_descendants_only():
     """running 的目标 + running 的子孙都收到暂停信号；idle 的子孙原样不动。
 
@@ -187,6 +193,7 @@ async def test_pause_agent_signals_running_descendants_only():
     assert rt._agent_lifecycle_manager.status_of("idle_kid") == "idle"
 
 
+@pytest.mark.asyncio
 async def test_pause_agent_skips_running_agent_with_no_live_run_token():
     """running 但没有在册 run token（race / 陈旧 record）——`_pause_task` 命不中,不计入返回值。"""
     rt = _rt()
@@ -200,6 +207,7 @@ async def test_pause_agent_skips_running_agent_with_no_live_run_token():
     assert paused == []
 
 
+@pytest.mark.asyncio
 async def test_pause_agent_non_running_raises():
     """spec 7：只对 running 生效，其余状态直接报错。"""
     rt = _rt()
@@ -209,6 +217,7 @@ async def test_pause_agent_non_running_raises():
         await rt.pause_agent("a1")
 
 
+@pytest.mark.asyncio
 async def test_pause_agent_unknown_raises():
     rt = _rt()
     with pytest.raises(AgentNotFound):
@@ -252,6 +261,7 @@ def _open_plain_text_wait_bubble(rt, *, agent_id, task_id, session_id="s1"):
     )
 
 
+@pytest.mark.asyncio
 async def test_resume_agent_resolves_the_pause_bubble_via_cold_resume(monkeypatch):
     """resume_agent 命中暂停气泡：真走 `reply_to_hitl` → `hitl.resolve`（真实组件）
     → 未被热投递消费 → `_resume_after_hitl` → `recover_agent`（这里桩掉，只记调用
@@ -263,7 +273,7 @@ async def test_resume_agent_resolves_the_pause_bubble_via_cold_resume(monkeypatc
     async def _fake_recover_agent(agent_id, **kw):
         recovered.append((agent_id, kw))
 
-    monkeypatch.setattr(rt, "recover_agent", _fake_recover_agent)
+    monkeypatch.setattr(rt, "_recover_session_locked", _fake_recover_agent)
     req = await _open_pause_bubble(rt, agent_id="root", task_id="t_root")
 
     await initialize_all(rt)
@@ -271,16 +281,17 @@ async def test_resume_agent_resolves_the_pause_bubble_via_cold_resume(monkeypatc
 
     assert resumed == ["root"]
     assert rt.hitl_registry.get(req.id).resolved is True
-    assert recovered and recovered[0][0] == "root"
+    assert recovered and recovered[0][0] == "s1"
     assert recovered[0][1]["hitl_id"] == req.id
     assert recovered[0][1]["resumed_task_id"] == "t_root"
 
 
+@pytest.mark.asyncio
 async def test_resume_agent_does_not_answer_a_real_ask_user_question(monkeypatch):
     """R24 的核心止损点：ask_user 的真实提问必须原样悬着，不能被 resume_agent 顺手答了。"""
     rt = _rt()
     _plant(rt, "root", None, status="waiting_human", session_id="s1")
-    monkeypatch.setattr(rt, "recover_agent", _unreachable_recover_agent)
+    monkeypatch.setattr(rt, "_recover_session_locked", _unreachable_recover_agent)
     req = await _open_ask_user_bubble(rt, agent_id="root", task_id="t_root")
 
     await initialize_all(rt)
@@ -290,11 +301,12 @@ async def test_resume_agent_does_not_answer_a_real_ask_user_question(monkeypatch
     assert rt.hitl_registry.get(req.id).resolved is False
 
 
+@pytest.mark.asyncio
 async def test_resume_agent_does_not_touch_plain_text_wait_bubble(monkeypatch):
     """同为 UserTurnDelivery 的软待命（正常一轮结束后的自然等待，非暂停产生）不该被续跑。"""
     rt = _rt()
     _plant(rt, "root", None, status="waiting_human", session_id="s1")
-    monkeypatch.setattr(rt, "recover_agent", _unreachable_recover_agent)
+    monkeypatch.setattr(rt, "_recover_session_locked", _unreachable_recover_agent)
     req = await _open_plain_text_wait_bubble(rt, agent_id="root", task_id="t_root")
 
     await initialize_all(rt)
@@ -308,6 +320,7 @@ async def _unreachable_recover_agent(*_a, **_kw):
     raise AssertionError("resume_agent 不该对这种气泡触发冷续跑")
 
 
+@pytest.mark.asyncio
 async def test_resume_agent_cascades_to_waiting_human_descendants_only(monkeypatch):
     rt = _rt()
     _plant(rt, "root", None, status="waiting_human", session_id="s1")
@@ -317,7 +330,7 @@ async def test_resume_agent_cascades_to_waiting_human_descendants_only(monkeypat
     async def _fake_recover_agent(agent_id, **kw):
         return None
 
-    monkeypatch.setattr(rt, "recover_agent", _fake_recover_agent)
+    monkeypatch.setattr(rt, "_recover_session_locked", _fake_recover_agent)
     r1 = await _open_pause_bubble(rt, agent_id="root", task_id="t_root")
     r2 = await _open_pause_bubble(rt, agent_id="kid", task_id="t_kid", edit=True)
 
@@ -330,6 +343,7 @@ async def test_resume_agent_cascades_to_waiting_human_descendants_only(monkeypat
     assert rt.hitl_registry.get(r2.id).resolved is True
 
 
+@pytest.mark.asyncio
 async def test_resume_agent_unknown_raises():
     rt = _rt()
     with pytest.raises(AgentNotFound):
@@ -346,6 +360,7 @@ async def test_resume_agent_unknown_raises():
 # 的组合回归）。
 
 
+@pytest.mark.asyncio
 async def test_send_message_finalizes_all_pending_hitl_of_target_agent():
     """钉住核心修复：`send_message` 之后，该 agent 名下不该再有任何未决 HITL。"""
     rt = _rt()
@@ -368,6 +383,7 @@ async def test_send_message_finalizes_all_pending_hitl_of_target_agent():
     assert [v for v in [item.data for item in await rt.list_pending_hitl(session_id="s1")] if v.agent_id == "a1"] == []
 
 
+@pytest.mark.asyncio
 async def test_send_message_does_not_touch_other_agents_pending_hitl():
     """不误伤：同 session 下另一个 agent 的未决提问不受影响（按 agent_id 过滤）。"""
     rt = _rt()
@@ -386,6 +402,7 @@ async def test_send_message_does_not_touch_other_agents_pending_hitl():
     assert rt.hitl_registry.get(req_a2.id).claim_pending is False
 
 
+@pytest.mark.asyncio
 async def test_send_message_resolves_stale_pause_bubble_before_new_real_question_arrives(
     monkeypatch,
 ):
@@ -466,7 +483,7 @@ async def test_send_message_resolves_stale_pause_bubble_before_new_real_question
     # 5. 核心断言：resume_agent 不能被那条早该终局的陈旧气泡误导去冷续跑——陈旧
     #    气泡已经被第 3 步收口，此刻 pending 列表里只有真问题（ToolResultDelivery），
     #    `_pause_bubble_of` 的类型过滤天然不会命中它。
-    monkeypatch.setattr(rt, "recover_agent", _unreachable_recover_agent)
+    monkeypatch.setattr(rt, "_recover_session_locked", _unreachable_recover_agent)
     await initialize_all(rt)
     resumed = await rt.resume_agent("root")
 

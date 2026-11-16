@@ -14,9 +14,9 @@ from tests._initialization import initialize_all
 from tests._snapshot_helpers import seed_snapshot
 from tests.unit.test_runtime_initialization_queries import append, container, runtime
 
-pytestmark = pytest.mark.asyncio
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("receipt_lost", [False, True])
 @pytest.mark.parametrize("retry_kind,expected_count", [("continue", 0), ("interrupted", 1)])
 async def test_stopped_requeue_submission_preserves_committed_budget(receipt_lost, retry_kind, expected_count):
@@ -66,6 +66,7 @@ async def test_stopped_requeue_submission_preserves_committed_budget(receipt_los
     assert await store.committed_head("s1") == head
 
 
+@pytest.mark.asyncio
 async def test_uncertain_batch_is_immutable_and_concurrent_retries_notify_once():
     store = InMemoryEventStore()
     bus = InProcessEventBus()
@@ -103,6 +104,7 @@ async def test_uncertain_batch_is_immutable_and_concurrent_retries_notify_once()
     assert not bus.has_pending_commit("t1") and "t1" not in bus._provisional
 
 
+@pytest.mark.asyncio
 async def test_discard_confirms_an_attempted_batch_instead_of_rolling_it_back():
     from ctx_weft.core.models.task import Task
     from ctx_weft.core.orchestrator.task.manager import TaskManager
@@ -133,6 +135,7 @@ async def test_discard_confirms_an_attempted_batch_instead_of_rolling_it_back():
     assert not any(r.event.type == EventType.ROUND_DISCARDED for r in rows)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["FINISHED", "CANCELED"])
 @pytest.mark.parametrize("snapshot", [False, True])
 async def test_startup_repairs_missing_idle_after_finalized_task(status, snapshot):

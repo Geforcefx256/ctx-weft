@@ -31,6 +31,11 @@ async def test_finalized_write_guard_releases_on_publication_failure(fake_state_
         raise cause
 
     ctx.event_bus.emit = fail
+    async def fail_batch(events, *, on_committed=None):
+        assert len(events) == 1
+        await fail(events[0])
+
+    ctx.event_bus.emit_batch = fail_batch
     tm._event_bus = ctx.event_bus
     with pytest.raises(failure) as raised:
         if producer == "loop":

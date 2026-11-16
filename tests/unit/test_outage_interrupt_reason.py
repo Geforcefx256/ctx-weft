@@ -23,7 +23,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 
 class _OutageLLM(MockLLMAdapter):
@@ -34,6 +33,7 @@ class _OutageLLM(MockLLMAdapter):
         return _gen()
 
 
+@pytest.mark.asyncio
 async def test_outage_interrupt_carries_llm_outage_reason():
     resolver = InlineAgentTemplateProvider()
     resolver.register(make_echo_template())

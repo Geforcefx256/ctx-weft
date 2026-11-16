@@ -24,8 +24,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
-
 
 def _runtime() -> CtxWeftRuntime:
     provider = InlineAgentTemplateProvider()
@@ -48,7 +46,7 @@ def _runtime_with_recorded_resume() -> tuple[CtxWeftRuntime, list[tuple]]:
     ``req.agent_id``，不再是 ``req.session_id``——桩记的第二个字段跟着换轴。
 
     记录的元组形态：
-    - ``("recover_agent", agent_id, resumed_task_id)`` —— ToolResultDelivery 续跑；
+    - ``("recover_session", agent_id, resumed_task_id)`` —— ToolResultDelivery 续跑；
     - ``("inject_user_turn", agent_id, task_id)`` —— UserTurnDelivery 续跑。
 
     `recover_agent` 不再接受 llm_account/llm_model（换模型走
@@ -62,9 +60,9 @@ def _runtime_with_recorded_resume() -> tuple[CtxWeftRuntime, list[tuple]]:
         if user_reply is not None:
             calls.append(("inject_user_turn", agent_id, resumed_task_id))
         else:
-            calls.append(("recover_agent", agent_id, resumed_task_id))
+            calls.append(("recover_session", agent_id, resumed_task_id))
 
-    rt.recover_agent = fake_recover_agent  # type: ignore[method-assign]
+    rt._recover_session_locked = fake_recover_agent  # type: ignore[method-assign]
     return rt, calls
 
 
@@ -117,7 +115,7 @@ async def test_reply_returns_the_view_and_drives_resume_by_delivery():
     # 这里种一个真实形态的请求验证这条透传，而不是巧合地依赖签名默认值 `agent_id=""`
     # 那个专供「legacy 折叠、真没有 agent_id 可传」场景的回退分支
     # （见 `tests/unit/test_cold_hitl_legacy_agent_id_resume.py`，终审 CRITICAL 2）。
-    assert calls == [("recover_agent", "agent-a", "t1")]
+    assert calls == [("recover_session", "s1", "t1")]
 
 
 async def test_user_turn_delivery_injects_instead_of_reconciling():
@@ -189,7 +187,7 @@ async def test_empty_agent_id_falls_back_to_session_id_not_recover_agent():
     async def fake_recover_session_locked(session_id, **kw):
         session_calls.append((session_id, kw.get("resumed_task_id")))
 
-    rt.recover_agent = fake_recover_agent  # type: ignore[method-assign]
+    rt._recover_session_locked = fake_recover_agent  # type: ignore[method-assign]
     rt._recover_session_locked = fake_recover_session_locked  # type: ignore[method-assign]
 
     await _warm(rt, "s1")
@@ -257,7 +255,7 @@ async def test_a_failed_cold_resume_after_commit_is_logged_loudly_and_still_rais
     async def _boom(*a, **kw):
         raise RuntimeError("owner TM rebuild exploded")
 
-    rt.recover_agent = _boom  # type: ignore[method-assign]
+    rt._recover_session_locked = _boom  # type: ignore[method-assign]
 
     with caplog.at_level("ERROR"):
         with pytest.raises(RuntimeError, match="owner TM rebuild exploded"):
@@ -353,7 +351,7 @@ async def test_reply_to_hitl_agent_id_match_proceeds_normally():
         HitlReply(hitl_id=req.id, outcome="accepted", agent_id="agent-a")
     )
     assert view is not None and view.outcome == "accepted"
-    assert calls == [("recover_agent", "agent-a", "t1")]
+    assert calls == [("recover_session", "s1", "t1")]
 
 
 def test_hitl_reply_requires_agent_id():

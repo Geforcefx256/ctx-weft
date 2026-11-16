@@ -54,9 +54,20 @@
 | `agent_id` | `str \| None` | |
 | **`origin`** | `str` | **V2 新增**：哪个组件发出的，见 §4。存量事件读出空串 |
 | `payload` | `dict` | 按类型而异，即下面各表的「payload」列 |
-| `metadata` | `dict` | |
+| `metadata` | `dict` | 所有事件共有的 JSON 扩展数据；SDK 不解释业务键，生产者按命名空间组织 |
 | `causation_id` | `str \| None` | |
 | `schema_version` | `int` | payload 版本，默认 `1` |
+
+顶层 `metadata` 在构造时验证 JSON 可序列化并形成独立副本，随事件提交、完整读取和重放。
+精简读取默认省略它，需要时设置 `EventReadProjection(include_metadata=True)`。
+提交后的事件不可补写扩展数据；提交重试必须保持原封套与 metadata 不变。
+
+Provider 的 `CapabilityEvent` 使用同样的顶层 `metadata`。`result` / `error` 的扩展按顺序
+顶层浅合并（后值覆盖同名键），进入 `CapabilityFinished.metadata`；已有 progress/stdout
+转换把扩展放在对应 `CapabilityProgress.metadata`，不混入最终结果。嵌套对象与列表不自动
+合并，更新同一命名空间时须提供完整新值。`needs_human` / `pin` 不隐式继承到恢复后的结果。
+现有 `CapabilityEvent.payload.metadata` 仍是执行/控制信息，照常交给 `InvocationResult`，
+与顶层扩展分离；外部扩展不自动进入对话记忆或模型输入。
 
 **envelope 管身份，payload 管内容。** payload 里不再重复 `task_id` / `agent_id`
 （V2 的清理动作之一）。唯一例外是 `TaskRecapStarted/Completed`——它的 `task_id`

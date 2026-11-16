@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.asyncio
 WORKER = Path(__file__).with_name("_remaining_user_journey_worker.py")
 
 
@@ -24,23 +23,27 @@ async def journey(path, scenario, variant, restart):
     await phase(path, scenario, variant, "verify")
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("variant", ["same_success", "same_fail", "cross_success", "cross_fail"])
 @pytest.mark.parametrize("restart", [False, True], ids=["same_process", "restart_at_step_two_question"])
 async def test_ordered_plan_runs_real_children_and_parent_then_allows_more_work(tmp_path, variant, restart):
     await journey(tmp_path, "plan", variant, restart)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("variant", ["hot", "cold", "restart", "before", "unknown", "decision_crash", "tool_crash"])
 async def test_accepted_modified_approval_executes_once_and_survives_restart(tmp_path, variant):
     await journey(tmp_path, "approval", variant, variant in {"restart", "decision_crash", "tool_crash"})
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("variant", ["main_first", "side_first", "main_first_hot", "side_first_hot"])
 @pytest.mark.parametrize("restart", [False, True], ids=["same_process", "restart_between_answers"])
 async def test_independent_agent_questions_keep_answers_and_followups_separate(tmp_path, variant, restart):
     await journey(tmp_path, "ports", variant, restart)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("variant", ["hot", "restart", "message_crash"])
 async def test_image_followup_withdraw_retype_and_restart_preserves_actual_bytes(tmp_path, variant):
     await journey(tmp_path, "image", variant, variant != "hot")

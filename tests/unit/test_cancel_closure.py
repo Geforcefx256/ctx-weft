@@ -38,7 +38,6 @@ from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from tests.integration.test_minimal_loop import InlineAgentTemplateProvider, make_echo_template, make_runtime
 from tests.unit._stub_runner import StubRunner
 
-pytestmark = pytest.mark.asyncio
 
 T = MemoryEventType
 
@@ -72,6 +71,7 @@ async def _seed_running_ack(mem, child: Task) -> None:
 # ── synthesize_cancel_closure（finalize.py 直测，真实 InMemoryMemoryProvider）───────────
 
 
+@pytest.mark.asyncio
 async def test_same_agent_started_task_ack_replaced_and_nested_finish_pair() -> None:
     mem = InMemoryMemoryProvider()
     child = _child("c1", started_at=now_utc(), origin_tool_call_id="call-1")
@@ -107,6 +107,7 @@ async def test_same_agent_started_task_ack_replaced_and_nested_finish_pair() -> 
     assert tool_calls == []
 
 
+@pytest.mark.asyncio
 async def test_cross_agent_started_task_ack_and_own_scope_finish_pair() -> None:
     mem = InMemoryMemoryProvider()
     child = _child(
@@ -135,6 +136,7 @@ async def test_cross_agent_started_task_ack_and_own_scope_finish_pair() -> None:
     assert 'outcome="cancelled"' in tool[0].content
 
 
+@pytest.mark.asyncio
 async def test_root_own_scope_finish_pair() -> None:
     """root（无 parent_task_id）：own-root 形态不需要框，直接在自己 scope 合成 finish 对。"""
     mem = InMemoryMemoryProvider()
@@ -156,6 +158,7 @@ async def test_root_own_scope_finish_pair() -> None:
     assert "Cancelled (user_cancel)" in tool[0].content
 
 
+@pytest.mark.asyncio
 async def test_born_cancel_no_frame_skips_entirely() -> None:
     """子任务从未真正 start（未走 ensure_dispatch_frame_at_start）→ 无框可闭 → 整体跳过。"""
     mem = InMemoryMemoryProvider()
@@ -195,6 +198,7 @@ def _tm(bus: _CapturingBus) -> tuple[TaskManager, Session]:
     return tm, session
 
 
+@pytest.mark.asyncio
 async def test_cancel_all_routes_only_started_tasks_zero_writes_for_unstarted() -> None:
     """cancel_all：已启动任务进 cancel_finalizer；未启动任务从不进入——零 memory 写。"""
     bus = _CapturingBus()
@@ -222,6 +226,7 @@ async def test_cancel_all_routes_only_started_tasks_zero_writes_for_unstarted() 
     assert tm.get_task("b").status == "CANCELED"
 
 
+@pytest.mark.asyncio
 async def test_cancel_all_routes_started_root_too() -> None:
     """root 没有 origin_tool_call_id，但只要 started_at 非空仍应进 cancel_finalizer
     （own-root 形态不需要框）。"""
@@ -243,6 +248,7 @@ async def test_cancel_all_routes_started_root_too() -> None:
     assert captured["ids"] == ["root"]
 
 
+@pytest.mark.asyncio
 async def test_inflight_cancel_funnel_signal_time_no_call_terminal_time_one_call() -> None:
     """在途取消 funnel：发信号时刻（task 仍在 _running_tasks、status 未坐实）不触发
     cancel_finalizer；只有 on_task_finished(CANCELED) 终态坐实后才调用一次。"""
@@ -271,6 +277,7 @@ async def test_inflight_cancel_funnel_signal_time_no_call_terminal_time_one_call
     assert calls[0][0] == ["c1"]
 
 
+@pytest.mark.asyncio
 async def test_race_normal_finish_does_not_call_cancel_finalizer() -> None:
     """抢跑正常收尾（status 落 FINISHED，不是 CANCELED）→ 绝不调用 cancel_finalizer，
     FinalizeStep 的真实终态覆盖 ack 自愈，取消胶囊 finish 对不会重复写。"""
@@ -295,6 +302,7 @@ async def test_race_normal_finish_does_not_call_cancel_finalizer() -> None:
     assert calls == []
 
 
+@pytest.mark.asyncio
 async def test_unstarted_task_cancel_never_calls_finalizer() -> None:
     """从未 start（started_at 为空）的任务即便终态落 CANCELED，也不触发 cancel_finalizer——
     它从未铸框/从未写过 memory，没有胶囊可闭。"""
@@ -327,6 +335,7 @@ def _runtime() -> CtxWeftRuntime:
     return runtime
 
 
+@pytest.mark.asyncio
 async def test_runtime_finalize_cancel_memory_root_own_scope_finish_pair() -> None:
     runtime = _runtime()
     memory = runtime.providers.get_memory()
@@ -346,6 +355,7 @@ async def test_runtime_finalize_cancel_memory_root_own_scope_finish_pair() -> No
     assert 'outcome="cancelled"' in tool[0].content
 
 
+@pytest.mark.asyncio
 async def test_runtime_finalize_cancel_memory_one_bad_task_does_not_block_others() -> None:
     runtime = _runtime()
     memory = runtime.providers.get_memory()

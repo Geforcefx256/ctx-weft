@@ -21,7 +21,6 @@ from ctx_weft.core.control.snapshot_writer import attach_snapshotting
 from tests._snapshot_helpers import latest_snapshot
 from tests._event_helpers import all_events
 
-pytestmark = pytest.mark.asyncio
 
 
 def _event(n: int, kind: str, *, task_id: str | None = None, payload: dict | None = None) -> Event:
@@ -33,6 +32,7 @@ def _event(n: int, kind: str, *, task_id: str | None = None, payload: dict | Non
     )
 
 
+@pytest.mark.asyncio
 async def test_late_committed_event_is_skipped_by_snapshot_recovery():
     """旧契约锚：B 触发快照后 A 才提交 → 快照恢复只见 b，全量回放见 a、b。"""
     bus = InProcessEventBus()

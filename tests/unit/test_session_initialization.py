@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """Per-session recovery: isolation, shared work, retries and bounded retention."""
 import asyncio
 import gc
@@ -12,7 +14,6 @@ from ctx_weft.core.control import startup
 from ctx_weft.protocols.events import EventType
 from tests.unit.test_runtime_initialization_queries import append, container, runtime
 
-pytestmark = pytest.mark.asyncio
 
 
 async def seeded():
@@ -25,6 +26,7 @@ async def seeded():
     return runtime(old.event_store), h
 
 
+@pytest.mark.asyncio
 async def test_single_session_never_enumerates_or_touches_other_sessions(monkeypatch):
     rt, h = await seeded()
     other = await container(runtime(rt.event_store), "other")
@@ -33,13 +35,14 @@ async def test_single_session_never_enumerates_or_touches_other_sessions(monkeyp
     head = await rt.event_store.committed_head("other")
     monkeypatch.setattr(rt.event_store, "list_session_ids", AsyncMock(side_effect=AssertionError("enumeration")))
     result = await rt.initialize(h.session_id)
-    assert result.state.root_task_status == "INTERRUPTED"
+    assert result.state.root_task.status == "INTERRUPTED"
     assert await rt.event_store.committed_head("other") == head
     assert rt._initialized_sessions == {h.session_id}
     assert not rt._initializing_sessions and not rt._task_managers
     assert not rt._agent_lifecycle_manager.all_agent_ids()
 
 
+@pytest.mark.asyncio
 async def test_concurrent_waiters_share_task_and_receive_detached_reports(monkeypatch):
     rt, h = await seeded()
     entered, release = asyncio.Event(), asyncio.Event()
@@ -65,6 +68,7 @@ async def test_concurrent_waiters_share_task_and_receive_detached_reports(monkey
     assert await rt.initialize(h.session_id) is None
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("cancel_all", [False, True])
 async def test_waiter_cancellation_does_not_cancel_initialization(monkeypatch, cancel_all):
     rt, h = await seeded()
@@ -91,6 +95,7 @@ async def test_waiter_cancellation_does_not_cancel_initialization(monkeypatch, c
     assert h.session_id in rt._initialized_sessions and not rt._initializing_sessions
 
 
+@pytest.mark.asyncio
 async def test_shared_failure_clears_task_and_can_retry(monkeypatch):
     rt, h = await seeded()
     entered, release = asyncio.Event(), asyncio.Event()
@@ -113,6 +118,7 @@ async def test_shared_failure_clears_task_and_can_retry(monkeypatch):
     assert (await rt.initialize(h.session_id)).state.has_interrupted_agents
 
 
+@pytest.mark.asyncio
 async def test_different_sessions_initialize_in_parallel(monkeypatch):
     rt, h = await seeded()
     await container(runtime(rt.event_store), "other")
@@ -130,6 +136,7 @@ async def test_different_sessions_initialize_in_parallel(monkeypatch):
     assert entered == {h.session_id, "other"}
 
 
+@pytest.mark.asyncio
 async def test_read_queries_do_not_initialize_or_repair():
     rt, h = await seeded()
     head = await rt.event_store.committed_head(h.session_id)
@@ -139,6 +146,7 @@ async def test_read_queries_do_not_initialize_or_repair():
     assert not rt._initialized_sessions and not rt._task_managers
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("entry", ["rebuild", "recover", "dispatch", "send", "resume"])
 async def test_execution_entry_initializes_before_loading(monkeypatch, entry):
     from ctx_weft import SessionStartParams
@@ -154,7 +162,7 @@ async def test_execution_entry_initializes_before_loading(monkeypatch, entry):
         if entry == "rebuild":
             await rt.rebuild_session(h.session_id, strict=True)
         elif entry == "recover":
-            await rt.recover_agent(h.root_agent_id, session_id=h.session_id, keep_alive=True)
+            await recover_fixture_session(rt, h.root_agent_id, session_id=h.session_id, keep_alive=True)
         elif entry == "dispatch":
             await rt.dispatch_task(h.session_id, "next", agent_id=h.root_agent_id, unattended=True)
         elif entry == "send":
@@ -168,6 +176,7 @@ async def test_execution_entry_initializes_before_loading(monkeypatch, entry):
     assert loaded and not rt._initializing_sessions
 
 
+@pytest.mark.asyncio
 async def test_missing_session_is_not_marked_and_new_creation_is_initialized():
     rt = runtime()
     with pytest.raises(SessionNotFound):
@@ -181,6 +190,7 @@ async def test_missing_session_is_not_marked_and_new_creation_is_initialized():
     assert h.session_id not in rt._initialized_sessions
 
 
+@pytest.mark.asyncio
 async def test_success_does_not_retain_task_or_report(monkeypatch):
     rt, h = await seeded()
     references = []
@@ -200,6 +210,7 @@ async def test_success_does_not_retain_task_or_report(monkeypatch):
     assert all(ref() is None for ref in references)
 
 
+@pytest.mark.asyncio
 async def test_cold_hitl_reply_initializes_before_resolving(monkeypatch):
     from ctx_weft.protocols.hitl import HitlReply
 
@@ -220,6 +231,7 @@ async def test_cold_hitl_reply_initializes_before_resolving(monkeypatch):
     assert not rt._initializing_sessions
 
 
+@pytest.mark.asyncio
 async def test_missing_session_purge_nested_commands_do_not_deadlock():
     rt = runtime()
     async with asyncio.timeout(1):

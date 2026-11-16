@@ -19,7 +19,6 @@ from ctx_weft.protocols.capability import (
 )
 from tests.unit.test_gateway_qualified import _gw, _state_ctx
 
-pytestmark = pytest.mark.asyncio
 
 
 class _BlockingTool(ToolCapabilityProvider):
@@ -54,6 +53,7 @@ class _BlockingTool(ToolCapabilityProvider):
         self.cancelled_with = invocation_id
 
 
+@pytest.mark.asyncio
 async def test_interrupt_reaches_tool_cleanup_and_calls_provider_cancel():
     p = _BlockingTool()
     mem, state, ctx = _state_ctx()
@@ -95,6 +95,7 @@ async def _wait_until(pred, timeout=8.0):
     return pred()
 
 
+@pytest.mark.asyncio
 async def test_real_subprocess_killed_on_interrupt():
     # End-to-end: a shell tool's child process tree must die when the tool is cancelled.
     marker = f"LOOMEX_INT_MARK_{os.getpid()}"

@@ -23,7 +23,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 _CHILD_TITLE = "followup"
 
@@ -100,6 +99,7 @@ async def _wait_for_n_finished(runtime, session_id, n, timeout=5.0):
     )
 
 
+@pytest.mark.asyncio
 async def test_delegate_same_batch_e2e():
     llm = _RouterLLM()
     runtime = _make_runtime(llm)

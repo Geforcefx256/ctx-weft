@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """Ignore public pause/cancel during the recovered TaskFinalized write."""
 
 import asyncio
@@ -82,7 +84,7 @@ async def test_skip_stop_during_recovered_finalized_write(tmp_path, monkeypatch,
             rt.event_bus.subscribe(None, started)
             tm = None
             try:
-                await rt.recover_agent(agent_id, session_id=sid)
+                await recover_fixture_session(rt, agent_id, session_id=sid)
                 tm = rt._task_managers[sid]
                 await asyncio.wait_for(entered.wait(), 5)
                 signal = rt.pause_agent if action == "pause" else rt.cancel_agent
@@ -111,7 +113,7 @@ async def test_skip_stop_during_recovered_finalized_write(tmp_path, monkeypatch,
                 assert not final.pending_observe and not final.open_runs
                 again = _runtime(llm, memory, store)
                 await initialize_all(again)
-                await again.recover_agent(agent_id, session_id=sid)
+                await recover_fixture_session(again, agent_id, session_id=sid)
                 await _drained(again._task_managers[sid])
                 assert again._task_managers[sid].get_task(task_id).status == "FINISHED"
                 assert llm.actor_turns == 1

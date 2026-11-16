@@ -44,7 +44,8 @@ from ctx_weft.core.loop.task_memory_fold import (
 from ctx_weft.core.models.config import RuntimeConfig
 from ctx_weft.core.orchestrator.task.disposition import RunOutcome, RunOutcomeKind, disposition_for
 from ctx_weft.core.utils.clock import now_utc
-from ctx_weft.core.utils.content import content_to_text, image_tokens
+from ctx_weft.core.utils.content import image_tokens
+from ctx_weft.protocols.content import content_to_text
 from ctx_weft.core.utils.ids import generate_id, mint_turn_call_ids
 from ctx_weft.core.utils.verdict import (
     VERDICT_CONTINUE,
@@ -1021,7 +1022,15 @@ async def emit_effect(state, ctx, event):
         if callable(protect):
             guard = protect(state.task.id)
     with guard:
-        await ctx.event_bus.emit(event)
+        if event.type == EventType.TASK_FINALIZED:
+            def publish_finalized():
+                state.task.finalized = True
+                value = event.payload.get("finished_at")
+                state.task.finished_at = datetime.fromisoformat(value) if value else event.timestamp
+
+            await ctx.event_bus.emit_batch((event,), on_committed=publish_finalized)
+        else:
+            await ctx.event_bus.emit(event)
     if observed_effect:
         state.extra.setdefault("observe_effects", []).append(key)
         if event.type == EventType.TASK_FINALIZED:

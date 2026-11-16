@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+from tests._recovery import recover_fixture_session
+
 import asyncio
 from datetime import datetime, timezone
 from unittest import mock
@@ -19,7 +21,7 @@ import pytest
 from ctx_weft.core.loop.driver import task_prompt_record_id
 from ctx_weft.core.models.config import RuntimeConfig
 from ctx_weft.core.runtime import SessionStartParams
-from ctx_weft.core.utils.content import content_to_text
+from ctx_weft.protocols.content import content_to_text
 from ctx_weft.core.utils.ids import mint_call_id
 from ctx_weft.protocols import (
     MemoryAddress,
@@ -49,7 +51,6 @@ from tests.integration.test_minimal_loop import (
 )
 from tests.step_helpers import suppress_observe_start
 
-pytestmark = pytest.mark.asyncio
 
 PROMPT = "the original request"
 SID, TID, AID = "ses_g", "tsk_g", "agt_root"
@@ -95,6 +96,7 @@ def _scope_ctx():
 # ── M6：提问恰好一条 ────────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status_event,record_id", [
     (EventType.TASK_AWAITING_HUMAN, None),          # 猜「没写」其实有（存量自动 id）
     (EventType.TASK_INTERRUPTED, None),
@@ -119,7 +121,7 @@ async def test_recovery_keeps_exactly_one_prompt(status_event, record_id) -> Non
     await rt.rebuild_session(SID)
     with suppress_observe_start():
         await initialize_all(rt)
-        await rt.recover_agent(AID)
+        await recover_fixture_session(rt, AID)
         await _poll(lambda: llm.act_requests or None, timeout=8.0)
         await asyncio.sleep(0.2)
 
@@ -129,6 +131,7 @@ async def test_recovery_keeps_exactly_one_prompt(status_event, record_id) -> Non
     assert len(prompts) == 1, f"提问必须恰好一条：{[(r.id, content_to_text(r.content)) for r in prompts]}"
 
 
+@pytest.mark.asyncio
 async def test_requeued_task_with_revised_prompt_still_writes_it() -> None:
     """TASK_REQUEUED 携带改写过的提问（存量 reopen 数据）：旧提问还在 memory 里，
     修订版仍然必须写进去——核对不得因为「这个 task 的提问已经有了」就误判成已存在。"""
@@ -157,7 +160,7 @@ async def test_requeued_task_with_revised_prompt_still_writes_it() -> None:
     await rt.rebuild_session(SID)
     with suppress_observe_start():
         await initialize_all(rt)
-        await rt.recover_agent(AID)
+        await recover_fixture_session(rt, AID)
         await _poll(lambda: llm.act_requests or None, timeout=8.0)
         await asyncio.sleep(0.2)
 
@@ -170,6 +173,7 @@ async def test_requeued_task_with_revised_prompt_still_writes_it() -> None:
 # ── L6：不该开的窗不开 ──────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_reply_to_a_terminal_task_opens_no_window() -> None:
     llm = _ScriptedLLM([_ask("tc1", "Q1?"), STALL_AFTER_CHUNK])
     rt = _runtime(llm, hitl_timeout_sec=0)
@@ -193,6 +197,7 @@ async def test_reply_to_a_terminal_task_opens_no_window() -> None:
         e.type for e in await all_events(rt.event_store, sid)]
 
 
+@pytest.mark.asyncio
 async def test_no_resume_delivery_opens_no_window() -> None:
     llm = _ScriptedLLM([_ask("tc1", "Q1?"), STALL_AFTER_CHUNK])
     rt = _runtime(llm, hitl_timeout_sec=0)
@@ -216,6 +221,7 @@ async def test_no_resume_delivery_opens_no_window() -> None:
 # ── M7：截断的结果不当完整结果 ──────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_truncated_recorded_result_is_not_backfilled() -> None:
     """`CapabilityFinished` 的 payload 有上限；被截断的那份不得当完整结果补写进对话。"""
     llm = _ActRouterLLM(act_responses=[MockResponse(text="done")], context_limit=100_000)
@@ -247,7 +253,7 @@ async def test_truncated_recorded_result_is_not_backfilled() -> None:
     await rt.rebuild_session(SID)
     with suppress_observe_start():
         await initialize_all(rt)
-        await rt.recover_agent(AID)
+        await recover_fixture_session(rt, AID)
         await _poll(lambda: llm.act_requests or None, timeout=8.0)
         await asyncio.sleep(0.2)
 

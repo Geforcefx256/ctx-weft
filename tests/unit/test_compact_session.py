@@ -28,8 +28,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
-
 
 def _runtime() -> CtxWeftRuntime:
     resolver = InlineAgentTemplateProvider()
@@ -87,7 +85,7 @@ async def test_compact_agent_uses_agent_lifecycle_managers_current_model_not_sta
     new_llm = MockLLMAdapter(responses=[MockResponse(text="SUMMARY-NEW")])
 
     class _TwoModelResolver:
-        def get_client(self, account=None, model=None):
+        def get_client(self, account=None, model=None, *, ctx):
             return new_llm if model == "model-new" else old_llm
 
     from ctx_weft.core import ProviderRegistry

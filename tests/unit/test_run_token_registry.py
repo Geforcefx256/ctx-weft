@@ -7,7 +7,6 @@ from ctx_weft.core.control import RunTokens
 from ctx_weft.providers.llm.adapters.mock import MockLLMAdapter
 from tests.integration.test_minimal_loop import InlineAgentTemplateProvider, make_runtime
 
-pytestmark = pytest.mark.asyncio
 
 
 def _rt():
@@ -15,6 +14,7 @@ def _rt():
                           agent_provider=InlineAgentTemplateProvider())
 
 
+@pytest.mark.asyncio
 async def test_register_and_deregister_run_tokens():
     rt = _rt()
     tokens = rt._register_run_tokens("s1", "t1")
@@ -25,6 +25,7 @@ async def test_register_and_deregister_run_tokens():
     assert "s1" not in rt._run_tokens          # 空桶随手回收
 
 
+@pytest.mark.asyncio
 async def test_born_paused_under_pausing_latch():
     rt = _rt()
     rt._pausing.add("s1")
@@ -32,6 +33,7 @@ async def test_born_paused_under_pausing_latch():
     assert tokens.pause.is_paused is True
 
 
+@pytest.mark.asyncio
 async def test_root_resume_point_claimed_once_under_pausing_latch():
     # 续跑点一次性名额：闩锁窗口内第一个 root run born-pause 并认领名额，其后的 root run
     # 一律 born-cancel——root agent 同时有多个任务（后继任务/多条消息）时，防止"第一个
@@ -44,6 +46,7 @@ async def test_root_resume_point_claimed_once_under_pausing_latch():
     assert second.cancel.is_cancelled and not second.pause.is_paused
 
 
+@pytest.mark.asyncio
 async def test_pause_claim_cleared_with_latch():
     # 名额随闩锁一起回收：本轮暂停的认领不得泄漏到同 session 的下一轮暂停。
     rt = _rt()
@@ -57,6 +60,7 @@ async def test_pause_claim_cleared_with_latch():
     assert again.pause.is_paused is True                 # 名额可再次认领
 
 
+@pytest.mark.asyncio
 async def test_non_root_run_born_cancel_not_paused_under_pausing_latch():
     # M-1：闩锁窗口内重排出的非 root agent run（多级委派被 _try_resume_parent 唤醒的中间
     # 父任务）须出生即 cancel、绝不 born-pause——检查点 pause 先于 cancel，双信号会让

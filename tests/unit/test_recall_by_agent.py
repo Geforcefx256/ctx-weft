@@ -14,7 +14,6 @@ from ctx_weft.protocols import (
 )
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 
-pytestmark = pytest.mark.asyncio
 
 T = MemoryEventType
 _BASE = datetime(2026, 1, 1, tzinfo=UTC)
@@ -34,6 +33,7 @@ def _ev(type_, scope, content, t) -> MemoryEvent:
                        timestamp=_BASE + timedelta(seconds=t))
 
 
+@pytest.mark.asyncio
 async def test_recalls_task_conversation_across_tasks_of_same_agent() -> None:
     m = InMemoryMemoryProvider()
     await m.ingest(_ev(T.USER_PROMPT, _sc("tA", "ag1"), "promptA", 0), _ctx())
@@ -46,6 +46,7 @@ async def test_recalls_task_conversation_across_tasks_of_same_agent() -> None:
     assert all(r.metadata.get("task_id") in {"tA", "tB"} for r in recs)
 
 
+@pytest.mark.asyncio
 async def test_excludes_superseded() -> None:
     m = InMemoryMemoryProvider()
     eid = await m.ingest(_ev(T.LLM_RESPONSE, _sc("tA", "ag1"), "live", 0), _ctx())
@@ -60,6 +61,7 @@ async def test_excludes_superseded() -> None:
     assert recs[0].id == eid  # the surviving "live" record is the first-ingested one
 
 
+@pytest.mark.asyncio
 async def test_limit_truncates_to_most_recent() -> None:
     m = InMemoryMemoryProvider()
     for i in range(3):
@@ -68,6 +70,7 @@ async def test_limit_truncates_to_most_recent() -> None:
     assert [r.content for r in recs] == ["r2"]  # newest-first, limit=1
 
 
+@pytest.mark.asyncio
 async def test_empty_types_returns_nothing() -> None:
     m = InMemoryMemoryProvider()
     await m.ingest(_ev(T.USER_PROMPT, _sc("tA", "ag1"), "x", 0), _ctx())

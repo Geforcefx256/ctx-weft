@@ -5,9 +5,10 @@ import os
 import sys
 from pathlib import Path
 
-from tests._initialization import initialize_all
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from tests._initialization import initialize_all
 
 from ctx_weft import SessionStartParams
 from ctx_weft.core.models.config import RuntimeConfig

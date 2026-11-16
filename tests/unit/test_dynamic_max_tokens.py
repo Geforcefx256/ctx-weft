@@ -6,6 +6,7 @@ request.prompt_token_estimate → 网关 apply_dynamic_max_tokens 纯消费。�
 
 from __future__ import annotations
 
+from ctx_weft.protocols.context import ProviderContext as _ProviderContext
 from ctx_weft.protocols import ModelCallConfig
 
 from ctx_weft.core.orchestrator.model import ResolvedModel
@@ -23,7 +24,7 @@ from ctx_weft.core.loop.llm_gateway import (
 from ctx_weft.core.utils.estimate import dynamic_max_tokens, estimate_tokens
 from ctx_weft.protocols import LLMMessage, LLMRequest
 from ctx_weft.protocols import OutputPolicy
-from ctx_weft.protocols.context import ImagePart, TextPart
+from ctx_weft.protocols.content import ImagePart, TextPart
 from ctx_weft.providers.llm import ModelCapabilities, ModelLimits
 from ctx_weft.providers.llm.tokenizer import HeuristicTokenizer
 
@@ -321,6 +322,9 @@ from ctx_weft.providers.llm.adapters.mock import MockLLMAdapter
 from ctx_weft.providers.llm.provider import LLMProvider, ModelConfig, _FixedModelClient
 
 
+_PROVIDER_CONTEXT = _ProviderContext(session_id="test")
+
+
 def test_fixed_model_client_exposes_reserve_and_ceiling():
     adapter = MockLLMAdapter(responses=[])
     client = _FixedModelClient(
@@ -364,7 +368,7 @@ def test_default_output_reserve_scales_with_window():
 
 class _StoreStub:
     def save(self, a): ...
-    def delete(self, n):
+    def delete(self, n, *, namespace="global"):
         return True
 
     def list_all(self):
@@ -392,7 +396,7 @@ def test_get_client_resolves_none_reserve_by_window():
         ),
         persist=False,
     )
-    client = p.get_client("a", "m")
+    client = p.get_client("a", "m", ctx=_PROVIDER_CONTEXT)
     assert client.output_reserve == default_output_reserve(200_000) == 12_500
 
 
@@ -419,4 +423,4 @@ def test_get_client_honors_explicit_zero_reserve():
         persist=False,
     )
     # 显式 0 不被"按尺寸默认"覆盖（is not None 判定）
-    assert p.get_client("a", "m").output_reserve == 0
+    assert p.get_client("a", "m", ctx=_PROVIDER_CONTEXT).output_reserve == 0

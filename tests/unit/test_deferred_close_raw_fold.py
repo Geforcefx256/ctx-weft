@@ -28,7 +28,6 @@ from ctx_weft.protocols.template import LoopConfig
 from ctx_weft.providers.llm.tokenizer import HeuristicTokenizer
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 
-pytestmark = pytest.mark.asyncio
 
 T = MemoryEventType
 _BASE = datetime(2026, 1, 1, tzinfo=UTC)
@@ -85,6 +84,7 @@ async def _active_raw(mem, scope) -> list:
 
 # ─── TEST 1: 无 LLM 总结的 close 不删 raw、登记延迟折叠 ───────────────────────
 
+@pytest.mark.asyncio
 async def test_close_without_llm_summary_keeps_raw_and_registers_fold() -> None:
     """规则 observe close（has_llm_summary=False）：末段 raw 保持 active；
     _close_synth 登记扩为 4 元组，第 4 元 = raw 所在 task scope（供 bg 替换后补删）。"""
@@ -105,6 +105,7 @@ async def test_close_without_llm_summary_keeps_raw_and_registers_fold() -> None:
 
 # ─── TEST 2: 有 LLM 总结的 close 照旧同步删 raw（回归）──────────────────────
 
+@pytest.mark.asyncio
 async def test_close_with_llm_summary_supersedes_raw_at_close() -> None:
     """前台 LLM observe close（has_llm_summary=True）：行为不变，close 即删末段 raw。"""
     mem = InMemoryMemoryProvider()
@@ -122,6 +123,7 @@ async def test_close_with_llm_summary_supersedes_raw_at_close() -> None:
 
 # ─── TEST 3: slot 命中（bg 先完成）→ 替换后立即补删 raw ───────────────────────
 
+@pytest.mark.asyncio
 async def test_slot_hit_folds_raw_immediately() -> None:
     """bg 先完成（_close_report 预置）+ has_llm_summary=False：
     finish 对直接用真报告，且末段 raw 随之补删（真摘要已落地）。"""
@@ -150,6 +152,7 @@ async def test_slot_hit_folds_raw_immediately() -> None:
 
 # ─── TEST 4: 同 agent 子任务延迟折叠登记的 raw scope = 子 task scope ──────────
 
+@pytest.mark.asyncio
 async def test_same_agent_child_defers_with_child_task_scope() -> None:
     """同 agent 子任务 close（嵌套 finish 对写 parent scope）：raw_fold_scope 必须是
     子任务自己的 task scope（raw 所在层），不是 finish 对所在的 parent scope。"""
@@ -221,6 +224,7 @@ async def _preset_placeholder_pair(mem, scope, task_id: str, pctx) -> None:
     ), pctx)
 
 
+@pytest.mark.asyncio
 async def test_bg_replace_success_folds_raw(monkeypatch, fake_state_ctx) -> None:
     """close 边界 bg 回调：_replace_finish_report 成功后按登记的 raw_fold_scope 补删末段 raw。"""
     state, ctx = fake_state_ctx  # task 层预置 [UP, LLM, TOOL]
@@ -248,6 +252,7 @@ async def test_bg_replace_success_folds_raw(monkeypatch, fake_state_ctx) -> None
     assert up, "USER_PROMPT 锚点保留"
 
 
+@pytest.mark.asyncio
 async def test_bg_no_usable_report_keeps_raw_and_placeholder(monkeypatch, fake_state_ctx) -> None:
     """close 边界 bg 无可用报告：raw 保留（延迟折叠不触发）、占位 finish 对不动、登记弹掉。"""
     state, ctx = fake_state_ctx

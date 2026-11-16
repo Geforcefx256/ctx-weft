@@ -6,9 +6,45 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Generic, Literal, TypeVar
 
+from ctx_weft.protocols.agent import AgentDetail
 from ctx_weft.protocols.events import StoredEvent
+from ctx_weft.protocols.hitl import HitlRequestView
+from ctx_weft.protocols import task
 
 T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class ShutdownReport:
+    """Execution quiescence and confirmed recoverability are separate guarantees."""
+
+    quiescent: bool
+    durable: bool
+    session_ids: tuple[str, ...] = ()
+    errors: tuple[str, ...] = ()
+
+
+class RuntimeClosedError(RuntimeError):
+    """A command was submitted after instance shutdown began."""
+
+
+class RuntimeShutdownError(RuntimeError):
+    def __init__(self, report: ShutdownReport):
+        self.report = report
+        super().__init__("Runtime shutdown incomplete: " + "; ".join(report.errors))
+
+
+@dataclass(frozen=True)
+class PromptDiagnostic:
+    """Redacted recompilation of saved inputs, not historical wire bytes."""
+
+    event_id: str
+    system_prompt: str
+    messages: list[dict[str, Any]]
+    tool_names: list[str]
+    capability_errors: list
+    trim: bool
+    source: Literal["recompiled"] = "recompiled"
 
 
 @dataclass(frozen=True)
@@ -32,17 +68,17 @@ class InitializationReport:
 
 @dataclass(frozen=True)
 class SessionStateSummary:
-    """Status facts at one committed cut; contains no runtime owners or HITL bodies."""
+    """One independent query snapshot composed of the existing public query values."""
 
-    root_agent_id: str
-    root_agent_status: str | None
-    root_task_id: str
-    root_task_status: str | None
-    has_running_agents: bool
-    has_interrupted_agents: bool
-    pending_hitl_count: int
-    pending_user_turn_hitl_count: int
-    waiting_user_turn_agent_id: str
+    root_agent: AgentDetail | None = None
+    root_task: task.TaskDetail | None = None
+    agents: tuple[AgentDetail, ...] = ()
+    pending_hitl: tuple[HitlRequestView, ...] = ()
+    has_running_agents: bool = False
+    has_interrupted_agents: bool = False
+    failure_counter: int = 0
+    threshold_tripped: bool = False
+    goal: str = ""
 
 
 @dataclass(frozen=True)
@@ -65,22 +101,5 @@ class SessionInitializationResult:
 class SessionDetail:
     session_id: str
     root_agent_id: str
-    goal: str
     created_at: datetime | None
-
-
-@dataclass(frozen=True)
-class TaskDetail:
-    task_id: str
-    session_id: str
-    assigned_agent_id: str | None
-    creator_agent_id: str | None
-    parent_task_id: str | None
-    status: str
-    title: str
-    description: str
-    outputs: Any
-    error: str | None
-    error_code: str | None
-    created_at: datetime | None
-    finished_at: datetime | None
+    state: SessionStateSummary

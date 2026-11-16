@@ -7,6 +7,10 @@
 
 from __future__ import annotations
 
+from tests._recovery import load_pending_fixture
+
+from tests._recovery import recover_fixture_session
+
 import asyncio
 import base64
 import hashlib
@@ -21,7 +25,6 @@ from ctx_weft.protocols.hitl import ToolResultDelivery, UserTurnDelivery
 from tests._event_helpers import append_one
 from tests._initialization import initialize_all
 
-pytestmark = pytest.mark.asyncio
 
 SID = "ses_1"
 AID = "agt_root"          # root agent id planted by `_session_prelude()`（`recover_agent` 主键）
@@ -264,7 +267,7 @@ async def _runtime_with_events(events, *, event_blob_store=None, prepare=True):
         await initialize_all(rt)
         await rt._load_agents_of(SID)
         await initialize_all(rt)
-        await rt.rebuild_hitl(SID)
+        await load_pending_fixture(rt, SID)
     rt._test_llm = llm
     return rt
 
@@ -313,34 +316,37 @@ def _is_event_side_ref(message) -> bool:
 
 
 def _text_of(message) -> str:
-    from ctx_weft.core.utils.content import content_to_text
+    from ctx_weft.protocols.content import content_to_text
     return content_to_text(message)
 
 
 # ── 装填 ────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_recovery_fills_the_registry_from_folded_events():
     rt = await _runtime_with_events(_legacy_pending_approval_events())
     await initialize_all(rt)
-    n = await rt.rebuild_hitl(SID)
+    n = await load_pending_fixture(rt, SID)
     assert n == 1
     assert rt.hitl_registry.list_pending(SID)[0].tool_call_id == "call_1"
 
 
+@pytest.mark.asyncio
 async def test_filled_requests_have_no_wait_slot():
     """重启后一切皆冷。"""
     rt = await _runtime_with_events(_legacy_pending_approval_events())
     await initialize_all(rt)
-    await rt.rebuild_hitl(SID)
+    await load_pending_fixture(rt, SID)
     assert rt.hitl_registry.list_pending(SID)[0].slot is None
 
 
+@pytest.mark.asyncio
 async def test_event_side_refs_are_hydrated_before_filling():
     """spec §12.3.3：event 侧 ref 直接进 memory 会写一个永远打不开的引用。"""
     rt = await _runtime_with_events(_legacy_answered_with_event_blob_ref())
     await initialize_all(rt)
-    await rt.rebuild_hitl(SID)
+    await load_pending_fixture(rt, SID)
     got = rt.hitl_registry.decision_for(SID, "call_1", "tool")
     assert got is not None
     decision, _ = got
@@ -348,21 +354,23 @@ async def test_event_side_refs_are_hydrated_before_filling():
     assert decision.message[0].data == base64.b64encode(PNG).decode()
 
 
+@pytest.mark.asyncio
 async def test_hydration_failure_degrades_to_text_and_never_raises():
     rt = await _runtime_with_events(_legacy_answered_with_broken_ref())
     await initialize_all(rt)
-    await rt.rebuild_hitl(SID)                       # 不得抛
+    await load_pending_fixture(rt, SID)                       # 不得抛
     decision, _ = rt.hitl_registry.decision_for(SID, "call_1", "tool")
     assert "[image" in _text_of(decision.message)
     assert not _is_event_side_ref(decision.message)
 
 
+@pytest.mark.asyncio
 async def test_hydration_never_raises_even_when_the_blob_store_explodes():
     """降级本身也不能再抛：异常会卡住整条恢复路径。"""
     rt = await _runtime_with_events(_legacy_answered_with_event_blob_ref(),
                                     event_blob_store=_ExplodingEventBlobStore())
     await initialize_all(rt)
-    await rt.rebuild_hitl(SID)                       # 不得抛
+    await load_pending_fixture(rt, SID)                       # 不得抛
     decision, _ = rt.hitl_registry.decision_for(SID, "call_1", "tool")
     assert not _is_event_side_ref(decision.message)
     assert "[image" in _text_of(decision.message)
@@ -371,47 +379,52 @@ async def test_hydration_never_raises_even_when_the_blob_store_explodes():
 # ── delivery：面板提示的原始事实（2026-09-04 Task 14 起派生串已删，host 自判） ──
 
 
+@pytest.mark.asyncio
 async def test_legacy_approval_pending_has_tool_result_delivery():
     """旧 approval 请求（有 tool_call_id、form != wait）折成 `ToolResultDelivery`——
     host 据此知道「有面板可答」（旧串是 PAUSED_HITL）。"""
     rt = await _runtime_with_events(_pending_with_tool_result_delivery())
     await initialize_all(rt)
-    await rt.rebuild_hitl(SID)
+    await load_pending_fixture(rt, SID)
     assert isinstance(rt.hitl_registry.list_pending(SID)[0].delivery, ToolResultDelivery)
 
 
+@pytest.mark.asyncio
 async def test_legacy_wait_only_pending_has_user_turn_delivery():
     """UserTurn = 软待命，没有面板要答（旧串是 PAUSED）—— 误标会让前端等一个
     不存在的面板。"""
     rt = await _runtime_with_events(_pending_with_user_turn_delivery())
     await initialize_all(rt)
-    await rt.rebuild_hitl(SID)
+    await load_pending_fixture(rt, SID)
     assert isinstance(rt.hitl_registry.list_pending(SID)[0].delivery, UserTurnDelivery)
 
 
+@pytest.mark.asyncio
 async def test_delivery_is_carried_by_the_explicit_field_not_by_form():
     """host 自定义 form 也能拿到正确的 delivery（旧的 PAUSED/PAUSED_HITL 判据曾经
     按 `form == "wait"` 字面量判定，那条路子对 host 自定义 form 会判错；新两事件
     模型下 `delivery` 是 `HITL_OPENED` 携带的显式字段，与 `form` 无关）。"""
     rt = await _runtime_with_events(_pending_with_custom_form_and_user_turn())
     await initialize_all(rt)
-    pend = await rt.rebuild_hitl(SID)
+    pend = await load_pending_fixture(rt, SID)
     assert pend == 1 and rt.hitl_registry.list_pending(SID)[0].form == "host:triage"
     assert isinstance(rt.hitl_registry.list_pending(SID)[0].delivery, UserTurnDelivery)
 
 
+@pytest.mark.asyncio
 async def test_nothing_is_pending_once_the_hitl_is_resolved_but_never_resumed():
     """决定已落盘、进程在续跑前死了：这条 HITL 已终局，恢复期装填后不应再出现在
     未决列表里（旧串在这种情况下是 `""`，即「无未决，不该暂停」）。"""
     rt = await _runtime_with_events(_resolved_but_never_resumed_tool_result())
     await initialize_all(rt)
-    await rt.rebuild_hitl(SID)
+    await load_pending_fixture(rt, SID)
     assert rt.hitl_registry.list_pending(SID) == []
 
 
 # ── 两个方向 ────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_a_task_with_an_unresolved_hitl_stays_parked_and_is_not_requeued():
     """最高风险的一条：人还没答，任务绝不能自己跑起来。
 
@@ -421,19 +434,20 @@ async def test_a_task_with_an_unresolved_hitl_stays_parked_and_is_not_requeued()
     """
     rt = await _runtime_with_events(_pending_with_tool_result_delivery())
     await initialize_all(rt)
-    await rt.recover_agent(AID)
+    await recover_fixture_session(rt, AID)
     tm = _tm(rt)
     assert tm.get_task(TID).status == "SUSPENDED"
     assert not tm._queue.has_pending()
     assert rt._test_llm.last_request is None
 
 
+@pytest.mark.asyncio
 async def test_a_new_model_unresolved_hitl_also_keeps_its_task_parked():
     """基线的 Critical：旧投影 reducer 没有 HITL_OPENED 分支 → parked 集合为空 → 人还
     没答，任务就被重排跑起来了。parked 真相源改成 registry 之后这条才成立。"""
     rt = await _runtime_with_events(_new_model_unresolved_tool_result())
     await initialize_all(rt)
-    await rt.recover_agent(AID)
+    await recover_fixture_session(rt, AID)
     tm = _tm(rt)
     assert [r.tool_call_id for r in rt.hitl_registry.list_pending(SID)] == ["call_1"]
     assert tm.get_task(TID).status == "SUSPENDED"
@@ -441,45 +455,50 @@ async def test_a_new_model_unresolved_hitl_also_keeps_its_task_parked():
     assert rt._test_llm.last_request is None
 
 
+@pytest.mark.asyncio
 async def test_a_task_parked_on_an_already_resolved_hitl_is_requeued():
     """崩溃窗口：决定已落盘、但进程在续跑之前死了 —— 任务必须重新跑起来。"""
     rt = await _runtime_with_events(_resolved_but_never_resumed_tool_result())
     await initialize_all(rt)
-    await rt.recover_agent(AID)
+    await recover_fixture_session(rt, AID)
     assert TID in await _drained_tasks(rt)
 
 
+@pytest.mark.asyncio
 async def test_a_task_on_a_resolved_new_model_hitl_is_requeued():
     """新两事件模型（HITL_OPENED + HITL_RESOLVED）的同一条路。旧投影对这条流是瞎的。"""
     rt = await _runtime_with_events(_new_model_resolved_tool_result())
     await initialize_all(rt)
-    await rt.recover_agent(AID)
+    await recover_fixture_session(rt, AID)
     assert rt.hitl_registry.list_pending(SID) == []          # 已终局 → 不 park
     assert rt.hitl_registry.decision_for(SID, "call_1", "authz")[0].outcome == "accepted"
     assert TID in await _drained_tasks(rt)
 
 
+@pytest.mark.asyncio
 async def test_resolved_for_session_sees_the_task_id_of_a_filled_decision():
     """承重点：装填出来的已终局记录必须带 task_id，否则恢复期认不出该唤醒哪个 task。"""
     rt = await _runtime_with_events(_resolved_but_never_resumed_tool_result())
     await initialize_all(rt)
-    await rt.rebuild_hitl(SID)
+    await load_pending_fixture(rt, SID)
     resolved = rt.hitl_registry.resolved_for_session(SID)
     assert [r.task_id for r in resolved] == [TID]
     assert rt.hitl_registry.resolved_for_session("other") == []
 
 
+@pytest.mark.asyncio
 async def test_a_resolved_user_turn_without_a_tool_call_id_is_still_filled():
     """`UserTurn` 的 park 没有 tool_call_id —— 按 tool_call 过滤会把整整一类请求丢掉。"""
     rt = await _runtime_with_events(_resolved_user_turn_never_injected())
     await initialize_all(rt)
-    await rt.rebuild_hitl(SID)
+    await load_pending_fixture(rt, SID)
     resolved = rt.hitl_registry.resolved_for_session(SID)
     assert len(resolved) == 1
     assert resolved[0].tool_call_id == "" and resolved[0].task_id == TID
     assert isinstance(resolved[0].delivery, UserTurnDelivery)
 
 
+@pytest.mark.asyncio
 async def test_recovery_injects_the_answer_of_a_resolved_user_turn():
     """崩溃窗口里最容易静默丢的一条：人答了 `wait_for_user`，进程在注入之前就死了。
 
@@ -488,13 +507,14 @@ async def test_recovery_injects_the_answer_of_a_resolved_user_turn():
     """
     rt = await _runtime_with_events(_resolved_user_turn_never_injected())
     await initialize_all(rt)
-    await rt.recover_agent(AID)
+    await recover_fixture_session(rt, AID)
     prompts = await _hitl_reply_prompts(rt)
     assert len(prompts) == 1
-    from ctx_weft.core.utils.content import content_to_text
+    from ctx_weft.protocols.content import content_to_text
     assert "use postgres" in content_to_text(prompts[0].content)
 
 
+@pytest.mark.asyncio
 async def test_requeue_of_a_resolved_user_turn_does_not_duplicate_the_injection():
     """UserTurn 侧的幂等靠 MemoryEvent.id = f"hitlreply:{hitl_id}"（§7.3/§12.2）。
 
@@ -502,12 +522,13 @@ async def test_requeue_of_a_resolved_user_turn_does_not_duplicate_the_injection(
     """
     rt = await _runtime_with_events(_resolved_user_turn_never_injected())
     await initialize_all(rt)
-    await rt.recover_agent(AID)
+    await recover_fixture_session(rt, AID)
     await initialize_all(rt)
-    await rt.recover_agent(AID)
+    await recover_fixture_session(rt, AID)
     assert len(await _hitl_reply_prompts(rt)) == 1
 
 
+@pytest.mark.asyncio
 async def test_a_task_parked_on_another_hitl_still_gets_the_reply_injected():
     """该 task 还挂着别的**未决** HITL：状态一动不动，但那条已终局的答复照样要补进对话。
 
@@ -526,13 +547,14 @@ async def test_a_task_parked_on_another_hitl_still_gets_the_reply_injected():
     ]
     rt = await _runtime_with_events(events)
     await initialize_all(rt)
-    await rt.recover_agent(AID)
+    await recover_fixture_session(rt, AID)
     tm = _tm(rt)
     assert tm.get_task(TID).status == "SUSPENDED"      # 只写记忆，绝不碰状态
     injected = await _hitl_reply_prompts(rt)
     assert [str(r.content) for r in injected] == ["use postgres"]
 
 
+@pytest.mark.asyncio
 async def test_restore_leaves_a_parent_with_live_children_suspended():
     """删掉 `resumable_task_ids` 之后的守卫：父任务提前置 PENDING 会让
     `_try_resume_parent`（以 status == "SUSPENDED" 为门）在子任务收尾时静默失效。"""
@@ -547,6 +569,7 @@ async def test_restore_leaves_a_parent_with_live_children_suspended():
     assert tm.get_task("c").status == "PENDING"     # 子任务本身被这一趟 restore 重排了
 
 
+@pytest.mark.asyncio
 async def test_recovery_does_not_touch_a_parent_suspended_on_a_live_child():
     """复审 Critical：补写必须是**只写**的。
 
@@ -566,7 +589,7 @@ async def test_recovery_does_not_touch_a_parent_suspended_on_a_live_child():
     """
     rt = await _runtime_with_events(_resolved_user_turn_on_a_parent_with_a_live_child())
     await initialize_all(rt)
-    await rt.recover_agent(AID)
+    await recover_fixture_session(rt, AID)
     parent = _tm(rt).get_task(TID)
     assert parent.status == "SUSPENDED"                  # 留给 _try_resume_parent
     assert parent.outputs is None                        # 从未 FINISHED 过，本就没有 outputs——实测确认，非猜测
@@ -574,38 +597,42 @@ async def test_recovery_does_not_touch_a_parent_suspended_on_a_live_child():
     assert len(await _hitl_reply_prompts(rt)) == 1       # 答复照样补上了
 
 
+@pytest.mark.asyncio
 async def test_recovery_backfill_survives_repeated_recovery_without_state_drift():
     """反复恢复：状态不漂移、注入不重复。"""
     rt = await _runtime_with_events(_resolved_user_turn_on_a_parent_with_a_live_child())
     await initialize_all(rt)
-    await rt.recover_agent(AID)
+    await recover_fixture_session(rt, AID)
     await initialize_all(rt)
-    await rt.recover_agent(AID)
+    await recover_fixture_session(rt, AID)
     parent = _tm(rt).get_task(TID)
     assert parent.status == "SUSPENDED"
     assert parent.outputs is None                        # 见上一个测试的注释：本就没有，不因重复恢复而变
     assert len(await _hitl_reply_prompts(rt)) == 1
 
 
+@pytest.mark.asyncio
 async def test_legacy_origin_user_turns_are_not_backfilled():
     """旧模型的应答不补写：旧路径的记忆记录没有 `hitlreply:` 幂等键，补一次就多一轮。"""
     rt = await _runtime_with_events(_legacy_answered_user_turn())
     await initialize_all(rt)
-    await rt.rebuild_hitl(SID)
+    await load_pending_fixture(rt, SID)
     resolved = rt.hitl_registry.resolved_for_session(SID)
     assert len(resolved) == 1 and resolved[0].legacy_origin is True
     await initialize_all(rt)
-    await rt.recover_agent(AID)
+    await recover_fixture_session(rt, AID)
     assert await _hitl_reply_prompts(rt) == []
 
 
+@pytest.mark.asyncio
 async def test_new_model_user_turns_are_not_flagged_legacy():
     rt = await _runtime_with_events(_resolved_user_turn_never_injected())
     await initialize_all(rt)
-    await rt.rebuild_hitl(SID)
+    await load_pending_fixture(rt, SID)
     assert rt.hitl_registry.resolved_for_session(SID)[0].legacy_origin is False
 
 
+@pytest.mark.asyncio
 async def test_resume_on_a_live_owner_neither_rebuilds_nor_backfills():
     """单例：内存里有活 owner 时，`/resume` 就地复用它——不重建一个 TM 去顶替它，也
     不跑重建路径那套崩溃善后（补注入已终局的 UserTurn）。
@@ -633,7 +660,7 @@ async def test_resume_on_a_live_owner_neither_rebuilds_nor_backfills():
     live._dispatch_tasks[TID] = dispatch
 
     await initialize_all(rt)
-    await rt.recover_agent(AID)               # 不带 resumed_task_id → /resume
+    await recover_fixture_session(rt, AID)               # 不带 resumed_task_id → /resume
     await asyncio.sleep(0)
 
     assert rt._task_managers[SID] is live, "活 owner 不得被重建出来的 TM 顶替"

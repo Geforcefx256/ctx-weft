@@ -44,7 +44,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 SID, AID = "ses_ca", "agt_root"
 
@@ -101,6 +100,7 @@ async def _idle_agent():
     return rt
 
 
+@pytest.mark.asyncio
 async def test_compact_agent_returns_receipt():
     rt = await _idle_agent()
     await initialize_all(rt)
@@ -110,6 +110,7 @@ async def test_compact_agent_returns_receipt():
     assert r.session_id == SID
 
 
+@pytest.mark.asyncio
 async def test_transient_task_id_is_flagged():
     """不传 task_id 时返回的是内存载体 id，事件库里查不到——这条此前只写在 docstring 里。"""
     rt = await _idle_agent()
@@ -118,6 +119,7 @@ async def test_transient_task_id_is_flagged():
     assert r.task_id_is_transient is True
 
 
+@pytest.mark.asyncio
 async def test_supplied_task_id_is_not_transient():
     rt = await _idle_agent()
     await initialize_all(rt)
@@ -126,6 +128,7 @@ async def test_supplied_task_id_is_not_transient():
     assert r.task_id_is_transient is False
 
 
+@pytest.mark.asyncio
 async def test_unknown_agent_raises():
     from ctx_weft.core.models.errors import AgentNotFound
 
@@ -135,12 +138,14 @@ async def test_unknown_agent_raises():
         await rt.compact_agent("agt_nope")
 
 
+@pytest.mark.asyncio
 async def test_compact_session_is_gone():
     """不留 shim（spec §1）。"""
     rt = await _idle_agent()
     assert not hasattr(rt, "compact_session")
 
 
+@pytest.mark.asyncio
 async def test_manual_compact_has_formal_step_events_and_monotonic_sequence():
     rt = await _idle_agent()
     await initialize_all(rt)
@@ -168,6 +173,7 @@ async def test_manual_compact_has_formal_step_events_and_monotonic_sequence():
                    for e in run)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
 async def test_manual_compact_propagates_failure_and_releases_busy_guard(monkeypatch, error_type):
     from ctx_weft.core.loop.steps.compact import CompactStep

@@ -40,9 +40,10 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 from ctx_weft.protocols.context import ProviderContext
+from ctx_weft.protocols.events import _snapshot_metadata
 
 if TYPE_CHECKING:
-    from ctx_weft.protocols.context import ContentPart
+    from ctx_weft.protocols.content import ContentPart
     from ctx_weft.protocols.hitl import HitlAsk, HitlDecision
     from ctx_weft.protocols.template import AgentTemplate
 
@@ -227,6 +228,13 @@ class CapabilityEvent:
     # 只作用于 content 里的文本 part：gateway 收到就用 `split_for_tool_result` 拆开、
     # 加工完再拼回去。provider 不需要知道这些加工存在。
     payload: dict[str, Any] = field(default_factory=dict)
+    # The same opaque envelope extensions as Event.metadata. Separate from the
+    # execution/control information in result payload["metadata"]. Result/error
+    # extensions shallow-merge into CapabilityFinished; progress stays local.
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.metadata = _snapshot_metadata(self.metadata)
 
 
 @dataclass
@@ -572,26 +580,6 @@ class RerunAuthorizer(ABC):
             message=decision.message or
             f"[Operation outcome unresolved] 工具 {capability.name} 的这次调用被中断，"
             f"人工审核后决定不重试。")
-
-
-@runtime_checkable
-class SkillIndexConsumer(Protocol):
-    """持有 skill 索引、需要在 skill 目录变动时被通知重建的 provider。
-
-    存在的理由是**打断一条 import 环**：`ProviderRegistry` 在
-    `register_capability` / `deregister_capability` 里要通知
-    `SkillExecutorCapabilityProvider` 重建索引，但后者住在 `core.orchestrator`，
-    而 orchestrator 反过来要 `ProviderRegistry` 的类型——registry 靠函数内惰性
-    import 绕了这个环。改成对本 Protocol 做 `isinstance`，registry 就完全不必知道
-    那个具体类，环真正消失而不是被挪个地方继续绕。
-
-    `runtime_checkable` 的 isinstance 只查方法名存在性，对这里够用：能被通知的
-    条件就是「有 mark_dirty」。
-    """
-
-    def mark_dirty(self) -> None:
-        """下次 list() 前重建索引。"""
-        ...
 
 
 @runtime_checkable

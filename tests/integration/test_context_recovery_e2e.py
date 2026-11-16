@@ -53,7 +53,6 @@ from tests.integration.test_compact_flow_e2e import _NOOP_NAME, _NoopToolProvide
 from tests.integration.test_minimal_loop import InlineAgentTemplateProvider, make_runtime
 from tests.step_helpers import patch_observe_start
 
-pytestmark = pytest.mark.asyncio
 
 #: 摘要正文里的哨兵：断言它出现在**续跑那次请求**里，即「模型真的看见了压缩后的进度」。
 #: 放在 Remaining 小节——Goal/Done 丢了还能从原始消息猜回来，Remaining 丢了就是进度丢了。
@@ -199,6 +198,7 @@ def _types(seen, event_type) -> list:
     return [p for t, p in seen if t == event_type.value]
 
 
+@pytest.mark.asyncio
 async def test_recovers_in_place_without_spending_a_retry(monkeypatch, caplog):
     """主路径：越线 → 回 prepare 压缩 → 续跑收尾。不吃 retry，且无悬挂 tool_call。"""
     runtime, llm, seen = _wire(monkeypatch)
@@ -251,6 +251,7 @@ async def test_recovers_in_place_without_spending_a_retry(monkeypatch, caplog):
     assert all(c.count(_USER_PROMPT) == 1 for c in collapsed), "原始节有界，不嵌套膨胀"
 
 
+@pytest.mark.asyncio
 async def test_initial_overbudget_history_is_compacted_before_first_actor_call(monkeypatch):
     """真实历史使首次完整估算越线；压缩和重装配必须发生在首次 actor 请求之前。"""
     runtime, llm, seen = _wire(
@@ -304,6 +305,7 @@ async def test_initial_overbudget_history_is_compacted_before_first_actor_call(m
     assert state.task.status == "FINISHED" and state.task.retry_count == 0
 
 
+@pytest.mark.asyncio
 async def test_tool_result_is_persisted_before_compaction(monkeypatch):
     """越线那一轮的工具**照执行完**：结果必须已落定（改造前它一条都不会有）。
 
@@ -330,6 +332,7 @@ async def test_tool_result_is_persisted_before_compaction(monkeypatch):
         "越线那一轮的工具结果必须已落定（执行点排在停机判定之前）"
 
 
+@pytest.mark.asyncio
 async def test_turn_budget_is_not_reset_by_recovery(monkeypatch):
     """轮数预算跨恢复累计：`max_turns_per_act=1` 时，恢复后不该白送第二轮。
 
@@ -352,6 +355,7 @@ async def test_turn_budget_is_not_reset_by_recovery(monkeypatch):
     assert len(llm.seen) == 1, f"续跑段不该再发 LLM 请求，实际发了 {len(llm.seen)} 次"
 
 
+@pytest.mark.asyncio
 async def test_gives_up_when_compaction_cannot_free_anything(monkeypatch):
     """终止性：恢复驱动的那次 compact 一无所获 → **不再**恢复第二次，退回 observe/retry。
 
@@ -383,6 +387,7 @@ async def test_gives_up_when_compaction_cannot_free_anything(monkeypatch):
                 if p.get("trigger") == "prepare_budget"], "恢复驱动的压缩本例应一无所获"
 
 
+@pytest.mark.asyncio
 async def test_plain_text_finish_wins_over_the_stop_line(monkeypatch):
     """越线 + **纯文本**回合 → 按正常收尾处理，不当机械退出。
 
@@ -405,6 +410,7 @@ async def test_plain_text_finish_wins_over_the_stop_line(monkeypatch):
     assert "Here is the final answer." in (state.task.outputs or ""),         "越线不得吞掉模型刚交出的答复"
 
 
+@pytest.mark.asyncio
 async def test_actor_done_wins_over_the_stop_line(monkeypatch):
     """工具轮次越线且收到 actor_done 信号 → 真正走 actor_done 分支，不恢复、不挂起。"""
     runtime, llm, seen = _wire(monkeypatch, responses=[
@@ -443,6 +449,7 @@ async def test_actor_done_wins_over_the_stop_line(monkeypatch):
     assert not _types(seen, EventType.TASK_REQUEUED)
 
 
+@pytest.mark.asyncio
 async def test_suspend_wins_over_the_stop_line(monkeypatch):
     """越线 + **dispatch** 同一轮 → suspend 胜出：本 run 本来就要停在等子任务，没有续跑可言。
 
@@ -467,6 +474,7 @@ async def test_suspend_wins_over_the_stop_line(monkeypatch):
     assert "observe" not in steps, steps
 
 
+@pytest.mark.asyncio
 async def test_predispatch_compact_reassembles_then_dispatches_without_another_llm_turn(monkeypatch):
     runtime, llm, seen = _wire(
         monkeypatch, predispatch_compact_token_ratio=0.5,
@@ -489,6 +497,7 @@ async def test_predispatch_compact_reassembles_then_dispatches_without_another_l
     assert len(dispatched) == 1
 
 
+@pytest.mark.asyncio
 async def test_quota_exhaustion_falls_back_to_the_retry_path(monkeypatch):
     """配额耗尽（每次压缩都有效、但每段都再越线）→ 第三次越线退回 observe → retry。
 
@@ -515,6 +524,7 @@ async def test_quota_exhaustion_falls_back_to_the_retry_path(monkeypatch):
     assert state.verdict is not None and state.verdict.task_outcome == "continue"
 
 
+@pytest.mark.asyncio
 async def test_recovery_disabled_keeps_legacy_retry_path(monkeypatch):
     """`max_context_recoveries=0` → 行为回到改造前：context_limit 直接退 observe → retry。"""
     runtime, llm, seen = _wire(monkeypatch, max_context_recoveries=0)

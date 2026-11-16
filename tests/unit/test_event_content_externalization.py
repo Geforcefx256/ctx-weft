@@ -11,7 +11,7 @@ import base64
 
 import pytest
 
-from ctx_weft.core.utils.content import content_to_event_jsonable
+from ctx_weft.protocols.content import content_to_event_jsonable
 from ctx_weft.protocols import BLOB_REF_PREFIX, ImagePart, ProviderContext, TextPart
 
 _PNG = base64.b64encode(b"\x89PNG_fake_bytes").decode()

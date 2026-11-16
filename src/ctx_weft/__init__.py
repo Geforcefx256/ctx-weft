@@ -1,5 +1,6 @@
 """ctx-weft: Agent Runtime SDK."""
 
+from ctx_weft.protocols.content import InvalidContentError, BlobStoreRequiredError
 from ctx_weft.core.models.config import RuntimeConfig
 from ctx_weft.core.models.errors import (
     AgentBusyError,
@@ -26,13 +27,11 @@ from ctx_weft.core.runtime import (
     SessionStartParams,
     TurnHandle,
 )
-from ctx_weft.protocols.agent import AgentDetail, AgentSummary, CompactReceipt
+from ctx_weft.protocols.agent import AgentDetail, AgentState, AgentSummary, CompactReceipt
 from ctx_weft.protocols.events import EventStore
 from ctx_weft.protocols.hitl import HitlReply, HitlRequestView
-from ctx_weft.protocols.runtime import (
-    InitializationReport, QueryResult, SessionDetail, SessionInitializationResult,
-    SessionStateSummary, TaskDetail,
-)
+from ctx_weft.protocols.runtime import InitializationReport, PromptDiagnostic, QueryResult, RuntimeClosedError, RuntimeShutdownError, ShutdownReport, SessionDetail, SessionInitializationResult, SessionStateSummary
+from ctx_weft.protocols.task import TaskDetail
 from ctx_weft.providers.events import InMemoryEventStore
 
 __all__ = [
@@ -43,6 +42,10 @@ __all__ = [
     "TurnHandle",
     "SessionHandle",
     "InitializationReport",
+    "PromptDiagnostic",
+    "RuntimeClosedError",
+    "RuntimeShutdownError",
+    "ShutdownReport",
     "SessionInitializationResult",
     "SessionStateSummary",
     "QueryResult",
@@ -54,12 +57,14 @@ __all__ = [
     "RuntimeConfig",
     # agent 发现与回执
     "AgentDetail",
+    "AgentState",
     "AgentSummary",
     "CompactReceipt",
     # HITL
     "HitlReply",
     "HitlRequestView",
     # 错误
+    "InvalidContentError", "BlobStoreRequiredError",
     "AgentNotFound",
     "AgentNotLoaded",
     "AgentNotRunningError",

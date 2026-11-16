@@ -22,7 +22,7 @@ from ctx_weft.core.assembler.legacy_task_memory import (
 )
 from ctx_weft.core.assembler.prompts import runtime_prompt
 from ctx_weft.core.media.fold import placeholder_refs
-from ctx_weft.core.utils.content import content_to_text
+from ctx_weft.protocols.content import content_to_text
 from ctx_weft.core.utils.ids import record_id
 from ctx_weft.protocols import (
     MemoryAddress,

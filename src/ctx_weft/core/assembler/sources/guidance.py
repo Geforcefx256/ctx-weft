@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from ctx_weft.core.models.status import TERMINAL_TASK_STATUSES
 from ctx_weft.core.utils.clock import as_utc
-from ctx_weft.core.utils.content import content_to_text
+from ctx_weft.protocols.content import content_to_text
 from ctx_weft.core.utils.ids import generate_id
 from ctx_weft.core.utils.task_ref import task_label
 

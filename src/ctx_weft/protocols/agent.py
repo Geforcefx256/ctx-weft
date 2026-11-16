@@ -8,6 +8,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
+from ctx_weft.protocols.llm import ModelCallConfig
+from ctx_weft.protocols.task import TaskDetail
+
+
+@dataclass(frozen=True)
+class AgentState:
+    """Execution facts shared by session and individual agent queries."""
+
+    agent_id: str
+    status: str
+    status_reason: str = ""
+    current_task: TaskDetail | None = None
+
 
 @dataclass(frozen=True)
 class AgentSummary:
@@ -23,13 +36,14 @@ class AgentSummary:
 class AgentDetail:
     agent_id: str
     parent_agent_id: str | None
-    status: str
-    current_task_id: str | None
+    state: AgentState
     spawn_depth: int
     session_id: str
     template_id: str
     created_at: datetime | None = None
-    current_task_status: str | None = None
+    llm_account: str = ""
+    llm_model: str = ""
+    llm_config: ModelCallConfig | None = None
 
 
 @dataclass(frozen=True)

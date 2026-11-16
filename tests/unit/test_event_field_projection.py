@@ -12,9 +12,30 @@ from ctx_weft.protocols.events import (
 )
 from tests.unit.test_read_primitives_conformance import _ev, store  # noqa: F401
 
-pytestmark = pytest.mark.asyncio
+
+@pytest.mark.asyncio
+async def test_metadata_survives_commit_reads_and_caller_mutation(store):
+    original = {"host": {"sources": [{"url": "https://example.com/"}]}}
+    event = replace(_ev(1, "Test"), metadata=original)
+    receipt = await store.append_batch("s1", "metadata-batch", [event])
+    original["host"]["sources"].clear()
+    event.metadata.clear()
+    receipt.records[0].event.metadata.clear()
+    row, = await store.read_range("s1")
+    expected = {"host": {"sources": [{"url": "https://example.com/"}]}}
+    assert row.event.metadata == expected
+    row.event.metadata.clear()
+    last = await store.read_last_of_type("s1", "Test")
+    assert last.event.metadata == expected
+    projection = EventReadProjection({"Test": ()}, include_metadata=True)
+    projected, = await store.read_range("s1", projection=projection)
+    assert projected.event.metadata == expected
+    replay = replace(_ev(1, "Test"), metadata=expected)
+    assert (await store.append_batch("s1", "metadata-batch", [replay])).records[0].event.metadata == expected
 
 
+
+@pytest.mark.asyncio
 async def test_projection_preserves_json_shape_and_envelopes(store):
     payload = {"keep": {"null": None, "false": False, "true": True, "zero": 0, "empty": "",
                          "array": [], "object": {}, "unicode": "中文", "drop": "large"},
@@ -41,6 +62,7 @@ async def test_projection_preserves_json_shape_and_envelopes(store):
     assert full.event.payload == payload and full.event.metadata == event.metadata
 
 
+@pytest.mark.asyncio
 async def test_projection_does_not_filter_envelopes_or_change_related_matching(store):
     await store.append_batch("s1", "batch", [
         replace(_ev(1, "TaskCreated"), payload={"task": {"id": "target", "body": "large"}}),
@@ -60,6 +82,7 @@ async def test_projection_does_not_filter_envelopes_or_change_related_matching(s
         await store.append_batch("s1", "invalid", [rows[0].event])
 
 
+@pytest.mark.asyncio
 async def test_whole_subtree_metadata_and_null_intermediate(store):
     event = replace(_ev(1, "Test"), payload={"a": None, "b": False, "c": {"nested": [1, None]}},
                     metadata={"kept": True})
@@ -69,6 +92,7 @@ async def test_whole_subtree_metadata_and_null_intermediate(store):
     assert row.event.payload == event.payload and row.event.metadata == event.metadata
 
 
+@pytest.mark.asyncio
 async def test_projection_cache_distinguishes_field_sets_and_whole_payload(store):
     event = replace(_ev(1, "Test"), payload={"a": False, "b": None, 'quote".key': "中文"})
     await store.append_batch("s1", "batch", [event])
@@ -82,6 +106,7 @@ async def test_projection_cache_distinguishes_field_sets_and_whole_payload(store
         assert (await store.read_last_of_type("s1", "Test", projection=projection)).event.payload == expected
 
 
+@pytest.mark.asyncio
 async def test_postgres_projection_compiles_without_full_orm_selection():
     from sqlalchemy import select
     from sqlalchemy.dialects.postgresql import dialect

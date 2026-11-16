@@ -93,6 +93,51 @@ async def test_run_single_task_forwards_config_to_act_and_observe():
 
 
 @pytest.mark.asyncio
+async def test_llm_provider_context_follows_session_subagent_and_cold_rebuild(tmp_path):
+    from ctx_weft.providers.events.store.sql import open_sqlite_event_store
+    from tests.runtime_helpers import close_runtime
+
+    async with open_sqlite_event_store(tmp_path / "context.sqlite") as store:
+        rt, llm = await runtime(event_store=store)
+        seen = []
+
+        class Resolver:
+            def get_client(self, account=None, model=None, *, ctx):
+                seen.append(ctx)
+                return llm
+
+        rt.providers.register_llm_provider(Resolver())
+        expected = {}
+        root_ids = {}
+        try:
+            for tenant in ("opaque-a", "opaque-b"):
+                session = await rt.create_session(template_id="agent:tpl_echo", tenant_id=tenant)
+                expected[session.session_id] = tenant
+                root_ids[session.session_id] = session.root_agent_id
+                turn = await rt.dispatch_task(
+                    session.session_id, "hello", tenant_id=tenant,
+                    settings={"use_subagent": True, "subagent_template": "agent:tpl_echo"},
+                )
+                await turn.wait_for_finish(timeout=10)
+                assert any(c.agent_id == turn.agent_id for c in seen)
+            sid = next(iter(expected))
+            assert rt.forget_session(sid)
+            await rt.rebuild_session(sid)
+            resumed = await rt.dispatch_task(
+                sid, "again", agent_id=root_ids[sid], tenant_id=expected[sid],
+                settings={"use_subagent": False},
+            )
+            await resumed.wait_for_finish(timeout=10)
+            assert seen
+            assert all(c.tenant_id == expected[c.session_id] for c in seen), [
+                (c.session_id, c.tenant_id, expected[c.session_id]) for c in seen
+            ]
+            assert all(c.agent_id and c.agent_template_id == "agent:tpl_echo" for c in seen)
+        finally:
+            await close_runtime(rt)
+
+
+@pytest.mark.asyncio
 async def test_sql_persistence_and_cold_rebuild_deliver_the_subclass(tmp_path):
     from ctx_weft.providers.events.store.sql import open_sqlite_event_store
     from ctx_weft.providers.llm import AnthropicCallConfig

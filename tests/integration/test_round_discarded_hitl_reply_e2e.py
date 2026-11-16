@@ -18,6 +18,8 @@ A 类（`send_message` 新建 task）那条在 `test_round_discarded_before_firs
 
 from __future__ import annotations
 
+from tests._recovery import load_pending_fixture
+
 import asyncio
 
 import pytest
@@ -37,7 +39,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 _MOCK_CONTEXT_LIMIT = 100_000
 _RETRACTED = "actually never mind, forget I asked"
@@ -90,7 +91,7 @@ async def _stored_types(rt, session_id: str) -> list[str]:
 
 
 async def _user_texts(rt, session_id: str, agent_id: str, task_id: str) -> list[str]:
-    from ctx_weft.core.utils.content import content_to_text
+    from ctx_weft.protocols.content import content_to_text
     view = await load_records(rt.providers.get_memory(),
         MemoryAddress(session_id=session_id, task_id=task_id, agent_id=agent_id),
         MemoryScope.TASK,
@@ -111,6 +112,7 @@ async def _wait_for_wait_bubble(rt, session_id: str, timeout: float = 5.0):
     raise TimeoutError("wait bubble never appeared")
 
 
+@pytest.mark.asyncio
 async def test_pause_before_first_chunk_puts_the_answered_bubble_back() -> None:
     llm = _StallsBeforeFirstChunkLLM(
         responses=[MockResponse(text=f"answer {i}") for i in range(8)],
@@ -218,6 +220,7 @@ async def test_pause_before_first_chunk_puts_the_answered_bubble_back() -> None:
     )
 
 
+@pytest.mark.asyncio
 async def test_retyped_reply_survives_a_restart_in_the_discard_window() -> None:
     """撤销之后**重启**，再重答同一个气泡——那句话仍然必须进 memory。
 
@@ -264,7 +267,7 @@ async def test_retyped_reply_survives_a_restart_in_the_discard_window() -> None:
     rt._evict_session_memory(sid)
     rt.hitl_registry.forget_session(sid)
     await initialize_all(rt)
-    await rt.rebuild_hitl(sid)
+    await load_pending_fixture(rt, sid)
     rebuilt = rt.hitl_registry.get(bubble.id)
     assert rebuilt is not None, "重建之后这个气泡必须还在（撤销不发事件，日志里它仍是未决）"
     assert rebuilt.claim_pending is False and rebuilt.pending_decision is None, (

@@ -17,8 +17,10 @@ from ctx_weft.protocols.events import EventType
 
 
 class _CapturingBus:
-    async def emit_batch(self, events):
+    async def emit_batch(self, events, *, on_committed=None):
         self.events.extend(events)
+        if on_committed is not None:
+            on_committed()
 
     def __init__(self) -> None:
         self.events: list = []

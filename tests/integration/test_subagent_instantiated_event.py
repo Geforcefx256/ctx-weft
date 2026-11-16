@@ -31,7 +31,6 @@ from tests.integration.test_minimal_loop import (
 )
 from tests.runtime_helpers import close_runtime
 
-pytestmark = pytest.mark.asyncio
 
 SUB_TEMPLATE_ID = "tpl_researcher"
 #: agent record / 事件里**存**的形态：规范的 `provider:name`。与下面 LLM 传的
@@ -131,6 +130,7 @@ async def _wait_for_subagent_task(runtime, session_id, timeout=8.0):
     )
 
 
+@pytest.mark.asyncio
 async def test_subagent_instantiation_emits_event_with_own_template(runtime_factory):
     llm = _SpawnLLM()
     runtime = runtime_factory(llm)
@@ -160,6 +160,7 @@ async def test_subagent_instantiation_emits_event_with_own_template(runtime_fact
     assert instantiated[-1].payload.get("template_id") == SUB_TEMPLATE_CANONICAL
 
 
+@pytest.mark.asyncio
 async def test_replayed_view_gives_subagent_its_own_template(runtime_factory):
     """端到端闭环：发射 + 折叠合起来，重放出的 AgentView 带子模板而非 root 模板。"""
     llm = _SpawnLLM()
@@ -194,6 +195,7 @@ async def test_replayed_view_gives_subagent_its_own_template(runtime_factory):
 # 会出现「先 Spawned、后 Rejected」的自相矛盾事件对。
 
 
+@pytest.mark.asyncio
 async def test_agent_spawned_emitted_with_parent_and_subtask(runtime_factory):
     llm = _SpawnLLM()
     runtime = runtime_factory(llm)
@@ -224,6 +226,7 @@ async def test_agent_spawned_emitted_with_parent_and_subtask(runtime_factory):
     assert ev.task_id == sub_task.id
 
 
+@pytest.mark.asyncio
 async def test_agent_spawned_precedes_agent_instantiated(runtime_factory):
     """因果顺序：先「这次 spawn 被准了」，再「诞生的 agent 长这样」。"""
     llm = _SpawnLLM()

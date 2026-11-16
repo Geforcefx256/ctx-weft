@@ -35,6 +35,8 @@ defaults would make these tests take minutes instead of completing instantly.
 """
 from __future__ import annotations
 
+from tests._recovery import recover_fixture_session
+
 import asyncio
 
 import pytest
@@ -58,7 +60,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 # The mock LLM's default context_limit (from MockLLMAdapter constructor default)
 _MOCK_CONTEXT_LIMIT = 100_000
@@ -232,6 +233,7 @@ def _agent_not_left_interrupted(seen: list, agent_id: str) -> bool:
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_outage_then_resume_completes():
     """Single outage → INTERRUPTED; then recover_agent re-drives to FINISHED.
 
@@ -312,7 +314,7 @@ async def test_outage_then_resume_completes():
     # ── Resume with healthy LLM ────────────────────────────────────────────────
     # recover_agent() returns None; drain runs as asyncio background task.
     await initialize_all(runtime)
-    result = await runtime.recover_agent(root_agent_id)
+    result = await recover_fixture_session(runtime, root_agent_id)
     assert result is None  # confirm the API contract (returns None)
 
     # Wait for the async drain to complete.
@@ -333,6 +335,7 @@ async def test_outage_then_resume_completes():
     )
 
 
+@pytest.mark.asyncio
 async def test_idempotent_outage_resume_completes():
     """Two outages + two resumes; each outage re-interrupts; final resume completes.
 
@@ -407,7 +410,7 @@ async def test_idempotent_outage_resume_completes():
     # ── First resume → second outage → still SUSPENDED ────────────────────────
     seen.clear()
     await initialize_all(runtime)
-    await runtime.recover_agent(root_agent_id)
+    await recover_fixture_session(runtime, root_agent_id)
 
     # Wait until the second outage fires: poll the spy list for the new
     # SessionInterrupted event from the background drain.
@@ -442,7 +445,7 @@ async def test_idempotent_outage_resume_completes():
     # ── Second resume → healthy LLM → FINISHED ────────────────────────────────
     seen.clear()
     await initialize_all(runtime)
-    await runtime.recover_agent(root_agent_id)
+    await recover_fixture_session(runtime, root_agent_id)
     await _wait_for_task_finished(runtime, session_id)
 
     view_final = await rebuild_view(runtime.event_store, session_id)

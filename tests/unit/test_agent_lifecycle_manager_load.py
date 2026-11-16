@@ -17,7 +17,6 @@ from tests.integration.test_minimal_loop import (
     make_echo_template,
 )
 
-pytestmark = pytest.mark.asyncio
 
 TPL = "agent:tpl_echo"
 
@@ -45,10 +44,11 @@ def _lm() -> AgentLifecycleManager:
     providers.register_capability(provider)
     return AgentLifecycleManager(
         template_lookup=TemplateLookup(providers=providers), event_bus=_Bus(),
-        model_resolver=lambda a, m: _Client(),
+        model_resolver=lambda a, m, **_context: _Client(),
     )
 
 
+@pytest.mark.asyncio
 async def test_load_fills_records_from_views():
     lm = _lm()
     views = {
@@ -64,6 +64,7 @@ async def test_load_fills_records_from_views():
     assert lm._agents["agt_b"].parent_agent_id == "agt_a"
 
 
+@pytest.mark.asyncio
 async def test_load_resolves_template_config_not_dataclass_defaults():
     """行为变化，且是变正确了：agents_from_projection 留的是 dataclass 默认值。"""
     lm = _lm()
@@ -75,6 +76,7 @@ async def test_load_resolves_template_config_not_dataclass_defaults():
     assert got.loop_config == tmpl.loop_config
 
 
+@pytest.mark.asyncio
 async def test_empty_template_id_stays_empty_and_warns(caplog):
     """存量事件流里子 agent 没发过 AgentInstantiated → template_id 为空。
 
@@ -95,6 +97,7 @@ async def test_empty_template_id_stays_empty_and_warns(caplog):
     assert "no template_id" in caplog.text       # 但要留痕
 
 
+@pytest.mark.asyncio
 async def test_load_is_idempotent():
     lm = _lm()
     views = {"agt_a": AgentView(id="agt_a", template_id=TPL)}
@@ -103,6 +106,7 @@ async def test_load_is_idempotent():
     assert len(lm._agents) == 1
 
 
+@pytest.mark.asyncio
 async def test_unresolvable_template_id_falls_back_to_default_config_not_raises():
     """恢复期缺口降级，不抛——模板查不到时用 MemoryConfig()/LoopConfig() 默认值继续。"""
     lm = _lm()

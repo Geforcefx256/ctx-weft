@@ -37,7 +37,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 
 def _finish(n: int = 12) -> list[MockResponse]:
@@ -86,6 +85,7 @@ def _spawned(events) -> list:
 # ── §9.1 全新树 ───────────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_fresh_tree_has_no_parent_and_does_not_touch_root_agent():
     rt, sid, root, events = await _runtime_with_session()
     before = len(events)
@@ -113,6 +113,7 @@ async def test_fresh_tree_has_no_parent_and_does_not_touch_root_agent():
 # ── 交互口（port_key）───────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_port_key_lands_on_the_task():
     """`port_key` 透传到 task 上——旁支交互线就是从这里开出来的（见 `Task.port_key`）。
 
@@ -135,6 +136,7 @@ async def test_port_key_lands_on_the_task():
     assert (task.port_key, task.unattended) == ("btw", False)
 
 
+@pytest.mark.asyncio
 async def test_unattended_without_port_key_falls_back_to_no_port():
     """未声明 port + `unattended=True` → 回落成「不接任何口」，即老 `unattended` 的原义。
 
@@ -155,6 +157,7 @@ async def test_unattended_without_port_key_falls_back_to_no_port():
     assert (task.port_key, task.unattended) == (PORT_NONE, True)
 
 
+@pytest.mark.asyncio
 async def test_explicit_main_port_with_unattended_is_the_third_cell():
     """显式给口 + `unattended=True` = 「接口但自治」：跑完把产出推到那个口，不参与往返。
 
@@ -178,6 +181,7 @@ async def test_explicit_main_port_with_unattended_is_the_third_cell():
 # ── §9.2 派生 ─────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_derived_subtree_records_parent_and_depth():
     rt, sid, root, events = await _runtime_with_session()
     before = len(events)
@@ -209,6 +213,7 @@ async def test_derived_subtree_records_parent_and_depth():
 # ── §9.3 重放等价（地基）──────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("derive", [False, True], ids=["fresh_tree", "derived"])
 async def test_replay_rebuilds_the_same_forest(derive: bool):
     """内存里的 `_AgentRecord` 与事件重放折出的 `AgentView` 必须逐字段相等。
@@ -241,6 +246,7 @@ async def test_replay_rebuilds_the_same_forest(derive: bool):
 # ── §9.7 两道守卫分岔（本轮的核心决定）────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_busy_agent_rejects_execution_but_allows_parenting():
     """A 在跑时：让它**执行** → AgentBusyError；只让它当**血缘父** → 放行。"""
     rt, sid, root, events = await _runtime_with_session()
@@ -268,6 +274,7 @@ async def test_busy_agent_rejects_execution_but_allows_parenting():
     assert rt._agent_lifecycle_manager.status_of(root) == "running"
 
 
+@pytest.mark.asyncio
 async def test_terminated_agent_rejected_in_both_roles():
     rt, sid, root, _ = await _runtime_with_session()
     rt._agent_lifecycle_manager._agents[root].status = "terminated"
@@ -283,6 +290,7 @@ async def test_terminated_agent_rejected_in_both_roles():
                                         subagent_template="agent:tpl_echo"))
 
 
+@pytest.mark.asyncio
 async def test_unknown_agent_rejected():
     rt, sid, _root, _ = await _runtime_with_session()
     with pytest.raises(AgentNotFound):
@@ -293,6 +301,7 @@ async def test_unknown_agent_rejected():
 # ── §9.8 派生不污染父对话 ─────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_derived_subtree_leaves_no_dispatch_frame_in_parent_scope():
     """顶层 task 的 `parent_task_id is None` → finalize 不往 A 的 scope 铸派发框。"""
     rt, sid, root, _ = await _runtime_with_session()
@@ -321,6 +330,7 @@ async def test_derived_subtree_leaves_no_dispatch_frame_in_parent_scope():
 # ── §9.5 跨树继承 ─────────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_fresh_tree_can_inherit_from_an_unrelated_agent():
     """血缘与记忆来源是正交的两个轴：无父的新树照样能拿 root 的上下文。"""
     rt, sid, root, _ = await _runtime_with_session()
@@ -352,6 +362,7 @@ async def test_fresh_tree_can_inherit_from_an_unrelated_agent():
 # ── §9.9 入口即拒（四条纯参数校验，零事件）────────────────────────────────────
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kwargs, why", [
     (dict(settings=NormalTaskSettings(use_subagent=False)),
      "V1: agent_id=None 且 use_subagent=False"),
@@ -374,6 +385,7 @@ async def test_entry_validation_rejects_with_zero_side_effects(kwargs, why):
     assert events[before:] == [], f"{why} —— 拒绝路径不得发任何事件"
 
 
+@pytest.mark.asyncio
 async def test_settings_accepts_raw_dict():
     """host 从 JSON 配置直接喂 —— 与 SessionStartParams.create(initial_task=dict) 同口径。"""
     rt, sid, _root, _ = await _runtime_with_session()
@@ -390,6 +402,7 @@ async def test_settings_accepts_raw_dict():
 # ── §9.10 不发 SessionResumed / 不受弃轮禁止 ─────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_dispatch_works_where_resume_is_blocked_by_unfinished_tasks():
     """同一个会话状态下：`start_session(resume=True)` 抛 `UnfinishedTasksError`，派发照跑。
 
@@ -454,6 +467,7 @@ async def test_dispatch_works_where_resume_is_blocked_by_unfinished_tasks():
 # ── §9.11 句柄可寻址 ─────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_handle_agent_is_addressable_afterwards():
     rt, sid, _root, _ = await _runtime_with_session()
     await initialize_all(rt)
@@ -477,6 +491,7 @@ async def test_handle_agent_is_addressable_afterwards():
 # ── 非 subagent：挂已有 agent 直接跑 ──────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_dispatch_onto_existing_idle_agent_creates_no_new_agent():
     rt, sid, root, events = await _runtime_with_session()
     before = len(events)
@@ -511,6 +526,7 @@ async def _container(**kw):
     return rt, sh, events
 
 
+@pytest.mark.asyncio
 async def test_container_session_has_root_agent_but_no_task():
     rt, sh, events = await _container()
 
@@ -526,6 +542,7 @@ async def test_container_session_has_root_agent_but_no_task():
     assert rt._task_managers[sh.session_id].all_tasks() == []
 
 
+@pytest.mark.asyncio
 async def test_container_session_does_not_announce_itself_finished():
     """空队列上的 drain 只是空转——不得因为「一件活都没有」就发会话终结信号。"""
     rt, sh, events = await _container()
@@ -534,6 +551,7 @@ async def test_container_session_does_not_announce_itself_finished():
     assert rt._task_managers[sh.session_id].is_alive()
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("onto_root", [True, False], ids=["onto_root_agent", "fresh_tree"])
 async def test_dispatch_into_a_container_session_runs(onto_root: bool):
     """容器会话的 TM 必须连 runner 一起接好，否则派进来的 task 静默搁浅。"""
@@ -555,6 +573,7 @@ async def test_dispatch_into_a_container_session_runs(onto_root: bool):
     assert (h.agent_id == sh.root_agent_id) is onto_root
 
 
+@pytest.mark.asyncio
 async def test_container_session_rejects_duplicate_session_id():
     rt, sh, _ = await _container(session_id="ses_fixed")
     assert sh.session_id == "ses_fixed"
@@ -564,6 +583,7 @@ async def test_container_session_rejects_duplicate_session_id():
                                 session_id="ses_fixed")
 
 
+@pytest.mark.asyncio
 async def test_container_session_replays_with_a_root_agent_and_no_tasks():
     """重放：root_agent_id 非空（resume 链的假设不破），task 表是空的。"""
     rt, sh, _ = await _container()

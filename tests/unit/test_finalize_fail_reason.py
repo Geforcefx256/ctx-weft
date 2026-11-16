@@ -32,7 +32,6 @@ from ctx_weft.protocols.template import LoopConfig
 from ctx_weft.providers.llm.tokenizer import HeuristicTokenizer
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 
-pytestmark = pytest.mark.asyncio
 
 T = MemoryEventType
 
@@ -94,6 +93,7 @@ async def _continuing_state(mem, *, task_error: str | None):
                            scope=scope, task=task, agent=agent, verdict=verdict, extra={})
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("task_error", ["登录页有人机校验，自动化被拦", None])
 @pytest.mark.parametrize("has_verdict", [True, False])
 async def test_continue_at_retry_limit_does_not_close_task(monkeypatch, task_error, has_verdict) -> None:
@@ -119,6 +119,7 @@ async def test_continue_at_retry_limit_does_not_close_task(monkeypatch, task_err
     assert outcome.events[0].payload["outcome"] == "continue"
 
 
+@pytest.mark.asyncio
 async def test_error_message_prefers_task_error() -> None:
     """observer 判死写了 task_failure_reason（→ task.error）→ error_message 用它，不用过程复述。"""
     mem = InMemoryMemoryProvider()
@@ -128,6 +129,7 @@ async def test_error_message_prefers_task_error() -> None:
     assert _task_failed_payload(outcome, state.task)["error_message"] == "第 2 步 API 调用 403：凭据无权限"
 
 
+@pytest.mark.asyncio
 async def test_error_message_empty_without_task_error() -> None:
     """无 task.error（如规则 observe 判死）→ error_message 置空，不拿过程复述冒充死因。"""
     mem = InMemoryMemoryProvider()

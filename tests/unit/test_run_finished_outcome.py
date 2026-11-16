@@ -24,7 +24,6 @@ import pytest
 from ctx_weft.protocols.events import EventType
 from tests._initialization import initialize_all
 
-pytestmark = pytest.mark.asyncio
 
 
 async def _events_from_outage() -> list:
@@ -288,6 +287,7 @@ async def _events_from_crash(exc: BaseException) -> tuple[list, BaseException]:
     return collected, caught
 
 
+@pytest.mark.asyncio
 async def test_cancel_run_finished_outcome_is_canceled() -> None:
     """取消支（`except asyncio.CancelledError`）同样走 `finally`，`outcome` 应为 canceled。"""
     events = await _events_from_cancel()
@@ -295,6 +295,7 @@ async def test_cancel_run_finished_outcome_is_canceled() -> None:
     assert ev.payload["outcome"] == "canceled"
 
 
+@pytest.mark.asyncio
 async def test_crash_run_finished_outcome_is_interrupted() -> None:
     """裁定 R7：崩溃支重抛前，`RunFinished` 已在 `finally` 里发到 bus——用
     `bus.subscribe` 收事件，配合 `pytest.raises` 风格的显式捕获断言重抛，两者
@@ -306,24 +307,28 @@ async def test_crash_run_finished_outcome_is_interrupted() -> None:
     assert ev.payload["outcome"] == "interrupted"
 
 
+@pytest.mark.asyncio
 async def test_run_finished_carries_the_run_outcome_not_task_status() -> None:
     events = await _events_from_outage()
     ev = next(e for e in events if e.type == EventType.RUN_FINISHED)
     assert ev.payload["outcome"] == "interrupted"
 
 
+@pytest.mark.asyncio
 async def test_park_run_reports_awaiting_human() -> None:
     events = await _events_from_park()
     ev = next(e for e in events if e.type == EventType.RUN_FINISHED)
     assert ev.payload["outcome"] == "awaiting_human"
 
 
+@pytest.mark.asyncio
 async def test_normal_run_reports_completed() -> None:
     events = await _events_from_normal()
     ev = next(e for e in events if e.type == EventType.RUN_FINISHED)
     assert ev.payload["outcome"] == "completed"
 
 
+@pytest.mark.asyncio
 async def test_will_retry_is_unchanged() -> None:
     """will_retry 是给 host 决定关不关流的，语义不变。"""
     events = await _events_from_normal()
@@ -331,6 +336,7 @@ async def test_will_retry_is_unchanged() -> None:
     assert "will_retry" in ev.payload
 
 
+@pytest.mark.asyncio
 async def test_final_status_key_still_present_but_deprecated() -> None:
     """`final_status` 保留一个发布周期，值是**发 RUN_FINISHED 那一刻**的 task.status。
 

@@ -11,7 +11,7 @@ import logging
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import ClassVar, Protocol
+from typing import ClassVar
 
 from ctx_weft.core.control.types import AgentView
 from ctx_weft.core.utils.event import emit_event
@@ -24,7 +24,7 @@ from ctx_weft.core.orchestrator.lifecycle.template_lookup import TemplateLookup
 from ctx_weft.core.models.agent import Agent, LoopGuard
 from ctx_weft.core.utils.clock import now_utc
 from ctx_weft.core.utils.ids import generate_id
-from ctx_weft.protocols import LLMClient, LoopConfig, MemoryConfig
+from ctx_weft.protocols import LoopConfig, MemoryConfig
 from ctx_weft.protocols.context import ProviderContext
 from ctx_weft.protocols.events import Event, EventBus, EventOrigin, EventType
 from ctx_weft.protocols.template import AgentTemplate
@@ -123,6 +123,7 @@ class AgentRecordView:
     current_task_id: str | None
     created_at: datetime | None
     status_reason: str = ""
+    llm: ModelChoice = field(default_factory=ModelChoice)
 
 
 @dataclass
@@ -180,6 +181,12 @@ class AgentLifecycleManager:
         "interrupted": EventType.AGENT_INTERRUPTED,
     }
 
+    async def detach_from_bus(self) -> None:
+        subscription = getattr(self, "_subscription", None)
+        if subscription is not None:
+            await subscription.unsubscribe()
+            self._subscription = None
+
     def attach_to_bus(self) -> None:
         """订阅。runtime 构造期调一次。
 
@@ -190,7 +197,7 @@ class AgentLifecycleManager:
         """
         # required=True（spec: event-commit）：必要状态消费者——异常穿出 emit，
         # 不再被 bus 吞掉；推测态照看（provisional）不变。
-        self.event_bus.subscribe(None, self.handle_event, provisional=True, required=True)
+        self._subscription = self.event_bus.subscribe(None, self.handle_event, provisional=True, required=True)
 
     async def handle_event(self, ev: Event) -> None:
         """总线回调。**只读事件、只喂状态机**，不碰其他组件。
@@ -255,6 +262,7 @@ class AgentLifecycleManager:
         reason: str = "",
         cascaded_from: str | None = None,
         expected_task_id: str | None = None,
+        metadata: dict | None = None,
     ) -> bool:
         """状态转移与事件发射的**唯一入口**。返回是否真的发生了转移。
 
@@ -294,6 +302,7 @@ class AgentLifecycleManager:
                     task_id=task_id,
                     agent_id=agent_id,
                     payload=dict(tr.payload),
+                    metadata=metadata,
                 ))
                 if inp is AgentInput.SETTLED:
                     self._pending_idle[agent_id] = event
@@ -346,7 +355,7 @@ class AgentLifecycleManager:
 
         真相源始终是事件日志：逐出之后用 `rebuild_session(session_id)` 就能装填回来，
         所以这里删得干净不必手软。**装填要调用方自己发起**——按 agent 反查会话那条路
-        （`rebuild_agent` → 扫全部 active session）已于 2026-09-21 删除，`recover_agent`
+        （`rebuild_agent` → 扫全部 active session）已于 2026-09-21 删除，`recover_session`
         与不带 `session_id` 的 `send_message` 现在对 registry miss 直接抛 `AgentNotLoaded`。
         """
         n = self._drop(set(self.agent_ids_of_session(session_id)))
@@ -420,6 +429,7 @@ class AgentLifecycleManager:
             status_reason=rec.status_reason,
             current_task_id=rec.current_task_id,
             created_at=rec.created_at,
+            llm=deepcopy(rec.llm),
         )
 
     def set_current_task(self, agent_id: str, task_id: str | None) -> None:
@@ -649,9 +659,9 @@ class AgentLifecycleManager:
         # 不分界、每次 `load()` 都无条件广播的后果是真实的、已经复现过：
         # `tests/integration/test_outage_resume.py::test_idempotent_outage_resume_completes`
         # 的 `_wait_for_interrupted_event` 把「看到一条新 AgentInterrupted」当成
-        # 「刚发生了一次新的中断」，若 `recover_agent()` 每次都在真实转移之外
+        # 「刚发生了一次新的中断」，若 `recover_session()` 每次都在真实转移之外
         # 额外回声一遍现状，这个假设就被推翻——测试会在上一轮 drain 还没跑完时就
-        # 发起下一轮 `recover_agent()`，两个 TaskManager 竞争同一个 session，
+        # 发起下一轮 `recover_session()`，两个 TaskManager 竞争同一个 session，
         # 任务卡死在 INTERRUPTED 永不完成（不是这个测试脆弱，是这类消费者对「事件
         # 到达 = 新事实发生」的假设本就合理，广播不该在没有新事实时重复兑现它）。
         for av in agent_views.values():
@@ -692,7 +702,7 @@ class AgentLifecycleManager:
                 memory_config=memory_config,
                 loop_config=loop_config,
                 # D1 修复：模型选择从 AgentView 读回，跨重启存活——不再是
-                # ModelChoice() 默认值（那是修复前 recover_agent 静默降级的根因）。
+                # ModelChoice() 默认值（那是修复前 recover_session 静默降级的根因）。
                 llm=ModelChoice(account=av.llm_account, model=av.llm_model,
                                 config=configs[av.id]),
                 # Task 14：五态机状态从 AgentView 读回，跨重启存活——不这样做的话
@@ -702,6 +712,7 @@ class AgentLifecycleManager:
                 status=av.status,
                 status_reason=av.status_reason,
                 current_task_id=current_task_id,
+                created_at=av.created_at,
             )
             if av.parent_agent_id is not None:
                 # 重建 _children——冷恢复必须让级联 cancel/pause（Task 19/20）在
@@ -934,6 +945,7 @@ class AgentLifecycleManager:
             "llm_account": llm.account,
             "llm_model": llm.model,
             "llm_config": llm_payload,
+            "created_at": self._agents[agent_id].created_at.isoformat(),
             },
         )
 
@@ -997,8 +1009,14 @@ class AgentLifecycleManager:
         缓存 client 是 `LLMClientResolver` 的职责——Registry 再存一份就有第二个
         缓存和它自己的失效问题（host 换了账号凭据，陈旧 client 继续被用）。
         """
-        choice = self._agents[agent_id].llm
-        client = self.model_resolver(choice.account, choice.model)
+        record = self._agents[agent_id]
+        choice = record.llm
+        ctx = ProviderContext(
+            session_id=record.session_id, tenant_id=record.tenant_id,
+            agent_id=agent_id, agent_template_id=record.template_id,
+            task_id=record.current_task_id,
+        )
+        client = self.model_resolver(choice.account, choice.model, ctx=ctx)
         return ResolvedModel.from_client(client, account=choice.account, model=choice.model,
                                          config=choice.config)
 

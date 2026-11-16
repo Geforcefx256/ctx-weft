@@ -19,7 +19,6 @@ from tests._initialization import initialize_all
 from tests.integration.test_minimal_loop import InlineAgentTemplateProvider, make_runtime
 from tests.unit.test_runtime_agent_api import _plant
 
-pytestmark = pytest.mark.asyncio
 
 
 class _RecordingBus:
@@ -112,6 +111,7 @@ async def runtime_without_hitl():
     return rt, bus, session_id
 
 
+@pytest.mark.asyncio
 async def test_cancel_session_resolves_pending_hitl(runtime_with_pending_hitl):
     rt, bus, session_id, hitl_id = runtime_with_pending_hitl
 
@@ -125,6 +125,7 @@ async def test_cancel_session_resolves_pending_hitl(runtime_with_pending_hitl):
     assert rt.hitl_registry.list_pending(session_id=session_id) == []
 
 
+@pytest.mark.asyncio
 async def test_cancel_session_resolves_pending_hitl_with_non_default_tenant(
         runtime_with_pending_hitl_non_default_tenant):
     """F7：取消路径把 `PendingHitl.tenant_id` 正确透传到 `HitlResolved`——全程非
@@ -142,6 +143,7 @@ async def test_cancel_session_resolves_pending_hitl_with_non_default_tenant(
     assert resolved[0].tenant_id != "default"
 
 
+@pytest.mark.asyncio
 async def test_hitl_cancelled_before_session_terminal(runtime_with_pending_hitl):
     """HitlResolved 必须先于该 session 下 agent 的终态事件——与熔断 trip 序列同一条纪律。
 
@@ -170,6 +172,7 @@ async def test_hitl_cancelled_before_session_terminal(runtime_with_pending_hitl)
     assert any(e.agent_id == "ag1" for e in terminated)
 
 
+@pytest.mark.asyncio
 async def test_cancel_session_without_pending_hitl_is_noop(runtime_without_hitl):
     """没有未决 HITL 时不该多发任何 HITL 事件。"""
     rt, bus, session_id = runtime_without_hitl

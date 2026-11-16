@@ -32,7 +32,6 @@ from tests.integration.test_minimal_loop import (
 )
 from tests.unit._legacy_recover import rebuild_all_active
 
-pytestmark = pytest.mark.asyncio
 
 _TS = datetime(2026, 9, 24, tzinfo=UTC)
 _SID, _AID = "A", "agt_1"
@@ -88,6 +87,7 @@ def _pending(rt) -> list[str]:
 
 # ── 判决终结 task 之后，气泡还在 ────────────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_the_bubble_outlives_the_finished_task(monkeypatch) -> None:
     """**要害**：task 已是终态，那个「等你说话」的入口仍然开着。
 
@@ -99,6 +99,7 @@ async def test_the_bubble_outlives_the_finished_task(monkeypatch) -> None:
 
 # ── 用户开口 → 新建分支收口它 ──────────────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_the_next_message_starts_a_new_task(monkeypatch) -> None:
     """气泡留着**不影响路由**：`send_message` 只看 `current_task_id` 是否终态。"""
     rt, _tm, finished_id, _hid = await _live_session(monkeypatch)
@@ -107,6 +108,7 @@ async def test_the_next_message_starts_a_new_task(monkeypatch) -> None:
     assert second.task_id != finished_id, "应当新开一轮，而不是注进已终结的 task"
 
 
+@pytest.mark.asyncio
 async def test_the_next_message_closes_the_stale_bubble(monkeypatch) -> None:
     """用户开口 = 这个入口被用掉了 → 收口。
 
@@ -128,6 +130,7 @@ async def test_the_next_message_closes_the_stale_bubble(monkeypatch) -> None:
     assert _pending(rt) == []
 
 
+@pytest.mark.asyncio
 async def test_a_fresh_park_still_works_after_that(monkeypatch) -> None:
     """收口是针对**旧**气泡的：新一轮自己再 park 时照常开得出来。"""
     rt, _tm, _tid, _hid = await _live_session(monkeypatch)

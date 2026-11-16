@@ -9,7 +9,6 @@ import pytest
 
 from ctx_weft.protocols.events import EventType
 
-pytestmark = pytest.mark.asyncio
 
 
 # `SessionPausedHitl` 不再由 core 发出——「等的是面板还是一句话」改由 pending 集合的
@@ -29,6 +28,7 @@ def _paused_event(session_id: str, form: str):
     )
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("form", ["wait", "question", "approval"])
 async def test_session_paused_hitl_folds_to_waiting_regardless_of_form(form) -> None:
     """L 档折叠目标是当前词表：PAUSED/PAUSED_HITL 两档合并进单一 WAITING
@@ -64,6 +64,7 @@ def _opened(session_id: str, delivery: dict):
                        {"hitl_id": "h1", "form": "whatever", "delivery": delivery})
 
 
+@pytest.mark.asyncio
 async def test_hitl_resolved_does_not_overwrite_a_terminal_status() -> None:
     """仅当仍处暂停态才掰回 RUNNING——迟到的 HITL_RESOLVED 不得复活一个已收尾的会话。"""
     from ctx_weft.core.control.reducers import reduce_events

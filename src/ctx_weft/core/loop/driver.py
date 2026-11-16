@@ -442,7 +442,7 @@ def task_prompt_record_id(task_id: str, content: "str | list[Any]") -> str:
     import hashlib
     from collections import Counter
 
-    from ctx_weft.core.utils.content import content_to_text
+    from ctx_weft.protocols.content import content_to_text
 
     text = content if isinstance(content, str) else content_to_text(content)
     kinds = Counter(getattr(p, "type", "?") for p in content) if isinstance(content, list) else {}
@@ -677,7 +677,8 @@ class StepDriver:
             raise
         finally:
             finished = make_event(state, EventType.RUN_FINISHED, {
-                "outcome": (RunOutcomeKind.CANCELED.value if cancelled else
+                "outcome": (RunOutcomeKind.INTERRUPTED.value if cancelled and getattr(ctx.task_manager, "shutdown_requested", False) else
+                            RunOutcomeKind.CANCELED.value if cancelled else
                             RunOutcomeKind.INTERRUPTED.value if error else
                             RunOutcomeKind.COMPLETED.value),
                 "final_status": state.task.status, "will_retry": False,

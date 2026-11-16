@@ -9,7 +9,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 
-from ctx_weft.core.utils.content import downgrade_images_to_text
+from ctx_weft.protocols.content import downgrade_images_to_text
 from ctx_weft.core.utils.content import image_part_count
 from ctx_weft.protocols import LLMMessage, LLMRequest
 

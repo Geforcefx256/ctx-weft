@@ -23,7 +23,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 
 def _is_background_recap(request) -> bool:
@@ -94,6 +93,7 @@ async def _wait_all_finished(runtime, session_id, n, timeout=8.0):
     )
 
 
+@pytest.mark.asyncio
 async def test_dispatch_boundary_recap_e2e():
     llm = _RouterLLM()
     resolver = InlineAgentTemplateProvider()

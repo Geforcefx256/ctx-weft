@@ -31,7 +31,6 @@ from ctx_weft.protocols import MemoryEventType, MemoryAddress, ProviderContext
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from tests.integration.test_minimal_loop import InlineAgentTemplateProvider, make_runtime
 
-pytestmark = pytest.mark.asyncio
 
 
 def _runtime_with_memory() -> tuple[CtxWeftRuntime, InMemoryMemoryProvider]:
@@ -78,6 +77,7 @@ def _user_turn_req(
     return req
 
 
+@pytest.mark.asyncio
 async def test_inject_writes_user_prompt_and_requeues() -> None:
     rt, mem = _runtime_with_memory()
     tm, task = _tm_with_task()
@@ -91,6 +91,7 @@ async def test_inject_writes_user_prompt_and_requeues() -> None:
     assert any(r.content == "ship it" and r.metadata.get("source") == "hitl_reply" for r in recs)
 
 
+@pytest.mark.asyncio
 async def test_inject_reject_writes_declined() -> None:
     rt, mem = _runtime_with_memory()
     tm, _ = _tm_with_task()
@@ -102,6 +103,7 @@ async def test_inject_reject_writes_declined() -> None:
     assert any("Human declined: not now" in r.content for r in recs)
 
 
+@pytest.mark.asyncio
 async def test_inject_missing_task_is_noop() -> None:
     rt, mem = _runtime_with_memory()
     tm = TaskManager(session_id="s1")             # 无 t1

@@ -15,7 +15,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 
 class _OutageLLM(MockLLMAdapter):
@@ -29,6 +28,7 @@ class _OutageLLM(MockLLMAdapter):
         return _gen()
 
 
+@pytest.mark.asyncio
 async def test_outage_marks_session_interrupted_not_failed():
     resolver = InlineAgentTemplateProvider()
     resolver.register(make_echo_template())

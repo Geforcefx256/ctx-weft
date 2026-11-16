@@ -7,7 +7,8 @@ answers. Every event envelope is retained to advance unfinished run sequences.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, replace
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
 from time import perf_counter
 
 from ctx_weft.core.control.reducers import (
@@ -18,6 +19,7 @@ from ctx_weft.core.control.reducers import (
     _apply,
     _rebuild_agents,
     deserialize_view,
+    fold_hitl_snapshot,
     restore_legacy_canceled_tasks,
     snapshot_facts_from_event,
     snapshot_is_usable,
@@ -34,25 +36,32 @@ def _fields(*keys):
 
 
 _TASK_FIELDS = _fields("id", "status", "session_id", "assigned_agent_id", "creator_agent_id",
-                       "parent_task_id", "dag_deps", "finalized")
+                       "parent_task_id", "dag_deps", "finalized", "error", "error_code",
+                       "failure_retry_count", "blocked_by_task_id", "created_at", "finished_at",
+                       "details_complete")
 _TASK_FIELDS += (("settings", "use_subagent"), ("settings_raw", "use_subagent"))
-_SESSION_FIELDS = _fields("id", "root_agent_id", "tenant_id", "failure_counter",
+_SESSION_FIELDS = _fields("id", "root_agent_id", "tenant_id", "goal", "failure_counter",
                           "threshold_tripped", "threshold_root_task_ids", "threshold_cancel_task_ids")
 _AGENT_FIELDS = _fields("id", "status", "status_reason", "current_task_id", "template_id",
-                        "parent_agent_id", "spawn_depth")
+                        "parent_agent_id", "spawn_depth", "llm_account", "llm_model",
+                        "llm_config", "created_at")
 _HITL_FIELDS = _fields("id", "hitl_id", "form", "session_id", "task_id", "agent_id", "tenant_id",
                        "delivery", "tool_call_id", "stage", "outcome")
 
 _PAYLOAD_FIELDS = {
     EventType.SESSION_CREATED: _fields("root_agent_id", "tenant_id"),
+    EventType.RECOGNIZE_INTENT_TOOL_CALL: _fields("session_goal"),
     EventType.FAILURE_THRESHOLD_HIT: _fields("root_task_ids", "cancel_task_ids"),
-    EventType.AGENT_INSTANTIATED: _fields("template_id", "llm_account", "llm_model"),
+    EventType.AGENT_INSTANTIATED: _fields("template_id", "llm_account", "llm_model", "llm_config",
+                                         "parent_agent_id", "spawn_depth", "created_at"),
+    EventType.AGENT_LLM_CHANGED: _fields("llm_account", "llm_model", "llm_config"),
     EventType.TASK_CREATED: tuple(("task", *path) for path in _TASK_FIELDS),
     EventType.TASK_REVIEWING: (
         *tuple(("successor", "task", *path) for path in _TASK_FIELDS),
         *_fields("replaced_task_ids", "rewired_dependencies"),
     ),
-    **{kind: _fields("reason", "assigned_agent_id") for kind in TASK_STATUS_BY_EVENT
+    **{kind: _fields("reason", "assigned_agent_id", "error_code", "error_message", "retry_count",
+                    "blocked_by_task_id", "finished_at") for kind in TASK_STATUS_BY_EVENT
        if kind != EventType.TASK_REVIEWING},
     **{kind: _fields("reason") for kind in _AGENT_STATUS_BY_EVENT},
     EventType.HITL_OPENED: _HITL_FIELDS,
@@ -76,7 +85,7 @@ _PAYLOAD_FIELDS[EventType.STATE_SNAPSHOT] = (
     *tuple(("state_blob", *path) for path in _BLOB_PATHS),
 )
 STARTUP_PROJECTION = EventReadProjection(_PAYLOAD_FIELDS)
-STARTUP_SNAPSHOT_VERSION = 1
+STARTUP_SNAPSHOT_VERSION = 3
 STARTUP_SNAPSHOT_PROJECTION = EventReadProjection({EventType.STATE_SNAPSHOT: _fields(
     "cut_position", "projection_version", "chain_depth", "reason",
     "startup_state_blob", "startup_projection_version",
@@ -98,6 +107,10 @@ def startup_snapshot_blob(blob: dict, current_task_statuses: dict[str, str] | No
 @dataclass
 class StartupRecoveryView(RunStateView):
     """A body-free accumulator; intentionally not an execution recovery view."""
+
+    # Ephemeral locators, never execution state or another HITL ledger. Entries
+    # refer to an opening event or the snapshot that supplied the live request.
+    hitl_source_positions: dict[str, int] = field(default_factory=dict)
 
 
 def apply_startup_events(events: list[Event | ProjectedEvent], view: StartupRecoveryView):
@@ -124,13 +137,15 @@ async def rebuild_startup_view(store, session_id: str, *, through_position: int)
     snapshot = None
     view = None
 
-    def decode(candidate):
+    def decode(candidate, source_position):
         blob = candidate.state_blob
         sessions = blob.get("sessions")
         if (not isinstance(sessions, dict) or not isinstance(sessions.get(session_id), dict)
                 or sessions[session_id].get("id") != session_id):
             raise ValueError("Startup snapshot has no matching session")
-        return StartupRecoveryView(**vars(deserialize_view(blob)))
+        result = StartupRecoveryView(**vars(deserialize_view(blob)))
+        result.hitl_source_positions = dict.fromkeys(result.hitl.opened, source_position)
+        return result
     if stored is not None:
         payload = stored.event.payload
         # Validate metadata before reading an old full blob: incompatible
@@ -144,7 +159,7 @@ async def rebuild_startup_view(store, session_id: str, *, through_position: int)
             if payload.get("startup_projection_version") == STARTUP_SNAPSHOT_VERSION and isinstance(compact, dict):
                 candidate = replace(metadata, state_blob=compact)
                 try:
-                    view = decode(candidate)
+                    view = decode(candidate, stored.position)
                     snapshot = candidate
                 except (KeyError, TypeError, ValueError, AttributeError):
                     logger.warning("Invalid compact startup snapshot for %s; trying legacy projection", session_id)
@@ -156,7 +171,7 @@ async def rebuild_startup_view(store, session_id: str, *, through_position: int)
                     candidate = snapshot_facts_from_event(legacy.event)
                     if snapshot_is_usable(candidate, through_position):
                         try:
-                            view = decode(candidate)
+                            view = decode(candidate, legacy.position)
                             snapshot = candidate
                         except (KeyError, TypeError, ValueError, AttributeError):
                             logger.warning("Invalid startup snapshot for %s; replaying control facts", session_id)
@@ -175,6 +190,15 @@ async def rebuild_startup_view(store, session_id: str, *, through_position: int)
         rows = await store.read_range(session_id, after_position=cursor, through_position=upper,
                                       exclude_types=REPLAY_EXCLUDE_TYPES, projection=STARTUP_PROJECTION)
         apply_startup_events([row.event for row in rows], view)
+        for row in rows:
+            if row.event.type in (EventType.HITL_OPENED, EventType.HITL_REQUIRED):
+                rid = row.event.payload.get("hitl_id")
+                if rid in view.hitl.opened:
+                    view.hitl_source_positions[rid] = row.position
+        view.hitl_source_positions = {
+            rid: position for rid, position in view.hitl_source_positions.items()
+            if rid in view.hitl.opened
+        }
         replayed += len(rows)
         cursor = upper
     if mode == "snapshot" and snapshot.projection_version == 10:
@@ -203,3 +227,40 @@ async def read_startup_task(store, session_id: str, task_id: str, *, through_pos
         apply_startup_events([row.event for row in rows], view)
         cursor = upper
     return view.tasks.get(task_id)
+
+
+async def read_startup_pending_hitl(store, view, session_id, head):
+    by_position = {}
+    for rid in view.hitl.pending:
+        position = view.hitl_source_positions[rid]
+        if not 0 < position <= head:
+            raise ValueError(f"Invalid HITL source position for {rid}")
+        by_position.setdefault(position, []).append(rid)
+    requests = {}
+    fields = ("id", "hitl_id", "form", "session_id", "task_id", "agent_id", "tenant_id",
+              "created_at", "subject_id", "prompt", "detail", "fields", "proposal",
+              "delivery", "tool_call_id", "stage", "capability_id", "question",
+              "context", "questions", "arguments")
+    for position, ids in by_position.items():
+        # Read exactly one durable envelope. Snapshot selection is restricted to
+        # the requested live entries; answers and execution payloads stay unread.
+        projection = EventReadProjection({
+            EventType.HITL_OPENED: tuple((key,) for key in fields),
+            EventType.HITL_REQUIRED: tuple((key,) for key in fields),
+            EventType.STATE_SNAPSHOT: tuple(
+                ("state_blob", "hitl", group, rid, key)
+                for group in ("pending", "resolved") for rid in ids for key in fields
+            ),
+        })
+        rows = await store.read_range(session_id, after_position=position - 1,
+                                      through_position=position, projection=projection)
+        if len(rows) != 1:
+            raise ValueError(f"Missing HITL source at position {position}")
+        event = rows[0].event
+        if event.type == EventType.STATE_SNAPSHOT:
+            hitl = deserialize_view(event.payload.get("state_blob") or {}).hitl
+        else:
+            hitl = fold_hitl_snapshot([event])
+        for rid in ids:
+            requests[rid] = hitl.opened[rid]
+    return tuple(deepcopy(requests[rid].to_view()) for rid in view.hitl.pending)

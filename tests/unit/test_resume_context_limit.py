@@ -17,7 +17,6 @@ from ctx_weft.providers.events import InMemoryEventStore
 from ctx_weft.providers.events import EventPersister
 from tests._event_helpers import append_one
 
-pytestmark = pytest.mark.asyncio
 
 _TS = datetime(2026, 6, 13, tzinfo=timezone.utc)
 
@@ -36,6 +35,7 @@ def _ev(seq: int, sid: str, type_: EventType, **payload) -> Event:
     )
 
 
+@pytest.mark.asyncio
 async def test_resume_session_ignores_legacy_context_limit() -> None:
     """Session built by resume_session carries context_limit from persisted event."""
     bus = InProcessEventBus()
@@ -59,7 +59,7 @@ async def test_resume_session_ignores_legacy_context_limit() -> None:
     sm = SessionRegistry(agent_lifecycle_manager=lm, event_bus=bus)
 
     # resume_session emits events on the bus; we don't need to assert them here.
-    session, root_task, task_manager = await sm.resume_session(
+    session, root_task, task_manager = await sm.start_next_turn(
         session_id=sid,
         event_store=store,
         user_prompt="continue",

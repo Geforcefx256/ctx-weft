@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """One logical observation survives producer/report races on the public runtime path."""
 
 import asyncio
@@ -15,7 +17,6 @@ from tests.integration.test_lifecycle_crash_boundaries import restart, run_worke
 from tests.integration.test_observe_application_recovery import assert_cold_recovery_is_noop
 from tests.integration.test_observe_lifecycle_crashes import assert_lifecycles
 
-pytestmark = pytest.mark.asyncio
 
 
 _BASELINES = {}
@@ -45,6 +46,7 @@ async def baseline(tmp_path_factory, mode):
     return _BASELINES[mode]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("size", ["short", "long"])
 @pytest.mark.parametrize("snapshot", [False, True])
 @pytest.mark.parametrize("scenario,cut", [
@@ -62,7 +64,7 @@ async def test_original_producer_ends_or_is_cancelled(tmp_path, tmp_path_factory
             rt = await restart(store, memory, mode, snapshot)
             root = (await rt.get_session("crash-session")).data.root_agent_id
             pending = (await rebuild_view(store, "crash-session")).pending_observe
-            await asyncio.wait_for(rt.recover_agent(root, session_id="crash-session",
+            await asyncio.wait_for(recover_fixture_session(rt, root, session_id="crash-session",
                 keep_alive=not pending and scenario == "late_subscribe"), 15)
             tm = rt._task_managers["crash-session"]
             while tm._background_asyncio_tasks:
@@ -109,5 +111,5 @@ async def test_original_producer_ends_or_is_cancelled(tmp_path, tmp_path_factory
                 head = await store.committed_head("crash-session")
                 again, _ = make_lifecycle_runtime(store, memory, mode)
                 await initialize_all(again)
-                await again.recover_agent(root, session_id="crash-session", keep_alive=True)
+                await recover_fixture_session(again, root, session_id="crash-session", keep_alive=True)
                 assert await store.committed_head("crash-session") == head

@@ -29,7 +29,6 @@ from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from tests.assembler_testkit import compiled_test_inputs, scripted_inputs
 from tests.step_helpers import patch_observe_start
 
-pytestmark = pytest.mark.asyncio
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -130,6 +129,7 @@ def _make_observe_state_ctx(task: Task, act_exit_reason: str):
     return state, ctx
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("child,boundary,report_boundary", [
     (False, "max_turns", "mechanical"),
     (False, "actor_done", "finish"),
@@ -182,6 +182,7 @@ def _with_observe_role(state) -> None:
     state.extra["template"] = SimpleNamespace(identity={"observe": SimpleNamespace(text="ROLE")})
 
 
+@pytest.mark.asyncio
 async def test_foreground_verdict_and_report_use_one_observe(monkeypatch):
     """前台 LLM 在同一次 observe 中生成判决和报告，不另起后台调用。"""
     launched = _spy_launch(monkeypatch)
@@ -207,6 +208,7 @@ async def test_foreground_verdict_and_report_use_one_observe(monkeypatch):
     assert len({e.payload["observe_id"] for e in stages}) == 1
 
 
+@pytest.mark.asyncio
 async def test_failed_foreground_verdict_stays_in_the_same_observe(monkeypatch):
     """LLM failure falls back within the existing observe, without a second request."""
     launched = _spy_launch(monkeypatch)
@@ -233,6 +235,7 @@ async def test_failed_foreground_verdict_stays_in_the_same_observe(monkeypatch):
 # ── act.py: soft-interrupt park fires for root ───────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_act_soft_interrupt_fires_for_root(monkeypatch):
     """act soft-interrupt park (_park_for_interrupt, root task) → background observe starts once."""
     from ctx_weft.core.assembler.assembler import AssembledPrompt
@@ -288,6 +291,7 @@ async def test_act_soft_interrupt_fires_for_root(monkeypatch):
 # ── act.py: soft-interrupt park does NOT fire for child ──────────────────────
 
 
+@pytest.mark.asyncio
 async def test_act_soft_interrupt_child_task_schedules_recap(monkeypatch):
     """act soft-interrupt park with child task → launch_recap NOT called."""
     from ctx_weft.core.assembler.assembler import AssembledPrompt
@@ -342,6 +346,7 @@ async def test_act_soft_interrupt_child_task_schedules_recap(monkeypatch):
 # ── act.py: plain-text pause fires for root (Task 13) ───────────────────────
 
 
+@pytest.mark.asyncio
 async def test_act_plain_text_pause_fires_for_root(monkeypatch):
     """act plain-text pause (_park_await_user, root task, interactive) → background observe starts once."""
     from ctx_weft.core.loop.steps.act import _finish_plain_text_turn
@@ -384,6 +389,7 @@ async def test_act_plain_text_pause_fires_for_root(monkeypatch):
 # ── act.py: plain-text pause does NOT fire for child (Task 13) ──────────────
 
 
+@pytest.mark.asyncio
 async def test_act_plain_text_pause_child_task_fires(monkeypatch):
     """子任务的纯文本 park **也**触发后台 observe（2026-09-22 去掉 `_is_own_root` 闸）。
 
@@ -459,6 +465,7 @@ def _make_suspend_state_ctx(task: Task):
     return state, ctx
 
 
+@pytest.mark.asyncio
 async def test_suspend_step_fires_dispatch_boundary_for_root(monkeypatch):
     """root task delegate suspend → launch_recap(boundary='dispatch') once."""
     launched = []
@@ -477,6 +484,7 @@ async def test_suspend_step_fires_dispatch_boundary_for_root(monkeypatch):
     assert launched == [("t1", "dispatch")], f"Expected one dispatch launch, got {launched}"
 
 
+@pytest.mark.asyncio
 async def test_suspend_step_fires_dispatch_boundary_for_child(monkeypatch):
     """non-root delegate parent fires same way (spec: no _is_own_root gating)."""
     launched = []

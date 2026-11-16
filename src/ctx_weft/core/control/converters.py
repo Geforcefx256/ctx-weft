@@ -5,10 +5,38 @@ Used by resume_session to rebuild Session/Task objects from event replay.
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 from ctx_weft.core.control.types import SessionView, TaskView
 from ctx_weft.core.models.session import Session
 from ctx_weft.core.models.task import Task, deserialize_settings
 from ctx_weft.core.utils.clock import as_utc
+from ctx_weft.protocols.agent import AgentDetail, AgentState
+from ctx_weft.protocols.llm import deserialize_call_config
+from ctx_weft.protocols.task import TaskDetail
+
+
+def task_detail(task) -> TaskDetail:
+    return TaskDetail(
+        task.id, task.session_id, task.assigned_agent_id or None,
+        task.creator_agent_id or None, task.parent_task_id or None,
+        task.status, task.title, task.description, deepcopy(task.outputs),
+        task.error, task.error_code, task.created_at, task.finished_at,
+        task.failure_retry_count, task.blocked_by_task_id, task.finalized,
+    )
+
+
+def agent_detail(agent_id, agent, session_id, current_task) -> AgentDetail:
+    choice = getattr(agent, "llm", None)
+    return AgentDetail(
+        agent_id=agent_id, parent_agent_id=agent.parent_agent_id,
+        state=AgentState(agent_id, agent.status, agent.status_reason, current_task),
+        spawn_depth=agent.spawn_depth, session_id=session_id, template_id=agent.template_id,
+        created_at=getattr(agent, "created_at", None),
+        llm_account=choice.account if choice is not None else agent.llm_account,
+        llm_model=choice.model if choice is not None else agent.llm_model,
+        llm_config=deepcopy(choice.config) if choice is not None else deserialize_call_config(agent.llm_config),
+    )
 
 
 def _as_utc_opt(dt):
@@ -72,6 +100,8 @@ def task_from_projection(proj: TaskView) -> Task:
         outputs=proj.outputs,
         error=proj.error,
         error_code=proj.error_code,
+        failure_retry_count=proj.failure_retry_count,
+        blocked_by_task_id=proj.blocked_by_task_id,
         created_at=_as_utc_opt(proj.created_at),
         finished_at=_as_utc_opt(proj.finished_at),
         finalized=proj.finalized,

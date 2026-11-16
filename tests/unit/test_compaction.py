@@ -23,7 +23,6 @@ from ctx_weft.protocols.template import LoopConfig
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from tests.assembler_testkit import compiled_test_inputs, scripted_inputs
 
-pytestmark = pytest.mark.asyncio
 
 T = MemoryEventType
 _BASE = datetime(2026, 1, 1, tzinfo=UTC)
@@ -140,6 +139,7 @@ async def _seed_root_residues(mem, sc, n: int, start_t: int = 0) -> None:
 
 # ═══════════════════ _should_compact triggers ═══════════════════
 
+@pytest.mark.asyncio
 async def test_trigger_token_ratio_over_and_under() -> None:
     mem = InMemoryMemoryProvider()
     cfg = LoopConfig(compact_token_ratio=0.8, compact_message_delta=10_000)  # delta off
@@ -149,6 +149,7 @@ async def test_trigger_token_ratio_over_and_under() -> None:
     assert await step._should_compact(state, ctx, token_estimate=900) is True
 
 
+@pytest.mark.asyncio
 async def test_trigger_no_division_when_limit_or_estimate_zero() -> None:
     mem = InMemoryMemoryProvider()
     cfg = LoopConfig(compact_message_delta=10_000)
@@ -174,6 +175,7 @@ async def test_trigger_no_division_when_limit_or_estimate_zero() -> None:
 
 # ═══════════════════ (c) fold_root_experience ═══════════════════
 
+@pytest.mark.asyncio
 async def test_fold_root_residues_keep_last_and_subtask_survive() -> None:
     mem = InMemoryMemoryProvider()
     sc = _sc("t1")
@@ -201,6 +203,7 @@ async def test_fold_root_residues_keep_last_and_subtask_survive() -> None:
     assert any(r.content == "SUM" for r in summ)
 
 
+@pytest.mark.asyncio
 async def test_fold_retains_delegated_with_result_by_keep_last() -> None:
     """派给别的 agent 的 root task（dispatch + result 已回）是完成胶囊——按 keep_last 保留/折叠，
     不再因 has_dispatch 无 finish 被当在途豁免。当前 task 不在其中,故这些单元正常参与 keep_last。"""
@@ -223,6 +226,7 @@ async def test_fold_retains_delegated_with_result_by_keep_last() -> None:
     assert alive == {"D2"}  # keep_last=1 → 仅最新的派发型完成胶囊保留，D0/D1 折入摘要
 
 
+@pytest.mark.asyncio
 async def test_fold_paired_dispatch_superseded_no_dangling() -> None:
     """新格式：所有已折胶囊的 AGENT_CONVERSATION_TURN 消失，最新 keep_last=1 的 origin=rt3 保留。"""
     mem = InMemoryMemoryProvider()
@@ -236,6 +240,7 @@ async def test_fold_paired_dispatch_superseded_no_dangling() -> None:
     assert alive_origins == {"rt3"}  # only the kept root's turns remain
 
 
+@pytest.mark.asyncio
 async def test_fold_rolls_old_summary_into_new() -> None:
     mem = InMemoryMemoryProvider()
     sc = _sc("t1")
@@ -249,6 +254,7 @@ async def test_fold_rolls_old_summary_into_new() -> None:
     assert "OLD SUMMARY" not in contents and "NEW" in contents  # rolled into one
 
 
+@pytest.mark.asyncio
 async def test_fold_anchor_precedes_surviving_body_capsule() -> None:
     """防御锚点：存活单元的 user 回合被折、task 层 user_prompt 却存活（跨层 split，存量数据）时，
     新摘要仍锚在该 user_prompt 之前——不只看 agent 回合的最早 ts。"""
@@ -271,6 +277,7 @@ async def test_fold_anchor_precedes_surviving_body_capsule() -> None:
     assert summ[0].timestamp < early_up.timestamp
 
 
+@pytest.mark.asyncio
 async def test_fold_at_or_below_keep_last_is_noop() -> None:
     mem = InMemoryMemoryProvider()
     sc = _sc("t1")
@@ -282,6 +289,7 @@ async def test_fold_at_or_below_keep_last_is_noop() -> None:
     assert summaries == []  # nothing written
 
 
+@pytest.mark.asyncio
 async def test_fold_summary_anchored_before_kept_window() -> None:
     mem = InMemoryMemoryProvider()
     sc = _sc("t1")
@@ -296,6 +304,7 @@ async def test_fold_summary_anchored_before_kept_window() -> None:
     assert summ[0].timestamp < min_kept_ts            # summary anchored before kept window
 
 
+@pytest.mark.asyncio
 async def test_count_root_residues_excludes_subtask() -> None:
     """新格式：root 胶囊（AGENT_CONVERSATION_TURN, parent=None）计 3；
     TASK_DISPATCH_RESULT(parent=t1) 为 working set，_count_root_residues 不计此类型。"""
@@ -319,6 +328,7 @@ def _delegate_pair(sc, oid: str, t: int, *, with_result: bool):
     return evs
 
 
+@pytest.mark.asyncio
 async def test_count_root_residues_counts_delegated_with_result() -> None:
     """派给别的 agent 的 root task：结果已回（result/tool 回合）→ 计入完成；仅 dispatch 无 result → 在途不计。"""
     mem = InMemoryMemoryProvider()
@@ -332,6 +342,7 @@ async def test_count_root_residues_counts_delegated_with_result() -> None:
     assert await _count_root_residues(_state(cur, LoopConfig()), _loop_ctx(mem, _FakeTM({}))) == 1
 
 
+@pytest.mark.asyncio
 async def test_count_root_residues_excludes_current_task_even_with_result() -> None:
     """当前正在跑的 task 即使 dispatch+result 齐全,也不算可折完成单元（当前任务不能折）。"""
     mem = InMemoryMemoryProvider()
@@ -345,6 +356,7 @@ async def test_count_root_residues_excludes_current_task_even_with_result() -> N
 
 # ═══════════════════ CompactStep.execute orchestration ═══════════════════
 
+@pytest.mark.asyncio
 async def test_execute_noop_when_budget_gate_closed() -> None:
     """预算门未开（token_estimate 低于 target）时，escalating_compact 空跑，不摸任何记录。"""
     mem = InMemoryMemoryProvider()
@@ -354,6 +366,7 @@ async def test_execute_noop_when_budget_gate_closed() -> None:
     assert await mem.recall_recent(_sc("t1"), [T.TASK_COMPACT_SUMMARY, T.AGENT_COMPACT_SUMMARY], 100, _ctx()) == []
 
 
+@pytest.mark.asyncio
 async def test_execute_folds_task_and_root() -> None:
     mem = InMemoryMemoryProvider()
     sc = _sc("t1")
@@ -373,6 +386,7 @@ async def test_execute_folds_task_and_root() -> None:
     assert agent_recs != []                                                  # (c) root folded
 
 
+@pytest.mark.asyncio
 async def test_execute_task_fold_untouches_subtask_residues() -> None:
     mem = InMemoryMemoryProvider()
     sc = _sc("t1")
@@ -393,6 +407,7 @@ async def test_execute_task_fold_untouches_subtask_residues() -> None:
     assert await mem.recall_recent(sc, [T.AGENT_COMPACT_SUMMARY], 100, _ctx()) == []  # no root fold
 
 
+@pytest.mark.asyncio
 async def test_execute_keeps_finished_short_body_then_folds_root() -> None:
     """task-resident（spec 2026-06-28 §5）：CompactStep 不再回收 finished 短 task——其 body 留
     task 层（即胶囊，由跨层 fold 管理）；root residues 仍照常 fold。"""
@@ -417,6 +432,7 @@ async def test_execute_keeps_finished_short_body_then_folds_root() -> None:
     assert await mem.recall_recent(sc, [T.AGENT_COMPACT_SUMMARY], 100, _ctx()) != []
 
 
+@pytest.mark.asyncio
 async def test_execute_idempotent_second_run_noop() -> None:
     """第一次跑（预算门开）真折一轮；折后负载回落，第二次预算门不开（context_tokens 低于
     target）→ 空跑不摸记录（escalating_compact 门未过时连 STARTED 都不发,见 gate 语义）。"""
@@ -439,6 +455,7 @@ async def test_execute_idempotent_second_run_noop() -> None:
 
 # ═══════════════════ pre-dispatch compaction (派发前压缩) ═══════════════════
 
+@pytest.mark.asyncio
 async def test_predispatch_folds_task_and_agent_layers() -> None:
     """派发前压缩越过阈值时，与 CompactStep 同构地同时折 task 层与 agent 层，事件标 pre_dispatch。"""
     from tests.unit.test_predispatch_compact import _compact_before_dispatch
@@ -465,6 +482,7 @@ async def test_predispatch_folds_task_and_agent_layers() -> None:
     assert await mem.recall_recent(sc, [T.AGENT_COMPACT_SUMMARY], 100, _ctx()) != []
 
 
+@pytest.mark.asyncio
 async def test_predispatch_gate_blocks_below_threshold() -> None:
     from tests.unit.test_predispatch_compact import _compact_before_dispatch
 

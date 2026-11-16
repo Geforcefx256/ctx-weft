@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """Same-agent child reports survive every handoff cut without losing the answer."""
 
 import asyncio
@@ -16,7 +18,6 @@ from tests._snapshot_helpers import seed_snapshot
 from tests.integration._same_agent_observe_worker import make_child_runtime
 from tests.integration.test_observe_lifecycle_crashes import assert_lifecycles
 
-pytestmark = pytest.mark.asyncio
 WORKER = Path(__file__).with_name("_same_agent_observe_worker.py")
 BASELINES = {}
 
@@ -52,7 +53,7 @@ async def recover(store, memory, size, snapshot=False):
     rt, llm = make_child_runtime(store, memory, size, recovering=True)
     await initialize_all(rt)
     root = (await rt.get_session("child-session")).data.root_agent_id
-    await rt.recover_agent(root, session_id="child-session")
+    await recover_fixture_session(rt, root, session_id="child-session")
     tm = rt._task_managers["child-session"]
     async with asyncio.timeout(20):
         while tm.running_task_ids() or tm._background_asyncio_tasks:
@@ -68,6 +69,7 @@ CASES = [(order, size, snapshot, cut) for order in ("early", "late") for size in
 CASES += [(order, "long", snapshot, "raw_folded") for order in ("early", "late") for snapshot in (False, True)]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("order,size,snapshot,cut", CASES)
 async def test_child_handoff_matches_normal(tmp_path, tmp_path_factory, order, size, snapshot, cut):
     if (order, size) not in BASELINES:
@@ -110,6 +112,7 @@ async def test_child_handoff_matches_normal(tmp_path, tmp_path_factory, order, s
             assert await content(store, memory) == actual
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("order", ["early", "late"])
 @pytest.mark.parametrize("size", ["short", "long"])
 @pytest.mark.parametrize("snapshot", [False, True])

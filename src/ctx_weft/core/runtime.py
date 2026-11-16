@@ -6,6 +6,9 @@ Phase 4 版本：完整 SessionRegistry + TaskManager + AgentLifecycleManager �
 
 from __future__ import annotations
 
+from ctx_weft.core.control.converters import agent_detail, task_detail
+from ctx_weft.core.control.session_queries import public_task_detail
+
 import asyncio
 import contextlib
 import functools
@@ -13,7 +16,7 @@ import inspect
 import logging
 from collections.abc import AsyncIterator, Callable
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -23,7 +26,8 @@ if TYPE_CHECKING:
 from ctx_weft.core.assembler import ContextAssembler
 from ctx_weft.core.control.reducers import read_task_view, rebuild_view, reduce_events
 from ctx_weft.core.models.config import RuntimeConfig
-from ctx_weft.protocols.runtime import QueryResult, SessionDetail, SessionInitializationResult, TaskDetail
+from ctx_weft.protocols.runtime import PromptDiagnostic, QueryResult, RuntimeClosedError, RuntimeShutdownError, SessionDetail, ShutdownReport, SessionInitializationResult
+from ctx_weft.protocols.task import TaskDetail
 from ctx_weft.core.assembler.assembler import AssemblerDeps
 from ctx_weft.core.assembler.prompts import runtime_prompt
 from ctx_weft.core.assembler.sources import (
@@ -36,10 +40,9 @@ from ctx_weft.core.assembler.sources import (
     SemanticRecallSource,
     TaskSpecSource,
 )
-from ctx_weft.protocols.capability import Authorizer
 from ctx_weft.core.control.tokens import CancelToken, PauseToken, RunTokens
 from ctx_weft.core.models.discriminators import CancelReason, InterruptReason
-from ctx_weft.protocols.events import Event, EventOrigin, EventStore, EventType
+from ctx_weft.protocols.events import Event, EventOrigin, EventType
 from ctx_weft.core.utils.event import emit_event
 from ctx_weft.core.hitl.registry import (
     HITL_STAGE_AUTHZ,
@@ -74,8 +77,7 @@ from ctx_weft.core.orchestrator.lifecycle.session_registry import SessionRegistr
 from ctx_weft.core.orchestrator.task.hooks import TaskManagerHooks
 from ctx_weft.core.orchestrator.task.manager import TaskManager
 from ctx_weft.core.orchestrator.task.disposition import RunOutcome, RunOutcomeKind
-from ctx_weft.core.orchestrator.task.queue import QueueEntry
-from ctx_weft.core.orchestrator.task.runner import AgentBinding, TaskRunner, effective_agent_id
+from ctx_weft.core.orchestrator.task.runner import AgentBinding, effective_agent_id
 from ctx_weft.core.models.status import TERMINAL_TASK_STATUSES
 from ctx_weft.core.registry import ProviderRegistry
 from ctx_weft.core.models.agent import Agent
@@ -96,10 +98,7 @@ from ctx_weft.core.utils.ids import generate_id
 from ctx_weft.core.utils.task_ref import task_ref
 from ctx_weft.protocols import (
     AgentTemplate,
-    Capability,
-    KnowledgeProvider,
     LLMClient,
-    LLMClientResolver,
     LLMOutageError,
     MemoryAddress,
     MemoryEvent,
@@ -112,9 +111,7 @@ from ctx_weft.protocols import (
 from ctx_weft.protocols.agent import AgentDetail, AgentSummary, CompactReceipt
 from ctx_weft.protocols.capability import (
     AgentCapabilityProvider,
-    CapabilityProvider,
     SessionScopedCapabilityProvider,
-    qualify,
 )
 from ctx_weft.protocols.events import EventBus, PersistenceUnavailableError
 from ctx_weft.protocols.hitl import (
@@ -202,7 +199,7 @@ async def _copy_memory_for_inherit(
     """
     # AGENT_COMPACT_SUMMARY（父的黑盒折叠派发日志）仍排除——对子无用（沿用 2026-06-23 的窄化意图，
     # 只是现在改为 mirror 而非「仅 OPEN-task body」）。
-    from ctx_weft.protocols import MemoryAddress, MemoryEvent, MemoryEventType
+    from ctx_weft.protocols import MemoryAddress, MemoryEvent
 
     ctx = ProviderContext(session_id=session_id, tenant_id=tenant_id)
 
@@ -214,7 +211,7 @@ async def _copy_memory_for_inherit(
     # (their start_task frame precedes them, so no naked leak) and cross-agent siblings arrive as
     # bubbles. AGENT_COMPACT_SUMMARY is still excluded — the parent's folded black-box dispatch log
     # is of little use to a child.
-    from ctx_weft.protocols import MemoryAddress, MemoryKind, MemoryScope
+    from ctx_weft.protocols import MemoryKind, MemoryScope
     # v2 P3a：body = TASK 视图默认 kinds（对话+段摘要，跨 task 半址）；frames = AGENT 视图
     # conversation turn（AGENT_COMPACT_SUMMARY = SUMMARY kind，天然排除）。
     body_records = await load_records(memory,
@@ -486,13 +483,21 @@ def _suspended_on_live_children(task_manager: "TaskManager", task: "Task") -> bo
     return False
 
 
-def _task_detail(task):
-    return TaskDetail(
-        task.id, task.session_id, task.assigned_agent_id or None,
-        task.creator_agent_id or None, task.parent_task_id or None,
-        task.status, task.title, task.description, deepcopy(task.outputs),
-        task.error, task.error_code, task.created_at, task.finished_at,
-    )
+def runtime_command(method):
+    @functools.wraps(method)
+    async def command(self, *args, **kwargs):
+        current = asyncio.current_task()
+        nested = current in self._commands
+        if self._closing and not nested:
+            raise RuntimeClosedError("Runtime is closing")
+        self._commands.add(current)
+        try:
+            return await method(self, *args, **kwargs)
+        finally:
+            if not nested:
+                self._commands.discard(current)
+    return command
+
 
 
 def _session_command(
@@ -502,6 +507,7 @@ def _session_command(
     missing_session_as_agent: bool = False,
     skip_no_resume_reply: bool = False,
     skip_finalized_stop: bool = False,
+    recover_storage_first: bool = False,
 ):
     """Serialize addressing, optional materialization and command delivery.
 
@@ -551,7 +557,7 @@ def _session_command(
             # future run. Do not let initialization or serialization queue it.
             if stop_is_protected():
                 return [] if aid else False
-            if (method.__name__ == "recover_agent" and self.storage_health(sid) is not None
+            if (recover_storage_first and self.storage_health(sid) is not None
                     and self._session_lock_owners.get(sid) is not asyncio.current_task()):
                 # Storage reconciliation may wait for emitters whose subscribers
                 # query this session. Complete it before owning the command guard.
@@ -587,7 +593,7 @@ def _session_command(
                         raise
                 return await method(self, *args, **kwargs)
 
-        return command
+        return runtime_command(command)
 
     return decorate
 
@@ -620,6 +626,10 @@ class CtxWeftRuntime:
         snapshot_every_n: int = 0,
     ) -> None:
         from ctx_weft.core.models.config import RuntimeConfig
+        self._closing = False
+        self._close_task = None
+        self._commands = set()
+        self._owned_tasks = set()
         self._config = config or RuntimeConfig()
         self._llm = llm  # fallback for backward compat / tests
         self.providers = providers or ProviderRegistry()
@@ -758,7 +768,7 @@ class CtxWeftRuntime:
         )
         # SM 的输入端：只认 TaskManager 的四类事件（_INPUT_BY_EVENT），本 task
         # 之后 TM 还没开始发这三条信号，运行时行为不变（docs/events-v2.md §2.1.1）。
-        # Per-session resume 锁：串行化同一 session 的 recover_agent，避免重叠的冷 HITL 应答 /
+        # Per-session resume 锁：串行化同一 session 的 recover_session，避免重叠的冷 HITL 应答 /
         # /resume 并发建出两个 TaskManager、两套 drain 竞争派发（spec/07 §9）。惰性建、不回收
         # （体量微小、按 session 数有界）。
         self._resume_locks: dict[str, asyncio.Lock] = {}
@@ -773,6 +783,112 @@ class CtxWeftRuntime:
         # Wiring is synchronous and does no history I/O. Recovery is per session.
         self._attach_runtime()
 
+    def _spawn(self, operation, **kwargs):
+        task = asyncio.create_task(operation, **kwargs)
+        self._owned_tasks.add(task)
+
+        def finished(done):
+            self._owned_tasks.discard(done)
+            if not done.cancelled():
+                done.exception()
+
+        task.add_done_callback(finished)
+        return task
+
+    async def close(self, *, timeout: float = 30.0) -> ShutdownReport:
+        """Stop this instance, retaining committed tasks/HITL for a fresh runtime.
+
+        Concurrent callers share shutdown. Timeout or caller cancellation never
+        abandons cleanup. A timeout report does not authorize closing providers;
+        await close again until execution is quiescent. Queries remain available.
+        """
+        current = asyncio.current_task()
+        if (current in self._commands or current in self._owned_tasks
+                or any(current in tm.owned_executions() for tm in self._task_managers.values())):
+            raise RuntimeError("close must be called outside runtime execution")
+        if timeout < 0:
+            raise ValueError("timeout must be non-negative")
+        if self._close_task is None:
+            self._closing = True
+            self._close_task = asyncio.create_task(self._close_instance())
+            self._close_task.add_done_callback(lambda t: None if t.cancelled() else t.exception())
+        done, _ = await asyncio.wait({self._close_task}, timeout=timeout)
+        if not done:
+            raise RuntimeShutdownError(ShutdownReport(
+                quiescent=False, durable=False, errors=("Shutdown timed out; cleanup is still running",)))
+        return self._close_task.result()
+
+    async def _close_instance(self) -> ShutdownReport:
+        from ctx_weft.core.control.startup import calibrate_session
+        from ctx_weft.core.models.errors import SessionNotFound
+
+        # Snapshot every owner before cancellation callbacks can remove entries.
+        managers = dict(self._task_managers)
+        sessions = set(managers) | set(self._initializing_sessions)
+        sessions.update(self._storage_unavailable)
+        errors = []
+        while True:
+            managers.update(self._task_managers)
+            sessions.update(managers)
+            for manager in managers.values():
+                manager.begin_shutdown()
+            tasks = set(self._owned_tasks) | set(self._commands)
+            for manager in managers.values():
+                tasks.update(manager.owned_executions())
+            for registry in self._step_executions.values():
+                tasks.update(registry.tasks.values())
+            tasks = {task for task in tasks if not task.done()}
+            if not tasks:
+                break
+            for task in tasks:
+                task.cancel()
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            errors.extend(repr(r) for r in results
+                          if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError))
+        # All producers have exited. Confirm submissions whose receipt was lost
+        # before dropping provisional buffers; never turn an uncommitted round
+        # into a committed one merely because the process is shutting down.
+        for sid in sorted(sessions):
+            try:
+                await self._confirm_storage_facts(sid)
+                await self.hitl.confirm_opens(sid)
+                await self.hitl.confirm_resolutions(sid)
+                manager = managers.get(sid)
+                if manager is not None:
+                    for tid in list(manager.open_round_task_ids):
+                        if manager._round_commit_started(tid):
+                            await manager.commit_round(tid)
+                    await self._confirm_assistant_events(manager.session)
+                    await self._settle_storage_assistant_memory(manager.session)
+                registry = self._step_executions.get(sid)
+                if registry is not None:
+                    await registry.confirm_metadata_commits(self._event_bus)
+                self._evict_session_memory(sid)
+                await calibrate_session(self.event_store, sid, reason="runtime_shutdown",
+                                        publish=self._event_bus.emit_batch)
+                # Cancellation may interrupt an append and temporarily isolate the
+                # session. All receipts and shutdown facts are now confirmed;
+                # read-only queries after close must see the recovered facts.
+                if not self.clear_storage_isolation(sid):
+                    raise RuntimeError("Shutdown left unconfirmed storage submissions")
+            except SessionNotFound:
+                pass  # A create command can be stopped before its first commit.
+            except Exception as exc:
+                errors.append(f"{sid}: {exc!r}")
+        for detach in (self.persistence.detach, self._agent_lifecycle_manager.detach_from_bus,
+                       self._session_registry.detach_from_bus):
+            try:
+                await detach()
+            except Exception as exc:
+                errors.append(f"detach: {exc!r}")
+        if sessions and self._config.event_commit_policy != "required":
+            errors.append("best_effort event commits cannot guarantee recoverable shutdown")
+        report = ShutdownReport(True, not errors, tuple(sorted(sessions)), tuple(errors))
+        if errors:
+            raise RuntimeShutdownError(report)
+        return report
+
+    @runtime_command
     async def initialize(self, session_id: str) -> SessionInitializationResult | None:
         """Autonomously recover one session before execution, without loading owners.
 
@@ -787,7 +903,7 @@ class CtxWeftRuntime:
             return None
         task = self._initializing_sessions.get(session_id)
         if task is None:
-            task = asyncio.create_task(self._initialize_session_once(session_id))
+            task = self._spawn(self._initialize_session_once(session_id))
             self._initializing_sessions[session_id] = task
 
             def completed(done):
@@ -893,10 +1009,12 @@ class CtxWeftRuntime:
         self,
         llm_account: str | None = None,
         llm_model: str | None = None,
+        *,
+        ctx: ProviderContext,
     ) -> LLMClient:
         """Resolve LLMClient: registry first, then fallback to self._llm."""
         if self.providers.has_llm_provider():
-            return self.providers.get_llm_provider().get_client(llm_account, llm_model)
+            return self.providers.get_llm_provider().get_client(llm_account, llm_model, ctx=ctx)
         if self._llm is not None:
             return self._llm
         raise RuntimeError(
@@ -945,11 +1063,7 @@ class CtxWeftRuntime:
         memory 侧不能外部化（`NullMemoryBlobStore`）时第一个产物是原样的同一对象；
         纯文本 content 两侧都是零 IO 直通（两个函数对 `str` 都原样返回）。
         """
-        from ctx_weft.core.utils.content import (
-            content_to_event_jsonable,
-            normalize_content,
-            validate_content,
-        )
+        from ctx_weft.protocols.content import content_to_event_jsonable, normalize_content, validate_content
 
         event_blob_store = self.providers.get_event_blob_store()
         validate_content(content, event_blob_store=event_blob_store)
@@ -1036,13 +1150,16 @@ class CtxWeftRuntime:
             self._start_storage_recovery(session_id)
 
     def _start_storage_recovery(self, session_id):
+        if self._closing:
+            raise RuntimeClosedError("Runtime is closing")
         task = self._storage_recovery_tasks.get(session_id)
         if task is None or task.done():
-            task = asyncio.create_task(self._recover_storage_session(session_id),
+            task = self._spawn(self._recover_storage_session(session_id),
                                        name=f"storage-recovery:{session_id}")
             self._storage_recovery_tasks[session_id] = task
         return task
 
+    @runtime_command
     async def recover_storage(self, session_id: str) -> bool:
         """Confirm original submissions and resume safely; concurrent callers share one worker.
 
@@ -1061,7 +1178,7 @@ class CtxWeftRuntime:
             if not self._config.storage_recovery_max_attempts or session_id not in self._storage_retryable:
                 raise PersistenceUnavailableError(self.storage_health(session_id))
             task = self._start_storage_recovery(session_id)
-        receipt = asyncio.create_task(self._commit_gate.wait_confirmation(session_id, batch_id))
+        receipt = self._spawn(self._commit_gate.wait_confirmation(session_id, batch_id))
         try:
             await asyncio.wait({receipt, task}, return_when=asyncio.FIRST_COMPLETED)
             if receipt.done():
@@ -1161,6 +1278,7 @@ class CtxWeftRuntime:
         return True
 
     @_session_command(load_session="skip", skip_finalized_stop=True)
+    @runtime_command
     async def pause_session(self, session_id: str) -> bool:
         """软打断（spec 2026-07-05）：放弃其余在途/排队任务，只留 root agent 当前那一轮。
         - 置 _pausing 闩锁：其间新派发的 root agent run 出生即 paused（被 _try_resume_parent
@@ -1257,6 +1375,7 @@ class CtxWeftRuntime:
         return True
 
     @_session_command(load_session="skip", skip_finalized_stop=True)
+    @runtime_command
     async def cancel_session(self, session_id: str) -> bool:
         """硬取消：清队列 + 该 session 下**每个 agent** 经 `cancel_agent` 显式转
         `terminated`（2026-09-04 spec §7.2）。
@@ -1272,7 +1391,7 @@ class CtxWeftRuntime:
         # 该做的事（把 agent 转 `terminated`、把提问收口）一件都没少。
         #
         # 只看 TM 的旧判据会让这些会话**静默早退**：`/cancel` 什么都没做就返回 False，
-        # 未决提问留成「有 HitlOpened 无终局事件」的孤儿，重启后 `rebuild_hitl` 又把它
+        # 未决提问留成「有 HitlOpened 无终局事件」的孤儿，重启后 `rebuild_session` 又把它
         # 当未决恢复出来（总账 A10 要防的正是这个）。
         per = self._run_tokens.get(session_id, {})
         task_manager = self._task_managers.get(session_id)
@@ -1314,7 +1433,7 @@ class CtxWeftRuntime:
             await executions.finish_metadata(self._event_bus)
         # ① 未决的 ask_user 一并终局，且**先于**下面 cancel_all 触发的会话终态——
         # 与熔断 trip 序列同一条纪律（HITL 终局须先于会话终态）。不终局的代价在重启后：
-        # rebuild_hitl 按「有 HitlOpened 无终局事件」折 pending，会把已取消会话的
+        # rebuild_session 按「有 HitlOpened 无终局事件」折 pending，会把已取消会话的
         # 提问当未决恢复出来（总账 A10）。
         # **先把开着的未提交窗口收掉**：窗口靠「那一轮的提交点」来关，而这条会话就此不再
         # 有下一轮。不收的代价有三：那一轮里发出的 `TASK_CANCELED` 等事实随缓冲一起消失、
@@ -1391,6 +1510,7 @@ class CtxWeftRuntime:
             for tid in tids:
                 registry.notify_finish(tid)
 
+    @runtime_command
     async def cancel_agent(self, agent_id: str, *, reason: str | None = None,
                            _session_cancel_admitted: bool = False) -> list[str]:
         """Terminate the agent and cancel its current task subtree through TaskManager.
@@ -1605,6 +1725,7 @@ class CtxWeftRuntime:
     # ── Agent 级暂停 / 恢复（Task 20）────────────────────────────────────────
 
     @_session_command(load_session="skip", allow_missing_session=True, skip_finalized_stop=True)
+    @runtime_command
     async def pause_agent(self, agent_id: str, *, reason: str | None = None) -> list[str]:
         """暂停 agent 及其全部**当前 running** 的子孙（spec 7）。
 
@@ -1654,6 +1775,7 @@ class CtxWeftRuntime:
         return paused
 
     @_session_command(load_session="required")
+    @runtime_command
     async def resume_agent(self, agent_id: str, *, session_id: str | None = None) -> list[str]:
         """恢复 agent 及其全部**由暂停产生**的等待气泡（spec 7；R24）。
 
@@ -1677,7 +1799,7 @@ class CtxWeftRuntime:
         `{PREFACE_AFTER_INTERRUPT, PREFACE_AFTER_INTERRUPT_EDIT}` 才是本方法该碰的。
 
         续跑走既有的 HITL 冷续跑通路（`reply_to_hitl` → `_resume_after_hitl` →
-        `recover_agent`），不直接 `apply_input(AgentInput.RESUMED)`——那样会把
+        `recover_session`），不直接 `apply_input(AgentInput.RESUMED)`——那样会把
         agent 状态拍成 `running`，但驱动它真正再跑起来的 task 这时其实还没有被
         重排/派发，状态与现实不符；`apply_input` 的唯一入口纪律也要求转移经由
         真事件发生，不由调用方越过 TaskManager 直接拍。真正的 `running` 由续跑
@@ -1723,6 +1845,7 @@ class CtxWeftRuntime:
     # record，因此换模型对**尚未派发**的 run 立即生效；已经在跑的 run 手上的
     # `ResolvedModel` 是那次 assemble() 时现解的快照，不会被这两条命令追改。
 
+    @runtime_command
     async def set_agent_llm(
         self, agent_id: str, *, llm_account: str = "", llm_model: str = "",
         llm_config: ModelCallConfig | None = None,
@@ -1734,6 +1857,7 @@ class CtxWeftRuntime:
                                   config=llm_config if llm_config is not None else ModelCallConfig()), reason=reason,
         )
 
+    @runtime_command
     async def set_session_llm(
         self, session_id: str, *, llm_account: str = "", llm_model: str = "",
         llm_config: ModelCallConfig | None = None,
@@ -1750,6 +1874,7 @@ class CtxWeftRuntime:
 
     # ── Phase 1 compat ───────────────────────────────────────────────────────
 
+    @runtime_command
     async def run_single_task(
         self,
         *,
@@ -1765,7 +1890,7 @@ class CtxWeftRuntime:
 
         60 处测试在用，返回的句柄已带 `agent_id`，与 agent-centric 不冲突——保留它是
         纯收益、删它是纯成本。"""
-        from ctx_weft.core.utils.content import content_to_text
+        from ctx_weft.protocols.content import content_to_text
 
         sid = session_id or generate_id("ses")
         # 单例：这条路径自己建一个 TM 跑到底——session 若已有主，就会与既有 TM 并存。
@@ -1780,7 +1905,7 @@ class CtxWeftRuntime:
             # 第一个「persist」，llm 不可解析须在它之前失败，而非之后（此调用只为早失败，
             # 结果不留用——agent 的窗口由下面 instantiate(llm=...) 内部按同一份 choice
             # 重新解出，registry 不缓存 client，这里的返回值即弃是设计的一部分）。
-            self._resolve_llm(llm_account, llm_model)
+            self._resolve_llm(llm_account, llm_model, ctx=ctx)
             # validate → normalize 的顺序与另外两个入口共用同一个方法，不再各写一遍。
             # event 侧产物在这条路径上没有**入口事件**载得下它（run_single_task 自己
             # register_task、不经 push_task，也不发 SESSION_CREATED），但它必须挂到 Task 上：
@@ -1838,7 +1963,7 @@ class CtxWeftRuntime:
             task_manager.register_task(task)
             # compat 路径不经 _register_and_drain（没有队列、没有 drain），但 TM 一样要登记为
             # 这个 session 的 owner：跑的这段时间里若有别的入口（send_message 冷启动的
-            # recover_agent 等）来找这个 session 的 TM，必须撞上这一个，而不是再建一个与它
+            # recover_session 等）来找这个 session 的 TM，必须撞上这一个，而不是再建一个与它
             # 并存（单例，见 `_bind_task_manager`）。跑完在下面的 finally 里摘掉——这个 TM
             # 没有 runner、没挂回调，留在册里会让之后的续跑拿到一个派发不了的 TM；摘掉之后
             # 续跑照旧从事件日志重建，与改动前一致。
@@ -1892,6 +2017,7 @@ class CtxWeftRuntime:
 
     # ── Phase 4 full session ─────────────────────────────────────────────────
 
+    @runtime_command
     async def create_session(
         self,
         *,
@@ -1973,6 +2099,7 @@ class CtxWeftRuntime:
             template_id=template_id,
         )
 
+    @runtime_command
     async def start_session(self, params: SessionStartParams) -> TurnHandle:
         """Create or resume a session and start execution.
 
@@ -2045,7 +2172,7 @@ class CtxWeftRuntime:
                 raise ValueError("session_id is required when resume=True")
             await self._rebuild_session_locked(params.session_id, tenant_id=params.tenant_id, strict=True)
             existing = self._task_managers[params.session_id]
-            session, root_task, task_manager = await sm.resume_session(
+            session, root_task, task_manager = await sm.start_next_turn(
                 session_id=params.session_id,
                 event_store=self.event_store,
                 user_prompt=params.user_prompt,
@@ -2189,7 +2316,7 @@ class CtxWeftRuntime:
         self._initialized_sessions.add(session.id)
         self._loaded_sessions.add(session.id)
         if start_tasks:
-            asyncio.create_task(task_manager.drain())
+            self._spawn(task_manager.drain())
 
     async def _on_task_terminal(self, session_id: str, task_id: str) -> None:
         """`on_task_terminal` 钩子：task 落终态时回收挂在它身上的东西。
@@ -2356,7 +2483,7 @@ class CtxWeftRuntime:
 
         **`_resume_locks[session_id]` 刻意不收**：它可能正被一个在
         `_recover_session_locked` 里的协程持有着。把字典项弹掉不会让那个协程放手，只会
-        让下一个 `recover_agent` `setdefault` 出**第二把锁**并直接进去——同一 session 上
+        让下一个 `recover_session` `setdefault` 出**第二把锁**并直接进去——同一 session 上
         两条重建路径并行，正是这把锁存在的理由。它按 session 数有界、体量微小，不回收
         是构造期就定下的（见 `__init__` 里那行注释）。
         """
@@ -2389,6 +2516,7 @@ class CtxWeftRuntime:
         return self._agent_lifecycle_manager.forget_agent(agent_id)
 
     @_session_command(load_session="optional")
+    @runtime_command
     async def purge_session(self, session_id: str) -> None:
         """**销毁**一条会话的运行时存在：终结还在跑的一切，然后把内存清干净。
 
@@ -2416,7 +2544,7 @@ class CtxWeftRuntime:
         **终结之前先确保它在内存里**：`cancel_session` 读的是 `hitl_registry` 与 ALM
         的内存现状——一条已经被 `forget_session` 逐出（或进程刚起来还没 `recover` 到）
         的会话，那两处都是空的，于是「收口未决 HITL」「逐个 `cancel_agent`」全都一次
-        不进，静默跳过。表现是删掉的会话在重启后又冒出一条未决提问：`rebuild_hitl` 按
+        不进，静默跳过。表现是删掉的会话在重启后又冒出一条未决提问：`rebuild_session` 按
         「有 `HitlOpened` 无终局事件」把它当未决恢复了出来。装填一次只是读事件日志喂
         内存，不跑任何东西；会话本就不在事件日志里则装填出 0 条，后面几步自然全是
         no-op。
@@ -2483,6 +2611,7 @@ class CtxWeftRuntime:
             if isinstance(_p, SessionScopedCapabilityProvider):
                 _p.deregister_session(session_id)
 
+    @runtime_command
     async def rebuild_session(
         self, session_id: str, *, tenant_id: str | None = None, strict: bool = False,
     ) -> int:
@@ -2574,7 +2703,10 @@ class CtxWeftRuntime:
         task_manager = self._session_registry._new_task_manager(session)
         task_manager.set_session(session)
         terminal_ids = {t.id for t in all_tasks if t.status in TERMINAL_TASK_STATUSES}
-        task_manager.restore(all_tasks, terminal_ids, enqueue=False)
+        task_manager.restore(
+            all_tasks, terminal_ids, enqueue=False,
+            threshold_tripped=sess_proj.threshold_tripped,
+        )
         task_manager.set_recovery_pending(True)
         task_manager.set_unhealthy_check(lambda sid: self.storage_health(sid) is not None)
         task_manager.set_runner(self._make_task_runner(
@@ -2830,46 +2962,14 @@ class CtxWeftRuntime:
 
     # ── Crash recovery ───────────────────────────────────────────────────────
 
-    @_session_command(load_session="required")
-    async def recover_agent(
-        self,
-        agent_id: str,
-        *,
-        session_id: str | None = None,
-        user_reply: "PendingHitl | None" = None,
-        resumed_task_id: str | None = None,
-        hitl_id: str = "",
-        keep_alive: bool = False,
-    ) -> None:
-        """Continue work using the session's unique owner.
+    @_session_command(load_session="required", recover_storage_first=True)
+    async def recover_session(self, session_id: str) -> None:
+        """Continue recoverable work in this session, without creating a new task.
 
-        A cold call needs session_id for addressing. Materialization always goes
-        through rebuild_session. Without resumed_task_id the existing behavior is
-        session-wide requeue; HITL internals target the answered task explicitly.
-        keep_alive only ensures materialization, with no drain or model calls."""
-        if session_id is not None:
-            await self.rebuild_session(session_id, strict=True)
-        rec = self._agent_lifecycle_manager.record_of(agent_id)
-        if rec is None:
-            raise AgentNotLoaded(
-                f"agent {agent_id!r} is not loaded — call rebuild_session(session_id) "
-                f"for its session first"
-            )
-        session_id = rec.session_id
-        lock = self._session_guard(session_id)
-        async with lock:
-            await self._recover_session_locked(
-                session_id, user_reply=user_reply,
-                resumed_task_id=resumed_task_id, hitl_id=hitl_id,
-                keep_alive=keep_alive,
-            )
-
-    async def prepare_agent(self, agent_id: str) -> None:
-        """Compatibility wrapper; rebuild_session owns all cold preparation."""
-        rec = self._agent_lifecycle_manager.record_of(agent_id)
-        if rec is None:
-            raise AgentNotLoaded(f"agent {agent_id!r} is not loaded")
-        await self.rebuild_session(rec.session_id, tenant_id=rec.tenant_id, strict=True)
+        Repeated calls reuse the same owner and never answer pending HITL requests.
+        Cold initialization and storage confirmation precede the guarded recovery.
+        """
+        await self._recover_session_locked(session_id)
 
     async def _recover_session_locked(
         self,
@@ -2893,7 +2993,10 @@ class CtxWeftRuntime:
         cold = prepared is not None and prepared[0] is tm
         resumable = any(t.status not in TERMINAL_TASK_STATUSES for t in tm.all_tasks())
         if cold and not resumable and not prepared[1]:
-            raise RuntimeError(f"Session {session_id!r} has no resumable tasks")
+            # A valid container has no tasks. Cold and hot recovery are both no-ops.
+            self._prepared_recoveries.pop(session_id, None)
+            tm.set_recovery_pending(False)
+            return
         try:
             await self._recover_in_existing_tm(
                 tm, user_reply=user_reply, resumed_task_id=resumed_task_id, hitl_id=hitl_id,
@@ -2931,32 +3034,28 @@ class CtxWeftRuntime:
            （那是 HITL 应答 / 注入消息）、且拍平文本与当前提问一致。L3 坍缩物以原文开头，
            因此用前缀匹配。
 
-        best-effort：读 memory 失败就保留猜测（与改造前同义），记一条 exception。
+        读写失败由 rebuild_session 的 strict 策略处理，不能宣布补写成功。
         """
         from ctx_weft.core.loop.driver import task_prompt_record_id
-        from ctx_weft.core.utils.content import content_to_text
+        from ctx_weft.protocols.content import content_to_text
         from ctx_weft.protocols import MemoryKind as _MK
         memory = self.providers.get_memory()
         ctx = ProviderContext(session_id=session_id, tenant_id=tenant_id)
         for task in tasks:
             if not task.user_prompt:
                 continue
-            try:
-                view = await load_records(memory,
-                    MemoryAddress(session_id=session_id, task_id=task.id),
-                    MemoryScope.TASK, ctx, kinds=[_MK.CONVERSATION_TURN],
-                )
-            except Exception:
-                logger.exception(
-                    "_verify_task_prompts_in_memory: load_records failed for task %s — "
-                    "keeping the projection's assumption", task.id)
-                continue
+            view = await load_records(memory,
+                MemoryAddress(session_id=session_id, task_id=task.id),
+                MemoryScope.TASK, ctx, kinds=[_MK.CONVERSATION_TURN],
+            )
             want_id = task_prompt_record_id(task.id, task.user_prompt)
             want_text = (task.user_prompt if isinstance(task.user_prompt, str)
                          else content_to_text(task.user_prompt)).strip()
             present = any(
                 r.id == want_id or (
-                    r.role == "user" and "source" not in (r.metadata or {})
+                    r.role == "user" and ("source" not in (r.metadata or {}) or (
+                        r.id == f"userprompt:{task.id}"
+                        and (r.metadata or {}).get("source") == "resume_heal"))
                     and (r.metadata or {}).get("task_id", task.id) == task.id
                     and want_text
                     and (r.content if isinstance(r.content, str)
@@ -3006,10 +3105,7 @@ class CtxWeftRuntime:
         悄悄吞掉。崩溃恢复是最不能再崩一次的地方——一个 task 的坏数据不该拖垮
         整场会话恢复。
         """
-        from ctx_weft.core.utils.content import (
-            content_to_jsonable, downgrade_images_to_text, hydrate_event_content,
-            normalize_content,
-        )
+        from ctx_weft.protocols.content import content_to_jsonable, downgrade_images_to_text, hydrate_event_content, normalize_content
 
         event_blob_store = self.providers.get_event_blob_store()
         blob_store = self.providers.get_memory_blob_store()
@@ -3173,7 +3269,7 @@ class CtxWeftRuntime:
                     launched = task_manager.start_foreground_recovery(task.id, agent_id,
                         lambda: self._resume_observe_finalization(state, loop_ctx, info, foreground=True))
                 else:
-                    launched = asyncio.create_task(self._resume_observe_finalization(state, loop_ctx, info))
+                    launched = self._spawn(self._resume_observe_finalization(state, loop_ctx, info))
                 loop_ctx.steps.executions.register(state.run_id, task.id, "observe", launched,
                     agent_id=agent_id, observe_id=info.get("observe_id", ""))
                 task_manager.track_background(launched)
@@ -3435,6 +3531,7 @@ class CtxWeftRuntime:
         self._register_and_drain(session, tm)
 
     @_session_command(load_session="skip", allow_missing_session=True)
+    @runtime_command
     async def compact_agent(
         self,
         agent_id: str,
@@ -3642,6 +3739,26 @@ class CtxWeftRuntime:
             session_id, through_position=head, include_types=types)
         return reduce_events([row.event for row in rows], session_id)
 
+    async def inspect_prompt(
+        self, session_id: str, event_id: str, *, trim: bool = True,
+    ) -> QueryResult[PromptDiagnostic]:
+        """Recompile redacted saved inputs without loading execution owners or invoking a model.
+
+        The returned prompt is diagnostic, not a guarantee of historical wire bytes.
+        Provider/template/memory reads use the session's persisted tenant identity.
+        """
+        from ctx_weft.core.orchestrator.lifecycle.template_lookup import TemplateLookup
+        from ctx_weft.core.prompt_diagnostics import inspect_prompt
+
+        diagnostic, position = await inspect_prompt(
+            self.event_store, session_id, event_id,
+            memory=self.providers.get_memory(),
+            template_lookup=TemplateLookup(self.providers),
+            capability_provider_index={p.name: p for p in self.providers.get_capability_providers()},
+            trim=trim,
+        )
+        return self._query_result(diagnostic, "events", self._session_is_loaded(session_id), position)
+
     async def get_session(self, session_id: str) -> QueryResult[SessionDetail]:
         async with self._session_guard(session_id):
             tm = self._task_managers.get(session_id)
@@ -3652,9 +3769,25 @@ class CtxWeftRuntime:
             else:
                 view, position = await self._query_view(session_id)
                 session = view.sessions[session_id]
+            from ctx_weft.core.control.session_queries import session_state_summary
+            if loaded:
+                from types import SimpleNamespace
+                lm = self._agent_lifecycle_manager
+                state_view = SimpleNamespace(
+                    agents={aid: lm.record_of(aid) for aid in lm.agent_ids_of_session(session_id)},
+                    tasks={t.id: t for t in tm.all_tasks()},
+                    hitl=SimpleNamespace(pending={r.id: r for r in self.hitl_registry.list_pending(session_id=session_id)}),
+                )
+                head = await self.event_store.committed_head(session_id)
+            else:
+                state_view, head = view, position
+            state = await session_state_summary(
+                self.event_store, state_view, session, head,
+                threshold_tripped=tm._threshold_tripped if loaded else None,
+            )
             detail = SessionDetail(
                 session.id, session.root_agent_id or "",
-                session.goal, session.created_at,
+                session.created_at, state,
             )
             return self._query_result(detail, "memory" if loaded else "events", loaded, position)
 
@@ -3663,7 +3796,7 @@ class CtxWeftRuntime:
             tm = self._task_managers.get(session_id)
             task = tm.get_task(task_id) if tm is not None else None
             if task is not None and task.details_complete:
-                return self._query_result(_task_detail(task), "memory", True)
+                return self._query_result(task_detail(task), "memory", True)
             head = await self.event_store.committed_head(session_id)
             task = await read_task_view(self.event_store, session_id, task_id, through_position=head)
             if task is None:
@@ -3671,7 +3804,7 @@ class CtxWeftRuntime:
                 if tm is None and (created is None or created.position > head):
                     raise SessionNotFound(session_id)
                 raise TaskNotFound(task_id)
-            return self._query_result(_task_detail(task), "events", False, head)
+            return self._query_result(task_detail(task), "events", False, head)
 
     async def list_tasks(
         self, session_id: str, *, agent_id: str | None = None,
@@ -3682,12 +3815,12 @@ class CtxWeftRuntime:
         async with self._session_guard(session_id):
             _, head = await self._query_view(session_id)
             view = await self._historical_task_view(session_id, through_position=head)
-            results = {tid: self._query_result(_task_detail(t), "events", False, head)
+            results = {tid: self._query_result(task_detail(t), "events", False, head)
                        for tid, t in view.tasks.items()}
             if session_id in self._task_managers:
                 for task in self._task_managers[session_id].all_tasks():
                     if task.details_complete:
-                        results[task.id] = self._query_result(_task_detail(task), "memory", True)
+                        results[task.id] = self._query_result(task_detail(task), "memory", True)
             items = [r for r in results.values()
                      if (agent_id is None or r.data.assigned_agent_id == agent_id)
                      and (statuses is None or r.data.status in statuses)]
@@ -3707,20 +3840,20 @@ class CtxWeftRuntime:
             rec = self._agent_lifecycle_manager.record_of(agent_id)
             if rec is not None and rec.session_id != session_id:
                 raise ValueError("agent_id does not belong to session_id")
-            if rec is not None and session_id in self._task_managers:
-                return self._query_result(self._get_agent_memory(agent_id), "memory", True)
-            view, head = await self._query_view(session_id)
-            agent = view.agents.get(agent_id)
-            if agent is None:
-                raise AgentNotFound(agent_id)
-            task = view.tasks.get(agent.current_task_id)
-            detail = AgentDetail(
-                agent_id=agent_id, session_id=session_id, template_id=agent.template_id,
-                parent_agent_id=agent.parent_agent_id, status=agent.status,
-                current_task_id=agent.current_task_id, spawn_depth=agent.spawn_depth,
-                current_task_status=task.status if task else None,
-            )
-            return self._query_result(detail, "events", False, head)
+            loaded = rec is not None and session_id in self._task_managers
+            if loaded:
+                agent = rec
+                head = await self.event_store.committed_head(session_id)
+                task = self._task_managers[session_id].get_task(agent.current_task_id)
+            else:
+                view, head = await self._query_view(session_id)
+                agent = view.agents.get(agent_id)
+                if agent is None:
+                    raise AgentNotFound(agent_id)
+                task = view.tasks.get(agent.current_task_id)
+            current = await public_task_detail(self.event_store, session_id, agent.current_task_id, task, head)
+            detail = agent_detail(agent_id, agent, session_id, current)
+            return self._query_result(detail, "memory" if loaded else "events", loaded, None if loaded else head)
 
     async def list_agents(
         self, *, session_id: str | None = None, parent_agent_id: str | None = None,
@@ -3777,7 +3910,7 @@ class CtxWeftRuntime:
         `agent_id` 是 agent-centric 下的主用过滤轴（2026-09-04 spec §5.2）：HITL 自
         09-03 起已彻底 agent 化，只有这个查询入口此前停在 session 维度。
 
-        **只读内存**：注意重启之后 registry 要先被装填（`rebuild_session()` / `rebuild_hitl()`）
+        **只读内存**：注意重启之后 registry 要先被装填（`rebuild_session()`）
         才有内容——「恢复是喂进来、不是查回去」（spec §3.1）。
         """
         return [
@@ -3830,37 +3963,8 @@ class CtxWeftRuntime:
             ))
         return out
 
-    def _get_agent_memory(self, agent_id: str) -> "AgentDetail":
-        """该 agent 的详情视图（spec 5）。未登记的 `agent_id` 抛 `AgentNotFound`。
-
-        `current_task_status`：经 `_task_managers[session_id].get_task(current_task_id)`
-        取。两处都可能落空——该 session 的 TaskManager 不在内存里（冷启动尚未
-        `recover_agent` 过，或持有方 `forget_session` 过），或 task 本身查不到——两种
-        情况都不是编程错误，是「这条任务此刻在内存里已经不可寻」的正常状态，因此都
-        原样降级成 `None`，不崩、不拿一个假状态字符串糊弄调用方。
-        """
-        reg = self._agent_lifecycle_manager
-        rec = reg.record_of(agent_id)
-        if rec is None:
-            raise AgentNotFound(f"unknown agent: {agent_id}")
-        task_status: str | None = None
-        if rec.current_task_id:
-            tm = self._task_managers.get(rec.session_id)
-            task = tm.get_task(rec.current_task_id) if tm is not None else None
-            task_status = task.status if task is not None else None
-        return AgentDetail(
-            agent_id=agent_id,
-            parent_agent_id=rec.parent_agent_id,
-            status=rec.status,
-            current_task_id=rec.current_task_id,
-            spawn_depth=rec.spawn_depth,
-            session_id=rec.session_id,
-            template_id=rec.template_id,
-            created_at=rec.created_at,
-            current_task_status=task_status,
-        )
-
     @_session_command(load_session="required", missing_session_as_agent=True)
+    @runtime_command
     async def send_message(
         self,
         agent_id: str,
@@ -3899,7 +4003,7 @@ class CtxWeftRuntime:
           `_try_resume_parent` 在子任务收尾时自然唤醒它。
 
         三条都返回句柄，`task_id` 恒非空。调用方要区分「开了新一轮」还是「并进旧的」，
-        比对返回的 `task_id` 与调用前 `get_agent(agent_id).current_task_id` 即可——
+        比对返回的 `task_id` 与调用前 `get_agent(agent_id).data.state.current_task.task_id` 即可——
         句柄里不放这个布尔，也不放 run_id（第三条路径在返回那一刻还没有新一轮，
         见 2026-09-04 spec §3.2）。
 
@@ -3945,7 +4049,7 @@ class CtxWeftRuntime:
             lock = self._session_guard(rec.session_id)
             async with lock:
                 await self._activate_prepared_tasks_locked(tm)
-                asyncio.create_task(tm.drain())
+                self._spawn(tm.drain())
 
         return TurnHandle(
             session_id=rec.session_id,
@@ -3987,7 +4091,7 @@ class CtxWeftRuntime:
         而 `send_message` 的注入分支会 `_cancel_pending_hitl_of`（`waiting_human` 的
         agent 收到外部消息 ⟹ 旧提问不会再有人答了）——那一步读的是 `hitl_registry`
         的内存。registry 冷着的话它一条都找不到，旧提问就成了「有 HitlOpened、无终局
-        事件」的孤儿，重启后 `rebuild_hitl` 会把它当未决恢复出来，还会被 `resume_agent`
+        事件」的孤儿，重启后 `rebuild_session` 会把它当未决恢复出来，还会被 `resume_agent`
         的 `_pause_bubble_of` 误当成暂停气泡放行一次冷续跑。装填要装齐。
 
         **统一装填 ALM、HITL 和 TaskManager**：重建保留任务的持久化状态，不入队、
@@ -3997,7 +4101,7 @@ class CtxWeftRuntime:
         严格装填失败直接抛出；不能把准备失败当作 agent 或旧任务不存在。
         """
         if session_id is None:
-            # HITL 那半在这条路上本来也装不了（`rebuild_hitl` 按 session 定址），所以
+            # HITL 那半在这条路上本来也装不了（`rebuild_session` 按 session 定址），所以
             # 从前那条 sweep 连自己的目标都只完成一半。
             raise AgentNotLoaded(
                 f"agent {agent_id!r} is not loaded and no session_id was given — "
@@ -4070,7 +4174,7 @@ class CtxWeftRuntime:
         bubble = self._pause_bubble_of(agent_id, session_id=session_id)
         if bubble is not None and bubble.delivery.preface == PREFACE_AFTER_INTERRUPT_EDIT:
             from ctx_weft.core.loop.steps.act import _interrupt_edit_prefix
-            from ctx_weft.core.utils.content import content_with_prefix
+            from ctx_weft.protocols.content import content_with_prefix
             content = content_with_prefix(content,
                 _interrupt_edit_prefix(await self._last_user_prompt(scope, pctx)))
         normalized, _event_jsonable = await self._validate_and_normalize_content(
@@ -4095,7 +4199,7 @@ class CtxWeftRuntime:
         # send_message 打断——旧提问再没人会去回答了）。顺序纪律与 `cancel_agent`/
         # `_cancel_session_hitl` 一致：必须先于下面 `requeue_for_message` 可能触发的
         # 状态推进（TaskRequeued -> ALM 让 agent 离开 waiting_human）；不然重启后
-        # `rebuild_hitl` 会把这条「有 HitlOpened 无终局事件」的陈旧提问当未决恢复
+        # `rebuild_session` 会把这条「有 HitlOpened 无终局事件」的陈旧提问当未决恢复
         # 出来，且它会一直挂在 `list_pending_hitl` 里，被 `resume_agent` 的
         # `_pause_bubble_of` 误当作暂停气泡命中、放行一次冷续跑（那正是 R24 那条
         # 止损点要防的场景：真问题悬而未决时替用户放行）。
@@ -4172,7 +4276,7 @@ class CtxWeftRuntime:
 
         正常入口已在判断旧任务前通过 `rebuild_session` 完成统一准备。这里仍保留
         缺 owner 的防御性兼容路径，处理只装填过 ALM 的旧入口：
-        `recover_agent(agent_id, keep_alive=True)` 只准备 owner，不提前执行或宣告会话结束。
+        `rebuild_session(session_id, strict=True)` 只准备 owner，不提前执行或宣告会话结束。
         已有活 owner 时直接复用，不再次重建。
         """
         reg = self._agent_lifecycle_manager
@@ -4189,11 +4293,11 @@ class CtxWeftRuntime:
             )
         tm = self._task_managers.get(rec.session_id)
         if tm is None or not tm.is_alive():
-            await self.recover_agent(agent_id, keep_alive=True)
+            await self.rebuild_session(rec.session_id, strict=True)
             rec = reg.record_of(agent_id)
             if rec is None:
-                # 上面那次 `recover_agent` 返回了，记录却不在——只可能是并发的
-                # `forget_session` / `forget_agent` 在这两步之间把它摘掉了（`recover_agent`
+                # 上面那次 `recover_session` 返回了，记录却不在——只可能是并发的
+                # `forget_session` / `forget_agent` 在这两步之间把它摘掉了（`recover_session`
                 # 自己对 miss 是直接抛 `AgentNotLoaded` 的，走不到这里；"session 在事件
                 # 日志里压根不存在"那条 RuntimeError 同样从它里面就抛出去了）。防御性地
                 # 给一个可诊断的类型化错误，而不是让下面的 `rec.session_id` 撞
@@ -4207,7 +4311,7 @@ class CtxWeftRuntime:
                 from ctx_weft.core.models.errors import SessionNotFound
                 raise SessionNotFound(
                     f"agent {agent_id!r} (session {rec.session_id!r}) has no live "
-                    f"TaskManager even after recover_agent(keep_alive=True) — this is "
+                    f"TaskManager even after rebuild_session(strict=True) — this is "
                     f"a bug in the recovery path, not a transient condition; do not retry "
                     f"blindly, file it"
                 )
@@ -4227,7 +4331,7 @@ class CtxWeftRuntime:
         normalized, event_jsonable = await self._validate_and_normalize_content(
             content, rec.session_id, tenant_id=rec.tenant_id,
         )
-        from ctx_weft.core.utils.content import content_to_text
+        from ctx_weft.protocols.content import content_to_text
         task = Task(
             id=generate_id("tsk"),
             session_id=rec.session_id,
@@ -4259,6 +4363,7 @@ class CtxWeftRuntime:
     # ── 宿主侧任务派发（spec/09）────────────────────────────────────────────────
 
     @_session_command(load_session="required")
+    @runtime_command
     async def dispatch_task(
         self,
         session_id: str,
@@ -4340,7 +4445,7 @@ class CtxWeftRuntime:
 
         from ctx_weft.core.models.errors import SessionNotFound
         from ctx_weft.core.models.task import deserialize_settings
-        from ctx_weft.core.utils.content import content_to_text
+        from ctx_weft.protocols.content import content_to_text
 
         # ── 1/2. tenant + 参数校验（零副作用、零 IO）──────────────────────────
         tenant_id = tenant_id or self._DEFAULT_TENANT
@@ -4383,7 +4488,7 @@ class CtxWeftRuntime:
             # 冷复活走与 `_start_task_for_agent` 同一条事件重建路径，不另写一套。
             # `keep_alive=True`：这个 TM 刚建好就要被塞新 task，不能让它对「没有可恢复
             # task」得出「空历史报错」或「立刻 finalize 收尾」两个结论（见
-            # `recover_agent` docstring）。session 在事件日志里不存在 → 这里抛。
+            # `recover_session` docstring）。session 在事件日志里不存在 → 这里抛。
             lock = self._session_guard(session_id)
             async with lock:
                 await self._recover_session_locked(session_id, keep_alive=True)
@@ -4481,7 +4586,7 @@ class CtxWeftRuntime:
         lock = self._session_guard(session_id)
         async with lock:
             await self._activate_prepared_tasks_locked(tm)
-            asyncio.create_task(tm.drain())
+            self._spawn(tm.drain())
         return TurnHandle(
             session_id=session_id,
             agent_id=exec_agent_id,
@@ -4495,6 +4600,7 @@ class CtxWeftRuntime:
         )
 
     @_session_command(load_session="required", skip_no_resume_reply=True)
+    @runtime_command
     async def reply_to_hitl(
         self, reply: "HitlReply", *, session_id: str | None = None,
     ) -> "HitlRequestView | None":
@@ -4622,7 +4728,7 @@ class CtxWeftRuntime:
 
         由 `reply_to_hitl` 调用时，`req` 已经**不可逆地终局**（`registry.resolve()`
         已提交、事实已发）——这是「唯一驱动方」路径本身，不是一个可以撤销重试的准备
-        阶段。若这里 `recover_agent` 抛出，重试 `reply_to_hitl` 只会撞见
+        阶段。若这里 `recover_session` 抛出，重试 `reply_to_hitl` 只会撞见
         `hitl.resolve()` 对已终局请求的幂等 `None`（不重发事实、不重新触发续跑），
         会话就此永久卡住、且没有第二次机会补上——这正是「既没热投递、也没冷续跑」的
         那个「都没有」路径。异常仍然原样传给调用方（host 需要知道这次应答的续跑没
@@ -4630,7 +4736,7 @@ class CtxWeftRuntime:
         「host 报的这次失败对应哪个已经提交但没跑起来的 HITL」。
 
         **冷路径必须先精确装填这一个 session**：`req` 本来就同时带着 `agent_id` **和**
-        `session_id`（`PendingHitl` 两个字段都有），而 `recover_agent` 对 registry miss
+        `session_id`（`PendingHitl` 两个字段都有），而 `recover_session` 对 registry miss
         是直接抛 `AgentNotLoaded` 的——它没有 session 语境，无从装填（2026-09-21 起；
         从前那条「扫全部 active session」的 sweep 已删）。所以这一步不是优化，是**这条
         冷应答路径能走通的前提**：漏掉它，人刚答完问题的那次续跑就会摔在
@@ -4674,35 +4780,8 @@ class CtxWeftRuntime:
     async def _recover_after_cold_hitl(
         self, agent_id: str, session_id: str, **recover_kwargs: Any,
     ) -> None:
-        """`_resume_after_hitl` 的两条真续跑分支（`ToolResultDelivery`/
-        `UserTurnDelivery`）共用的唯一路由（终审 CRITICAL 2）——两个调用点都过这里，
-        谁也不能独自漂移出一份不带这个回退的重复写法。
-
-        **legacy 冷 HITL 的 `agent_id == ""` 必须回退到 `session_id`**：一条折叠自
-        旧版 `HITL_REQUIRED` 事件的 `PendingHitl`（该事件从未持久化 `agent_id`，见
-        `_reply_turn_agent_id` 与 `tests/unit/test_cold_resume_agent_scope.py`）永远
-        没有 `agent_id` 可给 `recover_agent` 路由——`record_of("")` 必 miss，而键为 `""`
-        的记录无论如何装填都不会出现，最终必然抛错（今天是 `AgentNotLoaded`，空 id
-        原样拼进消息）。这一步发生在
-        `HitlService._commit` 已经把这条 HITL 判成终局**之后**（`reply_to_hitl` 的
-        docstring："冷续跑由本返回值驱动，不挂总线订阅"），没有第二次机会——会话因此
-        永久卡住。
-
-        换轴前，这条续跑走的是 `recover_session(session_id)`，天然不受这个问题影响
-        （它压根不看 agent_id）。换轴后 `recover_session` 整个改名成了以 agent_id 为
-        主键的 `recover_agent`，但 `PendingHitl` 本来就两个字段都有——`session_id`
-        永远可用（`HITL_REQUIRED`/`HITL_OPENED` 的信封本身就带 `session_id`，不像
-        `agent_id` 那样可能是旧 payload 里没有的字段）。回退因此直接绕开
-        `recover_agent` 的 agent_id 反查那一层，改走它内部真正做事的
-        `_recover_session_locked`（同一份重建逻辑，只是不经 agent_id → session_id
-        这道找不到路的间接层）——与 `recover_agent` 本身一样，须持同一把
-        per-session 锁（`_resume_locks`），不能绕过串行化。
-        """
-        if agent_id:
-            await self.recover_agent(agent_id, **recover_kwargs)
-            return
-        lock = self._session_guard(session_id)
-        async with lock:
+        """Resume only the answered task, independent of legacy agent addressing."""
+        async with self._session_guard(session_id):
             await self._recover_session_locked(session_id, **recover_kwargs)
 
     async def _hydrate_agent_for_cold_resume(self, req: PendingHitl) -> None:
@@ -4798,7 +4877,7 @@ class CtxWeftRuntime:
             session_id=session.id, tenant_id=session.tenant_id,
             task_id=target.id, agent_id=agent_id,
         )
-        from ctx_weft.core.utils.content import content_with_prefix
+        from ctx_weft.protocols.content import content_with_prefix
         from ctx_weft.protocols.hitl import HITL_OUTCOME_REJECTED
 
         # `effective_decision` 而不是 `decision`：两阶段之下（spec 2026-09-09）冷应答
@@ -5054,10 +5133,7 @@ class CtxWeftRuntime:
             replay_session,
             settled_memory_floor,
         )
-        from ctx_weft.core.utils.content import (
-            content_from_jsonable, hydrate_event_content,
-            normalize_content,
-        )
+        from ctx_weft.protocols.content import content_from_jsonable, hydrate_event_content, normalize_content
         from ctx_weft.protocols import MemoryEvent
 
         floor = await settled_memory_floor(self.event_store, session.id)
@@ -5203,7 +5279,7 @@ class CtxWeftRuntime:
         视图读不到（provider 不回显 ingest id、记录已被压缩折走）时集合为空 → 退回逐条
         写、行为与加界之前逐字节一致——失败方向朝「多做一次幂等写」，不朝「少救一条答复」。
         于是每次冷应答的代价从 O(N) 次写降到 O(该 session 里有已终局 UserTurn 的 task 数)
-        次读。**仍未被界住**的是 `rebuild_hitl` 的整流折叠，见那里的说明。
+        次读。**仍未被界住**的是 `rebuild_session` 的整流折叠，见那里的说明。
         """
         # 鸭子类型的 TM 替身可能没有这个方法（单测）——取不到就当作「没有在跑的 task」。
         _running = getattr(task_manager, "running_task_ids", None)
@@ -5284,7 +5360,7 @@ class CtxWeftRuntime:
             )
         except Exception:
             return ""
-        from ctx_weft.core.utils.content import content_to_text
+        from ctx_weft.protocols.content import content_to_text
         ups = [r for r in view if r.role == "user"]
         return content_to_text(ups[-1].content) if ups else ""
 
@@ -5317,13 +5393,6 @@ class CtxWeftRuntime:
         )
         return loaded, tenant_id
 
-    async def rebuild_hitl(self, session_id: str) -> int:
-        """Compatibility entry: materialize the complete session, then count pending HITL.
-
-        Never creates a separate partial registry or TaskManager."""
-        await self.rebuild_session(session_id, strict=True)
-        return len(self.hitl_registry.list_pending(session_id=session_id))
-
     async def _load_hitl_view(self, session_id: str, view) -> int:
         """Shared loader, including blob hydration and active-pending protection."""
         snapshot = view.hitl
@@ -5350,7 +5419,7 @@ class CtxWeftRuntime:
         memory ref），纯文本零成本直通。
 
         **best-effort，绝不抛**：抛错会卡住整条恢复路径（`recover` 的每个 session、
-        `recover_agent` 的每次续跑都过这里）。失败一律降级为文本占位——降级本身
+        `recover_session` 的每次续跑都过这里）。失败一律降级为文本占位——降级本身
         （`downgrade_images_to_text`，纯函数）也在 try 里兜一道，宁可留着原内容也不让
         恢复崩掉。
         """
@@ -5365,9 +5434,7 @@ class CtxWeftRuntime:
                 targets.setdefault(id(req.decision), (hitl_id, req.decision))
         if not targets:
             return
-        from ctx_weft.core.utils.content import (
-            downgrade_images_to_text, hydrate_event_content, normalize_content,
-        )
+        from ctx_weft.protocols.content import downgrade_images_to_text, hydrate_event_content, normalize_content
         # tenant 取自快照里的**请求本体**（`pending` / `resolved` 的 `PendingHitl`——它们
         # 由 `fold_hitl_snapshot` 从 `Event.tenant_id` 填），不去日志反查。同一会话的请求
         # 同属一个 tenant，故取到的第一个即可。
@@ -5439,7 +5506,7 @@ class CtxWeftRuntime:
     # 而一条被打断的会话完全可能正停在那儿等人回答。一个看起来在修 bug 的改动会静默制造
     # 一个更坏的。判据本身没了，这个反向依赖也就不存在了。
     #
-    # host 要按会话装填，拿自己的清单逐条调 `rebuild_hitl(session_id)` /
+    # host 要按会话装填，拿自己的清单逐条调 `rebuild_session(session_id)` /
     # `rebuild_session(session_id)`——两条都走 `rebuild_view` 的快照 + 增量，O(delta)。
 
     # ── Internal execution ───────────────────────────────────────────────────
@@ -5673,6 +5740,8 @@ class CtxWeftRuntime:
             )})
             logger.info("_run_loop: task %s parked on HITL", task.id)
         except asyncio.CancelledError:
+            if self._closing:
+                raise
             was_cancelled = True
             # Record cancellation of this execution, without changing task status.
             # After RunFinished, TaskManager applies any durable threshold decision
@@ -5820,7 +5889,7 @@ class CtxWeftRuntime:
             if isinstance(run_error, PersistenceUnavailableError):
                 finish.payload["outcome"] = RunOutcomeKind.INTERRUPTED.value
             commit.finished = finish
-            if not isinstance(run_error, PersistenceUnavailableError):
+            if not self._closing and not isinstance(run_error, PersistenceUnavailableError):
                 if canceled_event is not None:
                     await self._event_bus.emit(canceled_event)
                 await self._event_bus.emit(finish)
@@ -5903,7 +5972,7 @@ class _SessionTaskRunner:
 
     原 _make_task_runner 闭包的显式化：闭包捕获 → 实例字段。恢复播种不再靠
     per-runner 缓存——agent 身份/配置的唯一住所是 runtime 级 `AgentLifecycleManager`
-    registry（`lm`），恢复路径由 `recover_agent`/`rebuild_session` 经共用的
+    registry（`lm`），恢复路径由 `recover_session`/`rebuild_session` 经共用的
     `_load_agents_of` 显式调 `lm.load()` 装填。
     assigned_agent_id 回填 / started_at / TASK_STARTED 均归 TaskManager（两阶段契约）。
 

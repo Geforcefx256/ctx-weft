@@ -36,7 +36,6 @@ from ctx_weft.providers.llm.tokenizer import HeuristicTokenizer
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from tests._initialization import initialize_all
 
-pytestmark = pytest.mark.asyncio
 
 T = MemoryEventType
 
@@ -87,6 +86,7 @@ async def run_until_finalize(*, verdict: str, summary: str = "", retry_count: in
     return state
 
 
+@pytest.mark.asyncio
 async def test_observer_success_produces_a_completed_outcome() -> None:
     state = await run_until_finalize(verdict="success", summary="做完了")
     assert state.run_outcome is not None
@@ -95,6 +95,7 @@ async def test_observer_success_produces_a_completed_outcome() -> None:
     assert state.run_outcome.summary == "做完了"
 
 
+@pytest.mark.asyncio
 async def test_observer_retry_produces_the_verdict_not_the_disposition() -> None:
     """loop 只报「observer 说重试」，**不判**预算够不够——那是 TM 的活。"""
     state = await run_until_finalize(verdict="continue", summary="进行中", retry_count=99)
@@ -141,6 +142,7 @@ async def run_until_suspend(*, titles: list[str]):
     return state
 
 
+@pytest.mark.asyncio
 async def test_suspend_on_children_carries_spawn_titles() -> None:
     state = await run_until_suspend(titles=["查资料"])
     assert state.run_outcome.kind is RunOutcomeKind.SUSPENDED_ON_CHILDREN
@@ -202,6 +204,7 @@ async def run_until_park():
                               run_id="run_p2", initial_step="act", task=task, agent=agent)
 
 
+@pytest.mark.asyncio
 async def test_hitl_park_produces_awaiting_human_with_hitl_id() -> None:
     state = await run_until_park()
     assert state.run_outcome.kind is RunOutcomeKind.AWAITING_HUMAN
@@ -242,6 +245,7 @@ async def run_until_outage():
     return state
 
 
+@pytest.mark.asyncio
 async def test_llm_outage_produces_interrupted_not_retriable() -> None:
     state = await run_until_outage()
     assert state.run_outcome.kind is RunOutcomeKind.INTERRUPTED
@@ -305,6 +309,7 @@ async def run_until_cancel():
     return result_state, task
 
 
+@pytest.mark.asyncio
 async def test_cancellation_produces_canceled_outcome_with_no_reason() -> None:
     """取消支不编造 reason（R5：payload 该是 `{}` 而不是 `{"reason": ""}`）。"""
     state, task = await run_until_cancel()
@@ -371,6 +376,7 @@ async def run_until_crash(exc: BaseException):
                               run_id="run_x2", initial_step="act", task=task, agent=agent)
 
 
+@pytest.mark.asyncio
 async def test_run_crash_reraises_and_outcome_is_unreachable_to_caller() -> None:
     """崩溃支 `raise run_error`——`state`（连同它上面挂的 `run_outcome`）根本不
     返回给调用方。这里断言的正是这件事本身：调用方只拿到重抛的异常，拿不到
@@ -384,6 +390,7 @@ async def test_run_crash_reraises_and_outcome_is_unreachable_to_caller() -> None
 #    后，是否按 retriable 分流）───────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_crash_outcome_contract_non_retriable_exception_never_requeues() -> None:
     """`ContextOverflowError.retriable = False`——按崩溃支 `getattr(exc, "retriable",
     True)` 的同一构造方式喂给 disposition_for，即使预算充足也不该原地重试。"""
@@ -400,6 +407,7 @@ async def test_crash_outcome_contract_non_retriable_exception_never_requeues() -
     assert d.event_type == "TaskInterrupted"
 
 
+@pytest.mark.asyncio
 async def test_crash_outcome_contract_default_exception_retries_with_budget() -> None:
     """没有 `retriable` 属性的普通异常按契约缺省为 `True`——预算充足时该原地重试。"""
     from ctx_weft.core.models.errors import crash_error_code

@@ -17,7 +17,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from ctx_weft.protocols.context import ContentPart
+    from ctx_weft.protocols.content import ContentPart
 
 
 # 三种内建等待形态（spec 2026-07-05，替代旧 kind + capability_id sentinel 拼判）：

@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+from tests._recovery import recover_fixture_session
+
 from datetime import UTC, datetime
 
 import pytest
@@ -27,7 +29,6 @@ from tests.integration.test_minimal_loop import (
 )
 from tests.unit._legacy_recover import rebuild_all_active
 
-pytestmark = pytest.mark.asyncio
 
 _TS = datetime(2026, 6, 13, tzinfo=UTC)
 
@@ -66,6 +67,7 @@ async def _seed_legacy_wait_for_user_session(rt, sid: str, aid: str, tid: str, h
     await append_one(rt.event_store, ev(5, EventType.TASK_SUSPENDED))
 
 
+@pytest.mark.asyncio
 async def test_legacy_cold_hitl_reply_resumes_via_session_id_fallback() -> None:
     rt = _runtime_for_legacy_resume()
     sid, aid, tid, hid = "ses_legacy", "agt_root", "tsk_1", "hit_1"
@@ -93,6 +95,7 @@ async def test_legacy_cold_hitl_reply_resumes_via_session_id_fallback() -> None:
     )
 
 
+@pytest.mark.asyncio
 async def test_legacy_cold_hitl_reply_without_fix_would_raise_agent_not_found() -> None:
     """锁死 bug 本身的可复现性：直接调用未走回退的 `recover_agent("")`（模拟修复前
     `_resume_after_hitl` 的行为）必须撞见 `AgentNotFound`——证明 `_recover_after_
@@ -106,4 +109,4 @@ async def test_legacy_cold_hitl_reply_without_fix_would_raise_agent_not_found() 
 
     with pytest.raises(AgentNotFound):
         await initialize_all(rt)
-        await rt.recover_agent("", resumed_task_id=tid, hitl_id=hid)
+        await recover_fixture_session(rt, "", resumed_task_id=tid, hitl_id=hid)

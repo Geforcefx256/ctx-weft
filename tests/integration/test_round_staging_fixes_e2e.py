@@ -10,6 +10,10 @@
 
 from __future__ import annotations
 
+from tests._recovery import load_pending_fixture
+
+from tests._recovery import recover_fixture_session
+
 import asyncio
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
@@ -18,7 +22,7 @@ import pytest
 
 from ctx_weft.core.models.config import RuntimeConfig
 from ctx_weft.core.runtime import SessionStartParams
-from ctx_weft.core.utils.content import content_to_text
+from ctx_weft.protocols.content import content_to_text
 from ctx_weft.protocols import (
     MemoryAddress,
     MemoryEvent,
@@ -59,7 +63,6 @@ from tests.integration.test_minimal_loop import (
 )
 from tests.step_helpers import suppress_observe_start
 
-pytestmark = pytest.mark.asyncio
 
 
 def _build(llm, *, hitl_timeout_sec, memory=None, event_store=None, register=None):
@@ -102,6 +105,7 @@ def _fail_hitl_resolved(rt, *, times: int | None):
 # ── H3 / H4：提交失败不丢数据 ────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_commit_retries_after_hitl_resolved_fails_once() -> None:
     llm = _ScriptedLLM([_ask("tc1", "Q1?"), STALL_AFTER_CHUNK])
     rt = _build(llm, hitl_timeout_sec=0)
@@ -119,7 +123,7 @@ async def test_commit_retries_after_hitl_resolved_fails_once() -> None:
     await _poll(lambda: calls["n"] == 1 and not rt._task_managers[sid]._dispatch_tasks or None)
     llm.script.append(STALL_AFTER_CHUNK)
     rt.clear_storage_isolation(sid)
-    await rt.recover_agent(q1.agent_id, session_id=sid)
+    await recover_fixture_session(rt, q1.agent_id, session_id=sid)
     await _poll(lambda: rt.hitl_registry.get(q1.id).resolved or None, timeout=8.0)
     assert EventType.HITL_RESOLVED in await _stored_types(rt, sid)
     results = await _ask_user_results(rt, sid, q1)
@@ -127,6 +131,7 @@ async def test_commit_retries_after_hitl_resolved_fails_once() -> None:
     assert not rt._task_managers[sid].open_round_task_ids
 
 
+@pytest.mark.asyncio
 async def test_commit_failure_halts_without_losing_the_reply() -> None:
     llm = _ScriptedLLM([_ask("tc1", "Q1?"), STALL_AFTER_CHUNK])
     rt = _build(llm, hitl_timeout_sec=0)
@@ -154,6 +159,7 @@ async def test_commit_failure_halts_without_losing_the_reply() -> None:
 # ── H2：崩在提交中途，重启后重答用新答案 ──────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_restart_after_crash_mid_commit_uses_the_new_answer() -> None:
     memory = InMemoryMemoryProvider()
     llm1 = _ScriptedLLM([_ask("tc1", "Q1?"), STALL_AFTER_CHUNK])
@@ -178,7 +184,7 @@ async def test_restart_after_crash_mid_commit_uses_the_new_answer() -> None:
     llm2 = _ScriptedLLM([STALL_AFTER_CHUNK])
     rt2 = _build(llm2, hitl_timeout_sec=0, memory=memory, event_store=rt1.event_store)
     await initialize_all(rt2)
-    await rt2.rebuild_hitl(sid)
+    await load_pending_fixture(rt2, sid)
     pending = [p for p in rt2.hitl_registry.list_pending(session_id=sid) if p.id == q1.id]
     assert pending, "重启后问题必须回到待答"
     with suppress_observe_start():
@@ -200,6 +206,7 @@ async def test_restart_after_crash_mid_commit_uses_the_new_answer() -> None:
 MESSAGE = "also include the appendix"
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("message_in_memory", [False, True], ids=["missing", "present"])
 async def test_recovery_restores_an_appended_message_from_the_event_log(message_in_memory) -> None:
     llm = _ActRouterLLM(act_responses=[MockResponse(text="done")], context_limit=100_000)
@@ -243,7 +250,7 @@ async def test_recovery_restores_an_appended_message_from_the_event_log(message_
     await rt.rebuild_session(sid)
     with suppress_observe_start():
         await initialize_all(rt)
-        await rt.recover_agent(aid)
+        await recover_fixture_session(rt, aid)
         await _poll(lambda: llm.act_requests or None)
 
     assert MESSAGE in _all_request_text(llm.act_requests[0])
@@ -252,6 +259,7 @@ async def test_recovery_restores_an_appended_message_from_the_event_log(message_
     assert len(msgs) == 1 and msgs[0].id == "mem_appended", [r.id for r in msgs]
 
 
+@pytest.mark.asyncio
 async def test_injected_message_is_recorded_in_the_event_log() -> None:
     llm = _ScriptedLLM([MockResponse(text="first reply"), STALL_AFTER_CHUNK])
     rt = _build(llm, hitl_timeout_sec=None)
@@ -310,6 +318,7 @@ class _SlowAuthorizer(Authorizer):
         return AuthorizationDecision(allowed=True)
 
 
+@pytest.mark.asyncio
 async def test_pause_between_tools_after_a_hot_reply_retracts_it() -> None:
     tool, authz = _SlowTool(), _SlowAuthorizer()
     # 判定 `success`：重答之后那一轮调 `finish_task` 收尾，而它如今也 park + 后台判定（S-b）。
@@ -359,6 +368,7 @@ async def test_pause_between_tools_after_a_hot_reply_retracts_it() -> None:
 # ── M1：reply_to_hitl 没成时撤掉自己开的窗 ──────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_rejected_reply_does_not_leave_a_window_open() -> None:
     llm = _ScriptedLLM([_ask("tc1", "Q1?"), STALL_AFTER_CHUNK])
     rt = _build(llm, hitl_timeout_sec=0)
@@ -387,6 +397,7 @@ async def test_rejected_reply_does_not_leave_a_window_open() -> None:
     await _poll(lambda: rt.hitl_registry.get(q1.id).resolved or None, timeout=8.0)
 
 
+@pytest.mark.asyncio
 async def test_duplicate_reply_keeps_the_original_window() -> None:
     llm = _ScriptedLLM([_ask("tc1", "Q1?"), STALL_BEFORE_CHUNK])
     rt = _build(llm, hitl_timeout_sec=0)
@@ -408,6 +419,7 @@ async def test_duplicate_reply_keeps_the_original_window() -> None:
 # ── M2：注入消息不替别人的窗口提前提交 ─────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_injecting_into_an_open_hot_round_does_not_commit_it() -> None:
     """`send_message` 在 agent 跑着时直接拒（AgentBusyError），所以这一形状从公开入口只在
     「窗开着、task 已排队未开跑」的窄窗里可达；这里直接驱动注入分支钉住判据。"""

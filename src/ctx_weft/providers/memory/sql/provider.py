@@ -42,12 +42,8 @@ from sqlalchemy import and_, case, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ctx_weft.core.utils.clock import as_utc
-from ctx_weft.core.utils.content import (
-    collect_blob_refs,
-    content_from_jsonable,
-    content_to_jsonable,
-    extract_blob_refs,
-)
+from ctx_weft.core.utils.content import collect_blob_refs
+from ctx_weft.protocols.content import content_from_jsonable, content_to_jsonable, extract_blob_refs
 from ctx_weft.core.utils.ids import generate_id
 from ctx_weft.protocols import (
     BLOB_REF_PREFIX,

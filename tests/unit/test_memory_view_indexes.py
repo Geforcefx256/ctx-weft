@@ -17,7 +17,6 @@ from sqlalchemy import text
 
 from ctx_weft.providers.memory.sql import open_sqlite_memory
 
-pytestmark = pytest.mark.asyncio
 
 _VIEW_INDEXES = ("ix_memory_task_view", "ix_memory_agent_view", "ix_memory_topic_seq")
 
@@ -46,6 +45,7 @@ async def _plan(mem, sql: str, params: dict) -> str:
     return " | ".join(str(r[-1]) for r in rows)
 
 
+@pytest.mark.asyncio
 async def test_load_view_task_scope_uses_the_index_and_needs_no_sort(tmp_path) -> None:
     async with open_sqlite_memory(tmp_path / "mem.db") as mem:
         await _seeded(mem)
@@ -60,6 +60,7 @@ async def test_load_view_task_scope_uses_the_index_and_needs_no_sort(tmp_path) -
     assert "TEMP B-TREE" not in plan, f"排序该由索引提供，实际：{plan}"
 
 
+@pytest.mark.asyncio
 async def test_load_view_cross_task_aggregate_uses_the_agent_index(tmp_path) -> None:
     """跨 task 聚合（半址 `task_id=None` → 按 agent_id 过滤，layer 仍是 'task'）。
 
@@ -78,6 +79,7 @@ async def test_load_view_cross_task_aggregate_uses_the_agent_index(tmp_path) -> 
     assert "TEMP B-TREE" not in plan, f"排序该由索引提供，实际：{plan}"
 
 
+@pytest.mark.asyncio
 async def test_index_is_hit_regardless_of_how_the_boolean_is_written(tmp_path) -> None:
     """`is_superseded` 做**等值列**而不是部分索引谓词——两种布尔写法都必须命中。
 
@@ -98,6 +100,7 @@ async def test_index_is_hit_regardless_of_how_the_boolean_is_written(tmp_path) -
             assert "TEMP B-TREE" not in plan, f"{predicate!r} 仍需临时排序：{plan}"
 
 
+@pytest.mark.asyncio
 async def test_recall_topic_and_the_write_path_max_use_the_topic_index(tmp_path) -> None:
     """`recall_topic` 的游标查询按 topic_seq_no 升序，写路径要 `max(topic_seq_no)`。
 
@@ -119,6 +122,7 @@ async def test_recall_topic_and_the_write_path_max_use_the_topic_index(tmp_path)
         f"写路径的 max(topic_seq_no) 该走覆盖索引、不回表：{max_seq}")
 
 
+@pytest.mark.asyncio
 async def test_write_path_max_seq_no_is_covered(tmp_path) -> None:
     """写路径的 `max(seq_no)`（分区内下一个序号）同样不该回表。"""
     async with open_sqlite_memory(tmp_path / "mem.db") as mem:
@@ -132,6 +136,7 @@ async def test_write_path_max_seq_no_is_covered(tmp_path) -> None:
         f"max(seq_no) 该走覆盖索引、不回表：{plan}")
 
 
+@pytest.mark.asyncio
 async def test_all_three_indexes_exist_on_a_fresh_db(tmp_path) -> None:
     """新库由 models.py 的 `__table_args__` 建出——名字是跨仓契约（宿主 m021 照它建）。"""
     async with open_sqlite_memory(tmp_path / "mem.db") as mem:

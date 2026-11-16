@@ -30,7 +30,6 @@ from ctx_weft.protocols.template import LoopConfig
 from ctx_weft.providers.llm.tokenizer import HeuristicTokenizer
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 
-pytestmark = pytest.mark.asyncio
 
 T = MemoryEventType
 _BASE = datetime(2026, 1, 1, tzinfo=UTC)
@@ -74,6 +73,7 @@ async def _seed_conv_nonshort(mem, scope) -> None:
         await mem.ingest(_ev(T.LLM_RESPONSE, scope, big_text, i + 2, role="assistant"), _ctx())
 
 
+@pytest.mark.asyncio
 async def test_same_agent_child_mints_frame_and_writes_ack() -> None:
     """Child close writes a start at started_at and a terminal result after its capsule."""
     from ctx_weft.core.capabilities.control_tools import DELEGATE_TASK_NAME
@@ -129,6 +129,7 @@ async def _turns(mem, scope):
     return await mem.recall_recent(scope, [T.AGENT_CONVERSATION_TURN], 100, _ctx())
 
 
+@pytest.mark.asyncio
 async def test_start_hook_mints_frame_and_running_ack_at_started_at() -> None:
     """子任务 start 时（driver.run）即铸框 + running ack，同锚 started_at。
 
@@ -152,6 +153,7 @@ async def test_start_hook_mints_frame_and_running_ack_at_started_at() -> None:
     assert "running" in ack[0].content, f"start 态 ack 须表明在跑；got {ack[0].content!r}"
 
 
+@pytest.mark.asyncio
 async def test_start_hook_noop_without_parent() -> None:
     """root task（无 parent / 无 origin_tool_call_id）没有派发方，不铸框。"""
     from ctx_weft.core.loop.steps.finalize import ensure_dispatch_frame_at_start
@@ -163,6 +165,7 @@ async def test_start_hook_noop_without_parent() -> None:
     assert await _turns(mem, _sc("p1")) == [], "root task 不得铸框"
 
 
+@pytest.mark.asyncio
 async def test_start_hook_idempotent_across_reruns() -> None:
     """retry / resume 会重跑 driver.run：框与 ack 都不得重复，且 ts 不被改写。"""
     from ctx_weft.core.loop.steps.finalize import ensure_dispatch_frame_at_start
@@ -181,6 +184,7 @@ async def test_start_hook_idempotent_across_reruns() -> None:
     assert turns[-1].timestamp == started, "重跑不得改写原锚点"
 
 
+@pytest.mark.asyncio
 async def test_close_replaces_running_ack_with_terminal() -> None:
     """close 时 running ack 被终态**替换**（不是新增）——同一 tool_call_id 恒只有一条 active
     result，否则 reorder 会把两条都排到框后。"""
@@ -208,6 +212,7 @@ async def test_close_replaces_running_ack_with_terminal() -> None:
     assert acks[0].timestamp > started, "终态 result 须落在完成时刻，不再回填开始时刻"
 
 
+@pytest.mark.asyncio
 async def test_close_ack_follows_completion_while_frame_preserves_first_start_after_retry() -> None:
     """Retry preserves the first start; the terminal result follows the final attempt's closure."""
     from ctx_weft.core.loop.steps.finalize import ensure_dispatch_frame_at_start
@@ -241,6 +246,7 @@ async def test_close_ack_follows_completion_while_frame_preserves_first_start_af
     assert ack[0].timestamp > child.started_at
 
 
+@pytest.mark.asyncio
 async def test_same_agent_child_finish_pair_written_into_parent_scope() -> None:
     """task-resident：同 agent child 的 finish 对（AGENT_CONVERSATION_TURN, origin_task_id=child.id）
     写入 parent agent scope；**不镜像 body**（无 user 锚点），child raw body 留 child task 层。"""
@@ -288,6 +294,7 @@ async def test_same_agent_child_finish_pair_written_into_parent_scope() -> None:
     )
 
 
+@pytest.mark.asyncio
 async def test_cross_agent_child_bubble_is_conversation_turn() -> None:
     """§2.3：跨 agent child 的 dispatch result 写成 AGENT_CONVERSATION_TURN（tool 回合），
     与 gateway 写的 delegate assistant 回合靠 tool_call_id 配对；origin_task_id=delegating
@@ -328,6 +335,7 @@ async def test_cross_agent_child_bubble_is_conversation_turn() -> None:
     assert legacy == [], "cross-agent dispatch result must not write TASK_DISPATCH_RESULT enum"
 
 
+@pytest.mark.asyncio
 async def test_same_agent_close_mints_frame_and_ack_co_anchored() -> None:
     """§2.5(2026-07-03)：同 agent close（_close_one）铸派发框 + 配对静态 ack，
     框保留 task.started_at，终态 ack 落在子任务收尾之后，无 eager 框预置。"""
@@ -370,6 +378,7 @@ async def test_same_agent_close_mints_frame_and_ack_co_anchored() -> None:
     }, "ack content must only appear in the paired tool_call_id record"
 
 
+@pytest.mark.asyncio
 async def test_ensure_dispatch_frame_mixed_tz_no_crash() -> None:
     """派发框 timestamp 为 naive（事件重放 / DB 反序列化丢 tz），task.started_at 为 aware：
     _ensure_dispatch_frame 归一 tz 后返回**框自己的** ts，绝不 TypeError（回归 2026-07-03）。
@@ -407,6 +416,7 @@ async def test_ensure_dispatch_frame_mixed_tz_no_crash() -> None:
     assert ts.tzinfo is not None, "naive 框 ts 须被归一为 aware，否则调用方与 aware 比较时 TypeError"
 
 
+@pytest.mark.asyncio
 async def test_overlapping_children_keep_start_order_and_results_follow_their_closures() -> None:
     """Starts and terminal results follow their actual lifecycle, without synthetic tool adjacency."""
     from ctx_weft.core.loop.llm_gateway import legalize_messages
@@ -446,6 +456,7 @@ async def test_overlapping_children_keep_start_order_and_results_follow_their_cl
     assert "\n\n".join(m.content for m in legalize_messages(msgs)) == "\n\n".join(m.content for m in msgs)
 
 
+@pytest.mark.asyncio
 async def test_cross_agent_result_carries_outputs_and_task_summary() -> None:
     """Task 5: 跨 agent dispatch result（cross_agent bubble, mem_content）须含 outputs + task_summary，
     不掺 act_recap（mem_content 的 report 部分改用 task_summary）。"""
@@ -488,6 +499,7 @@ async def test_cross_agent_result_carries_outputs_and_task_summary() -> None:
     assert "本段" not in body                   # 不掺 act_recap
 
 
+@pytest.mark.asyncio
 async def test_plan_child_mints_start_task_frame_when_absent() -> None:
     """delegate_plan 子: parent scope 无预置框 → finalize 补铸 start_task 框，bubble/ACK 配对其 id。"""
     from ctx_weft.core.loop.steps.finalize import _close_one
@@ -523,6 +535,7 @@ async def test_plan_child_mints_start_task_frame_when_absent() -> None:
         if r.metadata.get("origin_task_id") == child.id)
 
 
+@pytest.mark.asyncio
 async def test_plan_child_frame_anchors_at_started_at() -> None:
     """时间戳锚 = task.started_at（task manager 真正启动 task 时），优先于 created_at。"""
     from ctx_weft.core.loop.steps.finalize import _close_one
@@ -553,6 +566,7 @@ async def test_plan_child_frame_anchors_at_started_at() -> None:
         if r.metadata.get("origin_task_id") == child.id)
 
 
+@pytest.mark.asyncio
 async def test_cross_agent_child_no_nested_capsule_in_parent_scope() -> None:
     """跨 agent child: parent scope 无 origin_task_id=child.id 的 AGENT_CONVERSATION_TURN。"""
     mem = InMemoryMemoryProvider()

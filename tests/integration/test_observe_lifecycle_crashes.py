@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """All four observe stages on actual foreground and recap execution paths."""
 
 import asyncio
@@ -14,7 +16,6 @@ from tests._initialization import initialize_all
 from tests.integration._lifecycle_crash_worker import make_lifecycle_runtime
 from tests.integration.test_lifecycle_crash_boundaries import restart, run_worker
 
-pytestmark = pytest.mark.asyncio
 
 
 def assert_lifecycles(rows):
@@ -53,6 +54,7 @@ def assert_lifecycles(rows):
     assert not any(r.event.type in {"TaskRecapRequested", "TaskRecapStarted", "TaskRecapDone"} for r in rows)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["foreground", "mechanical"])
 @pytest.mark.parametrize("snapshot", [False, True])
 @pytest.mark.parametrize("cut", ["observe_requested", "observe_started", "observe_completed",
@@ -64,7 +66,7 @@ async def test_foreground_and_recap_real_crash(tmp_path, mode, snapshot, cut):
         async with open_sqlite_memory(tmp_path / "memory.db") as memory:
             rt = await restart(store, memory, mode, snapshot)
             root = (await rt.get_session("crash-session")).data.root_agent_id
-            await rt.recover_agent(root, session_id="crash-session")
+            await recover_fixture_session(rt, root, session_id="crash-session")
             tm = rt._task_managers.get("crash-session")
             while tm and tm._background_asyncio_tasks:
                 await asyncio.gather(*list(tm._background_asyncio_tasks))
@@ -96,10 +98,11 @@ async def test_foreground_and_recap_real_crash(tmp_path, mode, snapshot, cut):
             head = await store.committed_head("crash-session")
             again, _ = make_lifecycle_runtime(store, memory, mode)
             await initialize_all(again)
-            await again.recover_agent(root, session_id="crash-session")
+            await recover_fixture_session(again, root, session_id="crash-session")
             assert await store.committed_head("crash-session") == head
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot", [False, True])
 @pytest.mark.parametrize("cut", ["summary_requested", "summary_started", "summary_completed", "summary_applied"])
 async def test_recap_only_real_crash(tmp_path, snapshot, cut):
@@ -109,6 +112,7 @@ async def test_recap_only_real_crash(tmp_path, snapshot, cut):
     await test_observe_real_process_crash(tmp_path, snapshot, "interrupt", boundary)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["foreground", "mechanical"])
 @pytest.mark.parametrize("snapshot", [False, True])
 async def test_crash_again_while_applying_foreground_result(tmp_path, mode, snapshot):
@@ -120,7 +124,7 @@ async def test_crash_again_while_applying_foreground_result(tmp_path, mode, snap
         async with open_sqlite_memory(tmp_path / "memory.db") as memory:
             rt = await restart(store, memory, mode, snapshot)
             root = (await rt.get_session("crash-session")).data.root_agent_id
-            await rt.recover_agent(root, session_id="crash-session")
+            await recover_fixture_session(rt, root, session_id="crash-session")
             tm = rt._task_managers.get("crash-session")
             while tm and tm._background_asyncio_tasks:
                 await asyncio.gather(*list(tm._background_asyncio_tasks))
@@ -133,10 +137,11 @@ async def test_crash_again_while_applying_foreground_result(tmp_path, mode, snap
             head = await store.committed_head("crash-session")
             again, _ = make_lifecycle_runtime(store, memory, mode)
             await initialize_all(again)
-            await again.recover_agent(root, session_id="crash-session")
+            await recover_fixture_session(again, root, session_id="crash-session")
             assert await store.committed_head("crash-session") == head
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot", [False, True])
 @pytest.mark.parametrize("mode", ["retry", "mechanical_retry"])
 async def test_requeued_foreground_decision_enqueues_after_crash(tmp_path, snapshot, mode):
@@ -145,7 +150,7 @@ async def test_requeued_foreground_decision_enqueues_after_crash(tmp_path, snaps
         async with open_sqlite_memory(tmp_path / "memory.db") as memory:
             rt = await restart(store, memory, "foreground", snapshot)
             root = (await rt.get_session("crash-session")).data.root_agent_id
-            await rt.recover_agent(root, session_id="crash-session")
+            await recover_fixture_session(rt, root, session_id="crash-session")
             tm = rt._task_managers["crash-session"]
             async with asyncio.timeout(20):
                 while (tm.running_task_ids() or tm._background_asyncio_tasks or

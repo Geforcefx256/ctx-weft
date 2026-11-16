@@ -13,7 +13,6 @@ from tests._snapshot_helpers import seed_snapshot
 from tests.integration.test_cancel_dispatch_windows import run_window
 from tests.integration.test_cancel_task_tree_recovery import cancel_content, recover
 
-pytestmark = pytest.mark.asyncio
 WORKER = Path(__file__).with_name("_actor_commit_worker.py")
 BASELINES = {}
 CASES = [(stage, fault, mode) for stage in ("start", "active", "observe")
@@ -25,6 +24,7 @@ CASES += [("start", "unknown", "recovery_actor_finished"),
 CASES += [(stage, "final_only_unknown", "hot") for stage in ("active", "observe")]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("stage,fault,mode", CASES)
 @pytest.mark.parametrize("snapshot", [False, True])
 async def test_actor_commit_and_cancellation_recovery(tmp_path, tmp_path_factory, stage, fault, mode, snapshot):

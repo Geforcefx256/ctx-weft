@@ -29,7 +29,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 
 def runtime(store, **config):
@@ -47,6 +46,7 @@ def event(identifier, **payload):
                    tenant_id="default", origin="test", payload=payload), id=identifier)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("receipt_lost", [False, True])
 async def test_inline_confirmation_uses_original_batch_and_not_new_events(receipt_lost):
     store = InMemoryEventStore()
@@ -70,6 +70,7 @@ async def test_inline_confirmation_uses_original_batch_and_not_new_events(receip
     assert not gate.has_pending("s1")
 
 
+@pytest.mark.asyncio
 async def test_unknown_envelopes_cannot_be_replaced_and_survive_caller_mutation():
     store = InMemoryEventStore()
     original = store.append_batch
@@ -91,6 +92,7 @@ async def test_unknown_envelopes_cannot_be_replaced_and_survive_caller_mutation(
     assert rows[0].event.payload == {"value": ["original"]}
 
 
+@pytest.mark.asyncio
 async def test_all_unknown_batches_must_confirm_before_isolation_clears():
     store = InMemoryEventStore()
     rt = runtime(store, storage_recovery_max_attempts=0)
@@ -125,6 +127,7 @@ async def test_all_unknown_batches_must_confirm_before_isolation_clears():
     assert len(await store.read_range("s1")) == 2
 
 
+@pytest.mark.asyncio
 async def test_inflight_submission_also_prevents_manual_clear():
     store = InMemoryEventStore()
     rt = runtime(store, storage_recovery_max_attempts=0)
@@ -149,6 +152,7 @@ async def test_inflight_submission_also_prevents_manual_clear():
     assert rt.clear_storage_isolation("s1")
 
 
+@pytest.mark.asyncio
 async def test_cancellation_after_real_commit_keeps_original_unknown_receipt():
     store = InMemoryEventStore()
     original = store.append_batch
@@ -167,6 +171,7 @@ async def test_cancellation_after_real_commit_keeps_original_unknown_receipt():
     assert len(await store.read_range("s1")) == 1
 
 
+@pytest.mark.asyncio
 async def test_real_sqlite_busy_is_classified_and_same_batch_is_retried(tmp_path):
     path = tmp_path / "locked.db"
     async with open_sqlite_event_store(path) as store:
@@ -201,6 +206,7 @@ async def test_real_sqlite_busy_is_classified_and_same_batch_is_retried(tmp_path
         assert len(await store.read_range("s1")) == 1
 
 
+@pytest.mark.asyncio
 async def test_recovery_deadline_keeps_unknown_batch_and_does_not_unlock_session():
     store = InMemoryEventStore()
     # Leave room for Windows scheduling when the healthy retry runs under load.
@@ -226,6 +232,7 @@ async def test_recovery_deadline_keeps_unknown_batch_and_does_not_unlock_session
     assert len(await store.read_range("s1")) == 1
 
 
+@pytest.mark.asyncio
 async def test_healthy_recovery_does_not_schedule_or_resume_business_work():
     rt = runtime(InMemoryEventStore())
 

@@ -25,7 +25,7 @@ import pytest
 
 from ctx_weft.core.models.config import RuntimeConfig
 from ctx_weft.core.runtime import SessionStartParams
-from ctx_weft.core.utils.content import content_to_text
+from ctx_weft.protocols.content import content_to_text
 from ctx_weft.protocols import (
     ImagePart,
     MemoryEventType,
@@ -53,7 +53,6 @@ from tests.integration.test_minimal_loop import (
 )
 from tests.runtime_helpers import wait_for_park
 
-pytestmark = pytest.mark.asyncio
 
 
 # ── shared test doubles ─────────────────────────────────────────────────────────
@@ -244,6 +243,7 @@ def _finish_call(tc_id: str = "tc_finish") -> MockResponse:
 # ── 1. 热审批：改参放行，结果回灌模型 ────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_hot_approval_rewrites_arguments_and_result_reaches_the_model() -> None:
     """驱动：真实 `start_session` → `ActStep` 经真实 `CapabilityGateway` 触发
     `HumanConfirmationAuthorizer` → 热等待（默认 `hitl_timeout_sec=None`，永不超时）→
@@ -304,6 +304,7 @@ async def test_hot_approval_rewrites_arguments_and_result_reaches_the_model() ->
 # ── 2. 冷审批：精确重入，恰好一次 ────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_cold_approval_reconciles_and_invokes_the_tool_exactly_once() -> None:
     """驱动：`hitl_timeout_sec=0` 强制热窗即刻驱逐 → `ActStep` 抛 `HitlPark` → task
     落 `AWAITING_HUMAN`、工具**尚未**执行 → `reply_to_hitl` 驱动 `recover_agent` →
@@ -367,6 +368,7 @@ async def test_cold_approval_reconciles_and_invokes_the_tool_exactly_once() -> N
 _IMAGE_B64 = "ZmFrZWJhc2U2NGRhdGE="  # 任意合法 base64；内容不重要，重要的是它是不是文本
 
 
+@pytest.mark.asyncio
 async def test_ask_user_cold_path_delivers_an_image_into_the_tool_result() -> None:
     """驱动：`ask_user` 让出 `needs_human`（`reply_as_result=True`）→ 零热窗立即驱逐 →
     `reply_to_hitl` 携带多模态 `message`（文本 + 图片）→ `recover_agent` → reconcile
@@ -460,6 +462,7 @@ async def test_ask_user_cold_path_delivers_an_image_into_the_tool_result() -> No
 # ── 4. 纯文本暂停 + 注入幂等 ──────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_plain_text_pause_injects_reply_once_and_ignores_duplicate() -> None:
     """驱动：act 纯文本回合（无 tool_call）在 interactive 根任务上冷 park（`UserTurnDelivery`）
     → `reply_to_hitl` 注入一条 `user` 回合并把任务重排回 `PENDING` → 续跑完成。第二次对

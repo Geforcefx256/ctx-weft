@@ -36,7 +36,6 @@ from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from tests.assembler_testkit import compiled_test_inputs
 from tests.hitl_env import make_hitl
 
-pytestmark = pytest.mark.asyncio
 
 _SID = "s1"
 
@@ -104,6 +103,7 @@ def _meta() -> dict:
     }
 
 
+@pytest.mark.asyncio
 async def test_task_finalized_carries_the_deliverable() -> None:
     """host 的 `tasks.outputs_json` 就靠这一条。S5 起它一直是空的。"""
     state, ctx, _mem, _hitl, rec, _bid = await _fixture()
@@ -118,6 +118,7 @@ async def test_task_finalized_carries_the_deliverable() -> None:
     assert payload["outputs"]["summary"] == "查了三处来源"
 
 
+@pytest.mark.asyncio
 async def test_the_result_is_published_for_the_parent_to_recall() -> None:
     """`recall_topic(task_id)` 是 parent 读子任务结果的正路——没有这一条它读到空。"""
     state, ctx, mem, _hitl, rec, _bid = await _fixture()
@@ -133,6 +134,7 @@ async def test_the_result_is_published_for_the_parent_to_recall() -> None:
     assert "甲的资料是这样的" in (mine[0].content or "")
 
 
+@pytest.mark.asyncio
 async def test_the_parent_scope_gets_the_dispatch_result() -> None:
     """bubble 给 parent：不写这一份，parent 醒来只看到「派发框 + 停在 running 的 ack」。
 
@@ -150,6 +152,7 @@ async def test_the_parent_scope_gets_the_dispatch_result() -> None:
     assert "甲的资料是这样的" in blob, "parent 那边看不到子任务的产出"
 
 
+@pytest.mark.asyncio
 async def test_the_park_bubble_is_closed() -> None:
     """让位入口用掉了 → 收。留着会把会话钉死在 PAUSED（气泡在折叠里优先于 task 终态）。"""
     state, ctx, _mem, hitl, _rec, bid = await _fixture()
@@ -158,6 +161,7 @@ async def test_the_park_bubble_is_closed() -> None:
     assert bid is not None
 
 
+@pytest.mark.asyncio
 async def test_a_root_task_is_closed_and_finalized_the_same_way() -> None:
     """root（`parent_task_id is None`）走的是同一条路：收尾做完，气泡也收。
 

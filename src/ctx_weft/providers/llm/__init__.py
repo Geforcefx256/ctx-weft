@@ -21,6 +21,8 @@ from ctx_weft.providers.llm.config import (
     ModelCapabilities,
     ModelConfig,
     ModelLimits,
+    ReasoningCapabilities,
+    ReasoningLevel,
 )
 from ctx_weft.providers.llm.provider import LLMProvider
 from ctx_weft.providers.llm.store import LLMAccountStoreProtocol
@@ -52,6 +54,7 @@ __all__ = [
     "ModelCapabilities",
     "ModelConfig",
     "ModelLimits",
+    "ReasoningCapabilities", "ReasoningLevel",
     "OpenAIAdapter",
     "OpenAICompatibleAdapter",
     "OpenAICompatibleMultimodalAdapter",

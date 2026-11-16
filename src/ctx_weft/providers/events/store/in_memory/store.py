@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from typing import overload
 
 from ctx_weft.protocols.events import (
@@ -66,8 +67,16 @@ class InMemoryEventStore(EventStore):
                 raise ValueError(
                     f"append_batch: event {e.id} session {e.session_id!r} != batch session "
                     f"{session_id!r}（批内事件必须同属一个 session）")
+        # Event construction snapshots metadata. Detach it again at the storage
+        # boundary so mutation of a notification cannot rewrite committed data.
+        events = [replace(event) for event in events]
         async with self._lock:
-            return self._append_batch_locked(session_id, batch_id, events)
+            receipt = self._append_batch_locked(session_id, batch_id, events)
+            return replace(receipt, records=tuple(self._copy_record(row) for row in receipt.records))
+
+    @staticmethod
+    def _copy_record(row: StoredEvent) -> StoredEvent:
+        return StoredEvent(event=replace(row.event), position=row.position)
 
     def _append_batch_locked(
         self, session_id: str, batch_id: str, events: list[Event],
@@ -179,7 +188,7 @@ class InMemoryEventStore(EventStore):
                     related |= tid in (p.get("rewired_dependencies") or {})
                 if not related:
                     continue
-            out.append(project_stored_event(se, projection) if projection is not None else se)
+            out.append(project_stored_event(se, projection) if projection is not None else self._copy_record(se))
         return out
 
     @overload
@@ -202,7 +211,7 @@ class InMemoryEventStore(EventStore):
         want = str(type_)
         for se in reversed(self._stored.get(session_id, [])):
             if se.event.type == want:
-                return project_stored_event(se, projection) if projection is not None else se
+                return project_stored_event(se, projection) if projection is not None else self._copy_record(se)
         return None
 
     async def committed_head(self, session_id: str) -> int:

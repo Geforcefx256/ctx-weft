@@ -20,6 +20,7 @@ read_last_of_type / read_session_events_of_types——快照不在其中，它�
 
 from __future__ import annotations
 
+import json
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -31,6 +32,29 @@ if TYPE_CHECKING:
     # 仅类型注解用；`protocols/events.py` 运行时只依赖 stdlib 的现状不变
     # （同层 import 不违反层序 ast 守卫，但保持现状更稳，见文件顶部说明）。
     from ctx_weft.protocols.context import ProviderContext
+
+
+def _snapshot_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    """Detach JSON event extensions without interpreting their business keys."""
+    if metadata is None:
+        return {}
+    if not isinstance(metadata, dict):
+        raise TypeError("Event metadata must be a dictionary")
+    if not metadata:
+        return {}
+
+    def check_keys(value):
+        if isinstance(value, dict):
+            if any(not isinstance(key, str) for key in value):
+                raise TypeError("Event metadata keys must be strings")
+            for child in value.values():
+                check_keys(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                check_keys(child)
+
+    check_keys(metadata)
+    return json.loads(json.dumps(metadata, ensure_ascii=False, allow_nan=False))
 
 
 @dataclass
@@ -48,9 +72,14 @@ class Event:
     agent_id: str | None = None
     origin: str = ""  # V2 新增：哪个组件发出的，见 docs/events-v2.md §4。存量事件读出空串
     payload: dict[str, Any] = field(default_factory=dict)
+    # Opaque, JSON-serializable extensions shared by every event type. Producers
+    # own their namespaces; SDK execution never interprets these business keys.
     metadata: dict[str, Any] = field(default_factory=dict)
     causation_id: str | None = None
     schema_version: int = 1  # payload 版本；reducer 据此分支
+
+    def __post_init__(self) -> None:
+        self.metadata = _snapshot_metadata(self.metadata)
 
 
 @dataclass
@@ -80,7 +109,7 @@ class EventType(StrEnum):
 
     # ── Session / Run / Step 域 ──
     SESSION_CREATED = "SessionCreated"
-    SESSION_RESUMED = "SessionResumed"     # recover_agent 续跑被打断的 session 时发
+    SESSION_RESUMED = "SessionResumed"     # recover_session 续跑被打断的 session 时发
     SESSION_STATUS_CHANGED = "SessionStatusChanged"
     SESSION_FINISHED = "SessionFinished"   # TaskManager 确定 session 真正结束时发（含 final_status）
     SESSION_PAUSED_HITL = "SessionPausedHitl"

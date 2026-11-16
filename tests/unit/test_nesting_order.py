@@ -42,7 +42,6 @@ from ctx_weft.protocols.capability import qualify
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from tests.assembler_testkit import history_messages, recalled_blocks
 
-pytestmark = pytest.mark.asyncio
 
 T = MemoryEventType
 _BASE = datetime(2026, 1, 1, tzinfo=UTC)
@@ -140,6 +139,7 @@ def _make_task(task_id, agent_id, *, parent_task_id=None, creator_agent_id=None,
 # G1：嵌套 + 异步回填语序 golden（the crux）
 # ════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.asyncio
 async def test_g1_nested_order_survives_async_backfill() -> None:
     """父 P 委派同 agent 子 C；C 段摘要 + finish 对以「晚 ingest（高 seq_no）+ 早逻辑 ts」回填。
 
@@ -269,6 +269,7 @@ async def test_g1_nested_order_survives_async_backfill() -> None:
             )
 
 
+@pytest.mark.asyncio
 async def test_g1_naive_seqno_primary_would_misorder() -> None:
     """对照：证明本场景下「seq_no-primary」排序会 visibly mis-order（即测试有判别力）。
 
@@ -324,6 +325,7 @@ async def test_g1_naive_seqno_primary_would_misorder() -> None:
 # 回锚纪律核查：既有锚定点用逻辑时刻（同步写入即逻辑时刻）
 # ════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.asyncio
 async def test_anchoring_discipline_finish_pair_anchors_close_time() -> None:
     """核查 _synthesize_dispatch_pair：finish 对两条 timestamp 同锚 close base（= now_utc()，
     同步写入即逻辑时刻，符合不变量 A），且 assistant/tool 同 ts → 由 scope 内 seq_no 定相邻序。
@@ -344,6 +346,7 @@ async def test_anchoring_discipline_finish_pair_anchors_close_time() -> None:
 # G2：短叶子 task 保留 raw body（嵌套场景内）
 # ════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.asyncio
 async def test_g2_short_leaf_keeps_raw_body() -> None:
     """短叶子 task close 后 raw body 原样留 task 层（spec §3.2）。
 
@@ -368,6 +371,7 @@ async def test_g2_short_leaf_keeps_raw_body() -> None:
 # G3：长 task body 压末段（嵌套场景内）
 # ════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.asyncio
 async def test_g3_long_task_body_is_compacted_anchors_only() -> None:
     """长 task close：supersede 末 raw 段（LLM_RESPONSE/TOOL_INVOCATION/TOOL_RESULT），
     保留 USER_PROMPT + TASK_COMPACT_SUMMARY 锚点（spec §3.2）。装配 body = [user][段摘要]。
@@ -401,6 +405,7 @@ async def test_g3_long_task_body_is_compacted_anchors_only() -> None:
 # G4：跨 agent 子 body 不进父 prompt（黑盒）
 # ════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.asyncio
 async def test_g4_cross_agent_child_body_not_in_parent_prompt() -> None:
     """跨 agent 子（不同 agent_id）的 body 在子 agent 的 task 层；父 prompt 仅见黑盒 dispatch
     result（mem_content），不见子 body（spec §3.1 / G4）。

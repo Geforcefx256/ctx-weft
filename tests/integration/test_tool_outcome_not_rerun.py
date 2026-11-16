@@ -38,7 +38,6 @@ from ctx_weft.protocols.capability import (
 from ctx_weft.providers.events import InProcessEventBus
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 
-pytestmark = pytest.mark.asyncio
 
 # 子进程副作用计数器：一次 INSERT = 一次外部副作用。只用 stdlib，跨平台无端口。
 _COUNTER_SCRIPT = """
@@ -130,6 +129,7 @@ def _fixture(db_path):
     return memory, state, ctx, tool
 
 
+@pytest.mark.asyncio
 async def test_result_write_failure_then_reconcile_does_not_rerun(tmp_path):
     """契约锚：副作用完成后结果写失败 → 恢复作结不重跑 → 外部计数 = 1。"""
     db = tmp_path / "effects.sqlite"

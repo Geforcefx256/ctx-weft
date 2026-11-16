@@ -10,7 +10,6 @@ from tests import compaction_testkit as cm
 from tests.model_testkit import model_snapshot
 from tests.unit.test_compact_history_priority import capsule, setup
 
-pytestmark = pytest.mark.asyncio
 
 
 def _state(ratio_trigger=0.8, ratio_target=0.6, limit=1000):
@@ -40,6 +39,7 @@ async def _const(value):
     return value
 
 
+@pytest.mark.asyncio
 async def test_stops_after_l1_when_under_target(monkeypatch):
     state, ctx, _ = await setup(monkeypatch)
     for i in range(3):
@@ -60,6 +60,7 @@ async def test_stops_after_l1_when_under_target(monkeypatch):
     assert "old1-body" in {r.id for r in body}
 
 
+@pytest.mark.asyncio
 async def test_escalates_l1_l2_l3(monkeypatch):
     state, ctx, _ = await setup(monkeypatch, target=0.01)
     for i in range(8):
@@ -80,11 +81,13 @@ async def test_escalates_l1_l2_l3(monkeypatch):
     ]
 
 
+@pytest.mark.asyncio
 async def test_invalid_window_rejected_before_compaction():
     with pytest.raises(ValueError, match="context_limit"):
         _state(limit=0)
 
 
+@pytest.mark.asyncio
 async def test_finished_event_aggregates(monkeypatch):
     state, ctx, _ = await setup(monkeypatch)
     await capsule(state, ctx, "old", 0)
@@ -97,6 +100,7 @@ async def test_finished_event_aggregates(monkeypatch):
     assert finished["est_after"] < finished["target_tokens"]
 
 
+@pytest.mark.asyncio
 async def test_no_started_no_finished_when_under_target():
     assert (
         await cm.escalating_compact(
@@ -106,6 +110,7 @@ async def test_no_started_no_finished_when_under_target():
     )
 
 
+@pytest.mark.asyncio
 async def test_finished_emitted_when_nothing_folded(monkeypatch):
     state, ctx, _ = await setup(monkeypatch, target=0.01)
     state.agent.loop_config.collapse_keep_last = 100
@@ -115,6 +120,7 @@ async def test_finished_emitted_when_nothing_folded(monkeypatch):
     assert events[-1].payload["total_superseded"] == 0
 
 
+@pytest.mark.asyncio
 async def test_started_emitted_live_via_bus(monkeypatch):
     state, ctx, bus = await setup(monkeypatch, target=0.01)
     await capsule(state, ctx, "old", 0)
@@ -129,6 +135,7 @@ async def test_started_emitted_live_via_bus(monkeypatch):
     assert events[-1].type == EventType.MEMORY_COMPACT_FINISHED
 
 
+@pytest.mark.asyncio
 async def test_force_preserves_order_even_below_target(monkeypatch):
     state, ctx, _ = await setup(monkeypatch)
     await capsule(state, ctx, "old", 0)

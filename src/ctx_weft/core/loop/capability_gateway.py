@@ -28,12 +28,8 @@ from typing import TYPE_CHECKING, Any
 import jsonschema
 
 from ctx_weft.core.assembler.prompts import runtime_prompt
-from ctx_weft.core.utils.content import (
-    legalize_tool_result_parts,
-    normalize_content_parts,
-    redact_content_for_event,
-    split_for_tool_result,
-)
+from ctx_weft.core.utils.content import legalize_tool_result_parts, redact_content_for_event, split_for_tool_result
+from ctx_weft.protocols.content import normalize_content_parts
 from ctx_weft.protocols.events import EventOrigin, EventType, PersistenceUnavailableError
 from ctx_weft.protocols.events import EventBus
 from ctx_weft.core.hitl.registry import (
@@ -47,7 +43,7 @@ from ctx_weft.protocols.capability import (
     RecoveryPolicy, RerunAuthorizer, ToolCapabilityProvider,
     RerunContext, normalize_recovery_policy, qualify,
 )
-from ctx_weft.protocols.context import ContentPart, TextPart
+from ctx_weft.protocols.content import ContentPart, TextPart
 from ctx_weft.protocols.llm import RAW_ARGS_KEY
 from ctx_weft.core.capabilities.control_tools import (
     ASK_USER_NAME,
@@ -174,6 +170,7 @@ class _ToolStream:
     texts: list[str] = field(default_factory=list)
     parts: list[ContentPart] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    event_metadata: dict[str, Any] = field(default_factory=dict)
     is_error: bool = False
     needs_human_ask: "HitlAsk | None" = None
 
@@ -833,7 +830,8 @@ class CapabilityGateway:
             content = normalize_content_parts([TextPart(text=text), *note_parts, *parts])
 
         # 7. 记录 result（事件 + TOOL_RESULT 入 memory）——审计通道（脱敏副本）
-        memory_id = await self._record_result(state, ctx, tool_name, invocation_id, audit_args, content, is_error, is_dispatch, is_silent, tool_call_id)
+        memory_id = await self._record_result(state, ctx, tool_name, invocation_id, audit_args, content, is_error, is_dispatch, is_silent, tool_call_id,
+                                              event_metadata=streamed.event_metadata)
 
         return InvocationResult(
             invocation_id=invocation_id, tool_name=tool_name,
@@ -964,8 +962,9 @@ class CapabilityGateway:
         CancelledError（在途被打断）→ 调 provider.cancel 作安全网后重抛（provider 自身的 finally，
         如 bash terminate_tree，已先杀进程树）。其它异常 → 收敛为错误 result，不让 loop 崩。
         """
+        streamed = _ToolStream()
         try:
-            return await self._stream_events(events, state, invocation_id)
+            return await self._stream_events(events, state, invocation_id, out=streamed)
         except asyncio.CancelledError:
             with contextlib.suppress(Exception):
                 await provider.cancel(invocation_id, provider_ctx)
@@ -974,10 +973,11 @@ class CapabilityGateway:
             raise  # Storage isolation is not an ordinary provider/tool error.
         except Exception as exc:
             logger.exception("CapabilityGateway: invoke failed for invocation %s", invocation_id)
-            return _ToolStream(texts=[f"[Exception: {exc}]"], is_error=True)
+            return _ToolStream(texts=[f"[Exception: {exc}]"], is_error=True,
+                               event_metadata=streamed.event_metadata)
 
     async def _stream_events(
-        self, events, state, invocation_id,
+        self, events, state, invocation_id, *, out=None,
     ) -> "_ToolStream":
         """消费一个 `CapabilityEvent` 流，聚合 result/metadata/error。
 
@@ -1001,9 +1001,12 @@ class CapabilityGateway:
         承诺的是「让出即关闭」。正常跑完的流 `aclose()` 是 no-op。
         """
         from ctx_weft.core.loop.driver import make_event
-        out = _ToolStream()
+        out = out if out is not None else _ToolStream()
         try:
             async for ev in events:
+                if ev.kind in ("result", "error"):
+                    # Opaque extensions are snapshots, not runtime control signals.
+                    out.event_metadata.update(deepcopy(getattr(ev, "metadata", {})))
                 if ev.kind == "needs_human":
                     out.needs_human_ask = ev.payload.get("ask")
                     break
@@ -1013,7 +1016,8 @@ class CapabilityGateway:
                             "invocation_id": invocation_id,
                             "kind": ev.kind,
                             "data": ev.payload.get("data", "")[:500],
-                        }, origin=EventOrigin.LOOP_CAPABILITY_GATEWAY))
+                        }, metadata=getattr(ev, "metadata", {}),
+                        origin=EventOrigin.LOOP_CAPABILITY_GATEWAY))
                 elif ev.kind == "result":
                     ev_text, ev_parts = split_for_tool_result(
                         normalize_content_parts(ev.payload.get("content", "")))
@@ -1041,6 +1045,7 @@ class CapabilityGateway:
 
     async def _record_result(
         self, state, ctx, tool_name, invocation_id, sanitized, content, is_error, is_dispatch, is_silent, tool_call_id,
+        *, event_metadata=None,
     ) -> str | None:
         """发 CapabilityFinished + ingest TOOL_RESULT（派发暂挂 / SILENT 不入 / 普通写 task 层）。"""
         from ctx_weft.core.loop.driver import make_event
@@ -1057,7 +1062,7 @@ class CapabilityGateway:
             "result": redacted[:8000],
             "result_length": len(redacted),
             "tool_call_id": tool_call_id,
-        }, origin=EventOrigin.LOOP_CAPABILITY_GATEWAY)
+        }, metadata=event_metadata, origin=EventOrigin.LOOP_CAPABILITY_GATEWAY)
         key = (state.session.id, tool_call_id or invocation_id)
         frozen_content = deepcopy(content)
         async def write():

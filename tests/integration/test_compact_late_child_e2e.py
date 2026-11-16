@@ -30,7 +30,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 SID = "compact-late-child"
 CHILD_ANSWER = "CHILD PARKED ANSWER"
 CURRENT_PROMPT = "INDEPENDENT CURRENT WORK"
@@ -168,6 +167,7 @@ async def wait_until(predicate):
             await asyncio.sleep(0.01)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
 @pytest.mark.parametrize("finish_timing", ["before_compact", "while_compact_waits"])
 async def test_late_child_closure_via_scheduler(tmp_path, backend, finish_timing):

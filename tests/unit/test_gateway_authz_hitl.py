@@ -39,7 +39,6 @@ from ctx_weft.providers.authorizer import HumanConfirmationAuthorizer
 from ctx_weft.providers.events import InProcessEventBus
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 
-pytestmark = pytest.mark.asyncio
 
 # 用 qualified 名做工具调用入口——与 CapabilityCache 的编码（cap.id 里的 ":" → "__"）一致。
 _CAP_ID = "fs:bash_exec"
@@ -184,6 +183,7 @@ def _snapshot_with_decision(tool_call_id: str, decision: HitlDecision) -> HitlSn
 # ── 测试 ────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_hot_approval_lets_the_call_through_with_modified_arguments():
     gw, reg, svc = _make_gateway(HumanConfirmationAuthorizer())
     task = asyncio.create_task(gw.invoke(_TOOL_NAME, {"command": "ls"},
@@ -197,6 +197,7 @@ async def test_hot_approval_lets_the_call_through_with_modified_arguments():
     assert _last_invoked_args() == {"command": "ls -l"}      # 改参真正生效
 
 
+@pytest.mark.asyncio
 async def test_hot_rejection_never_calls_the_provider():
     """安全不变式：Deny 时 provider.invoke 绝不被调用。"""
     gw, reg, svc = _make_gateway(HumanConfirmationAuthorizer())
@@ -211,6 +212,7 @@ async def test_hot_rejection_never_calls_the_provider():
     assert _provider_invocations() == 0
 
 
+@pytest.mark.asyncio
 async def test_eviction_raises_hitl_park_and_does_not_invoke():
     gw, reg, _svc = _make_gateway(HumanConfirmationAuthorizer(), timeout_sec=0)
     with pytest.raises(HitlPark):
@@ -220,6 +222,7 @@ async def test_eviction_raises_hitl_park_and_does_not_invoke():
     assert reg.list_pending()[0].resolved is False      # 请求仍未决
 
 
+@pytest.mark.asyncio
 async def test_a_cached_decision_short_circuits_without_asking_again():
     """冷路径重入：registry 已有该 tool_call 的决定 → 直接 on_decision，不新建请求。"""
     gw, reg, _svc = _make_gateway(HumanConfirmationAuthorizer())
@@ -232,6 +235,7 @@ async def test_a_cached_decision_short_circuits_without_asking_again():
     assert _provider_invocations() == 1
 
 
+@pytest.mark.asyncio
 async def test_a_cached_decision_carries_modified_arguments_into_the_provider():
     """人在批准前**改写的参数**必须跨重启仍然生效——不只是「短路发生了」。
 
@@ -256,6 +260,7 @@ async def test_a_cached_decision_carries_modified_arguments_into_the_provider():
     )
 
 
+@pytest.mark.asyncio
 async def test_a_cached_rejection_still_blocks_the_provider():
     """冷路径的另一半：缓存里是一次**拒绝**时，provider 同样绝不被调用。
 
@@ -273,6 +278,7 @@ async def test_a_cached_rejection_still_blocks_the_provider():
     assert reg.list_pending() == []
 
 
+@pytest.mark.asyncio
 async def test_a_plain_authorizer_never_touches_the_hitl_path():
     """不问人的 authorizer 走的路径与 HITL 无关，一行 HITL 代码都不执行。"""
     gw, reg, _svc = _make_gateway(_AllowAll())
@@ -281,6 +287,7 @@ async def test_a_plain_authorizer_never_touches_the_hitl_path():
     assert result.is_error is False and reg.list_pending() == []
 
 
+@pytest.mark.asyncio
 async def test_needs_human_without_the_gated_interface_is_a_contract_violation():
     """声明要问人却没实现 on_decision = 契约违例，当场报错，不静默降级。"""
     gw, reg, svc = _make_gateway(_AsksButNotGated())
@@ -307,6 +314,7 @@ async def _approve_hot(gw, reg, svc, args, *, tool_call_id="call_1", modified=No
     return await task
 
 
+@pytest.mark.asyncio
 async def test_re_entering_the_same_call_still_short_circuits():
     """合法重放：park/崩溃后 reconcile 用**同一份**参数重入同一个 tool_call。
 
@@ -325,6 +333,7 @@ async def test_re_entering_the_same_call_still_short_circuits():
     assert _last_invoked_args() == {"command": "ls -l"}  # 改写的参数照旧跟着这次调用
 
 
+@pytest.mark.asyncio
 async def test_a_second_distinct_call_reusing_the_tool_call_id_is_not_authorized():
     """模型复用 `call_1`（短 id 是常态）时，第 3 轮的批准不得替第 9 轮的**另一次**调用开门。
 

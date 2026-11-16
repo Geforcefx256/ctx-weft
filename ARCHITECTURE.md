@@ -1,173 +1,98 @@
-# ctx-weft 内部实现逻辑
+# ctx-weft 内部架构与改动边界
 
-> 本文讲 **引擎内部如何运转**：循环引擎、Step 流水线、上下文装配、任务编排、记忆模型 v2、会话生命周期与崩溃恢复、事件系统内部。
->
-> 想知道**怎么调用 SDK**，见 [README.md](./README.md)。这里的内容对编写自定义 Provider、调试事件流、扩展引擎有帮助，但日常使用不必读。
+> 核对日期：2026-11-16。本文描述当前工作区实现，供维护引擎与后续 agent 定位职责。
+> SDK 调用参考见 [README.md](./README.md)，公开契约以 `src/ctx_weft/__init__.py`、`protocols/` 和对应回归测试交叉核对。
+> 文档使用模块路径和符号定位，不保存易过期的源码行号或分支名。
 
-启动与装填的当前边界：同步构造完成公共接线；已有会话执行前 `await initialize(session_id)` 校准持久崩溃事实。
-同一会话初始化共享 Task，成功后只保留 ID；纯查询不初始化，不枚举其他会话。
-查询优先内存、回退事件临时投影，不登记运行对象。已有会话只由 `rebuild_session` 统一
-装填 Session、Agent、HITL、TaskManager 及接线；开启工作入口在同一会话锁内先确保装填。
-`_bind_task_manager` 保持唯一 owner 守卫，TaskManager 构造统一复用 SessionRegistry 的工厂。
-装填不 drain、不恢复 recap；真正执行前才激活 deferred recovery。
-`SessionStatusChanged` 已停发，仅兼容旧日志；会话状态由 host 维护，启动校准只补写 run、task、agent 与 HITL 恢复事实。
-投影和快照保存未结束 run 的任务、agent 及最大 sequence；`RunFinished` 将该 run 销账，
-任务裁剪不裁这份执行信息。启动校准复用快照加增量，不再另读完整 run 历史；旧版本快照回退全量日志。
+## 0. Agent 修改前必读
 
-前后台 observe 共用 `ObserveRequested → ObserveStarted → ObserveCompleted → ObserveApplied`。
-
-`report_observation.task_status` 使用四态：`success` / `fail` 结束任务，`continue`
-一律自动重新入队执行，`waiting` 停在 `AWAITING_HUMAN` 等待用户回复。`continue`
-不消耗运行异常重试预算，也不兼容为旧的等待语义。交互任务的纯文本回合先临时 park，
-后台判 `continue` 后先完成段摘要、收口本轮等待入口，再发布 `TaskRequeued` 并启动下一轮；
-判 `waiting` 则保留入口。前台判 `waiting` 同样建立可应答的 HITL 入口。
-后台自动续跑以 `ObserveCompleted.action="continue"` 持久化，恢复时完成原决定而不重新判决。
-`max_turns` 复核会展示本段已执行轮数：明确超出能力范围可判 `fail`，其余结果
-由代码收敛为 `continue`，不允许 `waiting` 或 `success`，观察失败也继续执行；其余场景
-观察没有可用判决时的机械 `success` 兜底保持不变。
-
-机械判决在前台调度入口由同步方法先返回，随后将 `verdict`、任务处置计划及
-`judge_task=false` 写入 `ObserveRequested`。前台直接进入 finalize，不调用 ObserveStep；
-后台沿同一个 `observe_id` 执行一次 ObserveStep 生成报告。执行是否判决只由 `judge_task` 控制。
-前台收尾的崩溃恢复由 runtime 负责，observe 内不再手动推进 FinalizeStep。
-LLM 执行后才确定的判决仍写入 `ObserveCompleted`。机械判决驱动的收尾允许早于报告完成，
-但 `ObserveApplied` 必须晚于任务处置与报告应用。报告订阅任务状态通知后读取持久化事实，
-因此晚订阅不依赖历史通知；应用时校验 finish 记录的 observe 归属，并与取消收尾串行。
-执行逻辑和四个事件的组装、发送统一位于 `core/loop/steps/observe.py`；driver 在调度前调用意图持久化入口，TaskManager 在仲裁和结算位置调用 observe 提供的回调。
-Requested 在执行前持久化（park 时嵌入 `HitlOpened`），Started 在观察前立即写入；Completed
-保存报告及执行后确定的判决。机械判决路径由 Requested 先于任务收尾，Completed 先于报告应用；
-LLM 判决路径由 Completed 先于判决应用。Applied 只在结果应用完成后销账。
-`TaskRecapRequested/Started/Done` 已停发，仅供旧日志重放。快照保存 `pending_observe` 的结果、
-已完成副作用与任务状态提交标记。冷恢复已有 Completed 时不再调用模型，沿原决定幂等补完。
-前台仍由 TaskManager 在 RunFinished 后落任务状态；机械判决与异步报告属于同一次 observe。
-收尾报告交接以完整持久化的 finish 对为准：其 metadata 保存原文保留策略和槽位数量；后台在真实报告写入、必要折叠完成后才发送 Applied。前后台先后次序仅影响等待，进程内通知只唤醒，不承载报告或恢复决定。
-前台 observe 可协作暂停/取消；暂停时旧 Completed（放弃判决）、旧 Applied 与携带新
-recap 请求的 HitlOpened 原子提交。气泡提交确认后才可回复；失败重试复用原事件封套。
-热恢复先确认停止 run 的原始起止事件，再按已提交交接事实补齐等待状态、槽位释放和 recap。
-未完成判决的冷恢复由 TaskManager 持有前台槽位和 dispatch，注册真实暂停/取消令牌；
-已接受的判决只恢复收尾。root、跨 agent 和同 agent 子任务的暂停均安排 report-only recap。
-observe 请求通过 `context_record_ids` 固定输入记录；memory 的 `read_records` 按原 ID
-读取含 superseded 的记录，并保持租户/会话隔离。装配、短段门与折叠共用这份范围；
-后续收尾已经接管的段不再追加旧摘要。旧快照遗漏引用时，从原请求事件补齐。
-新 user 回合的 HitlResolved 与消息回合在同一批提交，确认后才发布 claim 状态、写入暂存
-memory；首字前撤销仍丢弃整批，并恢复原气泡。
-熔断的 `FailureThresholdHit` 先持久化 root 失败及清场目标；在途 root 的 `TaskFailed`
-必须晚于其前台 `RunFinished`。启动校准独立闭合所有遗留 run，再兑现尚未完成的熔断决定。
-
----
-
-## 目录
-
-1. [架构总览与数据流](#1-架构总览与数据流)
-2. [核心组件职责](#2-核心组件职责)
-3. [Loop 引擎与 Step 流水线](#3-loop-引擎与-step-流水线)
-4. [LoopState / LoopContext / StepOutcome](#4-loopstate--loopcontext--stepoutcome)
-5. [上下文装配（ContextAssembler）](#5-上下文装配contextassembler)
-6. [能力解析与调用（CapabilityGateway）](#6-能力解析与调用capabilitygateway)
-7. [任务编排与 Agent 解析](#7-任务编排与-agent-解析)
-8. [记忆模型 v2 与写入时机](#8-记忆模型-v2-与写入时机)
-9. [Blackboard / Topic 机制](#9-blackboard--topic-机制)
-10. [会话生命周期与崩溃恢复](#10-会话生命周期与崩溃恢复)
-11. [事件系统内部](#11-事件系统内部)
-
----
+- 先读本仓 `AGENTS.md`、本文件及待改模块的测试，再检查 `git status --short`。工作区可能包含进行中的重构；未提交文件和新增模块都是当前实现的一部分，不得用 HEAD 覆盖。
+- `ctx-weft` 拥有执行语义；`NetliveCoworkPy` 拥有产品路由、身份与资源权限、HTTP/SSE 和展示投影。修复应落在实际拥有该职责的一侧。
+- 不为适配旧文档恢复已删除的入口、全局状态、第二份投影或状态推导。历史 spec、plans、upgrade 文档用于理解决策背景；与当前实现冲突时，先核对具体测试和迁移记录，不能仅凭旧方案改回代码。
+- 改事件、状态、记忆折叠、恢复或公开协议时，必须检查正常执行、暂停/取消、冷恢复及提交失败路径。不能只让当前热路径通过。
+- 测试中的边界约束也是设计依据。不得为让变更通过而随意扩大 import 白名单、删除隔离测试或伪造提交成功。
 
 ## 1. 架构总览与数据流
 
-```
-                         ┌──────────────────────────────────────┐
-                         │           CtxWeftRuntime              │
-                         │  SessionRegistry   create/resume      │
-  TemplateLookup ───────▶│  AgentLifecycleManager（ALM）          │
-  ProviderRegistry ─────▶│  TaskManager        队列 / drain        │
-   memory/cap/know/llm   │  HitlService/Registry/ReplyIntake      │
-                         └───────────────┬────────────────────────┘
-                                         │ 两阶段派发（task/runner.py）
-                                         ▼
-        ┌──────────────────────  一次 loop run  ──────────────────────┐
-        │  assemble: ALM instantiate/materialize → AgentBinding        │
-        │  execute : ContextAssembler ──▶ AssembledPrompt              │
-        │            CapabilityGateway ──▶ invoke / 鉴权 / HITL        │
-        │            LLMClient         ──▶ 流式 chunk                  │
-        │                                                                │
-        │  StepDriver: prepare → act → observe → finalize               │
-        │     （compact 为正式前台步骤；recognize_intent 旁路并发）        │
-        └───────────────────────────┬────────────────────────────────────┘
-                                    │ RunOutcome（execute 的返回值）
-                                    ▼
-                          TaskManager.apply_run_outcome
-                                    │ make_event(...) / emit
-                                    ▼
-                EventBus（+ CommitGate：先确认提交再通知，spec: event-commit）
-                                     │ 订阅
-                          ┌──────────┴──────────┐
-                     EventStore            外部订阅者（SSE / 日志）
-              (InMemory / SQL + 快照)
+```text
+host / 自定义 Provider
+  -> CtxWeftRuntime（公开命令、会话锁、生命周期与关闭）
+       -> SessionRegistry / AgentLifecycleManager
+       -> 每会话一个 TaskManager
+            -> TaskRunner.assemble -> AgentBinding（Agent / 模板 / 本次模型）
+            -> TaskRunner.execute -> StepDriver -> RunOutcome
+            -> disposition_for -> TaskManager 落任务状态、调度队列
+
+Step -> ContextAssembler -> PromptContext -> Jinja + PromptBuilder -> LLMRequest
+     -> llm_gateway / llm_stream -> LLMClient
+     -> CapabilityGateway -> Authorizer / HITL -> CapabilityProvider
+
+持久事件 -> EventBus -> CommitGate -> EventStore 确认 -> 订阅者
+恢复读取 -> committed position / 快照 / reducers -> 初始化或按需装填
 ```
 
-**一句话**：`CtxWeftRuntime` 把 task 交给**两阶段 TaskRunner**——`assemble` 装配执行 agent（`AgentBinding`），`execute` 驱动 StepDriver 按 `next_step` 顺序跑 Step；run 的**结局**以 `RunOutcome` 返回值交回 TaskManager（task 状态由 TM 据[处置表](#7-任务编排与-agent-解析)落地，loop 不写状态），事件全部经 `EventBus` 流出、`EventStore` 落盘。
-
-**为什么结局走返回值而非事件**：进程内 bus 在 `emit()` 里同步 drain——TM 拿到结局后要动队列、派下一个 task、发更多事件，全嵌套在最初那次 `emit()` 里层层重入。数据走返回值，TM 在 run 返回**之后**动手（`core/orchestrator/task/runner.py:44`）。
-
----
+`TaskRunner.execute` 的返回值是任务处置的数据通道。TaskManager 不订阅 RunFinished 来重新调度：进程内总线同步投递，订阅回调内再 drain 会导致重入。`RunFinished` 是执行事实，业务任务状态由 TaskManager 按处置表落地。
 
 ## 2. 核心组件职责
 
-> 路径相对 `src/ctx_weft/`，行号对应当前分支（`feat/multimodal`）工作区，可点击跳转。
+以下路径相对 `src/ctx_weft/`。
 
-| 组件 | 源码（file:line） | 职责 |
-|------|------------------|------|
-| `CtxWeftRuntime` | `core/runtime.py:522` | 顶层编排。运行入口：`run_single_task` `:1249`（compat）、`start_session` `:1387`、`send_message` `:2649`、`reply_to_hitl` `:2987`、`recover_agent` `:1950`、`compact_agent` `:2385`、`pause_session` `:828` / `pause_agent` `:1111` / `resume_agent` `:1157`、`cancel_session` `:906` / `cancel_agent` `:965`、`rebuild_session` `:1721` 等 |
-| `ProviderRegistry` | `core/registry.py:35` | 四类 provider（memory 唯一 / cap 列表 / knowledge 按 priority / llm 唯一）+ per-provider authorizer（`:107`）+ memory/event blob store（`:143` / `:170`）+ skill provider 增减的 `mark_dirty`（`:115`） |
-| `AgentLifecycleManager`（ALM） | `core/orchestrator/lifecycle/agent_manager.py:116` | agent 生命周期的唯一住所：`instantiate` `:566`（真新建，发 AgentSpawned/SpawnRejected/AgentInstantiated）、`materialize` `:799`（水合，零事件）、`resolve_model` `:783`、事件驱动 `load` `:421`（吃 TASK_* 事件回放装填 registry） |
-| `TemplateLookup` | `core/orchestrator/lifecycle/template_lookup.py` | 模板解析；`resolve_qualified` 接受限定形式（`agent__x`），裸 id 抛 `TemplateNotFoundError` |
-| `SessionRegistry` | `core/orchestrator/lifecycle/session_registry.py:68` | `create_session` `:128`（发 SESSION_CREATED，因果序 Session→Agent→Task）、`resume_session` `:231`（回放重建 + `UnfinishedTasksError` 弃轮禁止 `:262`） |
-| `TaskManager` | `core/orchestrator/task/manager.py:54` | 任务队列与调度：`drain` `:502`、`_run_task` `:536`、`apply_run_outcome` `:638`、`reopen_chain` `:707` / `reopen_task` `:746`、`restore` `:143`（崩溃恢复重建）、`track_background` `:119`、未提交窗口 `begin_round` `:281` / `commit_round` / `discard_round` |
-| `ContextAssembler` | `core/assembler/assembler.py:238` | 多 Source 取数 → budget 裁剪 → composer 拼 prompt（`assemble` `:246`） |
-| `CapabilityGateway` | `core/loop/capability_gateway.py:193` | capability 解析、鉴权/HITL、参数校验、`invoke` `:236`、memory 写入 + 事件 |
-| `CapabilityCache` | `core/capabilities/cache.py:28` | **per-session 共享**能力缓存（含 pin / clear_pins / available `:140`-`:170`）；run 结束 `evict`（`core/runtime.py:3907`），pin 清理挂 task 终态（`core/runtime.py:1548`） |
-| `StepDriver` | `core/loop/driver.py:253` | 按 `initial_step` 起步，`run` `:270` 循环执行 Step，发 StepStarted/Completed/Failed |
-| `EventBus` / `InProcessEventBus` | `protocols/events.py:320` / `providers/events/bus/in_process/bus.py:41` | `emit` `:53`、`subscribe` `:115`（支持 provisional）、未提交窗口 `begin/commit/discard_provisional` `:141`-`:155`、`stream` `:157`。进程内 emit **同步 drain**、不跨进程 |
-| `EventStore` / `InMemory` + SQL | `protocols/events.py:477` / `providers/events/store/in_memory/store.py:29` / `providers/events/store/sql/` | `append_batch`、`read_range`、`committed_head`、`read_last_of_type`——**四个方法全必需，没有可选扩展档** |
-| HITL 三件套 | `core/hitl/registry.py:183`（决定缓存）、`core/hitl/service.py:80`（`open` `:96` / `resolve` `:158` / `cancel` `:179`）、`core/hitl/reply_intake.py:29`（人类答复入核） | 人工介入请求/应答；等待协程栈在 `core/loop/hitl_waiter.py` |
+| 组件 / 源码 | 所有权与边界 |
+| --- | --- |
+| `core/runtime.py` / `CtxWeftRuntime` | 命令入口、会话锁、构造接线、初始化、装填、停止、查询和实例关闭；宿主通过公开入口调用 |
+| `core/registry.py` / `ProviderRegistry` | Memory 单实例、Capability 集合、按优先级的 Knowledge、LLM resolver、鉴权器和两类 blob store |
+| `core/orchestrator/lifecycle/agent_manager.py` / ALM | Agent 身份、状态、当前任务、模型选择；instantiate 创建并发事件，materialize 构造执行对象，load 重放已有事实 |
+| `core/orchestrator/lifecycle/template_lookup.py` | 模板限定 ID 的解析；模板只经 AgentCapabilityProvider 进入引擎 |
+| `core/orchestrator/lifecycle/session_registry.py` | 会话成员与 TaskManager 工厂；不持有聊天产品展示状态 |
+| `core/orchestrator/task/manager.py` | 任务队列、同 Agent 串行、恢复与结果应用；一个已装填会话只有一个 owner |
+| `core/orchestrator/task/disposition.py` | 纯函数 `disposition_for`：RunOutcome + 重试预算 -> 任务处置；无 bus、队列或 I/O |
+| `core/orchestrator/model.py` | ModelChoice / ResolvedModel 等执行侧模型值对象 |
+| `core/loop/driver.py` | StepDriver、LoopState / LoopContext、前后台 Step 执行与 ExecutionRegistry |
+| `core/assembler/` | Source 取事实、purpose 装配、Jinja 提示词程序及预算执行；不改变任务状态 |
+| `core/loop/capability_gateway.py` | 工具解析、鉴权、HITL、逻辑调用身份、执行与恢复对账 |
+| `core/capabilities/cache.py` | 按会话共享的能力缓存和 pin 生命周期；不在每个 Step 内另建缓存 |
+| `core/hitl/` | Registry 决定缓存、Service 请求生命周期、ReplyIntake 答复归一；协程等待在 loop/hitl_waiter.py |
+| `core/control/` | 持久事件折叠、查询视图、初始化校准与 SnapshotWriter |
+| `core/events/commit_gate.py` | 原批次提交确认、未知提交重试与存储隔离 |
+| `protocols/` | host、core、Provider 共用协议和 DTO；外部调用者不导入 core 实现 |
+| `providers/` | 可替换默认实现；不得反向依赖 core 的调度/恢复域逻辑，有限纯工具例外由边界测试明确列出 |
 
-**构造期自动注册的内置 Capability**（`CtxWeftRuntime.__init__`，`core/runtime.py:575`-`590`）：
+构造期自动注册 `ControlCapabilityProvider`、`SkillExecutorCapabilityProvider`、`MediaCapabilityProvider`，并要求注册至少一个 `AgentCapabilityProvider`。构造同步完成公共接线，不读取历史或发起恢复。
 
-- `ControlCapabilityProvider`（`core/capabilities/control_tools.py:623`）— 控制工具：`delegate_task` `:167` / `delegate_plan` `:234` / `finish_task` `:309` / `report_task_outcome` `:391` / `update_task_metadata` `:525` / `collect_process_report` `:504` / `ask_user` `:600`。（旧名 submit_task / submit_plan / submit_task_assessment / request_human_input 已改名。）
-- `SkillExecutorCapabilityProvider`（`core/capabilities/skill_executor.py:151`）— 把 LLM 的 skill 调用路由到对应 `SkillCapabilityProvider`；`mark_dirty` `:167` 重建索引。
-- `MediaCapabilityProvider`（`core/media/capability.py:341`）— `media:get_image` 等媒体工具。
+### 公开内容协议
 
-构造期还硬校验**至少一个 `AgentCapabilityProvider`**（`core/runtime.py:608`-`603`）。
+`protocols/content.py` 定义 TextPart、ImagePart、ContentPart 和 blob 引用前缀，并实现
+共享的解析、校验、JSON 转换、文本提取及 blob 外部化。协议模块不导入 core；
+`context.py` 只保留调用上下文和 Citation。共同异常基类在 `protocols/errors.py`，
+内容异常在 content 协议中定义，顶层也导出同一异常类型。
 
----
+新输入用 `parse_content` 严格解析，未知 part 不静默丢弃；历史读取仍用
+`normalize_content_parts` 的容错行为。`externalize_content` 只处理调用方明确指定的
+存储和 ProviderContext：已有引用要求 source_blob_store，跨存储读取后写入目标，
+缺失引用明确失败。返回成功只确认 blob 准备，不表示事件提交或任务派发。
+引擎的事件侧／记忆侧仍从原始输入各自外部化；已有事件恢复降级规则保持。
+`core/utils/content.py` 保留 token 预算、提示词渲染及工具结果策略，引用协议的共同实现。
 
 ## 3. Loop 引擎与 Step 流水线
 
-`StepDriver.run()`（`core/loop/driver.py:270`）是引擎心脏。流程：
+`CtxWeftRuntime._build_step_driver` 注册八个 Step，源码均在 `core/loop/steps/`。当前没有独立的 reason Step。
 
-1. **起步前持久化 user_prompt**（`_persist_user_prompt` `core/loop/driver.py:208`）：落库的是**原样 raw content**（多模态无损，`MemoryKind.CONVERSATION_TURN / TASK / role=user`）；`## Current Task` / `## Current Message` 框架由 composer **渲染期**生成、不落库。记录 id 存 `task.user_prompt_memory_id` 供丢弃路径 fold。
-2. **起步钩子**：`ensure_dispatch_frame_at_start`（见 [§8](#8-记忆模型-v2-与写入时机)）——子任务此刻在父 scope 铸派发框 + running ack。
-3. 从 `initial_step` 开始循环：
-   - 每轮先检查 `cancel_token`，已取消则抛出。
-   - 发 `StepStarted` → `step.execute(state, ctx)` → 应用 `outcome.state_patch` → 发 `outcome.events` → 发 `StepCompleted`；异常发 `StepFailed` 再 raise。
-   - `next_step = outcome.next_step`；为 `None` 时循环结束。
+| Step | 职责与接续 |
+| --- | --- |
+| `prepare` | 解析能力、估算预算、装配输入；进入 act，或 compact 后重装配 |
+| `act` | 模型/工具循环与回合提交；按退出原因进入 suspend、prepare、observe，或交接后台观察 |
+| `observe` | 判决及段报告的统一实现；前后台由执行模式和 judge_task 控制，前台判决后进入 finalize |
+| `finalize` | finish 记录、父 scope 回填、blackboard、TaskFinalized 和 RunOutcome；不自行写任务终态 |
+| `suspend` | 返回等待子任务的 RunOutcome，由 TaskManager 挂起及唤醒 |
+| `compact` | 统一前台压缩；由 options.after 指定重装配或结束维护 run |
+| `recognize_intent` | 旁路元信息生成，回填 title / description / session goal |
+| `reconcile` | 在模型执行前对账 dangling tool calls，再进入 prepare |
 
-### Step 注册表与跳转
+`StepDriver.run` 先确保子任务派发框，再持久化/暂存 raw user prompt，然后按 next_step 执行。`## Current Task` / `## Current Message` 是渲染框架，不存为用户原文。每步的事件、state_patch 和 StepStarted/Completed/Failed 由 driver 统一处理。
 
-`_build_step_driver(initial_step)`（`core/runtime.py:3729`）注册 **8 个** Step：
+有未配对工具调用时从 reconcile 开始，否则从 prepare 开始。软暂停由协作检查点 park；硬取消在 Step 边界中止，不能把暂停直接替换为取消协程。
 
-| Step | 源码（name= 行） | 作用 | `next_step` |
-|------|------------------|------|-------------|
-| `prepare` | `core/loop/steps/prepare.py:103` | 能力解析/绑定 + token 估算 + 命中阈值时切换 compact，完成后带 after_compact 回本步重装配 + 装配 prompt + guidance/resume cue 注入 | `"act"` 或 `"compact"` |
-| `act` | `core/loop/steps/act.py:60` | ReAct 循环：调 LLM → gateway 执行 tool_call → 写 memory，直到 actor_done / max_turns / context_limit / 纯文本 | `suspend_requested` → `"suspend"`（`core/loop/steps/act.py:156`），否则 `"observe"` |
-| `observe` | `core/loop/steps/observe.py:216` | 裁决：root/跨 agent 任务走机械判决 + 后台 observe；子任务走 LLM observe（`report_task_outcome` 为终止工具） | `"finalize"`（`core/loop/steps/observe.py:293`） |
-| `finalize` | `core/loop/steps/finalize.py:686` | 写 finish 对 / 派发结果回填父 scope / blackboard 发布 / 发 TASK_FINALIZED；**不写 task 状态** | `None`（`core/loop/steps/finalize.py:801`） |
-| `suspend` | `core/loop/steps/suspend.py:22` | 当前 task 等子任务，挂起；TaskManager 在子任务完成后重新入队 | `None` |
-| `compact` | `core/loop/steps/compact.py:733` | 记忆压缩（统一由 StepDriver 执行；options.after 指定接续） | `"prepare"` 或 `None` |
-| `recognize_intent` | `core/loop/steps/recognize_intent.py:99` | 旁路意图识别：回填 root task 的 title/description/session goal（`update_task_metadata`） | `None`（单发） |
-| `reconcile` | `core/loop/steps/reconcile.py:23` | resume 后补 dangling tool_call：已有结果的复用、悬挂的经 gateway 重执行 | `"prepare"` |
-
-**`initial_step` 的选定**（`_SessionTaskRunner.assemble` 里的 `_reconcile_or`，`core/runtime.py:4172`）：最近 assistant turn 有 dangling tool_call → `"reconcile"`（探测函数 `_task_has_dangling_tool_call` `core/runtime.py:480`），否则 `"prepare"`。`AgentBinding.initial_step` 默认 `"prepare"`（`core/orchestrator/task/runner.py:34`）。
+### 压缩与接续
 
 **step 参数与 compact 的三个入口**：
 
@@ -217,3 +142,164 @@ Observe 继续决定是否折段并生成报告，以固定观察输入调用 `f
 默认实现复用有界的不可变正文缓存，始终重新检查活动成员，按租户/会话隔离缓存键。
 普通工具通过调用/结果关联识别完成状态；被排除出对话协议的派发/silent 调用通过非渲染
 的执行关联及完成审计记录提供相同事实，不再由 Compact 传递 protected_ids。
+
+## 4. LoopState、执行上下文与模型配置
+
+`LoopState` 保存一次执行推进的数据（task、agent、session、本次 ResolvedModel、prompt、transcript、verdict、pending_act_turn 等）。`LoopContext` 提供依赖与控制令牌；`StepExecution` 指定本次前台/后台模式和 options。`StepOutcome` 只表达接续、补丁与事件，不能变成另一份任务状态机。
+
+ALM 保存 `ModelChoice(account, model, config)`，派发时解析为 `ResolvedModel` 并经 AgentBinding 交给执行。client、实际账号/模型、上下文窗口、输出预留与 output policy 必须来自同一次解析，不在 Step 中分别猜测。
+
+`protocols/llm.py` 中的 `ModelCallConfig` 保存 reasoning_effort、temperature、top_p、max_tokens、stop 等调用设置，支持显式序列化 codec。Agent 选择、run、请求及重试持有独立副本；修改查询返回值不能修改实际 Agent。模型切换和配置替换通过 `set_agent_llm` / `set_session_llm` 写 AgentLLMChanged，恢复重放保留完整配置。
+
+`core/loop/llm_gateway.py` 负责请求构造、消息合法化、动态输出预算和请求自愈；`core/loop/llm_stream.py` 拥有流的收集。Adapter 只解释自己的 wire 格式，经 protocols 接入，不能把收集器搬回默认 Provider。网络自愈不能重做已执行的工具副作用；LLM outage 最终走可恢复中断，不按普通任务失败消耗原地重试预算。
+
+## 5. 上下文装配与提示词职责
+
+`ContextRequest` 用 purpose 选择 act / observe / compact / recognize_intent，并用匹配的 Intent 携带参数。Source 从 Memory、Knowledge、能力和模板取事实，装配成 `PromptContext`；`prompts.py` 执行 `prompt_assets/steps/*.jinja`，`PromptBuilder` 执行预算、原子分组裁剪和合法消息输出。
+
+- 模板 identity facets（SOUL/ROLE 等）表达身份与质量原则；Jinja 表达提示词内容、顺序、调用指令和裁剪优先级；Python 负责事实、参数与机械预算。不要在 Source、Step、工具 schema 中复制另一套提示词程序。
+- 工具定义有独立预留预算，不作为普通文本任意裁掉。当前任务和工具调用/结果等受保护分组必须保持完整。
+- 已关闭任务的 full / lean 胶囊是装配时的可选视图。预算选择不等于持久折叠；真正 demotion 才修改记录。无可用摘要时保留 raw 证据，不造空胶囊。
+- 更改提示词先读 `core/assembler/prompt_assets/README.md`，同时核对 en / zh 资源及渲染、预算和协议测试。
+
+## 6. 能力调用、鉴权与恢复
+
+Provider 声明 capability，resolver 按引用绑定，gateway 负责解析及调用。鉴权器与 Provider 通过 registry 接线；人工审批通过统一 HITL 服务，不能在宿主或工具中另外维护审批决定缓存。
+
+控制工具以 `core/capabilities/control_tools.py` 的实际注册为准。当前使用 `switch_task`、`delegate_task`、`delegate_plan`、`ask_user`、`report_observation`、`update_task_metadata`。`finish_task` 仅保留旧事件/恢复名称，不是当前注册的可调用工具；不得根据历史文档重新暴露。`report_observation` 返回结构化观察结果，由 ObserveStep 应用。
+
+恢复以逻辑操作身份与已确认结果为准，不把模型 wire tool_call_id 当全局唯一调用。Reconcile 先复用已完成结果；未完成调用按活 capability 的 RecoveryPolicy 与已存执行事实处理。不能把“没有 TOOL_RESULT”直接等同为“从没执行”，更不能在未知提交时重跑有副作用的操作。
+
+ProviderContext 携带 tenant / session / agent 等身份和作用域；产品的用户、套件与 namespace 规则由宿主 Provider 解释，不渗入通用引擎。
+
+## 7. 任务编排、Agent 与观察生命周期
+
+### 任务与 Agent
+
+任务先 assemble 得到真实执行 Agent，再发 TaskStarted 并执行；同 Agent 任务串行，不同 Agent 可在配置并发范围内运行。`effective_agent_id` 是调度串行键和装配共用的归属规则，不能另写“当前活跃 Agent”猜测器。
+
+`send_message(agent_id, content, session_id=...)` 按 Agent 定址：空闲/终态当前任务可开新任务，已有任务按其状态注入或重排，等待子任务时保留父任务等待语义。running / terminated Agent 有明确守卫，不隐式排队。会话级聊天路由归宿主。
+
+ALM 是 Agent 状态和模型选择的唯一住所；TaskManager 应用任务处置，ALM 消费任务事件推进 Agent。新建 instantiate 和恢复 load/materialize 必须分开，重放不能再次发 AgentSpawned / AgentInstantiated。
+
+### RunOutcome 处置
+
+| 执行结果 | TaskManager 处置 |
+| --- | --- |
+| success / fail 判决 | FINISHED / FAILED |
+| continue 判决 | PENDING，自动重排，不消耗运行异常重试预算 |
+| waiting / HITL park | AWAITING_HUMAN，保留可应答入口 |
+| 等子任务 | SUSPENDED，由依赖完成唤醒 |
+| task switch | REVIEWING，沿任务切换协议收尾 |
+| 可重试运行异常 | 预算内重排，耗尽后 INTERRUPTED |
+| outage / 不可原地重试的中断 | INTERRUPTED，等显式恢复 |
+| 硬取消 | CANCELED，先确认在途 run 收口 |
+
+### Observe 持久协议与崩溃边界
+
+前后台 observe 共用 `ObserveRequested → ObserveStarted → ObserveCompleted → ObserveApplied`。
+
+`report_observation.task_status` 使用四态：`success` / `fail` 结束任务，`continue`
+一律自动重新入队执行，`waiting` 停在 `AWAITING_HUMAN` 等待用户回复。`continue`
+不消耗运行异常重试预算，也不兼容为旧的等待语义。交互任务的纯文本回合先临时 park，
+后台判 `continue` 后先完成段摘要、收口本轮等待入口，再发布 `TaskRequeued` 并启动下一轮；
+判 `waiting` 则保留入口。前台判 `waiting` 同样建立可应答的 HITL 入口。
+后台自动续跑以 `ObserveCompleted.action="continue"` 持久化，恢复时完成原决定而不重新判决。
+`max_turns` 复核会展示本段已执行轮数：明确超出能力范围可判 `fail`，其余结果
+由代码收敛为 `continue`，不允许 `waiting` 或 `success`，观察失败也继续执行；其余场景
+观察没有可用判决时的机械 `success` 兜底保持不变。
+
+当前前台 observe 先持久化请求，再执行 ObserveStep 的 LLM 复核；不再按 root、跨 Agent
+或 ROLE 是否存在跳过复核。`_mechanical_verdict` 只在没有可用判决时兜底，不能改回
+“前台先机械成功、后台补报告”。前后台执行模式与是否判决是两个维度，`judge_task`
+控制判决，report-only 观察仍可生成段报告。旧日志中预存的 verdict/disposition 仅按既有
+恢复路径兑现，不是新请求的默认生成策略。
+前台收尾的崩溃恢复由 runtime 负责，observe 内不手动推进 FinalizeStep。
+`ObserveCompleted` 保存报告及确定的判决/处置；`ObserveApplied` 必须晚于任务处置与
+报告应用。报告等待任务状态通知后仍读取持久化事实，晚订阅不依赖历史通知；应用时
+校验 finish 记录的 observe 归属，并与取消收尾串行。
+执行逻辑和四个事件的组装、发送统一位于 `core/loop/steps/observe.py`；driver 在调度前调用意图持久化入口，TaskManager 在仲裁和结算位置调用 observe 提供的回调。
+Requested 在执行前持久化（park 时嵌入 `HitlOpened`），Started 在观察前立即写入；Completed
+保存报告及执行后确定的判决。Completed 先于判决应用和相应折叠；Applied 只在结果应用完成后销账。
+`TaskRecapRequested/Started/Done` 已停发，仅供旧日志重放。快照保存 `pending_observe` 的结果、
+已完成副作用与任务状态提交标记。冷恢复已有 Completed 时不再调用模型，沿原决定幂等补完。
+前台仍由 TaskManager 在 RunFinished 后落任务状态；恢复沿原 observe_id 补完，不新建一份判决或报告。
+收尾报告交接以完整持久化的 finish 对为准：其 metadata 保存原文保留策略和槽位数量；后台在真实报告写入、必要折叠完成后才发送 Applied。前后台先后次序仅影响等待，进程内通知只唤醒，不承载报告或恢复决定。
+前台 observe 可协作暂停/取消；暂停时旧 Completed（放弃判决）、旧 Applied 与携带新
+recap 请求的 HitlOpened 原子提交。气泡提交确认后才可回复；失败重试复用原事件封套。
+热恢复先确认停止 run 的原始起止事件，再按已提交交接事实补齐等待状态、槽位释放和 recap。
+未完成判决的冷恢复由 TaskManager 持有前台槽位和 dispatch，注册真实暂停/取消令牌；
+已接受的判决只恢复收尾。root、跨 agent 和同 agent 子任务的暂停均安排 report-only recap。
+observe 请求通过 `context_record_ids` 固定输入记录；memory 的 `read_records` 按原 ID
+读取含 superseded 的记录，并保持租户/会话隔离。装配、短段门与折叠共用这份范围；
+后续收尾已经接管的段不再追加旧摘要。旧快照遗漏引用时，从原请求事件补齐。
+新 user 回合的 HitlResolved 与消息回合在同一批提交，确认后才发布 claim 状态、写入暂存
+memory；首字前撤销仍丢弃整批，并恢复原气泡。
+熔断的 `FailureThresholdHit` 先持久化 root 失败及清场目标；在途 root 的 `TaskFailed`
+必须晚于其前台 `RunFinished`。启动校准独立闭合所有遗留 run，再兑现尚未完成的熔断决定。
+
+## 8. 记忆、回合与收尾
+
+MemoryRecord 的 kind / scope / role 和关联 ID 是事实模型；渲染标题不是恢复协议。InMemory 与 SQL Provider 必须遵守同一归一、scope、序号、fold 和 organize 契约。
+
+用户原文、多模态 part 与工具结果通过统一路径写入。新用户回合在 provisional 窗口暂存，装配可见；确认后才写入持久 memory 和普通事件流，弃轮丢掉暂存。不能为简化 UI 提前确认，也不能把独立后台观察误归进新回合而一起丢弃。
+
+`task_memory_fold.py` 和 Finalize 统一负责派发框、finish 对、报告替换与父 scope 回填。观察请求固定 `context_record_ids`；折段只覆盖该段，不吞并新用户输入。晚到报告按已持久化的 finish_policy / 槽位更新，不复活已降级的正文。图片降级与 blob 引用保留各自生命周期，不能把展示文本当成图片原件。
+
+记忆压缩的模型和预算决策在 CompactStep，存储侧原子整理在 MemoryProvider.organize；详细边界见第 3 节。
+
+## 9. Blackboard / Topic
+
+成功收尾按 task.id 发布 blackboard 记录，供依赖方经 `recall_topic` 拉取。BlackboardSource 读取会话订阅和任务关系对应的内容。发布、订阅声明和读取仍存在，但 driver 的自动订阅接线已是 no-op；不要恢复旧的事件通知驱动 review/reopen 旁路。
+
+变更前核对 `core/assembler/sources/blackboard.py`、`core/loop/steps/finalize.py` 和 `test_no_blackboard_subscriptions.py`，不能仅依据早期 blackboard spec 接回旧状态机。
+
+## 10. 初始化、装填、查询与关闭
+
+| 入口 | 效果与禁止混入的工作 |
+| --- | --- |
+| 构造 | 同步公共接线；不枚举、初始化或装填历史 |
+| `initialize(session_id)` | 快照 + 增量校准崩溃事实；不装填执行对象，不启动模型/任务 |
+| `get_session/get_task/list_tasks/get_agent/list_agents/list_pending_hitl` | 异步 QueryResult 查询；内存优先、事件回退，不触发初始化或执行 |
+| `rebuild_session` | 已有会话唯一装填入口，装填 Session / Agent / HITL / TaskManager；不 drain |
+| `recover_session` | 在已校准、装填基础上恢复已有工作；输入先装入，再激活 deferred recovery |
+| `forget_session` | 仅在 quiescent 时逐出运行缓存，保留历史和初始化标记 |
+| `purge_session` | 显式删除执行状态并清初始化标记；与逐出缓存语义不同 |
+| `close` | 拒绝新命令，停止并等待本实例执行，保存可恢复事实，返回 ShutdownReport；不替宿主关闭外部 Providers/数据库 |
+
+会话详情与初始化报告共用 `SessionStateSummary`：goal、计数、熔断和完整公开查询对象来自同一次查询。`root_agent/agents` 使用既有 `AgentDetail`，`root_task` 和 `AgentState.current_task` 使用既有 `TaskDetail`，`pending_hitl` 使用既有 `HitlRequestView`。不另建状态包装类型；SDK 不选择某个中断原因作为产品主提示。启动校准仍使用轻量控制投影，返回时在同一提交位置按需读取任务及 HITL 正文，不重放整个会话历史。HITL 正文只从活账对应的开出事件或来源快照按 position 精确读取；启动投影不携带答复正文，也不另扫已关闭的 HITL 历史。
+
+同一会话 initialize 共享 Task，取消一个等待者不取消校准；成功后仅保留 ID。首次及并发调用获得独立初始化结果，后续返回 None；失败可重试。宿主若写投影失败，需保存并重试那份报告。初始化缓存以单进程独占存储范围为契约，不提供跨实例分布式执行锁。
+
+`_bind_task_manager` 保持唯一 owner，构造统一复用 SessionRegistry 工厂；会话锁内确保装填，真正执行前才激活 deferred recovery。`recover_agent`、`rebuild_hitl`、`prepare_agent` 已删除，不增加兼容回入口或全会话扫描。
+
+纯查询返回可独立修改的副本；未装填历史任务可从日志补读。无 session_id 的列表只列已装填对象；冷 Agent/HITL 访问必须明确会话 scope。
+
+`TurnHandle.wait_for_finish` 等任务终态及相关收尾完成，人工等待不算完成。关闭超时和持久化失败通过公开报告/异常表达，外部资源必须在执行真正静止后才能释放。
+
+## 11. 事件、提交与快照
+
+- 当前事件与瞬态集合定义在 `protocols/events.py`。required 策略下先由 CommitGate 确认持久化，再 fanout；best_effort 是显式策略，不能因存储失败自动降级。
+- `append_batch` 同会话原子提交；batch_id 和事件封套在重试中保持原样。同 batch 不同内容应冲突，不换 ID 盲目补发。存储隔离解除前不恢复业务副作用。
+- 存储按会话分配严格递增 position；事件 ID / timestamp / run sequence 都不能替代提交游标。恢复、投影及快照读取固定 committed head 切面。
+- EventStore 的区间读统一为 `read_range`，支持区间、类型、任务关联及字段投影；`read_last_of_type` 读取最近类型事件，`list_session_ids` 枚举日志分区供启动校准。协议没有 append / replay / read_session_events_of_types 兼容入口。构造时的三方法有序提交检查不代表只需实现那三个方法。
+- `EventReadProjection` 返回明确不完整的 ProjectedEvent，筛行在原事件上完成；不能把投影 DTO 当完整事件写回。字段裁剪用于轻量恢复/查询，不能在 Python 先读全正文再假装有界读取。
+- `core/control/reducers.py` 拥有重放语义和快照版本，`snapshot_writer.py` 拥有快照时机和切面；Provider 只执行存储，不复制版本常量或判定策略。
+- RoundCommitted / RoundDiscarded 是瞬态通知；SessionStatusChanged 与 TaskRecapRequested/Started/Done 仅兼容旧日志，不恢复发送。会话展示状态归宿主。
+- 快照保留未结束 run 的 task、agent 与最大 sequence，RunFinished 销账；裁掉终态任务不能裁掉恢复所需执行事实。旧快照按版本/缺项规则回退，不猜测完成。
+
+## 12. 修改定位与验证
+
+在本仓根目录用 `.venv/Scripts/python.exe -m pytest <对应测试>`；也可使用已同步的 uv 环境。按修改范围选择现有用例，不为纯文档修改运行完整业务集。
+
+| 修改范围 | 优先核对的回归测试（相对仓根） |
+| --- | --- |
+| 公开接口与分层 | `tests/unit/test_public_exports.py`、`test_runtime_public_api.py`、`test_provider_layer_boundary.py`、`test_protocols_imports.py` |
+| 初始化、查询、恢复 | `tests/unit/test_runtime_initialization_queries.py`、`test_public_session_recovery.py`、`test_session_initialization.py`；`tests/integration/test_session_lifecycle_forget_rebuild.py` |
+| 模型配置与流 | `tests/unit/test_model_call_config.py`、`test_agent_llm_replay.py`、`test_llm_stream_layering.py`、`test_llm_request_identity.py` |
+| 任务/Agent 状态 | `tests/unit/test_task_disposition.py`、`test_same_agent_serialization.py`、`test_agent_state_machine.py` |
+| 提交、position、恢复副作用 | `tests/unit/test_ordered_event_store_conformance.py`、`test_read_primitives_conformance.py`、`test_operation_recovery_policy.py`；`tests/integration/test_tool_outcome_not_rerun.py` |
+| 提示词与压缩 | `tests/unit/test_prompt_responsibility_boundaries.py`、`test_prompt_builder.py`、`test_compact_step_transitions.py`、`test_compact_wait_observe.py` |
+| Observe / HITL / 停止 | `tests/unit/test_observe_lifecycle.py`、`test_observe_recovery_ownership.py`；`tests/integration/test_foreground_observe_interrupt.py`、`test_cold_reply_settle_race_e2e.py` |
+
+跨仓修改执行协议时，先在本仓修复并验证，再按宿主的 `dev/sync_ctx_weft.py` 流程更新 wheel 和运行环境，最后跑宿主对应回归；只改源码仓不会更新宿主已安装副本。纯文档修改无需重建 wheel。

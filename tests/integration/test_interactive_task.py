@@ -46,7 +46,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 
 def _template(*, observe_role: bool):
@@ -123,6 +122,7 @@ def _act_state_ctx(unattended: bool, llm: MockLLMAdapter, *,
     return state, ctx, task, hitl, mem
 
 
+@pytest.mark.asyncio
 async def test_interactive_plain_text_parks_for_user() -> None:
     llm = MockLLMAdapter(responses=[MockResponse(text="Hi! Anything else?")])
     state, ctx, task, hitl, mem = _act_state_ctx(False, llm)
@@ -150,6 +150,7 @@ async def test_interactive_plain_text_parks_for_user() -> None:
     assert recs and all("final reply to the user" not in (r.content or "") for r in recs)
 
 
+@pytest.mark.asyncio
 async def test_auto_plain_text_completes() -> None:
     llm = MockLLMAdapter(responses=[MockResponse(text="Hi! Anything else?")])
     state, ctx, task, hitl, _mem = _act_state_ctx(True, llm)
@@ -162,6 +163,7 @@ async def test_auto_plain_text_completes() -> None:
     assert hitl.list_pending("s1") == []
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("unattended", [False, True])
 async def test_reply_links_memory_to_its_prompt(unattended) -> None:
     llm = MockLLMAdapter(responses=[MockResponse(text="linked reply")])
@@ -188,6 +190,7 @@ async def test_reply_links_memory_to_its_prompt(unattended) -> None:
     assert prompt.task_id == reply.task_id == record.address.task_id
 
 
+@pytest.mark.asyncio
 async def test_finish_task_finishes_task_end_to_end() -> None:
     resolver = InlineAgentTemplateProvider()
     resolver.register(make_echo_template())
@@ -205,6 +208,7 @@ async def test_finish_task_finishes_task_end_to_end() -> None:
     assert state.task.outputs == "computed: 42"
 
 
+@pytest.mark.asyncio
 async def test_guidance_injected_into_prompt_not_memory() -> None:
     resolver = InlineAgentTemplateProvider()
     resolver.register(make_echo_template())

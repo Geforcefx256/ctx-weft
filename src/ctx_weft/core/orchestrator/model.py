@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from ctx_weft.protocols import LLMClient, ModelCallConfig, OutputPolicy
+from ctx_weft.protocols.context import ProviderContext
 
 __all__ = ["ModelChoice", "ModelResolver", "ResolvedModel"]
 
@@ -98,4 +99,4 @@ class ResolvedModel:
 
 
 class ModelResolver(Protocol):
-    def __call__(self, account: str, model: str) -> LLMClient: ...
+    def __call__(self, account: str, model: str, *, ctx: ProviderContext) -> LLMClient: ...

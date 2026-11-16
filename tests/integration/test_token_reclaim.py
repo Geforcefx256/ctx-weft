@@ -21,9 +21,9 @@ from tests.integration.test_outage_resume import (
     _wait_for_run_finish,
 )
 
-pytestmark = pytest.mark.asyncio
 
 
+@pytest.mark.asyncio
 async def test_idle_park_reclaims_tokens_keeps_task_manager():
     # fail_for=1: the first act call raises LLMOutageError → task SUSPENDED → session idle.
     llm = _FlakyLLM(fail_for=1, responses=[], ri_responses=[MockResponse(text="")] * 3)

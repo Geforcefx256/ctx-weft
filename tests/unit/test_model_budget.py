@@ -40,7 +40,7 @@ async def test_switch_updates_next_dispatch_budget_without_mutating_running_snap
         "large": _Client(context_limit=200_000, output_reserve=8192),
         "small": _Client(context_limit=16_000, output_reserve=2000),
     }
-    registry = _reg(lambda account, model: clients[model])
+    registry = _reg(lambda account, model, **_context: clients[model])
     agent, _ = await registry.instantiate(
         template_id=TPL, session_id="s1", tenant_id="default", llm=ModelChoice(model="large")
     )
@@ -62,7 +62,7 @@ async def test_switch_updates_next_dispatch_budget_without_mutating_running_snap
 @pytest.mark.asyncio
 async def test_agents_in_same_session_have_independent_budgets():
     registry = _reg(
-        lambda account, model: _Client(
+        lambda account, model, **_context: _Client(
             context_limit=100_000 if model == "a" else 20_000, output_reserve=1000
         )
     )

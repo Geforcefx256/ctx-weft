@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """A saved foreground decision must remain cancellable through public recovery."""
 
 import asyncio
@@ -69,7 +71,7 @@ async def test_cancel_saved_foreground_decision_via_public_recovery(tmp_path, mo
             rt.event_bus.subscribe(None, at_run_boundary)
             tm = None
             try:
-                await rt.recover_agent(agent_id, session_id=session_id)
+                await recover_fixture_session(rt, agent_id, session_id=session_id)
                 tm = rt._task_managers[session_id]
                 if phase == "immediate":
                     acks.append(await rt.cancel_agent(agent_id))
@@ -94,12 +96,12 @@ async def test_cancel_saved_foreground_decision_via_public_recovery(tmp_path, mo
                               and r.position > canceled.position]
                 assert canceled.position < finalized.position < applied.position
                 await rt.cancel_agent(agent_id)
-                await rt.recover_agent(agent_id, session_id=session_id)
+                await recover_fixture_session(rt, agent_id, session_id=session_id)
                 await _drained(tm)
                 # Rebuild and recover once more to cover durable cancellation.
                 again = _runtime(llm, memory, store)
                 await initialize_all(again)
-                await again.recover_agent(agent_id, session_id=session_id)
+                await recover_fixture_session(again, agent_id, session_id=session_id)
                 await _drained(again._task_managers[session_id])
                 assert again._task_managers[session_id].get_task(task_id).status == "CANCELED"
                 assert not (await rebuild_view(store, session_id)).pending_observe

@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """Queued cancellation retries survive missing receipts and repeated process crashes."""
 
 import asyncio
@@ -15,7 +17,6 @@ from tests._initialization import initialize_all
 from tests._snapshot_helpers import seed_snapshot
 from tests.integration._queued_session_cancel_worker import SID, drain, runtime
 
-pytestmark = pytest.mark.asyncio
 WORKER = Path(__file__).with_name("_queued_session_cancel_worker.py")
 
 
@@ -41,6 +42,7 @@ async def content(memory, tasks):
     return sorted(result)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot", [False, True])
 @pytest.mark.parametrize("fault", ["none", "failed", "unknown", "unknown_retries", "failed_crash", "unknown_crash",
                                     "terminated", "canceled", "finalized", "recovery_canceled", "recovery_finalized"])
@@ -61,7 +63,7 @@ async def test_queued_session_cancel_recovers(tmp_path, snapshot, fault):
             await initialize_all(rt)
             await rt.rebuild_session(SID, strict=True)
             # Recover the terminated agent, without reissuing cancel_session.
-            await rt.recover_agent(owner, session_id=SID)
+            await recover_fixture_session(rt, owner, session_id=SID)
             await drain(rt)
             view = await rebuild_view(store, SID)
             assert not view.open_runs and not view.pending_observe and not view.hitl.pending
@@ -89,7 +91,7 @@ async def test_queued_session_cancel_recovers(tmp_path, snapshot, fault):
             rt2, llm2 = runtime(store, memory, recovering=True)
             await initialize_all(rt2)
             await rt2.rebuild_session(SID, strict=True)
-            await rt2.recover_agent(owner, session_id=SID)
+            await recover_fixture_session(rt2, owner, session_id=SID)
             await drain(rt2)
             assert await store.committed_head(SID) == head
             assert await content(memory, history.tasks.values()) == before

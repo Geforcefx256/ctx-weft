@@ -14,9 +14,9 @@ from tests._snapshot_helpers import seed_snapshot
 from tests.integration._session_cancel_worker import runtime, wait_until
 from tests.integration.test_pause_on_first_message_e2e import _NamesTasksLLM
 
-pytestmark = pytest.mark.asyncio
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot_phase", ["none", "before_followup", "after_followup"])
 async def test_followup_metadata_survives_cold_recovery(tmp_path, snapshot_phase):
     sid = "followup-metadata"
@@ -57,7 +57,7 @@ async def test_followup_metadata_survives_cold_recovery(tmp_path, snapshot_phase
             assert llm.sidecar_calls == 2
             hot = (await rt.get_task(sid, second.task_id)).data
             assert hot.title == "Task 2" and hot.description == "Goal 2"
-            assert (await rt.get_session(sid)).data.goal == "Session goal 2"
+            assert (await rt.get_session(sid)).data.state.goal == "Session goal 2"
 
             events = await all_events(store, sid)
             created = next(e for e in events
@@ -79,7 +79,7 @@ async def test_followup_metadata_survives_cold_recovery(tmp_path, snapshot_phase
             rt = runtime(store, memory, cold_llm, recovering=True)
             cold = (await rt.get_task(sid, second.task_id)).data
             assert cold.title == hot.title and cold.description == hot.description
-            assert (await rt.get_session(sid)).data.goal == "Session goal 2"
+            assert (await rt.get_session(sid)).data.state.goal == "Session goal 2"
             await initialize_all(rt)
             await rt.rebuild_session(sid, strict=True)
             restored = rt._task_managers[sid].get_task(second.task_id)
@@ -87,7 +87,7 @@ async def test_followup_metadata_survives_cold_recovery(tmp_path, snapshot_phase
             assert restored.user_prompt == "Second request"
             assert restored.status == "AWAITING_HUMAN"
             assert (await rt.get_task(sid, second.task_id)).data.title == hot.title
-            assert (await rt.get_session(sid)).data.goal == "Session goal 2"
+            assert (await rt.get_session(sid)).data.state.goal == "Session goal 2"
             assert (await rt.get_task(sid, first.task_id)).data.title == "Task 1"
             replayed = reduce_events(await all_events(store, sid), sid)
             rebuilt = await rebuild_view(store, sid)

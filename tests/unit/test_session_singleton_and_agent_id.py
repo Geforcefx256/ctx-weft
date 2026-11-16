@@ -12,6 +12,8 @@
 """
 from __future__ import annotations
 
+from tests._recovery import recover_fixture_session
+
 import asyncio
 
 import pytest
@@ -46,7 +48,6 @@ from tests.integration.test_send_message_after_session_done import (
 )
 from tests.unit._stub_runner import StubRunner
 
-pytestmark = pytest.mark.asyncio
 
 
 def _task(tid: str, status: str, **kw) -> Task:
@@ -82,6 +83,7 @@ async def _run_first_round(rt) -> tuple[str, str, str]:
 # ── TaskManager.requeue_resumable：/resume 在活 owner 上就地重排 ───────────────
 
 
+@pytest.mark.asyncio
 async def test_requeue_resumable_picks_exactly_what_restore_would():
     tm = TaskManager("s1", event_bus=InProcessEventBus(), max_concurrent=1)
     for t in (
@@ -139,6 +141,7 @@ def _live_owner(rt, ran: list[str]) -> TaskManager:
     return tm
 
 
+@pytest.mark.asyncio
 async def test_resume_on_a_live_owner_requeues_in_place_without_rebuilding(monkeypatch):
     rt = make_runtime(llm=MockLLMAdapter(responses=[]),
                       agent_provider=InlineAgentTemplateProvider())
@@ -156,11 +159,11 @@ async def test_resume_on_a_live_owner_requeues_in_place_without_rebuilding(monke
     tm = _live_owner(rt, ran)
 
     await initialize_all(rt)
-    await rt.recover_agent("agt")                 # /resume：不带 resumed_task_id
+    await recover_fixture_session(rt, "agt")                 # /resume：不带 resumed_task_id
     for _ in range(10):
         await asyncio.sleep(0)
     await initialize_all(rt)
-    await rt.recover_agent("agt")                 # 再按一次：幂等
+    await recover_fixture_session(rt, "agt")                 # 再按一次：幂等
     for _ in range(10):
         await asyncio.sleep(0)
 
@@ -169,6 +172,7 @@ async def test_resume_on_a_live_owner_requeues_in_place_without_rebuilding(monke
     assert ran == ["tsk_A"], "INTERRUPTED 的 task 应在活 owner 上就地重跑，且只跑一次"
 
 
+@pytest.mark.asyncio
 async def test_cold_answer_for_a_task_the_live_owner_does_not_hold_is_refused():
     """活 owner 持有本 session 的全部 task；不持有 = 不变量破了——抛，而不是另建一个
     TM 去兜（另建正是单例要消灭的东西）。"""
@@ -179,7 +183,7 @@ async def test_cold_answer_for_a_task_the_live_owner_does_not_hold_is_refused():
 
     with pytest.raises(RuntimeError, match="does not own task"):
         await initialize_all(rt)
-        await rt.recover_agent("agt", resumed_task_id="tsk_unknown")
+        await recover_fixture_session(rt, "agt", resumed_task_id="tsk_unknown")
     assert rt._task_managers["ses_1"] is tm
     assert not tm.recovery_pending, "拒绝未知 task 后不能遗留会话级派发屏障"
 
@@ -187,6 +191,7 @@ async def test_cold_answer_for_a_task_the_live_owner_does_not_hold_is_refused():
 # ── start_session ─────────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_start_session_refuses_to_create_a_session_id_that_already_exists():
     rt = _echo_runtime()
     sid, _aid, _first = await _run_first_round(rt)
@@ -205,6 +210,7 @@ async def test_start_session_refuses_to_create_a_session_id_that_already_exists(
     assert len(created) == 1, "入口即拒：不得落第二条 SESSION_CREATED"
 
 
+@pytest.mark.asyncio
 async def test_start_session_resume_pushes_into_the_live_task_manager():
     rt = _echo_runtime()
     sid, aid, first = await _run_first_round(rt)
@@ -227,6 +233,7 @@ async def test_start_session_resume_pushes_into_the_live_task_manager():
     await _wait_until(_second_done)
 
 
+@pytest.mark.asyncio
 async def test_start_session_resume_sees_unfinished_work_that_is_only_in_memory():
     """未提交窗口里的 task 还没落盘，事件视图看不见——活 owner 的内存要一并参与判定。"""
     rt = _echo_runtime()
@@ -246,6 +253,7 @@ async def test_start_session_resume_sees_unfinished_work_that_is_only_in_memory(
 # ── run_single_task ───────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_run_single_task_refuses_a_session_that_already_has_an_owner():
     rt = _echo_runtime(MockLLMAdapter(responses=[MockResponse(text="hi")]))
     rt._task_managers["ses_owned"] = TaskManager("ses_owned", event_bus=rt.event_bus)
@@ -256,6 +264,7 @@ async def test_run_single_task_refuses_a_session_that_already_has_an_owner():
             session_id="ses_owned", template_id="agent:tpl_echo", user_prompt="hi")
 
 
+@pytest.mark.asyncio
 async def test_run_single_task_owns_the_session_only_while_it_runs(monkeypatch):
     from ctx_weft.core.runtime import CtxWeftRuntime
 
@@ -289,9 +298,10 @@ def _alm() -> AgentLifecycleManager:
             pass
 
     return AgentLifecycleManager(template_lookup=None, event_bus=_Bus(),
-                                 model_resolver=lambda a, m: None)
+                                 model_resolver=lambda a, m, **_context: None)
 
 
+@pytest.mark.asyncio
 async def test_load_refuses_an_agent_id_owned_by_another_session():
     reg = _alm()
     await reg.load({"a1": AgentView(id="a1")}, session_id="s1", tenant_id="default")
@@ -304,6 +314,7 @@ async def test_load_refuses_an_agent_id_owned_by_another_session():
     assert not reg.has("a2"), "整批拒绝：检查先于任何改动"
 
 
+@pytest.mark.asyncio
 async def test_load_reloading_the_same_session_is_still_idempotent():
     reg = _alm()
     views = {"a1": AgentView(id="a1")}
@@ -312,6 +323,7 @@ async def test_load_reloading_the_same_session_is_still_idempotent():
     assert reg.record_of("a1").session_id == "s1"
 
 
+@pytest.mark.asyncio
 async def test_load_replaces_a_fallback_placeholder_from_another_session():
     """`materialize` 撞上还没装填的 id 会就地补一条占位；真记录随后装填时要能覆盖它
     ——占位不代表已确认的归属，不参与唯一性判定。

@@ -1,4 +1,4 @@
-from ctx_weft.core.utils.content import content_to_text, content_with_prefix, content_with_suffix
+from ctx_weft.protocols.content import content_to_text, content_with_prefix, content_with_suffix
 from ctx_weft.protocols import ImagePart, TextPart
 
 
@@ -71,5 +71,5 @@ def test_empty_list_yields_single_text_part():
 # ── re-export ────────────────────────────────────────────────────────────
 
 def test_content_to_text_reexported():
-    from ctx_weft.core.utils.content import content_to_text as util_impl
+    from ctx_weft.protocols.content import content_to_text as util_impl
     assert content_to_text is util_impl

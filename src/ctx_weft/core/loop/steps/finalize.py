@@ -22,7 +22,8 @@ from ctx_weft.core.loop.task_memory_fold import (
 )
 from ctx_weft.protocols.events import EventType
 from ctx_weft.core.orchestrator.task.disposition import RunOutcome, RunOutcomeKind
-from ctx_weft.core.utils.content import content_to_text, image_tokens
+from ctx_weft.core.utils.content import image_tokens
+from ctx_weft.protocols.content import content_to_text
 from ctx_weft.core.utils.clock import as_utc, now_utc
 from ctx_weft.core.utils.ids import generate_id
 from ctx_weft.core.utils.task_ref import task_ref
@@ -626,6 +627,7 @@ def task_finalized_event(state, task, *, outcome: str):
         state, EventType.TASK_FINALIZED,
         payload={
             "task_id": task.id,
+            "finished_at": task.finished_at.isoformat() if task.finished_at else None,
             **({"reason": "user_topic_switch"} if getattr(task, "switch_requested", False) else {}),
             "outcome": outcome,
             "outputs": {

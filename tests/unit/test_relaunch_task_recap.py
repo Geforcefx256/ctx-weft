@@ -18,7 +18,6 @@ from ctx_weft.protocols import MemoryEvent, MemoryEventType, MemoryAddress, Prov
 from ctx_weft.protocols.capability import qualify
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 
-pytestmark = pytest.mark.asyncio
 
 
 class _Client:
@@ -97,6 +96,7 @@ def minimal_runtime_with_session():
     return runtime, session, template, task_manager, task, agent_id, memory
 
 
+@pytest.mark.asyncio
 async def test_relaunch_does_not_reinfer_finish_policy(minimal_runtime_with_session, monkeypatch):
     """close 边界重跑：从 memory 读到 finish 对 tool_call_id 后 register_close_synth，并以该 boundary 重跑。"""
     runtime, session, template, task_manager, task, agent_id, memory = minimal_runtime_with_session
@@ -135,6 +135,7 @@ async def test_relaunch_does_not_reinfer_finish_policy(minimal_runtime_with_sess
     assert launched["boundary"] == "finish"
 
 
+@pytest.mark.asyncio
 async def test_relaunch_is_best_effort_swallows_errors(minimal_runtime_with_session, monkeypatch):
     """任何一步失败：不得抛出，只记日志跳过（best-effort）。"""
     runtime, session, template, task_manager, task, agent_id, memory = minimal_runtime_with_session
@@ -150,6 +151,7 @@ async def test_relaunch_is_best_effort_swallows_errors(minimal_runtime_with_sess
     )  # 不应抛出
 
 
+@pytest.mark.asyncio
 async def test_find_finish_pair_tool_call_id_found_and_none():
     _, session, _, _, task, agent_id, memory = _make_runtime_and_session()
     scope = MemoryAddress(session_id=session.id, task_id=task.id, agent_id=agent_id)
@@ -162,6 +164,7 @@ async def test_find_finish_pair_tool_call_id_found_and_none():
     assert target[1] == tcid
 
 
+@pytest.mark.asyncio
 async def test_relaunch_dispatch_boundary_no_close_synth(minimal_runtime_with_session, monkeypatch):
     """非 close 边界（dispatch，spec 2026-07-16）重跑：按原 boundary 重跑、
     不 register_close_synth（那是 close 边界替换占位 finish 对的专属动作）。"""

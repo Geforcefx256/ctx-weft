@@ -1,3 +1,4 @@
+
 """Real runtime worker; terminate only after a selected SQLite commit succeeds."""
 
 import asyncio
@@ -8,6 +9,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
+
+from tests._recovery import recover_fixture_session
 
 from tests._initialization import initialize_all
 from ctx_weft import SessionStartParams
@@ -321,7 +324,7 @@ async def worker(directory, mode, cut, recovering=False):
                 if mode == "background_continue":
                     llm.actor_count = llm.judgements = 1
                 session = await rt.get_session("crash-session")
-                await rt.recover_agent(session.data.root_agent_id, session_id="crash-session")
+                await recover_fixture_session(rt, session.data.root_agent_id, session_id="crash-session")
                 tm = rt._task_managers.get("crash-session")
                 while tm and tm._background_asyncio_tasks:
                     await asyncio.gather(*list(tm._background_asyncio_tasks))

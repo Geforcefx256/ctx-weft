@@ -14,7 +14,6 @@ from tests.integration.test_minimal_loop import (
     make_echo_template,
 )
 
-pytestmark = pytest.mark.asyncio
 
 TPL = "agent:tpl_echo"
 
@@ -43,18 +42,20 @@ def _lm() -> AgentLifecycleManager:
     lm = AgentLifecycleManager(
         template_lookup=TemplateLookup(providers=providers),
         event_bus=_Bus(),
-        model_resolver=lambda a, m: _Client(),
+        model_resolver=lambda a, m, **_context: _Client(),
     )
     lm.register_session("s1", tenant_id="default")
     return lm
 
 
+@pytest.mark.asyncio
 async def test_instantiate_has_no_existing_agent_id_param():
     import inspect
     sig = inspect.signature(AgentLifecycleManager.instantiate)
     assert "existing_agent_id" not in sig.parameters
 
 
+@pytest.mark.asyncio
 async def test_materialize_carries_template_config():
     lm = _lm()
     agent, tmpl = await lm.instantiate(
@@ -79,6 +80,7 @@ async def test_materialize_carries_template_config():
     assert not hasattr(got.loop_guard, "reserved_output_tokens")
 
 
+@pytest.mark.asyncio
 async def test_materialize_is_a_fresh_object_each_call():
     """Agent 带一次 run 的可变量（loop_guard.context_tokens 由 act.py 改写），
     所以每次派发产出新实例是正确的，不是浪费。"""
@@ -92,6 +94,7 @@ async def test_materialize_is_a_fresh_object_each_call():
     assert a is not b
 
 
+@pytest.mark.asyncio
 async def test_materialize_unknown_id_falls_back_and_never_raises(caplog):
     """恢复期缺口降级，不抛 —— 与 agents_from_projection 的既有口径一致。
 
@@ -109,6 +112,7 @@ async def test_materialize_unknown_id_falls_back_and_never_raises(caplog):
     assert lm.has("agt_never_seen")  # 就地补登记，第二次不再警告
 
 
+@pytest.mark.asyncio
 async def test_materialize_honours_the_given_session_not_the_most_recent_one():
     """撞上未登记 id 时按**调用方给的** session 归属，不是「最近一次 register_session」。
 
@@ -136,6 +140,7 @@ async def test_materialize_honours_the_given_session_not_the_most_recent_one():
     assert (rec.session_id, rec.tenant_id) == ("s_older", "tenant-older")
 
 
+@pytest.mark.asyncio
 async def test_materialize_requires_the_session_context():
     """`session_id` / `tenant_id` 必传——漏传要在签名层被挡住，而不是让 registry 去猜。
 
@@ -151,6 +156,7 @@ async def test_materialize_requires_the_session_context():
         assert params[name].kind is inspect.Parameter.KEYWORD_ONLY
 
 
+@pytest.mark.asyncio
 async def test_unregistered_session_still_honours_the_given_tenant():
     """连 session 都没登记过（更深的恢复缺口）：tenant 仍用调用方给的，模板留空。"""
     lm = _lm()

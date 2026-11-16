@@ -41,7 +41,6 @@ from tests._event_helpers import append_one
 #: `replay` 一起在 2026-09-21 搬进 core：一个只由必需读原语组合而成的算法，属于调用方。
 _REPLAY_BATCH = REPLAY_BATCH
 
-pytestmark = pytest.mark.asyncio
 
 _T0 = datetime(2026, 9, 20, tzinfo=UTC)
 _SID = "s_long"
@@ -105,6 +104,7 @@ async def _seed(store: InMemoryEventStore, n_noise: int) -> None:
 # ── 1. 段 recap 折叠：按类型收窄，不碰全量 ──────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_typed_read_does_not_touch_the_full_stream() -> None:
     """收窄入口本身：给它一个类型集，它只发一次类型查询、不碰全量。
 
@@ -124,6 +124,7 @@ async def test_typed_read_does_not_touch_the_full_stream() -> None:
     assert got == [], "503 条噪音里没有 HITL 事件，收窄就该一条都不取回"
 
 
+@pytest.mark.asyncio
 async def test_recap_fold_lives_in_the_projection_not_in_a_query() -> None:
     """段 recap 的账只有一处折叠实现，且在 `_apply` 里（进投影）。
 
@@ -148,6 +149,7 @@ async def test_recap_fold_lives_in_the_projection_not_in_a_query() -> None:
 # ── 2. 快照不可用时的全量重放：按 position 区间分批 ─────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_full_replay_is_batched_by_position_range() -> None:
     """无可用快照时由 store 分多批产出，**一次全量读都不发**。
 
@@ -171,6 +173,7 @@ async def test_full_replay_is_batched_by_position_range() -> None:
     assert view.session_id == _SID
 
 
+@pytest.mark.asyncio
 async def test_batched_replay_equals_one_shot_replay() -> None:
     """分批与整批**逐字段等价**——重放是左折叠、可结合，这条是那个论证的可执行版本。
 
@@ -193,6 +196,7 @@ async def test_batched_replay_equals_one_shot_replay() -> None:
     assert batched.task_status == one_shot.task_status
 
 
+@pytest.mark.asyncio
 async def test_replay_of_an_empty_session_does_not_query_at_all() -> None:
     """空会话（head == 0）：一个区间查询都不该发。"""
     store = _CountingStore()

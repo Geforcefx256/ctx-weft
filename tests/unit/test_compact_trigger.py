@@ -19,7 +19,6 @@ from ctx_weft.core.loop.steps.prepare import PrepareStep
 from ctx_weft.protocols import MemoryEventType
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 
-pytestmark = pytest.mark.asyncio
 T = MemoryEventType
 
 
@@ -46,12 +45,14 @@ def _state(*, ratio=0.8, context_limit=100000):
     return SimpleNamespace(agent=agent, scope=_scope(), resolved_model=model_snapshot(context_limit=context_limit))
 
 
+@pytest.mark.asyncio
 async def test_below_ratio_no_trigger() -> None:
     """token 比率不足 → 不触发（消息条数已废，无论条数多少都不参与判断）。"""
     mem = InMemoryMemoryProvider()
     assert await PrepareStep()._should_compact(_state(), _ctx(mem), token_estimate=10) is False
 
 
+@pytest.mark.asyncio
 async def test_token_ratio_still_triggers() -> None:
     """token 比例达阈值 → 触发。"""
     mem = InMemoryMemoryProvider()

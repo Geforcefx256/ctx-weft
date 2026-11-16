@@ -8,7 +8,6 @@ from ctx_weft.protocols import LLMCallError, LLMRequest
 from ctx_weft.providers.llm.adapters.anthropic import AnthropicAdapter
 from ctx_weft.providers.llm.adapters.openai_compatible import OpenAICompatibleAdapter
 
-pytestmark = pytest.mark.asyncio
 
 
 def _anthropic_adapter(handler):
@@ -90,6 +89,7 @@ class _OpenAIMidFlightClient:
 
 # ---------- Anthropic ----------
 
+@pytest.mark.asyncio
 async def test_503_is_outage():
     def handler(request):
         return httpx.Response(503, headers={"retry-after": "7"}, text="overloaded")
@@ -100,6 +100,7 @@ async def test_503_is_outage():
     assert ei.value.retry_after_sec == 7.0
 
 
+@pytest.mark.asyncio
 async def test_429_is_outage():
     def handler(request):
         return httpx.Response(429, text="rate limited")
@@ -109,6 +110,7 @@ async def test_429_is_outage():
     assert ei.value.retriable is True
 
 
+@pytest.mark.asyncio
 async def test_401_is_not_outage_and_not_retriable():
     def handler(request):
         return httpx.Response(401, text="bad key")
@@ -118,6 +120,7 @@ async def test_401_is_not_outage_and_not_retriable():
     assert ei.value.outage is False
 
 
+@pytest.mark.asyncio
 async def test_anthropic_mid_flight_transport_is_outage():
     """Transport error after first chunk is emitted → retriable outage (no inline retry)."""
     a = AnthropicAdapter(api_key="k")
@@ -130,6 +133,7 @@ async def test_anthropic_mid_flight_transport_is_outage():
     assert ei.value.outage is True
 
 
+@pytest.mark.asyncio
 async def test_bad_retry_after_header_gives_none():
     """Malformed retry-after header on 503 → retry_after_sec is None, outage is True."""
     def handler(request):
@@ -142,6 +146,7 @@ async def test_bad_retry_after_header_gives_none():
 
 # ---------- OpenAI (mirror) ----------
 
+@pytest.mark.asyncio
 async def test_openai_503_is_outage():
     def handler(request):
         return httpx.Response(503, headers={"retry-after": "5"}, text="overloaded")
@@ -152,6 +157,7 @@ async def test_openai_503_is_outage():
     assert ei.value.retry_after_sec == 5.0
 
 
+@pytest.mark.asyncio
 async def test_openai_429_is_outage():
     """OpenAI 429 → retriable outage, mirrors Anthropic 429 test."""
     def handler(request):
@@ -162,6 +168,7 @@ async def test_openai_429_is_outage():
     assert ei.value.retriable is True
 
 
+@pytest.mark.asyncio
 async def test_openai_401_is_not_outage_and_not_retriable():
     def handler(request):
         return httpx.Response(401, text="bad key")
@@ -171,6 +178,7 @@ async def test_openai_401_is_not_outage_and_not_retriable():
     assert ei.value.outage is False
 
 
+@pytest.mark.asyncio
 async def test_openai_mid_flight_transport_is_outage():
     """OpenAI transport error after first chunk is emitted → retriable outage."""
     a = OpenAICompatibleAdapter(api_key="k")

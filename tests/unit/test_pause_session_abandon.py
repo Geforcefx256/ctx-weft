@@ -13,7 +13,6 @@ from ctx_weft.providers.llm.adapters.mock import MockLLMAdapter
 from tests._initialization import initialize_all
 from tests.integration.test_minimal_loop import InlineAgentTemplateProvider, make_runtime
 
-pytestmark = pytest.mark.asyncio
 
 
 class _StubRunner:
@@ -47,6 +46,7 @@ def _wire(rt) -> tuple[TaskManager, Session]:
     return tm, sess
 
 
+@pytest.mark.asyncio
 async def test_pause_session_partitions_root_run_vs_rest():
     rt = _rt()
     tm, sess = _wire(rt)
@@ -72,6 +72,7 @@ async def test_pause_session_partitions_root_run_vs_rest():
     assert not hasattr(sess, "status")
 
 
+@pytest.mark.asyncio
 async def test_pause_session_inflight_root_run_claims_resume_point():
     # 在途 root run 被 pause → 名额已认领：闩锁窗口内此后派发的 root scope 任务（如
     # 子任务死光被 _try_resume_parent 重排的 SUSPENDED root 任务）born-cancel，不出第二气泡。
@@ -90,6 +91,7 @@ async def test_pause_session_inflight_root_run_claims_resume_point():
     assert late.pause.is_paused is False
 
 
+@pytest.mark.asyncio
 async def test_pause_session_unknown_task_runs_are_cancelled():
     # 旧 TM inflight：registry 在册但当前 TM 的 _running_agents 不认识 → 按"非 root 那一轮"cancel
     rt = _rt()
@@ -104,6 +106,7 @@ async def test_pause_session_unknown_task_runs_are_cancelled():
     assert stale.cancel.is_cancelled is True
 
 
+@pytest.mark.asyncio
 async def test_pause_session_idle_session_is_noop_false():
     rt = _rt()
     _wire(rt)   # TM 存在但无在跑、无排队 → is_done
@@ -156,6 +159,7 @@ async def _run_execute(rt, runner, *, agent_id):
     return captured
 
 
+@pytest.mark.asyncio
 async def test_execute_born_cancel_when_tm_cancelled():
     # TM 已整体取消（cancel_all 置 _cancelled）→ 之后经 execute 派发的 run 出生即取消
     rt = _rt()
@@ -164,6 +168,7 @@ async def test_execute_born_cancel_when_tm_cancelled():
     assert cap["cancel"].is_cancelled is True
 
 
+@pytest.mark.asyncio
 async def test_execute_born_cancel_for_non_root_run_during_pause():
     # _pausing 中、派发 agent 非 root → 弃子窗口内的迟到 run born-cancel（不额外 park 第二气泡）。
     # M-1：且**不得** born-pause——act 检查点 pause 先于 cancel，双信号会让多级委派中被
@@ -176,6 +181,7 @@ async def test_execute_born_cancel_for_non_root_run_during_pause():
     assert cap["pause"].is_paused is False
 
 
+@pytest.mark.asyncio
 async def test_execute_root_run_stays_born_paused_during_pause():
     # _pausing 中、派发 agent == root → 保持 born-paused（补偿逻辑不得把它 cancel）
     rt = _rt()
@@ -189,6 +195,7 @@ async def test_execute_root_run_stays_born_paused_during_pause():
 # ── I-2（runtime 级）：pause 恰逢 root 任务已入队未派发 → 保留、不随全清取消 ───────────
 
 
+@pytest.mark.asyncio
 async def test_pause_session_keeps_queued_root_task():
     rt = _rt()
     tm = TaskManager(session_id="s1", max_concurrent=1)
@@ -216,6 +223,7 @@ async def test_pause_session_keeps_queued_root_task():
     assert sub_tokens.cancel.is_cancelled is True
 
 
+@pytest.mark.asyncio
 async def test_pause_task_targets_single_run():
     # 定向暂停单个在途 task，其他 task 不受影响；task 不在跑→False
     # `_pause_task` 是内部原语（`pause_agent`/`pause_session` 仅有的两个调用方），

@@ -22,7 +22,6 @@ from tests.integration.test_minimal_loop import (
     make_echo_template,
 )
 
-pytestmark = pytest.mark.asyncio
 
 TPL = "agent:tpl_echo"
 
@@ -50,10 +49,11 @@ def _make_registry(bus) -> AgentLifecycleManager:
         template_lookup=TemplateLookup(providers),
         event_bus=bus,
         # 拿账号/模型现造一个 client——校验 resolve_model 真的把新 choice 传下去。
-        model_resolver=lambda account, model: _Client(account, model),
+        model_resolver=lambda account, model, **_context: _Client(account, model),
     )
 
 
+@pytest.mark.asyncio
 async def test_llm_switch_survives_a_full_replay_and_reload():
     """真实路径，不是手工捏造事件：instantiate → set_agent_llm → 重放 → load → resolve_model。"""
     origin_bus = _RecordingBus()
@@ -96,6 +96,7 @@ async def test_llm_switch_survives_a_full_replay_and_reload():
     assert fresh_bus.events == []  # Materialization must not replay durable facts onto the bus.
 
 
+@pytest.mark.asyncio
 async def test_session_llm_switch_also_survives_replay_for_every_agent():
     """`set_session_llm` 的 N 条事件在重放折叠后，每个 agent 都拿到新 choice。"""
     bus = _RecordingBus()

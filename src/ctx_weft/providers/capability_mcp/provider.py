@@ -32,7 +32,8 @@ from ctx_weft.protocols.capability import (
     ToolCapability,
     ToolCapabilityProvider,
 )
-from ctx_weft.protocols.context import ContentPart, ImagePart, ProviderContext, TextPart
+from ctx_weft.protocols.context import ProviderContext
+from ctx_weft.protocols.content import ContentPart, ImagePart, TextPart
 import httpx
 
 if TYPE_CHECKING:

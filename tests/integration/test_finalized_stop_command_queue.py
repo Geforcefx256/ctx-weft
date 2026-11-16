@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """A stop issued during finalization must never queue behind a public command."""
 
 import asyncio
@@ -64,7 +66,7 @@ async def test_stop_during_finalized_write_skips_public_command_queue(tmp_path, 
             monkeypatch.setattr(store, "append_batch", held_append)
             monkeypatch.setattr(rt, "_validate_and_normalize_content", held_normalize)
             rt.event_bus.subscribe(None, started)
-            await rt.recover_agent(agent, session_id=sid)
+            await recover_fixture_session(rt, agent, session_id=sid)
             tm = rt._task_managers[sid]
             try:
                 await asyncio.wait_for(write_entered.wait(), 5)

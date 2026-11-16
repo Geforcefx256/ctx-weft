@@ -28,7 +28,6 @@ from tests.integration.test_minimal_loop import (
 )
 from tests.runtime_helpers import close_runtime
 
-pytestmark = pytest.mark.asyncio
 
 SUB_TEMPLATE_ID = "tpl_researcher"
 SUB_TEMPLATE_REF = "agent__tpl_researcher"
@@ -128,6 +127,7 @@ async def _wait_until(predicate, timeout=5.0, interval=0.02):
     raise TimeoutError("condition not met within timeout")
 
 
+@pytest.mark.asyncio
 async def test_send_message_injects_into_suspended_parent_and_survives_child_wakeup(runtime_factory):
     llm = _GatedRouterLLM()
     runtime = runtime_factory(llm)
@@ -188,7 +188,7 @@ async def test_send_message_injects_into_suspended_parent_and_survives_child_wak
     #    不能被子任务完成的唤醒逻辑覆盖/丢弃。root 的第一次 act（delegate）里没有，
     #    子 agent 的 act 里也不该有（不同 task/agent scope）；只有 root 复跑那次
     #    act 的请求里应该有。
-    from ctx_weft.core.utils.content import content_to_text
+    from ctx_weft.protocols.content import content_to_text
 
     def _has_marker(req) -> bool:
         for m in req.messages:

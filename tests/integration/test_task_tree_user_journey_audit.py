@@ -20,7 +20,6 @@ from tests.integration.test_minimal_loop import (
 from tests.integration.test_send_message_after_session_done import _FinishEveryTaskLLM
 from tests.integration.test_user_journey_audit import assert_event_contract
 
-pytestmark = pytest.mark.asyncio
 SID = "whole-tree-journey"
 
 
@@ -51,6 +50,7 @@ class FinishingTreeLLM(TreeLLM):
         return super().complete(request, stream)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("fault", ["none", "before", "unknown"])
 @pytest.mark.parametrize("short", [False, True])
 async def test_cancel_tree_preserves_queued_work_and_child_agent_reuse(tmp_path, fault, short):

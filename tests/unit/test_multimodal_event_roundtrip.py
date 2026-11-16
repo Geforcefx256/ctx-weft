@@ -2,7 +2,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 
-from ctx_weft.core.utils.content import content_to_event_jsonable, content_to_jsonable
+from ctx_weft.protocols.content import content_to_event_jsonable, content_to_jsonable
 from ctx_weft.core.control.converters import task_from_projection
 from ctx_weft.core.control.reducers import reduce_events, serialize_view
 from ctx_weft.protocols.events import Event, EventType

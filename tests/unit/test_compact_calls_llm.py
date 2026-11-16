@@ -14,7 +14,6 @@ from ctx_weft.protocols import LLMChunk, LLMOutageError
 from ctx_weft.providers.llm.tokenizer import HeuristicTokenizer
 from tests.assembler_testkit import compiled_test_inputs, scripted_inputs
 
-pytestmark = pytest.mark.asyncio
 
 
 class _Assembler:
@@ -37,6 +36,7 @@ def _state_ctx():
     return state, ctx
 
 
+@pytest.mark.asyncio
 async def test_summarize_for_compact_returns_llm_text(monkeypatch):
     async def _ok(ctx, state, request, **kwargs):
         for t in ["sum", "mary"]:
@@ -49,6 +49,7 @@ async def test_summarize_for_compact_returns_llm_text(monkeypatch):
     assert out.degraded is True
 
 
+@pytest.mark.asyncio
 async def test_summarize_for_compact_propagates_outage(monkeypatch):
     async def _raise(ctx, state, request, **kwargs):
         raise LLMOutageError("self-heal exhausted")

@@ -22,7 +22,6 @@ from ctx_weft.protocols import MemoryAddress, MemoryEvent, MemoryEventType, Prov
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from tests.assembler_testkit import history_messages, recalled_blocks
 
-pytestmark = pytest.mark.asyncio
 
 T = MemoryEventType
 _BASE = datetime(2026, 1, 1, tzinfo=UTC)
@@ -67,6 +66,7 @@ async def _caps(mem, agent_scope):
 
 # ── task-resident：合成只写 finish 对、不镜像 body ────────────────────────────
 
+@pytest.mark.asyncio
 async def test_synthesize_writes_only_finish_pair():
     """task-resident：task 层有 UP/段摘要/LLM/TOOL 时，agent 层仍只写 finish 对（2 条）。
     body 不镜像、留 task 层。
@@ -99,6 +99,7 @@ async def test_synthesize_writes_only_finish_pair():
     assert len(body) == 4, "task-layer body must stay (not mirrored/superseded)"
 
 
+@pytest.mark.asyncio
 async def test_finish_pair_timestamp_anchors_close():
     """finish 对 timestamp 锚 close 时刻（now_utc），落在 task 层 body 之后。"""
     mem = InMemoryMemoryProvider()
@@ -123,6 +124,7 @@ async def test_finish_pair_timestamp_anchors_close():
 
 # ── finish 对的 tool_call_id 配对 ─────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_finish_pair_tool_call_id_matches():
     """finish 对：assistant.tool_calls[0].id == tool.tool_call_id。"""
     mem = InMemoryMemoryProvider()
@@ -140,6 +142,7 @@ async def test_finish_pair_tool_call_id_matches():
 
 # ── fail 结局在 tool content 里有 [outcome=fail] 前缀 ─────────────────────
 
+@pytest.mark.asyncio
 async def test_fail_outcome_prefix_in_tool_content():
     """outcome=fail 时 tool Process Report 内容带 [outcome=fail] 前缀。"""
     mem = InMemoryMemoryProvider()
@@ -181,6 +184,7 @@ def test_dispatch_ack_carries_no_child_payload():
 
 # ── finish 对 tool 槽标明归属 task（消灭匿名 finish）───────────────────────
 
+@pytest.mark.asyncio
 async def test_finish_tool_content_names_owning_task():
     """finish 对的 tool 槽带 `[task: '<title>' (<id>)]` 前缀标明归属。
 
@@ -200,6 +204,7 @@ async def test_finish_tool_content_names_owning_task():
     assert "综合总结" in tool_content
 
 
+@pytest.mark.asyncio
 async def test_finish_tool_content_names_task_before_fail_marker():
     """归属标记与 fail 标记共存，归属在前：`[task: 'X' (id)] [outcome=fail] …`。"""
     mem = InMemoryMemoryProvider()
@@ -215,6 +220,7 @@ async def test_finish_tool_content_names_task_before_fail_marker():
     )
 
 
+@pytest.mark.asyncio
 async def test_finish_tool_content_without_title_keeps_fail_marker():
     """title 为空（旧数据/未命名 task）→ 归属标记退化为裸 id，仍标明归属。
 
@@ -235,6 +241,7 @@ async def test_finish_tool_content_without_title_keeps_fail_marker():
     )
 
 
+@pytest.mark.asyncio
 async def test_adjacent_finish_pairs_are_distinguishable():
     """嵌套（孙→子）相邻 finish 对：两条 tool 槽各自标明归属，读者可区分谁收的尾。
 
@@ -259,6 +266,7 @@ async def test_adjacent_finish_pairs_are_distinguishable():
 
 # ── 无幸存 task 层记录时 finish 对仍写出 ─────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_no_task_records_still_writes_finish_pair():
     """task 层为空（清空或短 task 场景）时，仍写出 finish pair（2条）。"""
     mem = InMemoryMemoryProvider()
@@ -276,6 +284,7 @@ async def test_no_task_records_still_writes_finish_pair():
 
 # ── 回归：dict-list outputs 须正确提取进 blackboard mem_content（不得为空）─────────
 
+@pytest.mark.asyncio
 async def test_dict_list_outputs_extracted_in_memory_content():
     """回归：task.outputs=[{"type":"text","text":...}] 时，_build_memory_content 须提取文本
     （blackboard 汇报给 parent 的内容），不能为空（旧 content_to_text 返回 "" 的 bug）。
@@ -289,6 +298,7 @@ async def test_dict_list_outputs_extracted_in_memory_content():
     )
 
 
+@pytest.mark.asyncio
 async def test_embedded_process_report_in_outputs():
     """outputs 文本本身包含 "Process Report: " 时，必须用 full separator rsplit
     从最后一个分隔符切割，防止误切。
@@ -328,6 +338,7 @@ async def test_embedded_process_report_in_outputs():
 
 # ── 端到端相邻性守护：同 agent 派发对 + 子任务胶囊 ────────────────────────────
 
+@pytest.mark.asyncio
 async def test_e2e_same_agent_subtask_no_400() -> None:
     """Legacy synthetic calls become labels around the child capsule, preserving real tool legality."""
     pctx = _ctx()

@@ -1,8 +1,7 @@
 import json
 
-from ctx_weft.core.utils.content import (
-    content_from_jsonable, content_to_jsonable, redact_content_for_event,
-)
+from ctx_weft.core.utils.content import redact_content_for_event
+from ctx_weft.protocols.content import content_from_jsonable, content_to_jsonable
 from ctx_weft.protocols import ImagePart, TextPart
 
 

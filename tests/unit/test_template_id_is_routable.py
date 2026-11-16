@@ -72,7 +72,7 @@ class _SpyBus:
 
 def _mgr(lookup) -> AgentLifecycleManager:
     return AgentLifecycleManager(template_lookup=lookup, event_bus=_SpyBus(),
-                                 model_resolver=lambda a, m: None)
+                                 model_resolver=lambda a, m, **_context: None)
 
 
 def _alm(providers: list) -> AgentLifecycleManager:

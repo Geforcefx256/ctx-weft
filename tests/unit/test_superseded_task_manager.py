@@ -12,6 +12,8 @@
 """
 from __future__ import annotations
 
+from tests._recovery import recover_fixture_session
+
 import asyncio
 from datetime import datetime, timezone
 
@@ -29,7 +31,6 @@ from tests._initialization import initialize_all
 from tests.integration.test_minimal_loop import InlineAgentTemplateProvider, make_runtime
 from tests.unit._stub_runner import StubRunner
 
-pytestmark = pytest.mark.asyncio
 
 
 async def _noop_runner(_sid, _tid):
@@ -55,6 +56,7 @@ def _tm(bus: InProcessEventBus) -> TaskManager:
     return tm
 
 
+@pytest.mark.asyncio
 async def test_superseded_tm_skips_finish_when_replaced_during_gather() -> None:
     """顶替发生在 `_fire_session_done` 的 gather 期间：旧 TM 恢复后必须发现自己已非
     owner，no-op（不触发 `on_session_done` → 不会误 `_release_session` 掉新 TM）。
@@ -94,6 +96,7 @@ async def test_superseded_tm_skips_finish_when_replaced_during_gather() -> None:
     assert done_called == [], "被顶替的旧 TM 不应触发终结回调（_release_session）"
 
 
+@pytest.mark.asyncio
 async def test_current_tm_still_fires_session_finished() -> None:
     """对照：current TM（未被顶替）的 `_fire_session_done` 照常触发终结回调。
 
@@ -139,6 +142,7 @@ async def test_current_tm_still_fires_session_finished() -> None:
 # `test_current_tm_still_fires_session_finished` 继续覆盖。
 
 
+@pytest.mark.asyncio
 async def test_register_and_drain_refuses_a_second_tm() -> None:
     """单例：session 已有活 owner 时，第二个 TM 登记不上——不覆盖、不顶替。
 
@@ -165,6 +169,7 @@ async def test_register_and_drain_refuses_a_second_tm() -> None:
     assert rt._task_managers["s1"] is tm_old
 
 
+@pytest.mark.asyncio
 async def test_evicted_tm_is_no_longer_current() -> None:
     """活 owner 不会被顶替；被逐出之后，为同一 session 新建的 TM 才能登记，旧的随之
     不再是 owner（它迟到的收尾因此变 no-op，见下面两条端到端用例）。"""
@@ -185,6 +190,7 @@ async def test_evicted_tm_is_no_longer_current() -> None:
     assert tm_new._hooks.is_current is not None and tm_new._hooks.is_current() is True
 
 
+@pytest.mark.asyncio
 async def test_superseded_tm_drain_does_not_dispatch() -> None:
     """被顶替的 TM（_is_current()==False）的 drain 不派发任何任务——防重叠 resume 下两套 drain。"""
     tm = _tm(InProcessEventBus())
@@ -203,6 +209,7 @@ async def test_superseded_tm_drain_does_not_dispatch() -> None:
     assert started == [], "被顶替的 TM 的 drain 不应派发任务"
 
 
+@pytest.mark.asyncio
 async def test_current_tm_drain_dispatches() -> None:
     """对照：current TM（_is_current()==True）的 drain 正常派发。"""
     tm = _tm(InProcessEventBus())
@@ -239,6 +246,7 @@ def _plant_agent(rt: CtxWeftRuntime, agent_id: str, session_id: str) -> None:
     )
 
 
+@pytest.mark.asyncio
 async def test_recover_agent_serialized_per_session(monkeypatch) -> None:
     """per-session resume 锁：同一 session 的两次并发 recover_agent 串行执行（不并发建两套 drain）。
 
@@ -250,19 +258,22 @@ async def test_recover_agent_serialized_per_session(monkeypatch) -> None:
     active = {"n": 0, "max": 0}
     gate = asyncio.Event()
 
-    async def fake_rebuild_view(_store, _sid):
+    async def fake_rebuild_view(_sid):
         active["n"] += 1
         active["max"] = max(active["max"], active["n"])
         await gate.wait()
         active["n"] -= 1
         raise RuntimeError("stop after gate")  # 短路 recover 余下步骤，释放锁
 
-    monkeypatch.setattr("ctx_weft.core.control.reducers.rebuild_view", fake_rebuild_view)
+    from unittest.mock import AsyncMock
+    monkeypatch.setattr(rt, "initialize", AsyncMock(return_value=None))
+    monkeypatch.setattr(rt, "_rebuild_session_locked", AsyncMock())
+    monkeypatch.setattr(rt, "_recover_session_locked", fake_rebuild_view)
 
     await initialize_all(rt)
-    t1 = asyncio.create_task(rt.recover_agent("a1"))
+    t1 = asyncio.create_task(rt.recover_session("s1"))
     await initialize_all(rt)
-    t2 = asyncio.create_task(rt.recover_agent("a1"))
+    t2 = asyncio.create_task(rt.recover_session("s1"))
     await asyncio.sleep(0.02)  # 两个都尝试进入锁
     assert active["max"] == 1, "per-session 锁应串行化两次 recover（峰值并发=1）"
     gate.set()
@@ -270,6 +281,7 @@ async def test_recover_agent_serialized_per_session(monkeypatch) -> None:
     assert all(isinstance(r, RuntimeError) for r in res)
 
 
+@pytest.mark.asyncio
 async def test_recover_agent_different_sessions_not_serialized(monkeypatch) -> None:
     """不同 session 之间不应被 resume 锁串行化（各自独立锁，可并发）。"""
     rt = make_runtime(llm=MockLLMAdapter(responses=[]),
@@ -279,25 +291,29 @@ async def test_recover_agent_different_sessions_not_serialized(monkeypatch) -> N
     active = {"n": 0, "max": 0}
     gate = asyncio.Event()
 
-    async def fake_rebuild_view(_store, _sid):
+    async def fake_rebuild_view(_sid):
         active["n"] += 1
         active["max"] = max(active["max"], active["n"])
         await gate.wait()
         active["n"] -= 1
         raise RuntimeError("stop after gate")
 
-    monkeypatch.setattr("ctx_weft.core.control.reducers.rebuild_view", fake_rebuild_view)
+    from unittest.mock import AsyncMock
+    monkeypatch.setattr(rt, "initialize", AsyncMock(return_value=None))
+    monkeypatch.setattr(rt, "_rebuild_session_locked", AsyncMock())
+    monkeypatch.setattr(rt, "_recover_session_locked", fake_rebuild_view)
 
     await initialize_all(rt)
-    t1 = asyncio.create_task(rt.recover_agent("aA"))
+    t1 = asyncio.create_task(rt.recover_session("sA"))
     await initialize_all(rt)
-    t2 = asyncio.create_task(rt.recover_agent("aB"))
+    t2 = asyncio.create_task(rt.recover_session("sB"))
     await asyncio.sleep(0.02)
     assert active["max"] == 2, "不同 session 的 recover 应能并发（峰值并发=2）"
     gate.set()
     await asyncio.gather(t1, t2, return_exceptions=True)
 
 
+@pytest.mark.asyncio
 async def test_slow_prior_turn_bg_observe_does_not_clobber_next_turn() -> None:
     """端到端复现：第 N 轮 finish_task 后其 background observe 拖久了，第 N+1 轮已在
     **同一个 TM** 上开跑（单例：下一轮复用活 owner）；第 N 轮迟到的收尾必须 no-op——
@@ -343,6 +359,7 @@ async def test_slow_prior_turn_bg_observe_does_not_clobber_next_turn() -> None:
     assert finished == [], "上一轮迟到的收尾不得发 SessionFinished"
 
 
+@pytest.mark.asyncio
 async def test_probe_prior_turn_finishing_after_supersession() -> None:
     """探针：强制让旧 TM 的 on_task_finished 在它被逐出、新 TM 接管**之后**才跑
     （forced ordering）。单例下「非 owner 的旧 TM」只可能这样出现。

@@ -1,3 +1,4 @@
+
 """Real task-tree cancellation across agents, including failures and crash recovery."""
 
 import asyncio
@@ -5,10 +6,12 @@ import os
 import sys
 from pathlib import Path
 
-from tests._initialization import initialize_all
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
+
+from tests._recovery import recover_fixture_session
+from tests._initialization import initialize_all
 
 from ctx_weft import SessionStartParams
 from ctx_weft.core.control.reducers import rebuild_view
@@ -138,7 +141,7 @@ async def worker(path, cut, recovering=False):
             memory.ingest = ingest
             await initialize_all(rt)
             if recovering:
-                await rt.recover_agent(root_agent, session_id="tree-session")
+                await recover_fixture_session(rt, root_agent, session_id="tree-session")
                 tm = rt._task_managers["tree-session"]
                 while tm._background_asyncio_tasks:
                     await asyncio.gather(*list(tm._background_asyncio_tasks))

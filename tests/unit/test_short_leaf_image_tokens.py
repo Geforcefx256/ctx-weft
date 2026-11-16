@@ -10,7 +10,6 @@ from ctx_weft.protocols import (
 from ctx_weft.providers.llm.tokenizer import HeuristicTokenizer
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 
-pytestmark = pytest.mark.asyncio
 
 _PCTX = ProviderContext(session_id="s1", tenant_id="default", task_id="t1", agent_id="a1")
 _SCOPE = MemoryAddress(session_id="s1", task_id="t1", agent_id="a1")
@@ -33,6 +32,7 @@ async def _seed(mem, contents):
             timestamp=_BASE + timedelta(seconds=i), role="assistant"), _PCTX)
 
 
+@pytest.mark.asyncio
 async def test_short_leaf_true_for_small_text():
     """纯文本短任务仍判 short——改造前行为不得漂移。"""
     mem = InMemoryMemoryProvider()
@@ -42,6 +42,7 @@ async def test_short_leaf_true_for_small_text():
     assert got is True
 
 
+@pytest.mark.asyncio
 async def test_short_leaf_false_when_images_exceed_threshold():
     """一张图 1600 token 已超阈值 400，不得因图算 0 而误判 short。"""
     mem = InMemoryMemoryProvider()

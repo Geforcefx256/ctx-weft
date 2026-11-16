@@ -25,8 +25,7 @@ from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.providers.events import InMemoryEventStore
 from tests._event_helpers import append_one
 from tests._initialization import initialize_all
-
-pytestmark = pytest.mark.asyncio
+from tests._recovery import load_pending_fixture
 
 _T0 = datetime(2026, 9, 20, tzinfo=UTC)
 _SID = "s_long"
@@ -139,7 +138,7 @@ async def test_rebuild_hitl_reads_no_hitl_query_at_all() -> None:
     await _seed(store, n_noise=200)
 
     await initialize_all(rt)
-    n = await rt.rebuild_hitl(_SID)
+    n = await load_pending_fixture(rt, _SID)
 
     assert n == 1, f"应装填那条仍未决的，实际 {n}"
     assert store.full_reads == 0, "不该读整条事件流"
@@ -251,3 +250,38 @@ def test_projection_version_was_bumped_for_this_field() -> None:
     from ctx_weft.core.control import reducers
 
     assert reducers._PROJECTION_VERSION >= 4
+
+
+@pytest.mark.parametrize("snapshot", ["none", "current", "old_compact"])
+async def test_startup_reads_only_live_request_sources(snapshot):
+    from ctx_weft.core.control.reducers import rebuild_view
+    from ctx_weft.core.control.session_queries import session_state_summary
+    from ctx_weft.core.control.startup_view import rebuild_startup_view
+    from tests._snapshot_helpers import seed_snapshot
+
+    store = _CountingStore()
+    await _seed(store, n_noise=40)
+    # A resolved request can become pending after the snapshot. Its display
+    # fields must come from that snapshot, without rereading its old answers.
+    await append_one(store, _opened(50, "h_retracted"))
+    await append_one(store, _ev(51, EventType.HITL_RESOLVED,
+                               hitl_id="h_retracted", outcome="accepted", message="private answer"))
+    if snapshot != "none":
+        full = await rebuild_view(store, _SID)
+        await seed_snapshot(store, _SID, full, cut=await store.committed_head(_SID),
+                            overrides={"startup_projection_version": 0} if snapshot == "old_compact" else None)
+    await append_one(store, _ev(52, EventType.HITL_REPLY_RETRACTED, hitl_id="h_retracted"))
+    await append_one(store, _opened(53, "h_tail", prompt="new request"))
+    head = await store.committed_head(_SID)
+    expected = (await rebuild_view(store, _SID, through_position=head)).hitl.pending
+    light = await rebuild_startup_view(store, _SID, through_position=head)
+    assert all(not req.prompt and not req.fields for req in light.hitl.opened.values())
+    store.ranges.clear()
+    store.typed_reads.clear()
+
+    summary = await session_state_summary(store, light, light.sessions[_SID], head)
+
+    assert summary.pending_hitl == tuple(req.to_view() for req in expected.values())
+    assert all(upper - lower == 1 and not typed for lower, upper, typed in store.ranges)
+    assert len(store.ranges) == len(set(light.hitl_source_positions[rid] for rid in expected))
+    assert not store.typed_reads

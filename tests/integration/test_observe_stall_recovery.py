@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """Public recovery of a foreground report must preserve its parked task."""
 
 import asyncio
@@ -35,7 +37,7 @@ async def test_recover_foreground_report_preserves_waiting_task_and_actor_slot(s
                 "completed_at": requested.timestamp.isoformat()}))
 
     try:
-        await rt.recover_agent(handle.agent_id, session_id=handle.session_id)
+        await recover_fixture_session(rt, handle.agent_id, session_id=handle.session_id)
         async with asyncio.timeout(2):
             while tm._background_asyncio_tasks or tm._dispatch_tasks:
                 await asyncio.sleep(0.01)

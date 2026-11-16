@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-import pytest
 
 from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
@@ -21,7 +20,6 @@ from tests._initialization import initialize_all
 from tests.integration.test_minimal_loop import InlineAgentTemplateProvider, make_runtime
 from tests.unit._legacy_recover import rebuild_all_active
 
-pytestmark = pytest.mark.asyncio
 
 _TS = datetime(2026, 6, 13, tzinfo=timezone.utc)
 
@@ -119,7 +117,7 @@ async def test_broadcast_carries_the_folded_status_not_a_default() -> None:
     await _seed_crashed_session(rt.event_store, "S1", "agt_root")
     await rebuild_all_active(rt)
     await initialize_all(rt)
-    assert (await rt.get_agent("agt_root")).data.status == "waiting_human"
+    assert (await rt.get_agent("agt_root")).data.state.status == "waiting_human"
 
 
 async def test_crashed_running_is_settled_to_interrupted_and_terminated_stays_silent() -> None:
@@ -165,7 +163,7 @@ async def test_crashed_running_is_settled_to_interrupted_and_terminated_stays_si
     assert running_events == [], (
         f"崩溃时在跑的 agent 该被判成 interrupted，实得: {running_events}")
     await initialize_all(rt)
-    assert (await rt.get_agent("agt_running")).data.status == "interrupted"
+    assert (await rt.get_agent("agt_running")).data.state.status == "interrupted"
 
     terminated_events = [e.type for e in seen if getattr(e, "agent_id", None) == "agt_terminated"]
     assert terminated_events == [], f"unexpected broadcast for agt_terminated: {terminated_events}"

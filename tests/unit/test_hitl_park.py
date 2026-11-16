@@ -19,10 +19,6 @@ from tests.model_testkit import model_snapshot
 
 from types import SimpleNamespace
 
-import pytest
-
-pytestmark = pytest.mark.asyncio
-
 
 def test_hitl_park_is_base_exception_not_exception() -> None:
     from ctx_weft.core.loop.signals import HitlPark

@@ -336,6 +336,7 @@ async def _stream_until_stop(agen: Any, ctx: LoopContext) -> "AsyncIterator[Any]
         waiters.append(asyncio.ensure_future(ctx.cancel_token.wait()))
     if ctx.pause_token is not None:
         waiters.append(asyncio.ensure_future(ctx.pause_token.wait_paused()))
+    nxt = None
     try:
         while True:
             nxt = asyncio.ensure_future(agen.__anext__())
@@ -354,6 +355,10 @@ async def _stream_until_stop(agen: Any, ctx: LoopContext) -> "AsyncIterator[Any]
                 return
             yield chunk
     finally:
+        if nxt is not None:
+            if not nxt.done():
+                nxt.cancel()
+            await asyncio.gather(nxt, return_exceptions=True)
         for w in waiters:
             w.cancel()
         if waiters:
@@ -871,15 +876,22 @@ async def _await_tool_or_stop(invoke_task: "asyncio.Future", ctx: LoopContext) -
         waiters.append(asyncio.ensure_future(ctx.cancel_token.wait()))
     if ctx.pause_token is not None:
         waiters.append(asyncio.ensure_future(ctx.pause_token.wait_paused()))
-    if not waiters:
-        await asyncio.wait({invoke_task})
-        return True
     try:
+        if not waiters:
+            await asyncio.wait({invoke_task})
+            return True
         await asyncio.wait({invoke_task, *waiters}, return_when=asyncio.FIRST_COMPLETED)
+    except asyncio.CancelledError:
+        # Instance shutdown cancels the actor rather than the user cancel token.
+        # A tool may own an open transaction; do not leave it writing after exit.
+        invoke_task.cancel()
+        await asyncio.gather(invoke_task, return_exceptions=True)
+        raise
     finally:
         for w in waiters:
             w.cancel()
-        await asyncio.wait(set(waiters))
+        if waiters:
+            await asyncio.gather(*waiters, return_exceptions=True)
     if invoke_task.done():
         return True
     invoke_task.cancel()

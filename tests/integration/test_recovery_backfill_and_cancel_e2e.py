@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+from tests._recovery import recover_fixture_session
+
 import asyncio
 from datetime import datetime, timezone
 from unittest import mock
@@ -19,7 +21,7 @@ import pytest
 
 from ctx_weft.core.models.config import RuntimeConfig
 from ctx_weft.core.runtime import SessionStartParams
-from ctx_weft.core.utils.content import content_to_text
+from ctx_weft.protocols.content import content_to_text
 from ctx_weft.protocols import MemoryAddress, MemoryKind, MemoryScope, ProviderContext, load_records
 from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.protocols.hitl import HitlReply
@@ -41,7 +43,6 @@ from tests.integration.test_minimal_loop import (
 )
 from tests.step_helpers import suppress_observe_start
 
-pytestmark = pytest.mark.asyncio
 
 SID, TID, AID = "ses_b", "tsk_b", "agt_root"
 TS = datetime(2026, 9, 17, tzinfo=timezone.utc)
@@ -65,6 +66,7 @@ def _ev(seq, type_, ts=TS, **payload):
 # ── M8：还挂着别的未决问题，也要把已终局的答复补进对话 ─────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_answered_reply_is_injected_even_while_another_question_is_pending() -> None:
     llm = _ActRouterLLM(act_responses=[MockResponse(text="done")], context_limit=100_000)
     mem = InMemoryMemoryProvider()
@@ -98,7 +100,7 @@ async def test_answered_reply_is_injected_even_while_another_question_is_pending
     await rt.rebuild_session(SID)
     with suppress_observe_start():
         await initialize_all(rt)
-        await rt.recover_agent(AID)
+        await recover_fixture_session(rt, AID)
         await asyncio.sleep(0.3)
 
     scope = MemoryAddress(session_id=SID, task_id=TID, agent_id=AID)
@@ -117,6 +119,7 @@ async def test_answered_reply_is_injected_even_while_another_question_is_pending
 # ── L5：取消会话时先收窗，再收口气泡 ────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_cancel_session_closes_open_rounds_and_finalizes_claimed_replies() -> None:
     llm = _ScriptedLLM([_ask("tc1", "Q1?"), STALL_BEFORE_CHUNK])
     rt = _runtime(llm, hitl_timeout_sec=0)
@@ -150,6 +153,7 @@ async def test_cancel_session_closes_open_rounds_and_finalizes_claimed_replies()
     assert not getattr(bus, "_provisional", {}), "总线那半缓冲也要清干净"
 
 
+@pytest.mark.asyncio
 async def test_forget_session_refuses_while_a_round_is_open() -> None:
     llm = _ScriptedLLM([_ask("tc1", "Q1?"), STALL_BEFORE_CHUNK])
     rt = _runtime(llm, hitl_timeout_sec=0)
@@ -170,6 +174,7 @@ async def test_forget_session_refuses_while_a_round_is_open() -> None:
     assert sid in rt._task_managers
 
 
+@pytest.mark.asyncio
 async def test_quiescence_accounts_for_open_rounds_and_claimed_replies() -> None:
     """安静判据必须认这两样——它们都表示「有一轮正开着」，而且都不出现在待答列表里。
 

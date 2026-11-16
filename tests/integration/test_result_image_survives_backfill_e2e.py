@@ -11,6 +11,8 @@ payload 从前用的是自制短标记（只留 ref 前 12 个字符）——同
 
 from __future__ import annotations
 
+from tests._recovery import recover_fixture_session
+
 from datetime import datetime, timezone
 from unittest import mock
 
@@ -18,7 +20,8 @@ import pytest
 
 from ctx_weft import RuntimeConfig
 from ctx_weft.core.media.fold import placeholder_refs
-from ctx_weft.core.utils.content import content_to_text, redact_content_for_event
+from ctx_weft.core.utils.content import redact_content_for_event
+from ctx_weft.protocols.content import content_to_text
 from ctx_weft.core.utils.ids import mint_call_id
 from ctx_weft.protocols import (
     ImagePart,
@@ -43,7 +46,6 @@ from tests.integration.test_minimal_loop import (
 )
 from tests.step_helpers import suppress_observe_start
 
-pytestmark = pytest.mark.asyncio
 
 SID, TID, AID = "ses_i", "tsk_i", "agt_root"
 TS = datetime(2026, 9, 18, tzinfo=timezone.utc)
@@ -65,6 +67,7 @@ def test_event_payload_uses_the_retrievable_placeholder() -> None:
     assert redact_content_for_event("plain text") == "plain text"
 
 
+@pytest.mark.asyncio
 async def test_crash_between_result_event_and_memory_keeps_the_image_retrievable() -> None:
     llm = _ActRouterLLM(act_responses=[MockResponse(text="done")], context_limit=100_000)
     mem = InMemoryMemoryProvider()
@@ -121,7 +124,7 @@ async def test_crash_between_result_event_and_memory_keeps_the_image_retrievable
     await rt.rebuild_session(SID)
     with suppress_observe_start():
         await initialize_all(rt)
-        await rt.recover_agent(AID)
+        await recover_fixture_session(rt, AID)
         await _poll(lambda: llm.act_requests or None, timeout=8.0)
 
     view = await load_records(mem, scope, MemoryScope.TASK, pctx,

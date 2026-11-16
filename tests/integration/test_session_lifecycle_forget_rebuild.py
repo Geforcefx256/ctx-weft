@@ -22,6 +22,8 @@ task 终态不是 agent 终态），于是「正常结束的会话」在内存�
 """
 from __future__ import annotations
 
+from tests._recovery import recover_fixture_session
+
 import asyncio
 
 import pytest
@@ -42,7 +44,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 
 def _is_background_observe(request) -> bool:
@@ -119,6 +120,7 @@ async def _run_one_round(rt: CtxWeftRuntime):
     return sid, aid, tid
 
 
+@pytest.mark.asyncio
 async def test_finishing_a_session_keeps_it_in_memory():
     """核心契约：跑完不逐出。"""
     rt = _make_runtime()
@@ -127,11 +129,28 @@ async def test_finishing_a_session_keeps_it_in_memory():
     assert sid in rt._task_managers, "TaskManager 留着"
     assert rt._agent_lifecycle_manager.has(aid), "agent record 留着"
     await initialize_all(rt)
-    assert (await rt.get_agent(aid)).data.status == "idle", "agent 回 idle，不是消失"
+    assert (await rt.get_agent(aid)).data.state.status == "idle", "agent 回 idle，不是消失"
     await initialize_all(rt)
     assert [a.agent_id for a in [item.data for item in await rt.list_agents(session_id=sid)]] == [aid]
 
 
+@pytest.mark.asyncio
+async def test_full_public_snapshot_is_equal_after_real_loop_forget_and_rebuild():
+    rt = _make_runtime()
+    sid, aid, _ = await _run_one_round(rt)
+    hot = (await rt.get_session(sid)).data.state
+    assert hot.root_task.finalized and hot.root_task.finished_at is not None
+    assert hot.root_task == (await rt.get_task(sid, hot.root_task.task_id)).data
+    assert hot.root_agent == (await rt.get_agent(aid, session_id=sid)).data
+    assert rt.forget_session(sid)
+    assert (await rt.get_session(sid)).data.state == hot
+    from tests.unit.test_runtime_initialization_queries import runtime
+    assert (await runtime(rt.event_store).initialize(sid)).state == hot
+    await rt.rebuild_session(sid)
+    assert (await rt.get_session(sid)).data.state == hot
+
+
+@pytest.mark.asyncio
 async def test_forget_session_evicts_everything():
     rt = _make_runtime()
     sid, aid, _ = await _run_one_round(rt)
@@ -153,6 +172,7 @@ async def test_forget_session_evicts_everything():
     rt.forget_session(sid)   # 幂等
 
 
+@pytest.mark.asyncio
 async def test_rebuild_session_brings_it_back_without_running_anything():
     """`rebuild_session` 是 `forget_session` 的逆操作，且**只装填不跑**。"""
     rt = _make_runtime()
@@ -165,7 +185,7 @@ async def test_rebuild_session_brings_it_back_without_running_anything():
     assert n == 1
     assert rt._agent_lifecycle_manager.has(aid)
     await initialize_all(rt)
-    assert (await rt.get_agent(aid)).data.status == "idle"
+    assert (await rt.get_agent(aid)).data.state.status == "idle"
     await initialize_all(rt)
     assert [a.agent_id for a in [item.data for item in await rt.list_agents(session_id=sid)]] == [aid]
     # 冷准备建立 owner，但不入队、不执行；真正激活留给输入交付或显式恢复。
@@ -181,12 +201,14 @@ async def test_rebuild_session_brings_it_back_without_running_anything():
     assert view.tasks[tid].status == "FINISHED"
 
 
+@pytest.mark.asyncio
 async def test_rebuild_session_on_an_unknown_session_returns_zero_and_does_not_raise():
     rt = _make_runtime()
     await initialize_all(rt)
     assert await rt.rebuild_session("ses_never_existed") == 0
 
 
+@pytest.mark.asyncio
 async def test_forget_agent_evicts_one_without_touching_siblings():
     rt = _make_runtime()
     sid, aid, _ = await _run_one_round(rt)
@@ -198,6 +220,7 @@ async def test_forget_agent_evicts_one_without_touching_siblings():
     assert rt.forget_agent(aid) is False, "已经不在 → False，幂等"
 
 
+@pytest.mark.asyncio
 async def test_forget_agent_refuses_a_running_agent():
     """在跑的 agent 不许逐出：删掉 record 之后它的 TASK_* 会被 `handle_event` 静默
     丢弃，状态机停在 running 再也不会有 AGENT_IDLE。"""
@@ -211,6 +234,7 @@ async def test_forget_agent_refuses_a_running_agent():
 
 # ── forget 的准入判据：还活着就不许忘 ─────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_forget_session_refuses_while_a_task_is_still_queued():
     """光看 agent 状态不够：一个 PENDING 还没派发的 task，其 agent 在 ALM 里仍是
     `idle`——此时逐出会把 TM 连同那个排着队的 task 一起丢掉，它永远不会跑。"""
@@ -227,6 +251,7 @@ async def test_forget_session_refuses_while_a_task_is_still_queued():
     assert rt._agent_lifecycle_manager.has(aid)
 
 
+@pytest.mark.asyncio
 async def test_forget_session_refuses_while_someone_is_waiting_on_a_hitl(monkeypatch):
     """有人正等着回答 → 那条 pending 记录还要用，不许忘。"""
     rt = _make_runtime()
@@ -240,6 +265,7 @@ async def test_forget_session_refuses_while_someone_is_waiting_on_a_hitl(monkeyp
     assert rt._agent_lifecycle_manager.has(aid)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["running", "waiting_human", "interrupted"])
 async def test_forget_refuses_agents_that_are_still_live(status):
     """五态里只有 idle / terminated 可以忘：其余三态各自还有人或事在等它。"""
@@ -253,6 +279,7 @@ async def test_forget_refuses_agents_that_are_still_live(status):
     assert rt._agent_lifecycle_manager.has(aid)
 
 
+@pytest.mark.asyncio
 async def test_forget_agent_does_not_look_at_the_rest_of_the_session():
     """单点逐出只对这一个 agent 负责：同 session 的队列/别的 agent 不是它的判据。"""
     rt = _make_runtime()
@@ -269,6 +296,7 @@ async def test_forget_agent_does_not_look_at_the_rest_of_the_session():
 
 # ── purge：销毁 ──────────────────────────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_purge_session_terminates_then_evicts_unconditionally():
     """`purge_session` 对**还活着**的会话也必须收干净——那正是它与 forget 的分野。"""
     rt = _make_runtime()
@@ -288,6 +316,7 @@ async def test_purge_session_terminates_then_evicts_unconditionally():
         (await rt.get_agent(aid)).data
 
 
+@pytest.mark.asyncio
 async def test_purge_session_is_idempotent_and_safe_on_an_unknown_session():
     rt = _make_runtime()
     await initialize_all(rt)
@@ -299,6 +328,7 @@ async def test_purge_session_is_idempotent_and_safe_on_an_unknown_session():
     await rt.purge_session(sid)                      # 幂等
 
 
+@pytest.mark.asyncio
 async def test_purge_does_not_touch_the_event_log():
     """core 不管持久化：purge 停掉并遗忘运行时那一半，事实仍在事件日志里，
     因此 `rebuild_session` 还能把它装回来（删事件是调用方自己的步骤）。"""
@@ -314,6 +344,7 @@ async def test_purge_does_not_touch_the_event_log():
     assert rt._agent_lifecycle_manager.has(aid)
 
 
+@pytest.mark.asyncio
 async def test_purge_rebuilds_a_cold_session_before_terminating_it():
     """已被逐出内存的会话再 purge：必须先装填再终结，否则收口一次都不进。
 
@@ -363,6 +394,7 @@ def _plant_hitl(rt, session_id: str, agent_id: str, *, resolved: bool):
     return hid
 
 
+@pytest.mark.asyncio
 async def test_forget_session_keeps_resolved_hitl_records():
     """`forget_session` 只是忘记，会话随时能装填回来——已终局记录还要给
     `resolved_for_session()` 的崩溃窗口兜底用（决定已落盘、进程在续跑前就死了；对
@@ -377,6 +409,7 @@ async def test_forget_session_keeps_resolved_hitl_records():
     assert [r.id for r in rt.hitl_registry.resolved_for_session(sid)] == [hid]
 
 
+@pytest.mark.asyncio
 async def test_purge_session_drops_the_hitl_records():
     """purge 之后会话不会回来了，留着就是指向一个再也重建不出来的 session 的孤儿——
     而 `gc()` 只按 `max_resolved` 裁剪最旧的，要等它被后来的挤出去才消失。"""
@@ -391,6 +424,7 @@ async def test_purge_session_drops_the_hitl_records():
     assert rt.hitl_registry.resolved_for_session(sid) == []
 
 
+@pytest.mark.asyncio
 async def test_purge_does_not_touch_other_sessions_hitl_records():
     rt = _make_runtime()
     sid_a, aid_a, _ = await _run_one_round(rt)
@@ -405,6 +439,7 @@ async def test_purge_does_not_touch_other_sessions_hitl_records():
     assert rt.hitl_registry.get(hid_b) is not None, "只摘这一条会话的"
 
 
+@pytest.mark.asyncio
 async def test_registry_forget_session_warns_when_it_drops_an_unresolved_one(caplog):
     """摘到未决的说明上一步没做干净（热等待者会就此永远挂着）——要响亮，不能忍。"""
     import logging
@@ -427,6 +462,7 @@ async def test_registry_forget_session_warns_when_it_drops_an_unresolved_one(cap
 
 # ── forget 之后重新启用：不只是"句柄回来了"，得真的跑完 ───────────────────────
 
+@pytest.mark.asyncio
 async def test_a_forgotten_session_runs_a_full_new_round_end_to_end():
     """逐出 → 再发一条 → 新 task 必须**真的跑到 FINISHED**。
 
@@ -454,12 +490,13 @@ async def test_a_forgotten_session_runs_a_full_new_round_end_to_end():
 
     # 跑完之后一切照旧：agent 回 idle、两轮的 task 都在、还能再来一轮。
     await initialize_all(rt)
-    assert (await rt.get_agent(aid)).data.status == "idle"
+    assert (await rt.get_agent(aid)).data.state.status == "idle"
     view = await rebuild_view(rt.event_store, sid)
     assert {t.status for t in view.tasks.values()} == {"FINISHED"}
     assert len(view.tasks) == 2
 
 
+@pytest.mark.asyncio
 async def test_forget_then_rebuild_then_send_also_runs():
     """host 可能先 `rebuild_session`（比如 `_root_agent_id` 那一步）再发消息——
     send_message 复用准备好的 owner，在输入交付后才激活任务。"""
@@ -487,6 +524,7 @@ async def test_forget_then_rebuild_then_send_also_runs():
     assert sid in rt._task_managers
 
 
+@pytest.mark.asyncio
 async def test_two_forget_send_cycles_in_a_row():
     """逐出→跑→再逐出→再跑。装填不是一次性的，得能反复。"""
     rt = _make_runtime()
@@ -536,6 +574,7 @@ async def _seed_crashed_running(rt, sid: str, aid: str) -> None:
     await append_one(rt.event_store, ev(3, EventType.AGENT_RUNNING, agent_id=aid))
 
 
+@pytest.mark.asyncio
 async def test_rebuild_settles_a_crashed_running_agent_to_interrupted():
     """core 自己裁定，不再让宿主去折事件流替它下判决。
 
@@ -561,10 +600,11 @@ async def test_rebuild_settles_a_crashed_running_agent_to_interrupted():
 
     assert n == 1
     await initialize_all(rt)
-    assert (await rt.get_agent(aid)).data.status == "interrupted", "崩溃残影的 running 必须被判掉"
+    assert (await rt.get_agent(aid)).data.state.status == "interrupted", "崩溃残影的 running 必须被判掉"
     assert seen == [], "启动校准直接提交，不通过总线广播或装填"
 
 
+@pytest.mark.asyncio
 async def test_settling_is_idempotent_across_repeated_rebuilds():
     """`AgentInterrupted` 落库之后，再装填折出来就是 `interrupted`，同态输入不再发事件。"""
     rt = _make_runtime()
@@ -586,10 +626,11 @@ async def test_settling_is_idempotent_across_repeated_rebuilds():
     await rt.rebuild_session(sid)
 
     await initialize_all(rt)
-    assert (await rt.get_agent(aid)).data.status == "interrupted"
+    assert (await rt.get_agent(aid)).data.state.status == "interrupted"
     assert seen == [], f"重复装填不该重复发转移事件，实得 {seen}"
 
 
+@pytest.mark.asyncio
 async def test_a_finished_session_is_not_settled():
     """正常跑完的会话装填回来是 `idle`，不该被判成中断。"""
     rt = _make_runtime()
@@ -607,23 +648,24 @@ async def test_a_finished_session_is_not_settled():
     await rt.rebuild_session(sid)
 
     await initialize_all(rt)
-    assert (await rt.get_agent(aid)).data.status == "idle"
+    assert (await rt.get_agent(aid)).data.state.status == "idle"
     assert "AgentInterrupted" not in seen
 
 
+@pytest.mark.asyncio
 async def test_recover_agent_cold_preparation_settles_without_starting_steps():
     """recover_agent 的准备档也走统一冷装填，校准状态但不启动执行。"""
     rt = _make_runtime()
     sid, aid = "S_prepare", "agt_crashed"
     await _seed_crashed_running(rt, sid, aid)
     await initialize_all(rt)
-    assert (await rt.get_agent(aid, session_id=sid)).data.status == "interrupted"
+    assert (await rt.get_agent(aid, session_id=sid)).data.state.status == "interrupted"
 
     await initialize_all(rt)
-    await rt.recover_agent(aid, session_id=sid, keep_alive=True)
+    await recover_fixture_session(rt, aid, session_id=sid, keep_alive=True)
 
     await initialize_all(rt)
-    assert (await rt.get_agent(aid)).data.status == "interrupted"
+    assert (await rt.get_agent(aid)).data.state.status == "interrupted"
     tm = rt._task_managers[sid]
     assert rt._prepared_recoveries[sid][0] is tm
     assert tm._queue.pending_count() == 0

@@ -33,7 +33,6 @@ from ctx_weft.protocols.hitl import HitlAsk, HitlReply, ToolResultDelivery
 from ctx_weft.providers.events import InProcessEventBus
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 
-pytestmark = pytest.mark.asyncio
 
 _AGENT_ID = "agt_1"
 
@@ -204,6 +203,7 @@ def _ctx() -> LoopContext:
 # ── 测试 ────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_needs_human_stops_stream_consumption_immediately():
     """该事件是流的终点——其后的 result 事件必须不可见。"""
     provider = _AsksThenResumes()
@@ -218,6 +218,7 @@ async def test_needs_human_stops_stream_consumption_immediately():
     assert _text_of(result.content).strip().endswith("deployed")
 
 
+@pytest.mark.asyncio
 async def test_resume_gets_the_resume_state_and_does_not_recompute():
     provider = _AsksThenResumes()
     gw, reg, svc = _make_gateway(provider)
@@ -231,6 +232,7 @@ async def test_resume_gets_the_resume_state_and_does_not_recompute():
     assert provider.applied_with == ({"plan": "deploy-7"}, "accepted")
 
 
+@pytest.mark.asyncio
 async def test_reply_as_result_short_circuits_without_reentry():
     gw, reg, svc = _make_gateway(_AsksAsResult())
     task = asyncio.create_task(gw.invoke("control__ask_user", {}, _state(), _ctx(),
@@ -242,6 +244,7 @@ async def test_reply_as_result_short_circuits_without_reentry():
     assert "小明" in _text_of(result.content)
 
 
+@pytest.mark.asyncio
 async def test_reply_as_result_carries_multimodal_answers_through():
     """人的答复带图时，图必须进最终 content，不能被拍成文本。
 
@@ -265,6 +268,7 @@ async def test_reply_as_result_carries_multimodal_answers_through():
     assert any(isinstance(p, ImagePart) for p in result.content)
 
 
+@pytest.mark.asyncio
 async def test_needs_human_without_resumable_is_a_contract_violation():
     gw, reg, svc = _make_gateway(_AsksButNotResumable())
     task = asyncio.create_task(gw.invoke("broken__x", {}, _state(), _ctx(),
@@ -276,12 +280,14 @@ async def test_needs_human_without_resumable_is_a_contract_violation():
     assert result.is_error is True and "does not implement" in _text_of(result.content)
 
 
+@pytest.mark.asyncio
 async def test_eviction_in_the_tool_path_parks_without_a_result():
     gw, _reg, _svc = _make_gateway(_AsksThenResumes(), timeout_sec=0)
     with pytest.raises(HitlPark):
         await gw.invoke("deploy__apply", {}, _state(), _ctx(), tool_call_id="call_1")
 
 
+@pytest.mark.asyncio
 async def test_the_ask_is_recorded_under_the_tool_stage():
     """确认走的是 HITL_STAGE_TOOL 而不是 authz 那条——两阶段键必须分开（安全修复的核心）。"""
     provider = _AsksThenResumes()

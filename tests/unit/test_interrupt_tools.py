@@ -39,7 +39,6 @@ from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from tests.assembler_testkit import compiled_test_inputs, scripted_inputs
 from tests.hitl_env import make_hitl
 
-pytestmark = pytest.mark.asyncio
 
 
 class _ToolProvider(ToolCapabilityProvider):
@@ -109,6 +108,7 @@ async def _tool_results(mem, ctx, scope):
     return await mem.recall_recent(scope, [MemoryEventType.TOOL_RESULT], 20, ctx.provider_ctx)
 
 
+@pytest.mark.asyncio
 async def test_interrupt_between_tools_cancels_not_started():
     # tc_a completes (and fires interrupt); tc_b never starts → cancelled.
     provider = _ToolProvider()
@@ -134,6 +134,7 @@ async def test_interrupt_between_tools_cancels_not_started():
     assert CANCELLED_MARK in by_name["mcp__t__b"].content
 
 
+@pytest.mark.asyncio
 async def test_interrupt_during_tool_marks_interrupted_and_cancels_rest():
     block = asyncio.Event()
     started = asyncio.Event()

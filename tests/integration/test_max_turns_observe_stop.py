@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """Stop a real 50-turn foreground observation during and after its memory fold."""
 
 import asyncio
@@ -201,7 +203,7 @@ async def test_stop_after_fifty_turns_at_observe_fold(tmp_path, monkeypatch, bac
                 if backend == "sqlite":
                     rt = _runtime(llm, memory, rt.event_store)
                     await initialize_all(rt)
-                await rt.recover_agent(handle.agent_id, session_id=handle.session_id)
+                await recover_fixture_session(rt, handle.agent_id, session_id=handle.session_id)
                 assert llm.actor_turns == 50
                 llm.finish = True
                 resumed = await rt.send_message(handle.agent_id, "Continue the work",

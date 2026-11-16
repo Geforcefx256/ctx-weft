@@ -21,7 +21,6 @@ from tests.integration.test_minimal_loop import (
     make_echo_template,
 )
 
-pytestmark = pytest.mark.asyncio
 
 TPL = "agent:tpl_echo"
 
@@ -47,13 +46,14 @@ def _reg():
     reg = AgentLifecycleManager(
         template_lookup=TemplateLookup(providers),
         event_bus=_Bus(),
-        model_resolver=lambda a, m: _Client(),
+        model_resolver=lambda a, m, **_context: _Client(),
     )
     reg.register_session("s1", tenant_id="default")
     reg.register_session("s2", tenant_id="default")
     return reg
 
 
+@pytest.mark.asyncio
 async def test_set_agent_llm_emits_and_returns_true():
     reg = _reg()
     a, _ = await reg.instantiate(template_id=TPL, session_id="s1", tenant_id="default")
@@ -65,6 +65,7 @@ async def test_set_agent_llm_emits_and_returns_true():
     assert reg._agents[a.id].llm == ModelChoice(account="x", model="y")
 
 
+@pytest.mark.asyncio
 async def test_same_choice_is_a_noop():
     """host 重复点击不刷屏。"""
     reg = _reg()
@@ -76,6 +77,7 @@ async def test_same_choice_is_a_noop():
     assert reg.event_bus.events == []
 
 
+@pytest.mark.asyncio
 async def test_set_session_llm_emits_n_events_sharing_causation_id():
     reg = _reg()
     a, _ = await reg.instantiate(template_id=TPL, session_id="s1", tenant_id="default")
@@ -96,6 +98,7 @@ async def test_set_session_llm_emits_n_events_sharing_causation_id():
     assert reg._agents[other.id].llm == ModelChoice()
 
 
+@pytest.mark.asyncio
 async def test_set_llm_touches_no_task_state():
     """纯赋值：不入队、不改任何 task 状态、不触发调度。"""
     reg = _reg()
@@ -113,6 +116,6 @@ def test_resume_hint_is_gone():
 
 def test_recover_agent_takes_no_llm_params():
     from ctx_weft.core.runtime import CtxWeftRuntime
-    sig = inspect.signature(CtxWeftRuntime.recover_agent)
+    sig = inspect.signature(CtxWeftRuntime.recover_session)
     assert "llm_account" not in sig.parameters
     assert "llm_model" not in sig.parameters

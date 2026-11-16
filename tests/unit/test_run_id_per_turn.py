@@ -81,7 +81,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 
 def assert_no_duplicate_sequence(events):
@@ -221,6 +220,7 @@ async def _two_turn_session():
     return seen
 
 
+@pytest.mark.asyncio
 async def test_two_turns_do_not_share_a_run_id():
     """headline 不变式必须只看**主循环**（`_run_loop`，origin=RUNTIME）自己的两个
     run——`recognize_intent` / `background_observe` 在这条改动完全没碰过的代码路径
@@ -242,14 +242,17 @@ async def test_two_turns_do_not_share_a_run_id():
     assert len(main_run_ids) >= 2, f"两轮的主循环共用了 run_id: {main_run_ids}"
 
 
+@pytest.mark.asyncio
 async def test_sequence_is_unique_per_run():
     assert_no_duplicate_sequence(await _two_turn_session())
 
 
+@pytest.mark.asyncio
 async def test_runs_are_paired():
     assert_every_run_has_one_start_and_finish(await _two_turn_session())
 
 
+@pytest.mark.asyncio
 async def test_session_task_runner_has_no_default_run_id():
     """结构性守卫：这个字段不该再存在。"""
     assert "default_run_id" not in inspect.signature(_SessionTaskRunner.__init__).parameters

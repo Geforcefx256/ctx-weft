@@ -9,7 +9,6 @@ import pytest
 
 from tests.integration.test_user_control_journeys import run_phase
 
-pytestmark = pytest.mark.asyncio
 WORKER = Path(__file__).with_name("_approval_commit_worker.py")
 
 
@@ -20,12 +19,14 @@ async def approval_phase(path, mode, stage, *, crashes=False):
     assert result.returncode == (73 if crashes else 0), result.stdout + result.stderr
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["before", "unknown", "before_recover", "unknown_recover", "concurrent"])
 async def test_hot_rejection_retries_original_decision_before_waking_actor(tmp_path, mode):
     await approval_phase(tmp_path, mode, "hot")
     await run_phase(tmp_path, "approval", "verify", "hot")
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["before_crash", "after_crash"])
 @pytest.mark.parametrize("crash_during_recovery", [False, True])
 async def test_hot_rejection_commit_crashes_recover_without_reviving_approval(tmp_path, mode, crash_during_recovery):
@@ -36,6 +37,7 @@ async def test_hot_rejection_commit_crashes_recover_without_reviving_approval(tm
     await run_phase(tmp_path, "approval", "verify", "hot")
 
 
+@pytest.mark.asyncio
 async def test_real_legacy_closed_before_resolved_journal_stays_closed_after_restart(tmp_path):
     # Exact databases captured by the old public hot-rejection journey, including
     # its completed followup task. No events or memory records are synthesized.

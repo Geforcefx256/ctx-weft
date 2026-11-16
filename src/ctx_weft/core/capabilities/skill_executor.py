@@ -4,9 +4,8 @@
 @skill_executor_tool 装饰器参照 @control_tool，从 Annotated 注解提取 schema；
 runtime-injected 参数（ctx / skill_provider / skill_name）通过 _SKIP 排除在外。
 
-索引机制：
-  ProviderRegistry 注册新 SkillCapabilityProvider 时调用 mark_dirty()；
-  首次 invoke 时异步重建 _index: skill_name → SkillCapabilityProvider。
+每次操作使用本次 ProviderContext 查找已分配的 skill。
+上下文相关的列表不在执行器中缓存，资源索引和可见性由 Skill Provider 管理。
 """
 
 from __future__ import annotations
@@ -147,43 +146,39 @@ async def exec_script(
 
 # ── SkillExecutorCapabilityProvider ──────────────────────────────────────────
 
+class AmbiguousSkillError(ValueError):
+    """A qualified skill reference must identify exactly one capability."""
+
+
 class SkillExecutorCapabilityProvider(ToolCapabilityProvider):
     """默认内置，runtime 初始化时自动注册，与 ControlCapabilityProvider 同级。
 
-    索引：skill_name → SkillCapabilityProvider
-    注册新 SkillCapabilityProvider 时调用 mark_dirty()，
-    首次 invoke 时延迟重建索引。
+    只解析路由和转交参数，不解释 ProviderContext 中的业务身份。
     """
 
     name = PROVIDER_NAME
 
     def __init__(self, provider_registry: "ProviderRegistry") -> None:
         self._registry = provider_registry
-        # qualified skill name → (provider, bare skill name)
-        self._index: dict[str, tuple[SkillCapabilityProvider, str]] = {}
-        self._dirty = True
 
-    def mark_dirty(self) -> None:
-        """ProviderRegistry 注册新 SkillCapabilityProvider 时调用。"""
-        self._dirty = True
-
-    async def _ensure_index(self, ctx: ProviderContext) -> None:
-        if not self._dirty:
-            return
-        self._index.clear()
+    async def _resolve_skill(
+        self, skill_ref: str, ctx: ProviderContext,
+    ) -> tuple[SkillCapabilityProvider, str] | None:
+        matches: list[tuple[SkillCapabilityProvider, str]] = []
         for p in self._registry.get_capability_providers():
             if not isinstance(p, SkillCapabilityProvider):
                 continue
             try:
                 for cap in await p.list(ctx):
                     if isinstance(cap, SkillCapability):
-                        key = qualify(cap.id)
-                        if key not in self._index:
-                            self._index[key] = (p, cap.name)   # 先注册的 provider 优先
+                        if qualify(cap.id) == skill_ref:
+                            matches.append((p, cap.name))
             except Exception:
-                logger.exception("SkillExecutorCapabilityProvider: index build failed for %s", p.name)
-        self._dirty = False
-        logger.debug("SkillExecutorCapabilityProvider: index rebuilt (%d skills)", len(self._index))
+                logger.exception("SkillExecutorCapabilityProvider: skill discovery failed for %s", p.name)
+                raise
+        if len(matches) > 1:
+            raise AmbiguousSkillError(f"skill '{skill_ref}' matches multiple capabilities")
+        return matches[0] if matches else None
 
     # ── ToolCapabilityProvider ────────────────────────────────────────────────
 
@@ -218,12 +213,18 @@ class SkillExecutorCapabilityProvider(ToolCapabilityProvider):
                                            "message": "task.settings has no skill_name"})
             return
 
-        await self._ensure_index(ctx)
-        entry_p = self._index.get(skill_name)
+        try:
+            entry_p = await self._resolve_skill(skill_name, ctx)
+        except AmbiguousSkillError as exc:
+            yield CapabilityEvent(kind="error", payload={"code": "AMBIGUOUS_SKILL", "message": str(exc)})
+            return
+        except Exception as exc:
+            yield CapabilityEvent(kind="error", payload={"code": "SKILL_DISCOVERY_ERROR", "message": str(exc)})
+            return
         if entry_p is None:
             yield CapabilityEvent(kind="error",
                                   payload={"code": "SKILL_NOT_FOUND",
-                                           "message": f"skill '{skill_name}' not in index"})
+                                           "message": f"skill '{skill_name}' not available"})
             return
         provider, bare_skill_name = entry_p
 

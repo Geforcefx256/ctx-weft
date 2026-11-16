@@ -37,7 +37,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 SUB_TEMPLATE_ID = "tpl_researcher"
 # delegate_task 收限定形式（agent__x），见 test_subagent_instantiated_event.py 的注释
@@ -173,6 +172,7 @@ async def _wait_both_finished(runtime, session_id, timeout=10.0):
     )
 
 
+@pytest.mark.asyncio
 async def test_subagent_runs_its_own_loop_and_result_flows_back():
     llm = _RecordingRouterLLM()
     runtime = _make_runtime(llm)

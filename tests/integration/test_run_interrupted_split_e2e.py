@@ -29,7 +29,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 TASK_INTERRUPTED = "TaskInterrupted"
 _MOCK_CONTEXT_LIMIT = 100_000
@@ -82,6 +81,7 @@ async def _wait_for(seen: list, type_: str, timeout: float = 10.0) -> None:
     raise TimeoutError(f"{type_} not seen within {timeout}s; got {[e.type for e in seen]}")
 
 
+@pytest.mark.asyncio
 async def test_crash_retry_then_suspend_order() -> None:
     runtime = _runtime(_CrashLLM(responses=[]))
     seen: list = []
@@ -112,6 +112,7 @@ async def test_crash_retry_then_suspend_order() -> None:
     assert [t.status for t in view.tasks.values()] == ["INTERRUPTED"]
 
 
+@pytest.mark.asyncio
 async def test_outage_emits_both_run_and_task_interrupted() -> None:
     """outage 支没有重试判定：run 级与 task 级两条事实都从 `_run_loop` 里发。"""
 

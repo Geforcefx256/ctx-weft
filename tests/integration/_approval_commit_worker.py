@@ -1,3 +1,4 @@
+
 """Inject storage failures at an actual user's hot approval reply."""
 
 import asyncio
@@ -7,9 +8,11 @@ import os
 import sys
 from pathlib import Path
 
-from tests._initialization import initialize_all
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from tests._recovery import recover_fixture_session
+from tests._initialization import initialize_all
 
 from ctx_weft.protocols.events import PersistenceUnavailableError
 from ctx_weft.protocols.hitl import HitlReply
@@ -98,7 +101,7 @@ async def main(path, mode, stage):
                     assert not any(r.event.type == "HitlClosed" for r in rows)
                     rt.clear_storage_isolation(SID)
                 if mode.endswith("_recover"):
-                    await rt.recover_agent(data["root"], session_id=SID)
+                    await recover_fixture_session(rt, data["root"], session_id=SID)
                 else:
                     answer = await reply("RETRY_ALTERNATE still must not replace it")
                     assert answer.outcome == "rejected"
@@ -119,7 +122,7 @@ async def main(path, mode, stage):
                 if any(q.data.id == data["approval"] for q in pending):
                     await reply()
                 else:
-                    await rt.recover_agent(data["root"], session_id=SID)
+                    await recover_fixture_session(rt, data["root"], session_id=SID)
             assert await rt.recover_storage(SID)
             data = await complete(rt, a, b, tool, store, memory, data, "approval", restarted=stage != "hot", answered=True)
             assert not any("RETRY_ALTERNATE" in request_text(r) for k, r in a.calls if k == "actor")

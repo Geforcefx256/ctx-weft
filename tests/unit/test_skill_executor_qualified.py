@@ -1,4 +1,4 @@
-"""SkillExecutor: index keyed by qualified skill name; provider gets the bare name."""
+"""SkillExecutor resolves each operation with its context and passes the bare name."""
 
 from __future__ import annotations
 
@@ -131,3 +131,49 @@ async def test_exec_schema_and_dispatch_use_command_only() -> None:
     assert provider.exec_called_with == ("pdf", command, ctx)
     assert events[-1].kind == "result"
     assert events[-1].payload["content"] == "out"
+
+
+class _ContextualProvider(_FakeSkillProvider):
+    def __init__(self):
+        super().__init__()
+        self.names = {"a": "pdf", "b": "sheet"}
+        self.calls = []
+
+    async def list(self, ctx):
+        import asyncio
+        await asyncio.sleep(0)
+        name = self.names.get(ctx.session_id)
+        return [SkillCapability(id=f"local_skill:{name}", name=name)] if name else []
+
+    async def list_files(self, skill_name, pattern, limit, ctx):
+        self.calls.append((skill_name, ctx))
+        return skill_name
+
+
+async def test_each_operation_resolves_its_own_context_concurrently():
+    import asyncio
+
+    provider = _ContextualProvider()
+    executor = SkillExecutorCapabilityProvider(_Registry([provider]))
+    contexts = [ProviderContext(session_id=s, skill_name=f"local_skill__{name}")
+                for s, name in [("a", "pdf"), ("b", "sheet"), ("a", "pdf")]]
+
+    async def call(ctx):
+        return [e async for e in executor.invoke("skill_executor:list_files", {}, ctx)]
+
+    results = await asyncio.gather(*(call(ctx) for ctx in contexts))
+    assert all(any(e.kind == "result" for e in events) for events in results)
+    assert all(actual is expected for (_, actual), expected in zip(provider.calls, contexts))
+    provider.names["a"] = "new"
+    changed = ProviderContext(session_id="a", skill_name="local_skill__new")
+    assert any(e.kind == "result" for e in await call(changed))
+    assert any(e.payload.get("code") == "SKILL_NOT_FOUND" for e in await call(contexts[0]))
+
+
+async def test_duplicate_reference_is_rejected_without_invoking_either_provider():
+    first, second = _FakeSkillProvider(), _FakeSkillProvider()
+    executor = SkillExecutorCapabilityProvider(_Registry([first, second]))
+    ctx = ProviderContext(session_id="s", skill_name="local_skill__pdf")
+    events = [e async for e in executor.invoke("skill_executor:list_files", {}, ctx)]
+    assert events[-1].payload["code"] == "AMBIGUOUS_SKILL"
+    assert first.list_files_called_with is None and second.list_files_called_with is None

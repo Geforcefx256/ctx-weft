@@ -28,7 +28,6 @@ from ctx_weft.protocols import (
 )
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 
-pytestmark = pytest.mark.asyncio
 
 _BASE = datetime(2026, 9, 16, tzinfo=UTC)
 _ROOT = MemoryAddress(session_id="s1", task_id="root", agent_id="a1")
@@ -113,6 +112,7 @@ def _orphans(view):
 # ── L3：按回合切 ───────────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_l3_never_orphans_parallel_tool_results():
     """最后一轮并行调两个工具：保留区必须带上那一轮的 assistant，两条结果都不成孤儿。"""
     mem = InMemoryMemoryProvider()
@@ -132,6 +132,7 @@ async def test_l3_never_orphans_parallel_tool_results():
     assert "look first" not in kept and "result of a" not in kept, kept
 
 
+@pytest.mark.asyncio
 async def test_l3_audit_records_do_not_consume_keep_slots():
     """`keep_last` 数的是**会被渲染**的记录：审计不进 prompt，不该占保留名额。"""
     mem = InMemoryMemoryProvider()
@@ -149,6 +150,7 @@ async def test_l3_audit_records_do_not_consume_keep_slots():
     assert not _orphans(view)
 
 
+@pytest.mark.asyncio
 async def test_l3_single_round_is_left_alone_without_spending_a_summary():
     """整个 task 只有一轮（一次并行调三个工具）：按回合切就没有可折的东西。
 
@@ -176,6 +178,7 @@ async def test_l3_single_round_is_left_alone_without_spending_a_summary():
     assert calls == ["summarize"]
 
 
+@pytest.mark.asyncio
 async def test_escalating_passes_l3_summary_lazily(monkeypatch):
     """No current-task plan means no summary call, even in forced compaction."""
     from ctx_weft.providers.memory import organize as planning
@@ -243,6 +246,7 @@ def _escalating_state(*, limit, target):
                            extra={}, run_id="r1", sequence_counter=0)
 
 
+@pytest.mark.asyncio
 async def test_kept_capsules_are_ordered_oldest_first():
     """逐颗降级的前提：`_kept_origin_ids` 必须给出**从老到新**的顺序（曾是无序 set）。"""
     mem = InMemoryMemoryProvider()
@@ -256,6 +260,7 @@ async def test_kept_capsules_are_ordered_oldest_first():
     assert list(kept) == ["c_old", "c_mid", "c_new"], kept
 
 
+@pytest.mark.asyncio
 async def test_l1_demotes_oldest_capsule_first_and_stops_at_target():
     """降一颗就达标 → 只降最老那颗，新的保持 rich。
 
@@ -278,6 +283,7 @@ async def test_l1_demotes_oldest_capsule_first_and_stops_at_target():
     assert len(l2) == 1 and l2[0]["demoted_capsules"] == 1, l2
 
 
+@pytest.mark.asyncio
 async def test_l1_keeps_going_until_target_when_one_is_not_enough():
     """对照：一颗不够就接着降第二颗，仍然按从老到新的顺序。"""
     mem = InMemoryMemoryProvider()

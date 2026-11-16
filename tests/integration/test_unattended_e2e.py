@@ -35,7 +35,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 
 class _RouterLLM(MockLLMAdapter):
@@ -86,6 +85,7 @@ def _runtime_with_gated_tool(llm):
     return runtime, tool
 
 
+@pytest.mark.asyncio
 async def test_unattended_session_finishes_instead_of_parking_on_hitl() -> None:
     """驱动：`start_session(unattended=True)` → act 调一个需人工审批的工具 → 守卫在
     `HitlService.open()` 挡下 → gateway 合成拒绝 → 第二轮 act 收尾。
@@ -121,6 +121,7 @@ async def test_unattended_session_finishes_instead_of_parking_on_hitl() -> None:
     )
 
 
+@pytest.mark.asyncio
 async def test_send_message_unattended_marks_the_task_it_opens() -> None:
     """`send_message(unattended=True)` 开出的新 task 带标记，且被强制 auto——
     没有人会发下一条消息，interactive 的纯文本让位在这里等于永久挂起。"""

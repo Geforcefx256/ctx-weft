@@ -33,7 +33,9 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, Protocol, runtime_checkable
 
-from ctx_weft.protocols.context import ContentPart, normalize_content_parts
+from ctx_weft.protocols import content as content_protocol
+from ctx_weft.protocols.context import ProviderContext
+from ctx_weft.protocols.content import ContentPart
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Adapter 契约：数据类型（adapter 读 LLMRequest/Message/Tool，产 LLMChunk/ToolCall/Usage）
@@ -123,8 +125,8 @@ class LLMMessage:
         自己的边界——``dataclasses.replace``（gateway rehydrate 后即用）会重跑本方法，
         故经 gateway 的路径也一并覆盖。
 
-        归一实现是三处边界共用的 ``core.content.normalize_content_parts``——spec §3① 要求
-        形态转换收在归一层。经 ``protocols.context.normalize_content_parts`` 这个**惰性绑定**
+        归一实现是三处边界共用的 ``protocols.content.normalize_content_parts``——spec §3① 要求
+        形态转换收在归一层。经 ``protocols.content.normalize_content_parts`` 这个**惰性绑定**
         转调：protocols 是比 core 低的层，模块级导入 core 会把依赖反向；而把
         ``from ... import`` 写进 ``__post_init__`` 则要为每次构造付 361 ns 的 import 开销
         （见该绑定的 docstring 实测）。
@@ -132,7 +134,7 @@ class LLMMessage:
         性能：本方法在出网热路径上无条件被调。``str``（绝大多数消息）与已合规的 dataclass
         列表都返回**同一对象**、不重建——纯文本路径逐字节不变。
         """
-        self.content = normalize_content_parts(self.content)
+        self.content = content_protocol.normalize_content_parts(self.content)
 
 
 # ── Tool ──────────────────────────────────────────────────────────────────────
@@ -561,5 +563,7 @@ class LLMClientResolver(Protocol):
         self,
         account: str | None = None,
         model: str | None = None,
+        *,
+        ctx: ProviderContext,
     ) -> LLMClient:
         ...

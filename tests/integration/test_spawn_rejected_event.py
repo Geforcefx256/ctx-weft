@@ -30,7 +30,6 @@ from tests.integration.test_subagent_instantiated_event import (
 )
 from tests.runtime_helpers import close_runtime
 
-pytestmark = pytest.mark.asyncio
 
 
 def _depth_barred_template():
@@ -64,6 +63,7 @@ async def _wait_for_event(runtime, session_id, event_type, timeout=8.0):
     )
 
 
+@pytest.mark.asyncio
 async def test_depth_limit_emits_spawn_rejected(runtime_factory):
     llm = _SpawnLLM()
     runtime = runtime_factory(llm)
@@ -84,6 +84,7 @@ async def test_depth_limit_emits_spawn_rejected(runtime_factory):
     assert ev.payload.get("attempted_subtask_id")
 
 
+@pytest.mark.asyncio
 async def test_spawn_rejected_names_the_parent_not_a_phantom_child(runtime_factory):
     """子 agent 没诞生，envelope 的 agent_id 必须是**父**——没有子 id 可填。"""
     llm = _SpawnLLM()
@@ -104,6 +105,7 @@ async def test_spawn_rejected_names_the_parent_not_a_phantom_child(runtime_facto
     assert rejected[-1].agent_id == root_agent_id
 
 
+@pytest.mark.asyncio
 async def test_rejected_spawn_produces_no_agent_instantiated(runtime_factory):
     """被拒 = 没有 agent 诞生。两个事件的分工正靠这条守住。"""
     llm = _SpawnLLM()

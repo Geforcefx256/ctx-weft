@@ -33,11 +33,11 @@ from tests.integration.test_hitl_e2e_v2 import (
 from tests.runtime_helpers import wait_for_park
 from tests.unit._legacy_recover import rebuild_all_active
 
-pytestmark = pytest.mark.asyncio
 
 TENANT = "acme"
 
 
+@pytest.mark.asyncio
 async def test_hot_approval_session_events_all_carry_the_sessions_tenant() -> None:
     """`start_session(tenant_id="acme")` 走一轮热审批 + finish，总线上不许出现
     `tenant_id != "acme"` 的事件——`SessionCreated` 本就正确，`TaskCreated`（root task）
@@ -82,6 +82,7 @@ async def test_hot_approval_session_events_all_carry_the_sessions_tenant() -> No
     assert {"HitlOpened", "HitlResolved", "TaskCreated"} <= types_seen
 
 
+@pytest.mark.asyncio
 async def test_recovery_queue_signal_carries_the_recovered_sessions_tenant() -> None:
     """进程重启场景：`recover()` 装填 ALM 后发的 AGENT_* 现状广播必须带上被恢复会话的
     真实 tenant，而不是新 runtime 实例的默认值。

@@ -299,7 +299,7 @@ class ContextAssembler:
             capability_blocks,
             resolve_capabilities,
         )
-        from ctx_weft.protocols.context import normalize_content_parts
+        from ctx_weft.protocols.content import normalize_content_parts
 
         if isinstance(inputs, dict):
             inputs = PromptContext.from_payload(inputs)

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from tests.model_testkit import model_snapshot
-
 import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -20,6 +18,7 @@ from ctx_weft.protocols import (
 )
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from tests.assembler_testkit import compiled_test_inputs, scripted_inputs
+from tests.model_testkit import model_snapshot
 
 
 def _template_with_role():
@@ -172,6 +171,11 @@ async def fake_state_ctx():
 
         async def emit(self, event: Any) -> None:
             self.emitted.append(event)
+
+        async def emit_batch(self, events, *, on_committed=None) -> None:
+            self.emitted.extend(events)
+            if on_committed is not None:
+                on_committed()
 
     ctx = LoopContext(
         assembler=_FakeAssembler(),

@@ -25,7 +25,6 @@ from ctx_weft.protocols.template import LoopConfig
 from ctx_weft.providers.llm.tokenizer import HeuristicTokenizer
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 
-pytestmark = pytest.mark.asyncio
 
 T = MemoryEventType
 _BASE = datetime(2026, 1, 1, tzinfo=UTC)
@@ -115,6 +114,7 @@ async def _alive_summaries(mem):
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_l0_units_have_body_and_finish_pair() -> None:
     """sanity：finalize 后每个 L0 单元都有 task 层 body + agent 层 finish 对。"""
     mem = InMemoryMemoryProvider()
@@ -123,6 +123,7 @@ async def test_l0_units_have_body_and_finish_pair() -> None:
     assert await _alive_finish_pair(mem, "R0"), "L0 unit must have agent-layer finish pair"
 
 
+@pytest.mark.asyncio
 async def test_fold_drops_whole_unit_body_and_finish() -> None:
     """超 keep_last 的最老单元**整体**折成摘要：task 层胶囊 + finish 对一起 supersede（不再有
     「body 删、finish 留」的 L1 中间态）；未超的保留完整胶囊。"""
@@ -148,6 +149,7 @@ async def test_fold_drops_whole_unit_body_and_finish() -> None:
     assert summ[0].role == "user"
 
 
+@pytest.mark.asyncio
 async def test_fold_keeps_only_keep_last_capsules() -> None:
     """keep_last=1，开 4 个 → 最老 3 个整体折成一条摘要，仅最新 1 个保留为完整胶囊。"""
     mem = InMemoryMemoryProvider()
@@ -165,6 +167,7 @@ async def test_fold_keeps_only_keep_last_capsules() -> None:
     assert len(await _alive_summaries(mem)) == 1
 
 
+@pytest.mark.asyncio
 async def test_count_root_residues_counts_capsules() -> None:
     """_count_root_residues 数「结束顶层单元（胶囊）」；折成摘要的单元不计。"""
     mem = InMemoryMemoryProvider()
@@ -179,6 +182,7 @@ async def test_count_root_residues_counts_capsules() -> None:
     assert await _count_root_residues(state, ctx) == 2, "after fold, 2 capsules remain"
 
 
+@pytest.mark.asyncio
 async def test_summary_anchored_before_kept() -> None:
     """摘要锚到保留胶囊最早 ts − 1µs（不变量 A）。"""
     mem = InMemoryMemoryProvider()

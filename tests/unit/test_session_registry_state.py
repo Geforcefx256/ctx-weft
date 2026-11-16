@@ -4,12 +4,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-import pytest
 
 from ctx_weft.core.orchestrator.lifecycle.session_registry import SessionRegistry, _SessionState
 from ctx_weft.protocols.events import Event, EventType
-
-pytestmark = pytest.mark.asyncio
 
 
 class _SpyBus:

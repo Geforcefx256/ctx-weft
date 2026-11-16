@@ -18,7 +18,6 @@ from ctx_weft.core.orchestrator.lifecycle.agent_manager import AgentLifecycleMan
 from ctx_weft.core.orchestrator.lifecycle.session_registry import SessionRegistry
 from tests._event_helpers import append_one
 
-pytestmark = pytest.mark.asyncio
 
 
 def _ev(seq: int, type_: EventType, **payload) -> Event:
@@ -46,6 +45,7 @@ async def _runtime_and_sm():
     return runtime, sm
 
 
+@pytest.mark.asyncio
 async def test_resume_refuses_active_leftover() -> None:
     """上一轮滞留 ACTIVE（如硬崩溃未恢复）→ 拒绝开新轮,异常携带任务清单。"""
     runtime, sm = await _runtime_and_sm()
@@ -54,11 +54,12 @@ async def test_resume_refuses_active_leftover() -> None:
     await append_one(runtime.event_store, _ev(3, EventType.TASK_STARTED, task_id="t1"))
 
     with pytest.raises(UnfinishedTasksError) as ei:
-        await sm.resume_session("ses_1", runtime.event_store, user_prompt="next", task_manager=sm._new_task_manager(Session(id="ses_1", user_prompt="")))
+        await sm.start_next_turn("ses_1", runtime.event_store, user_prompt="next", task_manager=sm._new_task_manager(Session(id="ses_1", user_prompt="")))
     assert ei.value.session_id == "ses_1"
     assert "t1" in ei.value.task_ids
 
 
+@pytest.mark.asyncio
 async def test_resume_refuses_suspended_leftover() -> None:
     """滞留 SUSPENDED（打断后 HITL 已取消等）同样拒绝——非终态即未完。"""
     runtime, sm = await _runtime_and_sm()
@@ -68,9 +69,10 @@ async def test_resume_refuses_suspended_leftover() -> None:
     await append_one(runtime.event_store, _ev(4, EventType.TASK_SUSPENDED, task_id="t1"))
 
     with pytest.raises(UnfinishedTasksError):
-        await sm.resume_session("ses_1", runtime.event_store, user_prompt="next", task_manager=sm._new_task_manager(Session(id="ses_1", user_prompt="")))
+        await sm.start_next_turn("ses_1", runtime.event_store, user_prompt="next", task_manager=sm._new_task_manager(Session(id="ses_1", user_prompt="")))
 
 
+@pytest.mark.asyncio
 async def test_resume_allows_terminal_and_helper_tasks() -> None:
     """全部终态 + 辅助任务（compact/metadata,restore 也从不重排它们）→ 正常开新轮。"""
     runtime, sm = await _runtime_and_sm()
@@ -85,7 +87,7 @@ async def test_resume_allows_terminal_and_helper_tasks() -> None:
               "settings": {"_type": "MetadataFillerTaskSettings"}}))
     await append_one(runtime.event_store, _ev(6, EventType.TASK_STARTED, task_id="t2"))
 
-    session, root_task, tm = await sm.resume_session(
+    session, root_task, tm = await sm.start_next_turn(
         "ses_1", runtime.event_store, user_prompt="next", task_manager=sm._new_task_manager(Session(id="ses_1", user_prompt="")))
     assert session.id == "ses_1" and not hasattr(session, "status")
     assert root_task.id and tm.get_task(root_task.id) is not None

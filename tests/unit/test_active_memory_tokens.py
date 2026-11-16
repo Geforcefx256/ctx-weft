@@ -7,7 +7,6 @@ from ctx_weft.providers.llm.tokenizer import HeuristicTokenizer
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from ctx_weft.protocols import MemoryEvent, MemoryEventType as T, MemoryAddress, ProviderContext
 
-pytestmark = pytest.mark.asyncio
 _BASE = datetime(2026, 7, 1, tzinfo=UTC)
 
 
@@ -15,6 +14,7 @@ def _pctx():
     return ProviderContext(session_id="s", tenant_id="tn")
 
 
+@pytest.mark.asyncio
 async def test_active_tokens_sums_and_drops_after_supersede():
     mem = InMemoryMemoryProvider()
     scope = MemoryAddress(session_id="s", task_id="t1", agent_id="a")
@@ -35,6 +35,7 @@ async def test_active_tokens_sums_and_drops_after_supersede():
     assert after < before
 
 
+@pytest.mark.asyncio
 async def test_active_tokens_counts_image_parts():
     from ctx_weft.protocols import ImagePart, TextPart
     mem = InMemoryMemoryProvider()
@@ -52,6 +53,7 @@ async def test_active_tokens_counts_image_parts():
     assert total == text_only + 1600 + 4  # Message framing matches prepare/gateway.
 
 
+@pytest.mark.asyncio
 async def test_active_tokens_plain_text_includes_message_framing():
     """Count each emitted message's framing as well as its text."""
     mem = InMemoryMemoryProvider()

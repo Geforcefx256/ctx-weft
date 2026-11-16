@@ -52,7 +52,8 @@ from ctx_weft.core.loop.driver import make_event
 from ctx_weft.core.loop.llm_stream import DelegatingLLMStream, stream_until_cancel
 from ctx_weft.core.models.discriminators import InterruptReason
 from ctx_weft.core.orchestrator.model import ResolvedModel
-from ctx_weft.core.utils.content import redact_content_for_event, rehydrate_content
+from ctx_weft.core.utils.content import redact_content_for_event
+from ctx_weft.protocols.content import rehydrate_content
 from ctx_weft.core.utils.estimate import (
     dynamic_max_tokens,
     estimate_message_tokens,
@@ -617,8 +618,8 @@ async def externalize_prompt_images(inputs, *, event_blob_store, ctx):
     Memory references stay references. Only unpersisted input content can still
     contain inline images; send those through the existing event blob boundary.
     """
-    from ctx_weft.core.utils.content import content_to_event_jsonable
-    from ctx_weft.protocols.context import normalize_content_parts
+    from ctx_weft.protocols.content import content_to_event_jsonable
+    from ctx_weft.protocols.content import normalize_content_parts
 
     async def content(value):
         if not isinstance(value, list):

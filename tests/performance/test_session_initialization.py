@@ -12,9 +12,9 @@ from tests.unit.test_runtime_initialization_queries import runtime
 from ctx_weft.core.utils.event import new_event
 from ctx_weft.protocols.events import EventType
 
-pytestmark = pytest.mark.asyncio
 
 
+@pytest.mark.asyncio
 async def test_many_initialized_sessions_release_reports_and_repeat_without_io(monkeypatch, record_property):
     rt = runtime()
     count = 300

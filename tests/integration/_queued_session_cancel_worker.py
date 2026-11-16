@@ -1,3 +1,4 @@
+
 """Exercise session cancellation with a full pool and multiple queued tasks per agent."""
 
 import asyncio
@@ -5,9 +6,11 @@ import os
 import sys
 from pathlib import Path
 
-from tests._initialization import initialize_all
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from tests._recovery import recover_fixture_session
+from tests._initialization import initialize_all
 
 from ctx_weft import SessionStartParams
 from ctx_weft.core.control.reducers import rebuild_view
@@ -112,7 +115,7 @@ async def worker(path, fault, recovering=False):
             rt._read_persisted_task = read
             if recovering:
                 await rt.rebuild_session(SID, strict=True)
-                await rt.recover_agent(owner, session_id=SID)
+                await recover_fixture_session(rt, owner, session_id=SID)
                 await drain(rt)
                 raise AssertionError("recovery missed crash injection")
             async with asyncio.timeout(15):

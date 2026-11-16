@@ -18,13 +18,13 @@ TC_B = mint_call_id(anchor="recB", ordinal=0, raw_id="tc1", turn_seq=0)
 import pytest
 
 
-pytestmark = pytest.mark.asyncio
 
 
 class _NullBus:
     async def emit(self, *_a, **_k): ...
 
 
+@pytest.mark.asyncio
 async def test_reconcile_invokes_only_dangling_tool_calls() -> None:
     from datetime import UTC, datetime, timedelta
     from types import SimpleNamespace
@@ -72,6 +72,7 @@ async def test_reconcile_invokes_only_dangling_tool_calls() -> None:
     assert outcome.next_step == "prepare", "不停机——把结果交给 agent 继续"
 
 
+@pytest.mark.asyncio
 async def test_reconcile_no_dangling_routes_to_prepare() -> None:
     from datetime import UTC, datetime, timedelta
     from types import SimpleNamespace
@@ -107,6 +108,7 @@ async def test_reconcile_no_dangling_routes_to_prepare() -> None:
     assert outcome.next_step == "prepare"
 
 
+@pytest.mark.asyncio
 async def test_resolve_reconcile_detection_helper() -> None:
     from datetime import UTC, datetime, timedelta
     from ctx_weft.core.runtime import _task_has_dangling_tool_call

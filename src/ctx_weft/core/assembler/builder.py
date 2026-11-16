@@ -15,13 +15,8 @@ from datetime import datetime
 from typing import Any, Literal
 
 from ctx_weft.core.models.errors import ContextOverflowError
-from ctx_weft.core.utils.content import (
-    content_to_text,
-    content_with_prefix,
-    content_with_suffix,
-    downgrade_images_to_text,
-    image_part_count,
-)
+from ctx_weft.core.utils.content import image_part_count
+from ctx_weft.protocols.content import content_to_text, content_with_prefix, content_with_suffix, downgrade_images_to_text
 from ctx_weft.core.utils.estimate import (
     estimate_message_tokens,
     estimate_tools_tokens,
@@ -197,7 +192,7 @@ def _capability_facts(context, purpose: str, capabilities=None) -> list[dict[str
 def _prompt_facts(context, records=None, template=None, *, capabilities=None,
                   skill_definition=None) -> dict[str, Any]:
     from ctx_weft.core.utils.task_ref import task_label_parts, task_ref_parts
-    from ctx_weft.protocols.context import normalize_content_parts
+    from ctx_weft.protocols.content import normalize_content_parts
 
     records = context._records if records is None else records
     template_name, judge_task, scope = _intent_values(context)

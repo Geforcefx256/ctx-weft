@@ -15,7 +15,6 @@ from tests.integration.test_minimal_loop import InlineAgentTemplateProvider, mak
 from tests.integration.test_observe_turn_limit_status import _WorkTool
 from tests.integration.test_pause_on_first_message_e2e import _NamesTasksLLM
 
-pytestmark = pytest.mark.asyncio
 
 
 class ScriptedVerdicts(_NamesTasksLLM):
@@ -71,6 +70,7 @@ async def quiescent(rt, handle):
     return tm.get_task(handle.task_id)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("last", ["success", "fail"])
 async def test_background_continue_runs_without_user_input_then_closes(last):
     rt, llm, handle = await start(["continue", last])
@@ -88,6 +88,7 @@ async def test_background_continue_runs_without_user_input_then_closes(last):
     assert continuation.position < requeue.position
 
 
+@pytest.mark.asyncio
 async def test_waiting_stops_until_user_reply_after_plain_text():
     rt, llm, handle = await start(["waiting", "success"])
     task = await quiescent(rt, handle)
@@ -106,6 +107,7 @@ async def test_waiting_stops_until_user_reply_after_plain_text():
     assert not rt.hitl.registry.list_pending(handle.session_id)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("reported", ["success", "waiting", "continue"])
 async def test_max_turns_always_runs_again_without_waiting(reported):
     rt, llm, handle = await start([reported, "success"], tool_first=True)
@@ -123,6 +125,7 @@ async def test_max_turns_always_runs_again_without_waiting(reported):
     assert not rt.hitl.registry.list_pending(handle.session_id)
 
 
+@pytest.mark.asyncio
 async def test_max_turns_can_fail_when_the_task_exceeds_capability():
     rt, llm, handle = await start(["fail"], tool_first=True)
     task = await quiescent(rt, handle)
@@ -134,6 +137,7 @@ async def test_max_turns_can_fail_when_the_task_exceeds_capability():
                                    EventType.HITL_OPENED) for r in rows)
 
 
+@pytest.mark.asyncio
 async def test_continue_then_waiting_preserves_only_the_current_wait():
     rt, llm, handle = await start(["continue", "waiting", "success"])
     task = await quiescent(rt, handle)
@@ -147,6 +151,7 @@ async def test_continue_then_waiting_preserves_only_the_current_wait():
     assert llm.actor_count == 3
 
 
+@pytest.mark.asyncio
 async def test_user_reply_during_continuation_application_does_not_duplicate_actor(monkeypatch):
     from ctx_weft.providers.memory import organize as memory_ops
 
@@ -174,6 +179,7 @@ async def test_user_reply_during_continuation_application_does_not_duplicate_act
     assert not rt.hitl.registry.list_pending(handle.session_id)
 
 
+@pytest.mark.asyncio
 async def test_cancel_during_continuation_application_prevents_requeue(monkeypatch):
     from ctx_weft.providers.memory import organize as memory_ops
 

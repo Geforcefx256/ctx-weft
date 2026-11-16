@@ -8,7 +8,6 @@ from tests._snapshot_helpers import seed_snapshot
 from tests.integration.test_cancel_dispatch_windows import run_window
 from tests.integration.test_cancel_task_tree_recovery import cancel_content, recover
 
-pytestmark = pytest.mark.asyncio
 BASELINES = {}
 CASES = [(fault, None) for fault in (
     "run_failed", "run_unknown", "run_failed_twice", "run_unknown_twice",
@@ -18,6 +17,7 @@ CASES += [(fault, cut) for fault in ("run_failed_crash", "run_unknown_crash")
 CASES += [("run_failed_crash", "actor_finished")]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["active", "observe"])
 @pytest.mark.parametrize("snapshot", [False, True])
 @pytest.mark.parametrize("fault,second_cut", CASES)

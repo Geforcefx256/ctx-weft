@@ -15,6 +15,7 @@ host 即便显式传了 model，事件仍恒报 "mock"；依赖账号 default_mo
 
 from __future__ import annotations
 
+from ctx_weft.protocols.context import ProviderContext as _ProviderContext
 import pytest
 
 from ctx_weft.core import CtxWeftRuntime
@@ -35,6 +36,9 @@ from ctx_weft.providers.llm.provider import LLMAccount, LLMProvider, ModelConfig
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from tests._initialization import initialize_all
 from tests.integration.test_minimal_loop import make_runtime
+
+
+_PROVIDER_CONTEXT = _ProviderContext(session_id="test")
 
 # ── minimal fakes（自包含，避免跨测试文件 import）─────────────────────────────
 
@@ -95,7 +99,7 @@ class _OneAccountResolver:
         self._account = account
         self._default_model = default_model
 
-    def get_client(self, account=None, model=None):
+    def get_client(self, account=None, model=None, *, ctx):
         return _FixedModelClient(
             self._adapter,
             model or self._default_model,
@@ -159,9 +163,9 @@ def test_provider_get_client_carries_resolved_identity():
         ),
         persist=False,
     )
-    client = p.get_client(None, None)  # 双缺省 → 唯一账号 + default_model
+    client = p.get_client(None, None, ctx=_PROVIDER_CONTEXT)  # 双缺省 → 唯一账号 + default_model
     assert client.model == "real-model-x"
-    assert client.account == "acct-main"
+    assert client.account == p.get_account("acct-main").resource_id
 
 
 # ── run_single_task：真实创建路径的事件真值 ───────────────────────────────────

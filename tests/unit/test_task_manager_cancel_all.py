@@ -9,7 +9,6 @@ from ctx_weft.core.models.session import Session
 from ctx_weft.core.models.task import NormalTaskSettings, Task
 from tests.unit._stub_runner import StubRunner
 
-pytestmark = pytest.mark.asyncio
 
 
 def _tm() -> TaskManager:
@@ -18,6 +17,7 @@ def _tm() -> TaskManager:
     return tm
 
 
+@pytest.mark.asyncio
 async def test_cancel_all_cancels_pending_and_session():
     tm = _tm()
     for tid in ("a", "b"):
@@ -33,6 +33,7 @@ async def test_cancel_all_cancels_pending_and_session():
     assert not hasattr(tm._session, "status")
 
 
+@pytest.mark.asyncio
 async def test_drain_is_a_noop_after_cancel_all():
     tm = _tm()
     tm.set_runner(StubRunner(tm))               # would be called if drain scheduled

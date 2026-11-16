@@ -17,7 +17,6 @@ from tests.integration.test_minimal_loop import (
 )
 from tests.unit._legacy_recover import rebuild_all_active
 
-pytestmark = pytest.mark.asyncio
 
 _TS = datetime(2026, 6, 13, tzinfo=UTC)
 
@@ -41,6 +40,7 @@ async def _noop_drain(self) -> None:
     return None
 
 
+@pytest.mark.asyncio
 async def test_send_message_reuses_a_cold_prepared_task_manager(
     monkeypatch,
 ) -> None:
@@ -76,6 +76,7 @@ async def test_send_message_reuses_a_cold_prepared_task_manager(
     assert tm.get_task(handle.task_id).status not in ("FINISHED", "FAILED", "CANCELED")
 
 
+@pytest.mark.asyncio
 async def test_send_message_fast_path_does_not_rebuild_when_session_already_live(
     monkeypatch,
 ) -> None:
@@ -102,13 +103,13 @@ async def test_send_message_fast_path_does_not_rebuild_when_session_already_live
     tm.get_task(first.task_id).status = "FINISHED"
 
     called: list[str] = []
-    orig_recover_agent = rt.recover_agent
+    orig_recover_agent = rt.recover_session
 
     async def _spy_recover_agent(agent_id, **kw):
         called.append(agent_id)
         return await orig_recover_agent(agent_id, **kw)
 
-    monkeypatch.setattr(rt, "recover_agent", _spy_recover_agent, raising=False)
+    monkeypatch.setattr(rt, "recover_session", _spy_recover_agent, raising=False)
 
     await initialize_all(rt)
     handle = await rt.send_message(aid, "second message")

@@ -1,13 +1,4 @@
-"""ProviderRegistry：宿主注册进来的四类 provider 的唯一住所。
-
-**为什么单独成模块**：它此前住在 3465 行的 `runtime.py` 里，而 `runtime.py` 是
-**装配器**，不是类型的家。后果是一条 import 环——`orchestrator` 的
-`skill_executor_capability` / `template_lookup` 都要 `ProviderRegistry` 的类型，
-只能 `TYPE_CHECKING` 里反向引 `core.runtime`；registry 这边通知 skill 索引重建时
-又要惰性 import 回 orchestrator。两头各绕一次。
-
-搬到这里 + 用 `SkillIndexConsumer` Protocol 取代对具体类的 isinstance 之后，本模块
-只依赖 `protocols`，成为真正的叶子，那条环消失。
+"""ProviderRegistry：宿主注册的 Provider 及其授权器。
 
 公共 API 不变：`from ctx_weft import ProviderRegistry` 与
 `from ctx_weft.core import ProviderRegistry` 照旧。
@@ -24,8 +15,6 @@ from ctx_weft.protocols import (
     KnowledgeProvider,
     LLMClientResolver,
     MemoryProvider,
-    SkillCapabilityProvider,
-    SkillIndexConsumer,
 )
 
 if TYPE_CHECKING:
@@ -39,7 +28,7 @@ class ProviderRegistry:
     四种 provider 类型：
       memory     — 唯一；重复注册覆盖
       knowledge  — 有序列表，按 priority 升序（数字小 = 优先级高）
-      capability — 有序列表；SkillCapabilityProvider 注册/注销时通知 SkillExecutorCapabilityProvider
+      capability — 有序列表；发现与解析由调用方携带上下文执行
       llm        — 唯一；重复注册覆盖
     """
 
@@ -104,19 +93,14 @@ class ProviderRegistry:
         if tool_rerun_authorizers:
             self._capability_rerun_authorizers.update(tool_rerun_authorizers)
         # recovery_policy 的取值校验在 resolver 的异步面做（那里能 await provider.list）。
-        if isinstance(provider, SkillCapabilityProvider):
-            self._notify_skill_executor_dirty()
 
     def deregister_capability(self, provider_name: str) -> bool:
         before = len(self._capabilities)
-        removed = [p for p in self._capabilities if p.name == provider_name]
         self._capabilities = [p for p in self._capabilities if p.name != provider_name]
         prefix = provider_name + ":"
         for reg in (self._capability_authorizers, self._capability_rerun_authorizers):
             for key in [k for k in reg if k == provider_name or k.startswith(prefix)]:
                 del reg[key]
-        if any(isinstance(p, SkillCapabilityProvider) for p in removed):
-            self._notify_skill_executor_dirty()
         return len(self._capabilities) < before
 
     def get_capability_providers(self) -> list[CapabilityProvider]:
@@ -141,19 +125,6 @@ class ProviderRegistry:
     def get_capability_rerun_authorizers(self) -> "dict[str, RerunAuthorizer]":
         """provider_name / capability_id → RerunAuthorizer，供 CapabilityGateway 使用。"""
         return dict(self._capability_rerun_authorizers)
-
-    def _notify_skill_executor_dirty(self) -> None:
-        """SkillCapabilityProvider 增减时通知持有 skill 索引的 provider 重建。
-
-        判据是 `SkillIndexConsumer` 这个 Protocol，不是具体类：本模块因此完全不必
-        知道 `SkillExecutorCapabilityProvider` 的存在。改造前这里对具体类做
-        isinstance，而那个类住在 `core.orchestrator`、后者又要本类的类型，只能靠
-        函数内惰性 import 绕环——现在环真正没了。
-        """
-        for p in self._capabilities:
-            if isinstance(p, SkillIndexConsumer):
-                p.mark_dirty()
-                break
 
     # ── LLM ──────────────────────────────────────────────────────────────────
 

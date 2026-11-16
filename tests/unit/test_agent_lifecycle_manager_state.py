@@ -13,7 +13,6 @@ from tests.integration.test_minimal_loop import (
     make_echo_template,
 )
 
-pytestmark = pytest.mark.asyncio
 
 
 class _Bus:
@@ -41,10 +40,11 @@ def _lm() -> AgentLifecycleManager:
     providers.register_capability(provider)
     return AgentLifecycleManager(
         template_lookup=TemplateLookup(providers=providers), event_bus=_Bus(),
-        model_resolver=lambda a, m: _Client(),
+        model_resolver=lambda a, m, **_context: _Client(),
     )
 
 
+@pytest.mark.asyncio
 async def test_instantiate_registers_a_record():
     lm = _lm()
     agent, _tmpl = await lm.instantiate(
@@ -54,6 +54,7 @@ async def test_instantiate_registers_a_record():
     assert lm.template_id_of(agent.id) == agent.template_id
 
 
+@pytest.mark.asyncio
 async def test_register_session_is_reentrant():
     lm = _lm()
     lm.register_session("s1", tenant_id="t1")
@@ -62,6 +63,7 @@ async def test_register_session_is_reentrant():
     assert lm._sessions["s1"].tenant_id == "t1"
 
 
+@pytest.mark.asyncio
 async def test_forget_session_drops_only_that_sessions_agents():
     lm = _lm()
     a, _ = await lm.instantiate(
@@ -73,6 +75,7 @@ async def test_forget_session_drops_only_that_sessions_agents():
     assert lm.has(b.id)
 
 
+@pytest.mark.asyncio
 async def test_instantiate_parent_fallback_uses_this_calls_session_not_most_recent():
     """多 session 并发恢复：unregistered 父 agent 的回落语境该取*本次 instantiate
     调用自己*的 session/tenant，不是「最近一次 register_session 的会话」——否则

@@ -56,7 +56,7 @@ async def test_reopen_resets_failure_state_and_dispatches_on_the_same_owner(
     await _fail_without_dispatch(owner, old_root)
     owner.set_recovery_pending(recovery_pending)
 
-    session, root, reopened = await registry.resume_session(
+    session, root, reopened = await registry.start_next_turn(
         "s1", store, user_prompt="new", task_manager=owner)
 
     assert reopened is owner
@@ -102,7 +102,7 @@ async def test_reopen_refusal_preserves_the_existing_breaker():
     failures = list(owner._recent_failures)
 
     with pytest.raises(UnfinishedTasksError):
-        await registry.resume_session("s1", store, user_prompt="new", task_manager=owner)
+        await registry.start_next_turn("s1", store, user_prompt="new", task_manager=owner)
 
     assert owner.session is old_session and old_session.failure_counter == 1
     assert owner.is_cancelled() and owner._threshold_tripped
@@ -129,7 +129,7 @@ async def test_reopen_waits_for_old_terminal_dispatch_before_resetting():
     await asyncio.wait_for(entered.wait(), timeout=2)
     assert old_root.status == "FAILED"  # Terminal fact published; settlement still running.
 
-    reopening = asyncio.create_task(registry.resume_session(
+    reopening = asyncio.create_task(registry.start_next_turn(
         "s1", store, user_prompt="new", task_manager=owner))
     try:
         await asyncio.sleep(0)

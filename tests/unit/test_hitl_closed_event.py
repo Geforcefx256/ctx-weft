@@ -28,7 +28,6 @@ from ctx_weft.protocols.hitl import (
 )
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 
-pytestmark = pytest.mark.asyncio
 
 _T0 = datetime(2026, 9, 20, tzinfo=UTC)
 
@@ -79,6 +78,7 @@ async def _harness(monkeypatch):
     return rt, session, task, trace, emitted
 
 
+@pytest.mark.asyncio
 async def test_emitted_after_the_ingest_not_before(monkeypatch):
     """顺序就是正确性：先 ingest 再盖章。
 
@@ -99,6 +99,7 @@ async def test_emitted_after_the_ingest_not_before(monkeypatch):
     assert (ev.session_id, ev.task_id, ev.tenant_id) == ("s1", "t1", "acme")
 
 
+@pytest.mark.asyncio
 async def test_not_emitted_when_the_ingest_fails(monkeypatch):
     """ingest 失败 → 不许发。发了就等于宣布「已注入」，那条答复再也不会被补。"""
     rt, session, task, trace, emitted = await _harness(monkeypatch)
@@ -115,6 +116,7 @@ async def test_not_emitted_when_the_ingest_fails(monkeypatch):
     assert emitted == [], "ingest 没成，绝不能宣布已注入"
 
 
+@pytest.mark.asyncio
 async def test_emit_failure_does_not_undo_a_successful_injection(monkeypatch):
     """发事件失败**不抛**：注入已经成功、回滚不了，抛出去会把一次成功变成恢复失败。
 
@@ -139,6 +141,7 @@ async def test_emit_failure_does_not_undo_a_successful_injection(monkeypatch):
     assert [r.content for r in recs] == ["我的答复"], "注入本身必须已经生效"
 
 
+@pytest.mark.asyncio
 async def test_registry_no_longer_lists_it_for_re_injection(monkeypatch):
     """端到端的那条闭环：发过 injected 之后，折叠 → registry → 补注入清单里没有它。
 

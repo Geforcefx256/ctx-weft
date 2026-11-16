@@ -37,18 +37,11 @@ from ctx_weft.protocols.capability import (
     SkillCapability,
     SkillCapabilityProvider,
     SkillDefinition,
-    SkillIndexConsumer,
     ToolCapability,
     ToolCapabilityProvider,
 )
-from ctx_weft.protocols.context import (
-    BLOB_REF_PREFIX,
-    Citation,
-    ContentPart,
-    ImagePart,
-    ProviderContext,
-    TextPart,
-)
+from ctx_weft.protocols.context import Citation, ProviderContext
+from ctx_weft.protocols.content import BLOB_REF_PREFIX, ContentPart, ImagePart, TextPart
 from ctx_weft.protocols.events import (
     EVENT_TYPES,
     TRANSIENT_EVENT_TYPES,
@@ -140,14 +133,9 @@ from ctx_weft.protocols.memory import (
     Subscription,
     load_records,
 )
-from ctx_weft.protocols.runtime import (
-    InitializationReport,
-    QueryResult,
-    SessionDetail,
-    SessionInitializationResult,
-    SessionStateSummary,
-    TaskDetail,
-)
+from ctx_weft.protocols.agent import AgentState
+from ctx_weft.protocols.runtime import InitializationReport, QueryResult, SessionDetail, SessionInitializationResult, SessionStateSummary
+from ctx_weft.protocols.task import TaskDetail
 from ctx_weft.protocols.template import (
     AgentTemplate,
     CapabilityRef,
@@ -176,7 +164,6 @@ __all__ = [
     "SessionScopedCapabilityProvider",
     "SkillCapability",
     "SkillCapabilityProvider",
-    "SkillIndexConsumer",
     "SkillDefinition",
     "ToolCapability",
     "ToolCapabilityProvider",
@@ -279,5 +266,11 @@ __all__ = [
 ]
 
 
-__all__ += ["InitializationReport", "QueryResult", "SessionDetail", "TaskDetail",
+__all__ += ["AgentState", "InitializationReport", "QueryResult", "SessionDetail", "TaskDetail",
             "SessionInitializationResult", "SessionStateSummary"]
+
+from ctx_weft.protocols.runtime import (
+    PromptDiagnostic, RuntimeClosedError, RuntimeShutdownError, ShutdownReport,
+)
+
+__all__ += ["PromptDiagnostic", "RuntimeClosedError", "RuntimeShutdownError", "ShutdownReport"]

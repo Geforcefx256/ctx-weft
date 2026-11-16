@@ -63,13 +63,14 @@ async def store_pair(request, tmp_path):
 
         url = f"sqlite+aiosqlite:///{tmp_path / 'events.sqlite'}"
         engine, f1 = make_session_factory(url, connect_args={"timeout": 15})
-        _, f2 = make_session_factory(url, connect_args={"timeout": 15})
+        engine2, f2 = make_session_factory(url, connect_args={"timeout": 15})
         try:
             from ctx_weft.providers.events.store.sql.models import Base
             async with engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
             yield SqlEventStore(f1), SqlEventStore(f2)
         finally:
+            await engine2.dispose()
             await engine.dispose()
 
 

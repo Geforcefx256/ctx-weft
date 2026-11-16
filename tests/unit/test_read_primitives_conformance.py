@@ -16,7 +16,6 @@ import pytest
 
 from ctx_weft.protocols.events import Event, EventType, StoredEvent
 
-pytestmark = pytest.mark.asyncio
 
 _T0 = datetime(2026, 9, 20, tzinfo=UTC)
 _SID = "s1"
@@ -58,6 +57,7 @@ async def _seed(store) -> None:
 # ── read_last_of_type ─────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_last_of_type_returns_the_highest_position(store) -> None:
     """「最后一条」= position 最大，与 `read_range` / `committed_head` 同一个序。
 
@@ -73,6 +73,7 @@ async def test_last_of_type_returns_the_highest_position(store) -> None:
     assert got.position == 4
 
 
+@pytest.mark.asyncio
 async def test_last_of_type_reads_exactly_one(store) -> None:
     """只读一条——这是它存在的理由。
 
@@ -89,6 +90,7 @@ async def test_last_of_type_reads_exactly_one(store) -> None:
     assert got is not None and got.event.id == all_of_type[-1].event.id
 
 
+@pytest.mark.asyncio
 async def test_last_of_type_is_none_when_absent(store) -> None:
     """没有这种事件 → None，不是空列表、不抛。"""
     await _seed(store)
@@ -97,6 +99,7 @@ async def test_last_of_type_is_none_when_absent(store) -> None:
     assert await store.read_last_of_type("s_other", EventType.MEMORY_COMPACTED) is None
 
 
+@pytest.mark.asyncio
 async def test_related_task_filter_includes_cross_task_facts_and_respects_cut(store):
     from dataclasses import replace
 
@@ -122,6 +125,7 @@ async def test_related_task_filter_includes_cross_task_facts_and_respects_cut(st
 # ── read_range(exclude_types=) ────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_exclude_types_skips_them(store) -> None:
     """排除掉的不返回，其余原样、仍按 position 升序。
 
@@ -136,6 +140,7 @@ async def test_exclude_types_skips_them(store) -> None:
     assert [se.position for se in got] == [1, 3, 5], "position 原样，不重编号"
 
 
+@pytest.mark.asyncio
 async def test_exclude_types_default_is_no_filtering(store) -> None:
     """不传 → 行为与从前逐字一致（全取）。"""
     await _seed(store)
@@ -145,6 +150,7 @@ async def test_exclude_types_default_is_no_filtering(store) -> None:
     assert len(got) == 5
 
 
+@pytest.mark.asyncio
 async def test_exclude_types_composes_with_the_position_window(store) -> None:
     """与 position 窗口叠加，不互相干扰。"""
     await _seed(store)
@@ -156,6 +162,7 @@ async def test_exclude_types_composes_with_the_position_window(store) -> None:
     assert [se.position for se in got] == [3, 5]
 
 
+@pytest.mark.asyncio
 async def test_head_is_unaffected_by_exclusion(store) -> None:
     """`committed_head` 不受排除影响——它是提交位点，不是某次查询的结果。
 

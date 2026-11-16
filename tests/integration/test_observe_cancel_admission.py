@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """An accepted session cancel survives a later observation publication window."""
 
 import asyncio
@@ -161,13 +163,13 @@ async def test_accepted_session_cancel_survives_later_finalized_write_and_recove
             # If recovery accidentally revives the work, the model can finish;
             # actor count and cancellation facts will expose the extra execution.
             llm.finish = True
-            await rt.recover_agent(handle.agent_id, session_id=handle.session_id)
+            await recover_fixture_session(rt, handle.agent_id, session_id=handle.session_id)
             await _drained(tm, timeout=5)
             assert tm.get_task(handle.task_id).status == "CANCELED" and llm.actors == 1
             if backend == "sqlite":
                 rt = _runtime(llm, memory, rt.event_store)
                 await initialize_all(rt)
-                await rt.recover_agent(handle.agent_id, session_id=handle.session_id)
+                await recover_fixture_session(rt, handle.agent_id, session_id=handle.session_id)
                 tm = rt._task_managers[handle.session_id]
                 owners.append(tm)
                 await _drained(tm, timeout=5)

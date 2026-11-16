@@ -275,8 +275,8 @@ async def test_runtime_new_goal_runs_before_old_review_and_late_review_keeps_age
         await asyncio.wait_for(old_closed.wait(), 5)
         await initialize_all(rt)
         agent = (await rt.get_agent(handle.agent_id)).data
-        assert agent.current_task_id == successor.id
-        assert agent.status == "running"
+        assert agent.state.current_task.task_id == successor.id
+        assert agent.state.status == "running"
         assert old.status == ("FINISHED" if old_verdict == "success" else "FAILED")
         release_new.set()
         for _ in range(100):

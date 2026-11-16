@@ -5,54 +5,24 @@ from __future__ import annotations
 import logging
 from time import perf_counter
 
+from ctx_weft.core.control.session_queries import session_state_summary
 from ctx_weft.core.control.startup_view import (
     apply_startup_events,
-    read_startup_task,
     rebuild_startup_view,
 )
 from ctx_weft.core.models.discriminators import CancelReason, TaskErrorCode
 from ctx_weft.core.orchestrator.lifecycle.agent_state import AgentInput, next_agent_transition
 from ctx_weft.core.utils.event import new_event
 from ctx_weft.protocols.events import EventOrigin, EventType
-from ctx_weft.protocols.hitl import HITL_OUTCOME_CANCELLED, NoResumeDelivery, UserTurnDelivery
+from ctx_weft.protocols.hitl import HITL_OUTCOME_CANCELLED, NoResumeDelivery
 from ctx_weft.protocols.runtime import (
     SessionInitializationResult,
-    SessionStateSummary,
 )
 
 logger = logging.getLogger(__name__)
 
 
-async def _session_state_summary(store, view, session, head: int) -> SessionStateSummary:
-    agents = list(view.agents.values())
-    root = view.agents.get(session.root_agent_id)
-    if root is None:
-        root = next((a for a in agents if a.parent_agent_id is None), None)
-    pending = list(view.hitl.pending.values())
-    user_turns = [r for r in pending if isinstance(r.delivery, UserTurnDelivery)]
-    running = any(a.status == "running" for a in agents)
-    interrupted = any(a.status == "interrupted" for a in agents)
-    task_id = root.current_task_id if root else ""
-    task = view.tasks.get(task_id)
-    # A pruned root task is needed only if no agent/HITL fact already determines
-    # the display state. Read that task at this same cut, never all task history.
-    if (task is None and task_id and not running and not pending and not interrupted
-            and root.status != "terminated"):
-        task = await read_startup_task(store, session.id, task_id, through_position=head)
-    return SessionStateSummary(
-        root_agent_id=root.id if root else session.root_agent_id or "",
-        root_agent_status=root.status if root else None,
-        root_task_id=task_id or "",
-        root_task_status=task.status if task else None,
-        has_running_agents=running,
-        has_interrupted_agents=interrupted,
-        pending_hitl_count=len(pending),
-        pending_user_turn_hitl_count=len(user_turns),
-        waiting_user_turn_agent_id=next((r.agent_id for r in reversed(user_turns) if r.agent_id), ""),
-    )
-
-
-async def calibrate_session(store, sid: str) -> SessionInitializationResult:
+async def calibrate_session(store, sid: str, *, reason: str = "crash_recovery", publish=None) -> SessionInitializationResult:
     """Calibrate only the addressed session at its durable cut; never enumerate."""
     started = perf_counter()
     head = await store.committed_head(sid)
@@ -66,7 +36,7 @@ async def calibrate_session(store, sid: str) -> SessionInitializationResult:
     for run_id, run in view.open_runs.items():
         sequence = run["sequence"]
         for kind, payload in (
-            (EventType.RUN_INTERRUPTED, {"reason": "crash_recovery"}),
+            (EventType.RUN_INTERRUPTED, {"reason": reason}),
             (EventType.RUN_FINISHED, {"outcome": "interrupted"}),
         ):
             sequence += 1
@@ -127,7 +97,7 @@ async def calibrate_session(store, sid: str) -> SessionInitializationResult:
             EventType.TASK_INTERRUPTED, session_id=sid,
             tenant_id=session.tenant_id, origin=EventOrigin.RUNTIME,
             task_id=task.id, agent_id=aid,
-            payload={"reason": "crash_recovery", "error_message": "Process interrupted"},
+            payload={"reason": reason, "error_message": "Process interrupted"},
         ))
         if aid:
             affected_agents.add(aid)
@@ -162,7 +132,7 @@ async def calibrate_session(store, sid: str) -> SessionInitializationResult:
                 (AgentInput.SETTLED if aid in settled_agents else
                  AgentInput.AWAITING_HUMAN if req else AgentInput.INTERRUPTED),
                 task_id=agent.current_task_id, hitl_id=req.id if req else "",
-                reason="crash_recovery")
+                reason=reason)
             if transition is None:
                 continue
             events.append(new_event(
@@ -175,13 +145,19 @@ async def calibrate_session(store, sid: str) -> SessionInitializationResult:
     committed = head
     if events:
         # No bus fanout: startup must not populate runtime registries or snapshots.
-        receipt = await store.append_batch(sid, f"startup:{sid}:{head}", events)
-        stored = list(receipt.records)
+        if publish is None:
+            receipt = await store.append_batch(sid, f"startup:{sid}:{head}", events)
+            stored = list(receipt.records)
+        else:
+            await publish(events)
+            ids = {event.id for event in events}
+            stored = [row for row in await store.read_range(sid, after_position=head)
+                      if row.event.id in ids]
         committed = stored[-1].position
         apply_startup_events([row.event for row in stored], view)
     result = SessionInitializationResult(
         session_id=sid, before_position=head, committed_position=committed,
-        state=await _session_state_summary(store, view, session, committed),
+        state=await session_state_summary(store, view, session, committed),
         startup_events=stored,
     )
     logger.debug("Session initialized: session=%s duration_ms=%.1f", sid,

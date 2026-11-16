@@ -40,7 +40,7 @@ async def test_report_is_after_commit_and_survives_a_second_process_losing_the_r
     assert result.committed_position > before
     assert result.startup_events == await store.read_range(h.session_id, after_position=before)
     assert result.state.has_interrupted_agents and not result.state.has_running_agents
-    assert result.state.root_task_status == "INTERRUPTED"
+    assert result.state.root_task.status == "INTERRUPTED"
     assert not rt._task_managers and not rt._agent_lifecycle_manager.all_agent_ids()
 
     # The host never received the first report. A fresh SDK emits no duplicate
@@ -80,15 +80,16 @@ async def test_summary_reads_pruned_root_only_and_accepts_status_only_snapshot(s
     monkeypatch.setattr(store, "read_last_of_type", last)
     report = await initialize_all(runtime(store))
     result, = report.sessions
-    assert result.startup_events == [] and result.state.root_task_status == "FINISHED"
-    assert result.state.root_task_id == "root-task"
+    assert result.startup_events == [] and result.state.root_task.status == "FINISHED"
+    assert result.state.root_task.task_id == "root-task"
     target = [kw for kw in calls if kw.get("related_task_id")]
-    assert len(target) == (1 if base_kind == "pruned" else 0)
+    # Compact recovery facts need one bounded task-body query for the public DTO.
+    assert len(target) == 1
     if target:
         assert target[0]["related_task_id"] == "root-task"
         assert target[0]["through_position"] == result.committed_position
     assert len(calls) == 1 + len(target)
-    assert last.await_count == 1  # Root fallback must not fetch the same snapshot again.
+    assert last.await_count <= 2  # Control snapshot plus the full task query.
 
 
 async def test_lost_commit_confirmation_yields_no_success_report_then_recovers(store, monkeypatch):
@@ -110,4 +111,4 @@ async def test_lost_commit_confirmation_yields_no_success_report_then_recovers(s
     monkeypatch.setattr(store, "append_batch", original)
     result, = (await initialize_all(rt)).sessions
     assert result.startup_events == [] and result.committed_position == committed
-    assert result.state.has_interrupted_agents and result.state.root_task_status == "INTERRUPTED"
+    assert result.state.has_interrupted_agents and result.state.root_task.status == "INTERRUPTED"

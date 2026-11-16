@@ -6,10 +6,9 @@ from ctx_weft.core.events.commit_gate import CommitGate
 from ctx_weft.core.models.task import Task
 from ctx_weft.core.orchestrator.task.disposition import RunOutcome, RunOutcomeKind
 from ctx_weft.core.orchestrator.task.manager import TaskManager
-from ctx_weft.protocols.events import EventType
+from ctx_weft.protocols.events import EventType, PersistenceUnavailableError
 from ctx_weft.providers.events import InMemoryEventStore, InProcessEventBus
 
-pytestmark = pytest.mark.asyncio
 
 
 def setup(*, retry_count=0):
@@ -22,6 +21,7 @@ def setup(*, retry_count=0):
     return tm, task, bus, store
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("outcome,retries,status,count", [
     (RunOutcome(RunOutcomeKind.COMPLETED, verdict="success"), 0, "FINISHED", 0),
     (RunOutcome(RunOutcomeKind.COMPLETED, verdict="fail"), 0, "FAILED", 0),
@@ -52,9 +52,11 @@ async def test_subscriber_queries_new_state_only_after_commit(outcome, retries, 
     bus.subscribe(None, query)
     assert await tm.apply_run_outcome(task.id, outcome) == status
     assert before_commit == [("ACTIVE", retries)]
-    assert notified == [(status, count, outcome.error or None, outcome.error_code or None)]
+    code = outcome.error_code or ("TASK_FAILED_BY_OBSERVER" if status == "FAILED" else None)
+    assert notified == [(status, count, outcome.error or None, code)]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("retry_entry", ["apply", "reconcile"])
 @pytest.mark.parametrize("retry_count", [0, 2])
 @pytest.mark.parametrize("kind", [RunOutcomeKind.COMPLETED, RunOutcomeKind.INTERRUPTED])
@@ -85,9 +87,33 @@ async def test_notification_retry_preserves_the_committed_budget(retry_entry, re
     assert not tm._pending_emissions
 
 
+@pytest.mark.asyncio
 async def test_manager_without_bus_still_publishes_disposition():
     tm = TaskManager("s1")
     task = Task(id="t1", session_id="s1", status="ACTIVE")
     tm.register_task(task)
     await tm.apply_run_outcome(task.id, RunOutcome(RunOutcomeKind.COMPLETED, verdict="continue"))
     assert (task.status, task.retry_count) == ("PENDING", 0)
+
+
+@pytest.mark.asyncio
+async def test_failed_commit_does_not_publish_failure_metadata_and_retry_keeps_its_count():
+    tm, task, bus, store = setup(retry_count=3)
+    append = store.append_batch
+    attempts = []
+
+    async def fail_once(sid, bid, events):
+        attempts.append((bid, events[0].id))
+        if len(attempts) == 1:
+            raise OSError("storage offline")
+        return await append(sid, bid, events)
+
+    store.append_batch = fail_once
+    outcome = RunOutcome(RunOutcomeKind.COMPLETED, verdict="fail", error="actual cause")
+    with pytest.raises(PersistenceUnavailableError):
+        await tm.apply_run_outcome(task.id, outcome)
+    assert (task.status, task.error_code, task.failure_retry_count) == ("ACTIVE", None, None)
+    await tm.apply_run_outcome(task.id, outcome)
+    assert task.error == "actual cause" and task.error_code == "TASK_FAILED_BY_OBSERVER"
+    assert task.failure_retry_count == 3 and task.retry_count == 3
+    assert attempts[0] == attempts[1] and len(await store.read_range("s1")) == 1

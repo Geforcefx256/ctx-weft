@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """Whole user journeys: interrupt, retract, edit, finish, restart and work again.
 
 Only provider I/O and model latency are controlled. Runtime entry points, task
@@ -26,7 +28,6 @@ from tests.integration.test_send_message_after_session_done import (
     _is_background_observe,
 )
 
-pytestmark = pytest.mark.asyncio
 SID = "whole-user-journey"
 
 
@@ -139,6 +140,7 @@ async def assert_event_contract(store, sid):
                 assert finishes[run][0].position < terminal.position
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("entry", ["send", "reply"])
 @pytest.mark.parametrize("short", [False, True])
 @pytest.mark.parametrize("late", [False, True])
@@ -212,7 +214,7 @@ async def test_repeated_edit_retract_finish_restart_and_next_task(tmp_path, entr
             cold = runtime(store, memory, _FinishEveryTaskLLM(), short)
             await initialize_all(cold)
             await cold.rebuild_session(SID, strict=True)
-            await cold.recover_agent(h.agent_id, session_id=SID)
+            await recover_fixture_session(cold, h.agent_id, session_id=SID)
             await idle(cold)
             assert await store.committed_head(SID) == head
             assert [(r.id, r.content) for r in await body(memory, h.task_id)] == before
@@ -221,6 +223,7 @@ async def test_repeated_edit_retract_finish_restart_and_next_task(tmp_path, entr
             await settled(cold, nxt)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("entry", ["send", "reply"])
 async def test_immediate_input_from_confirmed_pause_notice_remains_retractable(tmp_path, entry):
     """Hosts may post either API as soon as they display the confirmed pause."""
@@ -270,6 +273,7 @@ async def test_immediate_input_from_confirmed_pause_notice_remains_retractable(t
                 await rt.cancel_session(SID)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("entry", ["send", "reply"])
 @pytest.mark.parametrize("fault,action", [
     ("before", "resume"), ("unknown", "resume"), ("memory", "resume"),
@@ -308,7 +312,7 @@ async def test_resume_after_input_commit_failure_finishes_and_accepts_next_work(
             for _ in range(2):
                 rt.clear_storage_isolation(SID)
                 try:
-                    await rt.recover_agent(h.agent_id, session_id=SID)
+                    await recover_fixture_session(rt, h.agent_id, session_id=SID)
                 except Exception as exc:
                     from ctx_weft.protocols.events import PersistenceUnavailableError
                     assert isinstance(exc, OSError if fault == "memory" else PersistenceUnavailableError)
@@ -332,7 +336,7 @@ async def test_resume_after_input_commit_failure_finishes_and_accepts_next_work(
                 view = await rebuild_view(store, SID)
                 assert not view.open_runs and not view.pending_observe and not view.hitl.pending
                 return
-            await rt.recover_agent(h.agent_id, session_id=SID)
+            await recover_fixture_session(rt, h.agent_id, session_id=SID)
             await settled(rt, h)
             records = await body(memory, h.task_id)
             assert sum("FINAL_REQUEST" in str(r.content) for r in records if r.role == "user") == 1
@@ -340,6 +344,7 @@ async def test_resume_after_input_commit_failure_finishes_and_accepts_next_work(
             await settled(rt, nxt)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("entry", ["send", "reply"])
 @pytest.mark.parametrize("snapshot", [False, True])
 @pytest.mark.parametrize("recovery_fault", ["none", "crash_again", "memory_write"])
@@ -379,7 +384,7 @@ async def test_cold_input_recovery_preserves_request_through_to_next_task(tmp_pa
             task, = tm.all_tasks()
             aid = tm.session.root_agent_id
             try:
-                await rt.recover_agent(aid, session_id=SID)
+                await recover_fixture_session(rt, aid, session_id=SID)
             except OSError:
                 assert recovery_fault == "memory_write" and failed
                 assert not tm._dispatch_tasks and not llm.actor_requests
@@ -387,7 +392,7 @@ async def test_cold_input_recovery_preserves_request_through_to_next_task(tmp_pa
                 await tm.drain()  # An unrelated settlement cannot bypass recovery.
                 assert not tm._dispatch_tasks and not llm.actor_requests
                 memory.ingest = original
-                await rt.recover_agent(aid, session_id=SID)
+                await recover_fixture_session(rt, aid, session_id=SID)
             h = type("Handle", (), {"task_id": task.id, "agent_id": aid})()
             await wait_until(lambda: task.status == "FINISHED")
             await idle(rt)
@@ -399,7 +404,7 @@ async def test_cold_input_recovery_preserves_request_through_to_next_task(tmp_pa
             again = runtime(store, memory, _FinishEveryTaskLLM(), False)
             await initialize_all(again)
             await again.rebuild_session(SID, strict=True)
-            await again.recover_agent(h.agent_id, session_id=SID)
+            await recover_fixture_session(again, h.agent_id, session_id=SID)
             await idle(again)
             assert await store.committed_head(SID) == head
             assert [(r.id, r.content) for r in await body(memory, task.id)] == before
@@ -408,6 +413,7 @@ async def test_cold_input_recovery_preserves_request_through_to_next_task(tmp_pa
             await assert_event_contract(store, SID)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("finish_fault", ["before", "unknown"])
 async def test_uncertain_input_then_repeated_finish_failure_retains_original_run(tmp_path, finish_fault):
     from copy import deepcopy
@@ -451,7 +457,7 @@ async def test_uncertain_input_then_repeated_finish_failure_retains_original_run
             for _ in range(2):
                 rt.clear_storage_isolation(SID)
                 with pytest.raises(PersistenceUnavailableError):
-                    await rt.recover_agent(h.agent_id, session_id=SID)
+                    await recover_fixture_session(rt, h.agent_id, session_id=SID)
                 assert rt._pending_actor_runs[(SID, h.task_id)].finished.id == original_finish
                 assert h.task_id in tm.running_task_ids() and not tm._dispatch_tasks
             assert len(finish_attempts) >= 2
@@ -459,7 +465,7 @@ async def test_uncertain_input_then_repeated_finish_failure_retains_original_run
             finish_available.set()
             store.append_batch = original
             rt.clear_storage_isolation(SID)
-            await rt.recover_agent(h.agent_id, session_id=SID)
+            await recover_fixture_session(rt, h.agent_id, session_id=SID)
             await settled(rt, h)
             assert (SID, h.task_id) not in rt._pending_actor_runs
             await assert_event_contract(store, SID)

@@ -263,7 +263,7 @@ def test_blob_ref_prefix_lives_in_context() -> None:
 
     import ctx_weft.protocols.memory as memory_module
     from ctx_weft.protocols import BLOB_REF_PREFIX as PkgPrefix
-    from ctx_weft.protocols.context import BLOB_REF_PREFIX
+    from ctx_weft.protocols.content import BLOB_REF_PREFIX
     from ctx_weft.protocols.memory import BLOB_REF_PREFIX as MemPrefix
 
     assert BLOB_REF_PREFIX == "blob:"

@@ -6,9 +6,9 @@
 """
 from __future__ import annotations
 
-from ctx_weft.core.utils.content import content_to_text
+from ctx_weft.protocols.content import content_to_text
 from ctx_weft.protocols.capability import AgentCapability, Capability
-from ctx_weft.protocols.context import TextPart
+from ctx_weft.protocols.content import TextPart
 
 
 def test_str_passthrough():

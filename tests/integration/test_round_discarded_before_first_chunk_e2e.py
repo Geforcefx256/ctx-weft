@@ -32,7 +32,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 _MOCK_CONTEXT_LIMIT = 100_000
 _DISCARDED_PROMPT = "this question gets taken back"
@@ -89,10 +88,11 @@ async def _user_texts(rt, session_id: str, agent_id: str, task_id: str) -> list[
         ProviderContext(session_id=session_id, tenant_id="default",
                         task_id=task_id, agent_id=agent_id),
     )
-    from ctx_weft.core.utils.content import content_to_text
+    from ctx_weft.protocols.content import content_to_text
     return [content_to_text(r.content) for r in view if r.role == "user"]
 
 
+@pytest.mark.asyncio
 async def test_pause_before_first_chunk_discards_the_whole_round() -> None:
     # 备足响应：第一轮 act + observe/recognize_intent 旁路 + 第⑤步那一轮，各自可能
     # 多调一次。数量不是本用例要盯的东西，给够即可。

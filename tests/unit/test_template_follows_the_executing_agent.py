@@ -43,7 +43,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 SID = "ses_1"
 ROOT, SUB = "agt_root", "agt_sub"
@@ -104,6 +103,7 @@ async def _load_two_agents(rt, *, sub_template_id: str = "agent:tpl_sub") -> Non
     )
 
 
+@pytest.mark.asyncio
 async def test_a_user_message_to_a_sub_agent_uses_the_sub_agents_template():
     """这就是 bug 本身：从前这里拿到的是 root 的 `tpl_echo`。"""
     rt = _runtime()
@@ -119,6 +119,7 @@ async def test_a_user_message_to_a_sub_agent_uses_the_sub_agents_template():
     assert binding.agent.template_id == "agent:tpl_sub"   # 与 record 一致，两处不再打架
 
 
+@pytest.mark.asyncio
 async def test_a_user_message_to_the_root_agent_still_uses_the_root_template():
     """反向那一半：修完不能把 root 也搞错（root task 是这条分支上最常走的一支）。"""
     rt = _runtime()
@@ -133,6 +134,7 @@ async def test_a_user_message_to_the_root_agent_still_uses_the_root_template():
     assert binding.template.id == "agent:tpl_echo"
 
 
+@pytest.mark.asyncio
 async def test_a_missing_template_id_falls_back_to_the_hosts_master_template(caplog):
     """agent 没有自己的模板（存量事件流没发过 AgentInstantiated）→ 用 host 声明的母版。
 
@@ -153,6 +155,7 @@ async def test_a_missing_template_id_falls_back_to_the_hosts_master_template(cap
     assert "解析不出来" in caplog.text                # 每次装配都留痕，不静默
 
 
+@pytest.mark.asyncio
 async def test_without_a_fallback_a_missing_template_id_raises_instead_of_borrowing():
     """没配母版就抛，**不借会话的模板**。
 

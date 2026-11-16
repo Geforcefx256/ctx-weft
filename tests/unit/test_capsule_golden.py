@@ -40,7 +40,6 @@ from ctx_weft.protocols.template import LoopConfig
 from ctx_weft.providers.llm.tokenizer import HeuristicTokenizer
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 
-pytestmark = pytest.mark.asyncio
 
 T = MemoryEventType
 _BASE = datetime(2026, 1, 1, tzinfo=UTC)
@@ -121,6 +120,7 @@ def _loop_ctx(mem: InMemoryMemoryProvider, tm=None):
 
 # ─── A1: 单段正常 finish（无段摘要，只 finish 对） ──────────────────────────────
 
+@pytest.mark.asyncio
 async def test_A1_single_segment_finish() -> None:
     """情况 1（task-resident）: task 层原始 UP + LLM/TOOL 处理（无段摘要），close 后
     agent 层 = 仅 finish 对（assistant act_recap + finish_task() 标记 + tool Process Report，2 条），
@@ -168,6 +168,7 @@ async def test_A1_single_segment_finish() -> None:
 
 # ─── A3: ② 流中打断（段摘要含「被打断」，半截 assistant/cancelled tool 不进胶囊） ──
 
+@pytest.mark.asyncio
 async def test_A3_mid_stream_interrupt_annotation() -> None:
     """情况 3（task-resident）: 段①含 LLM_RESPONSE(interrupted=True) + cancelled TOOL_RESULT；
     后台 observe 产 TASK_COMPACT_SUMMARY（含「被打断」字样，apply_compact 折叠后幸存、interrupted
@@ -269,6 +270,7 @@ async def test_A3_mid_stream_interrupt_annotation() -> None:
 
 # ─── A4: ① 编辑式打断（两 user 锚点相邻，其间无段摘要） ──────────────────────
 
+@pytest.mark.asyncio
 async def test_A4_edit_interrupt_adjacent_anchors() -> None:
     """情况 4（task-resident）: task 层 = [USER_PROMPT 原始][USER_PROMPT edit-note][处理]。
     close 后 agent 层 = 仅 finish 对；body（两 user 锚点相邻、其间无段摘要）留 task 层。
@@ -344,6 +346,7 @@ async def test_A4_edit_interrupt_adjacent_anchors() -> None:
 
 # ─── A6: fail 收尾（result 占位，tool "[outcome=fail]"，配对完整） ───────────────
 
+@pytest.mark.asyncio
 async def test_A6_fail_outcome() -> None:
     """情况 6: outcome=fail，task.outputs 为空。
     断言 finish 对 = [assistant act_recap + finish_task()][tool "[outcome=fail] Process Report: …"]。
@@ -387,6 +390,7 @@ async def test_A6_fail_outcome() -> None:
 
 # ─── A10: short task 不合成胶囊（负向） ────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_A10_short_task_synthesizes_finish_pair_keeps_body() -> None:
     """A10（task-resident）：短叶子 task finish 后也无条件合成 finish 对（取消 short 延迟），
     agent 层 = 仅 finish 对（2 条）；task 层 raw body 原样留（不被 supersede）。
@@ -435,6 +439,7 @@ async def test_A10_short_task_synthesizes_finish_pair_keeps_body() -> None:
 
 # ─── H3: 递归嵌套（同 agent 孙任务） ──────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_H3_recursive_nesting_grandchild() -> None:
     """H3: 同 agent 子任务再委派同 agent 孙任务（recursion depth=2）。
     断言孙胶囊平铺嵌在父 agent scope，各层 origin_task_id 归属正确，深度 ≤ 2 层均可见。
@@ -537,6 +542,7 @@ async def test_H3_recursive_nesting_grandchild() -> None:
 
 # ─── H4: 跨 agent 隔离（parent 看不到子 agent 段摘要/user 锚点） ────────────────
 
+@pytest.mark.asyncio
 async def test_H4_cross_agent_isolation() -> None:
     """情况 8 / H4: root 委派跨 agent 子任务（use_subagent=True，creator≠assigned）。
 
@@ -663,6 +669,7 @@ async def test_H4_cross_agent_isolation() -> None:
 
 # ─── H8: 短同 agent 子任务未配对隐去 ──────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_H8_short_same_agent_child_keeps_delegate_and_writes_ack() -> None:
     """H8（§2.5, 2026-07-03）：短同 agent 子任务 close → finalize 铸派发框 + 配对静态 ack，
     框保留 task.started_at，ack 排在 child 收尾之后；child raw body 留 child 层。

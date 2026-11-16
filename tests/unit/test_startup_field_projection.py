@@ -1,3 +1,5 @@
+
+from ctx_weft.core.control import session_queries as session_query_module
 """Light startup must produce the same durable repairs as full reconstruction."""
 
 # ruff: noqa: F811 -- pytest fixtures are explicitly imported for parametrization.
@@ -19,7 +21,6 @@ from tests._snapshot_helpers import seed_snapshot
 from tests.unit.test_read_primitives_conformance import _ev, store  # noqa: F401
 from tests.unit.test_runtime_initialization_queries import runtime
 
-pytestmark = pytest.mark.asyncio
 
 
 async def seed_history(store, scenario):
@@ -70,10 +71,11 @@ async def full_startup(monkeypatch, store):
         return await read_task_view(store, sid, tid, through_position=through_position, use_snapshot=False)
     with monkeypatch.context() as context:
         context.setattr(startup, "rebuild_startup_view", rebuild_view)
-        context.setattr(startup, "read_startup_task", full_task)
+        context.setattr(session_query_module, "read_task_view", full_task)
         return await initialize_all(runtime(store))
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("scenario", ["running", "human", "no_resume", "threshold",
                                       "legacy_retracted", "review", "terminated", "finished"])
 @pytest.mark.parametrize("snapshot", [None, 11, 10, 4])
@@ -103,6 +105,7 @@ async def test_light_startup_matches_full_repairs(store, monkeypatch, scenario, 
     assert [r.state for r in second.sessions] == [r.state for r in actual.sessions]
 
 
+@pytest.mark.asyncio
 async def test_full_reducer_rejects_partial_events(store):
     from ctx_weft.core.control.types import RunStateView
     await store.append_batch("s1", "batch", [_ev(1, "TaskStarted")])
@@ -111,6 +114,7 @@ async def test_full_reducer_rejects_partial_events(store):
         apply_events([row.event], RunStateView("", "", "", ""))
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("compact", ["absent", "corrupt", "unknown-version"])
 async def test_old_or_invalid_compact_snapshot_uses_legacy_projection(store, monkeypatch, compact):
     await seed_history(store, "finished")
@@ -127,6 +131,7 @@ async def test_old_or_invalid_compact_snapshot_uses_legacy_projection(store, mon
     assert repair_facts(await initialize_all(runtime(store))) == repair_facts(expected)
 
 
+@pytest.mark.asyncio
 async def test_account_only_agent_instantiation_preserves_running_state(store, monkeypatch):
     events = [
         replace(_ev(1, EventType.SESSION_CREATED), agent_id="root", payload={"root_agent_id": "root"}),
@@ -139,6 +144,7 @@ async def test_account_only_agent_instantiation_preserves_running_state(store, m
     assert repair_facts(await initialize_all(runtime(store))) == repair_facts(await full_startup(monkeypatch, reference))
 
 
+@pytest.mark.asyncio
 async def test_initialization_never_loads_bodies_on_cold_execution(store):
     await seed_history(store, "finished")
     first = runtime(store)

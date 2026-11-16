@@ -34,7 +34,7 @@ from ctx_weft.core.media.refs import (
     encode_image_placeholder,
     find_image_placeholders,
 )
-from ctx_weft.core.utils.content import content_to_text
+from ctx_weft.protocols.content import content_to_text
 from ctx_weft.protocols import (
     ImagePart,
     MemoryAddress,

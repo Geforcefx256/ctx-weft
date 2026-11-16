@@ -96,3 +96,50 @@ def test_make_event_does_not_bump_counter_on_bad_type():
 
     ev = make_event(st, EventType.STEP_STARTED)
     assert st.sequence_counter == 4 and ev.sequence == 4
+
+
+@pytest.mark.parametrize("kind", list(EventType))
+def test_all_event_types_capture_opaque_metadata(kind):
+    metadata = {"host": {"values": [None, False, 0, "中文"]}}
+    event = new_event(kind, session_id="s", tenant_id="d", origin="test", metadata=metadata)
+    metadata["host"]["values"].append("mutated")
+    assert event.metadata == {"host": {"values": [None, False, 0, "中文"]}}
+    assert event.payload == {}
+
+
+@pytest.mark.parametrize("metadata", [{"x": object()}, {"x": float("nan")}, {"x": {1: "bad key"}}])
+def test_event_metadata_must_be_json_data(metadata):
+    with pytest.raises((TypeError, ValueError)):
+        new_event(EventType.RUN_STARTED, session_id="s", tenant_id="d", origin="test", metadata=metadata)
+
+
+async def test_session_and_hitl_emitters_forward_metadata():
+    from types import SimpleNamespace as NS
+    from ctx_weft.core.hitl.service import HitlService
+    from ctx_weft.core.orchestrator.lifecycle.session_registry import SessionRegistry
+
+    bus = _Bus()
+    extensions = {"host": {"trace": ["x"]}}
+    await SessionRegistry._emit(NS(event_bus=bus), EventType.SESSION_RESUMED,
+                               "s", "d", {}, metadata=extensions)
+    service = NS(_now=lambda: datetime.now(timezone.utc))
+    request = NS(session_id="s", tenant_id="d", task_id="t", agent_id="a")
+    hitl = HitlService._make_event(service, EventType.HITL_CLOSED, request,
+                                   {"hitl_id": "h"}, metadata=extensions)
+    extensions["host"]["trace"].clear()
+    assert bus.events[0].metadata == hitl.metadata == {"host": {"trace": ["x"]}}
+
+
+async def test_task_emitter_keeps_original_metadata_while_retrying():
+    from types import SimpleNamespace as NS
+    from unittest.mock import AsyncMock
+    from ctx_weft.core.orchestrator.task.manager import TaskManager
+
+    owner = NS(_session_id="s", _session=NS(tenant_id="d"), _pending_emissions={},
+               _agent_id_of=lambda tid: "a", _publish_emission=AsyncMock())
+    extensions = {"host": {"trace": ["original"]}}
+    first = await TaskManager._emit(owner, EventType.TASK_STARTED, "t", {}, metadata=extensions)
+    extensions["host"]["trace"].clear()
+    retried = await TaskManager._emit(owner, EventType.TASK_STARTED, "t", {}, metadata={"host": "changed"})
+    assert retried is first
+    assert retried.metadata == {"host": {"trace": ["original"]}}

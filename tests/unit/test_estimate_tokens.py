@@ -133,7 +133,7 @@ def test_cjk_not_double_counted_as_non_ascii():
 
 # ── estimate_content_tokens / estimate_tool_calls_tokens（gateway 与 prepare/composer 共用）──
 from ctx_weft.core.utils.estimate import estimate_content_tokens, estimate_tool_calls_tokens
-from ctx_weft.protocols.context import ImagePart, TextPart
+from ctx_weft.protocols.content import ImagePart, TextPart
 
 
 def test_content_tokens_adds_framing_even_when_empty():

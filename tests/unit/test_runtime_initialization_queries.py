@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests._recovery import recover_fixture_session
+
 import asyncio
 
 import pytest
@@ -21,9 +23,9 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("query", ["get_session", "get_task", "list_tasks", "get_agent"])
 async def test_dispatch_callback_can_query_same_session(query):
     rt = runtime()
@@ -59,6 +61,7 @@ async def test_dispatch_callback_can_query_same_session(query):
         await subscription.unsubscribe()
 
 
+@pytest.mark.asyncio
 async def test_successor_task_query_uses_cross_task_history_without_loading():
     rt = runtime()
     h = await container(rt)
@@ -110,6 +113,7 @@ async def append(store, sid, *specs):
     await store.append_batch(sid, events[0].id, events)
 
 
+@pytest.mark.asyncio
 async def test_initialize_and_rebuild_accept_pruned_dependency_without_timestamp():
     from ctx_weft.core.control.reducers import prune_view_for_snapshot
     from tests._snapshot_helpers import seed_snapshot
@@ -134,6 +138,7 @@ async def test_initialize_and_rebuild_accept_pruned_dependency_without_timestamp
     assert rt._task_managers[h.session_id].get_task("live") is not None
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("loaded", [False, True])
 async def test_wait_for_finish_requires_durable_recap_done(loaded):
     from ctx_weft.core.runtime import TurnHandle
@@ -167,6 +172,7 @@ async def test_wait_for_finish_requires_durable_recap_done(loaded):
     await handle.wait_for_finish(timeout=0.1)
 
 
+@pytest.mark.asyncio
 async def test_wait_does_not_bypass_deferred_recap_on_terminal_event(monkeypatch):
     from ctx_weft.core.runtime import TurnHandle
 
@@ -203,10 +209,11 @@ async def test_wait_does_not_bypass_deferred_recap_on_terminal_event(monkeypatch
         return True
 
     monkeypatch.setattr(rt, "_relaunch_observe", complete_recap)
-    await rt.recover_agent(h.root_agent_id)
+    await recover_fixture_session(rt, h.root_agent_id)
     await handle.wait_for_finish(timeout=0.1)
 
 
+@pytest.mark.asyncio
 async def test_new_sessions_do_not_require_global_initialize():
     rt = runtime()
     h = await rt.create_session(template_id="agent:tpl_echo")
@@ -215,6 +222,7 @@ async def test_new_sessions_do_not_require_global_initialize():
     assert (await rt.get_session(h.session_id)).loaded
 
 
+@pytest.mark.asyncio
 async def test_slim_dependency_queries_keep_details_after_loading():
     from ctx_weft.core.control.reducers import prune_view_for_snapshot
     from tests._snapshot_helpers import seed_snapshot
@@ -244,6 +252,7 @@ async def test_slim_dependency_queries_keep_details_after_loading():
     assert not slim.details_complete  # Queries do not hydrate runtime owners.
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot_kind", ["new", "missing_task", "legacy"])
 async def test_pending_observe_snapshot_recovers_and_retries(snapshot_kind, monkeypatch):
     from ctx_weft.core.control.reducers import prune_view_for_snapshot
@@ -279,7 +288,7 @@ async def test_pending_observe_snapshot_recovers_and_retries(snapshot_kind, monk
     def fail(*args, **kwargs):
         raise OSError("temporary failure")
     monkeypatch.setattr(rt._agent_lifecycle_manager, "materialize", fail)
-    await rt.recover_agent(h.root_agent_id)
+    await recover_fixture_session(rt, h.root_agent_id)
     assert "t" in rt._prepared_recoveries[h.session_id][2]
     with pytest.raises(TimeoutError):
         await handle.wait_for_finish(timeout=0.05)
@@ -293,12 +302,13 @@ async def test_pending_observe_snapshot_recovers_and_retries(snapshot_kind, monk
             payload={"task_id": "t", "boundary": "finish"}))
         return True
     monkeypatch.setattr(rt, "_relaunch_observe", complete)
-    await rt.recover_agent(h.root_agent_id)
+    await recover_fixture_session(rt, h.root_agent_id)
     assert started == ["t"]
     assert h.session_id not in rt._prepared_recoveries
     await handle.wait_for_finish(timeout=0.1)
 
 
+@pytest.mark.asyncio
 async def test_startup_calibrates_without_loading_and_preserves_waits():
     store = InMemoryEventStore()
     old = runtime(store)
@@ -333,6 +343,7 @@ async def test_startup_calibrates_without_loading_and_preserves_waits():
     assert await store.committed_head(h.session_id) == head
 
 
+@pytest.mark.asyncio
 async def test_initialization_failure_can_retry_without_duplicate_wiring(monkeypatch):
     store = InMemoryEventStore()
     h = await container(runtime(store))
@@ -352,6 +363,7 @@ async def test_initialization_failure_can_retry_without_duplicate_wiring(monkeyp
     assert rt.event_bus._subscribers == subscribers
 
 
+@pytest.mark.asyncio
 async def test_query_cold_hot_and_evicted_without_loading():
     rt = runtime()
     h = await container(rt)
@@ -362,7 +374,7 @@ async def test_query_cold_hot_and_evicted_without_loading():
     assert result.source == "events" and not result.loaded
     assert result.committed_position == head
     agent = await rt.get_agent(h.root_agent_id, session_id=h.session_id)
-    assert agent.source == "events" and agent.data.status == "idle"
+    assert agent.source == "events" and agent.data.state.status == "idle"
     assert not rt._task_managers
     assert rt._agent_lifecycle_manager.all_agent_ids() == []
     assert await rt.event_store.committed_head(h.session_id) == head
@@ -370,6 +382,7 @@ async def test_query_cold_hot_and_evicted_without_loading():
     assert (await rt.get_agent(h.root_agent_id)).source == "memory"
 
 
+@pytest.mark.asyncio
 async def test_concurrent_rebuild_and_dispatch_share_exactly_one_owner(monkeypatch):
     rt = runtime()
     h = await container(rt)
@@ -392,6 +405,7 @@ async def test_concurrent_rebuild_and_dispatch_share_exactly_one_owner(monkeypat
     assert rt._task_managers[h.session_id] is owners[0]
 
 
+@pytest.mark.asyncio
 async def test_rebuild_failure_rolls_back_all_runtime_records(monkeypatch):
     rt = runtime()
     h = await container(rt)
@@ -410,6 +424,7 @@ async def test_rebuild_failure_rolls_back_all_runtime_records(monkeypatch):
     assert rt._session_is_loaded(h.session_id)
 
 
+@pytest.mark.asyncio
 async def test_missing_member_rebuild_keeps_live_owner():
     rt = runtime()
     h = await container(rt)
@@ -420,6 +435,7 @@ async def test_missing_member_rebuild_keeps_live_owner():
     assert (await rt.get_agent(h.root_agent_id)).data.agent_id == h.root_agent_id
 
 
+@pytest.mark.asyncio
 async def test_cold_existing_id_cannot_be_created_twice():
     rt = runtime()
     h = await container(rt)
@@ -432,6 +448,7 @@ async def test_cold_existing_id_cannot_be_created_twice():
             session_id=h.session_id))
 
 
+@pytest.mark.asyncio
 async def test_task_queries_merge_live_state_and_history():
     rt = runtime()
     h = await container(rt)
@@ -451,6 +468,7 @@ async def test_task_queries_merge_live_state_and_history():
     assert (await rt.get_task(h.session_id, "old")).data.outputs == {"answer": 42}
 
 
+@pytest.mark.asyncio
 async def test_store_session_enumeration_is_partition_only():
     store = InMemoryEventStore()
     for sid in ("c", "a", "b"):
@@ -459,6 +477,7 @@ async def test_store_session_enumeration_is_partition_only():
     assert await store.list_session_ids(after_session_id="b", limit=2) == ["c"]
 
 
+@pytest.mark.asyncio
 async def test_historical_task_survives_pruned_recovery_snapshot():
     from ctx_weft.core.control.reducers import prune_view_for_snapshot
     from tests._snapshot_helpers import seed_snapshot
@@ -479,6 +498,7 @@ async def test_historical_task_survives_pruned_recovery_snapshot():
     assert not rt._task_managers
 
 
+@pytest.mark.asyncio
 async def test_sql_restart_calibration_and_queries(tmp_path):
     from ctx_weft.providers.events.store.sql import open_sqlite_event_store
 
@@ -504,6 +524,7 @@ async def test_sql_restart_calibration_and_queries(tmp_path):
         assert len(rt._task_managers) == 1
 
 
+@pytest.mark.asyncio
 async def test_wait_after_terminal_and_repeated_wait_are_immediate():
     from tests.integration.test_send_message_after_session_done import _FinishEveryTaskLLM
     rt = runtime(max_concurrent=4)
@@ -518,6 +539,7 @@ async def test_wait_after_terminal_and_repeated_wait_are_immediate():
     assert (await rt.get_task(handle.session_id, handle.task_id)).data.status == "FINISHED"
 
 
+@pytest.mark.asyncio
 async def test_wait_does_not_close_subscription_on_an_idle_tick():
     from ctx_weft.core.runtime import TurnHandle
     from ctx_weft.providers.events import InProcessEventBus
@@ -532,6 +554,7 @@ async def test_wait_does_not_close_subscription_on_an_idle_tick():
     assert not bus._subscribers
 
 
+@pytest.mark.asyncio
 async def test_simultaneous_cold_send_reuses_owner(monkeypatch):
     from tests.integration.test_send_message_after_session_done import _FinishEveryTaskLLM
     rt = runtime()
@@ -555,6 +578,7 @@ async def test_simultaneous_cold_send_reuses_owner(monkeypatch):
     assert rt._task_managers[h.session_id] is owners[0]
 
 
+@pytest.mark.asyncio
 async def test_initialize_retry_after_commit_does_not_duplicate_facts(monkeypatch):
     store = InMemoryEventStore()
     h = await container(runtime(store))
@@ -579,6 +603,7 @@ async def test_initialize_retry_after_commit_does_not_duplicate_facts(monkeypatc
     assert len(facts) == 1
 
 
+@pytest.mark.asyncio
 async def test_startup_closes_abandoned_run_envelope():
     store = InMemoryEventStore()
     h = await container(runtime(store))
@@ -597,6 +622,7 @@ async def test_startup_closes_abandoned_run_envelope():
     assert all(r.event.run_id == "abandoned" for r in rows)
 
 
+@pytest.mark.asyncio
 async def test_startup_preserves_a_durable_hot_human_wait():
     from ctx_weft.protocols.hitl import HitlAsk, ToolResultDelivery
     store = InMemoryEventStore()
@@ -614,10 +640,11 @@ async def test_startup_preserves_a_durable_hot_human_wait():
     report = await initialize_all(rt)
     assert not report.interrupted_task_ids
     assert (await rt.get_task(h.session_id, "active")).data.status == "AWAITING_HUMAN"
-    assert (await rt.get_agent(h.root_agent_id, session_id=h.session_id)).data.status == "waiting_human"
+    assert (await rt.get_agent(h.root_agent_id, session_id=h.session_id)).data.state.status == "waiting_human"
     assert not rt._task_managers
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("base_kind", ["full", "slim", "pruned", "absent"])
 async def test_get_task_reads_only_target_facts_and_uses_snapshot(base_kind):
     from ctx_weft.core.control.reducers import prune_view_for_snapshot
@@ -670,6 +697,7 @@ async def test_get_task_reads_only_target_facts_and_uses_snapshot(base_kind):
     assert not rt._task_managers
 
 
+@pytest.mark.asyncio
 async def test_get_task_applies_review_of_target_under_another_task_id():
     rt = runtime()
     h = await container(rt)

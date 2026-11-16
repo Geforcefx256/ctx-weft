@@ -25,7 +25,6 @@ from ctx_weft.protocols import MemoryEventType, MemoryAddress, ProviderContext
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from tests.integration.test_minimal_loop import InlineAgentTemplateProvider, make_echo_template, make_runtime
 
-pytestmark = pytest.mark.asyncio
 
 
 def _runtime() -> CtxWeftRuntime:
@@ -73,6 +72,7 @@ async def _seed_running_ack(memory, session, child: Task) -> None:
     )
 
 
+@pytest.mark.asyncio
 async def test_root_finish_pair_written_on_own_scope() -> None:
     runtime = _runtime()
     memory = runtime.providers.get_memory()
@@ -99,6 +99,7 @@ async def test_root_finish_pair_written_on_own_scope() -> None:
     assert "3) c3: boom3" in tool[0].content
 
 
+@pytest.mark.asyncio
 async def test_ack_task_running_ack_replaced_with_cancelled_text() -> None:
     runtime = _runtime()
     memory = runtime.providers.get_memory()
@@ -128,6 +129,7 @@ async def test_ack_task_running_ack_replaced_with_cancelled_text() -> None:
     assert tool_after[0].id != tool_before[0].id
 
 
+@pytest.mark.asyncio
 async def test_root_none_only_replaces_ack() -> None:
     runtime = _runtime()
     memory = runtime.providers.get_memory()
@@ -149,6 +151,7 @@ async def test_root_none_only_replaces_ack() -> None:
     assert assistant == []
 
 
+@pytest.mark.asyncio
 async def test_one_bad_ack_task_does_not_block_others() -> None:
     runtime = _runtime()
     memory = runtime.providers.get_memory()

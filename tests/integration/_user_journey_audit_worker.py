@@ -1,3 +1,4 @@
+
 """Exit after a real input commit, or while its recovery writes are in progress."""
 
 import asyncio
@@ -5,9 +6,11 @@ import os
 import sys
 from pathlib import Path
 
-from tests._initialization import initialize_all
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from tests._recovery import recover_fixture_session
+from tests._initialization import initialize_all
 
 from ctx_weft import SessionStartParams
 from ctx_weft.core.control.reducers import prune_view_for_snapshot, rebuild_view
@@ -34,7 +37,7 @@ async def run(path, entry, snapshot, recovering):
                 await initialize_all(rt)
                 await rt.rebuild_session(SID, strict=True)
                 aid = rt._task_managers[SID].session.root_agent_id
-                await rt.recover_agent(aid, session_id=SID)
+                await recover_fixture_session(rt, aid, session_id=SID)
             else:
                 await initialize_all(rt)
                 h = await rt.start_session(SessionStartParams.create(session_id=SID,

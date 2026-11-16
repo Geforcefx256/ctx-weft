@@ -44,7 +44,6 @@ from ctx_weft.protocols.hitl import (
 )
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 
-pytestmark = pytest.mark.asyncio
 
 T = MemoryEventType
 
@@ -77,6 +76,7 @@ async def _fold_trailing_segment(mem: InMemoryMemoryProvider) -> None:
 # ── Fix 2: provider anchor ─────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_trailing_fold_summary_anchored_to_segment_not_now():
     """A trailing-segment fold summary is anchored to the last archived event's timestamp,
     NOT wall-clock now()."""
@@ -92,6 +92,7 @@ async def test_trailing_fold_summary_anchored_to_segment_not_now():
     )
 
 
+@pytest.mark.asyncio
 async def test_user_prompt_after_trailing_fold_sorts_newest():
     """After folding a trailing segment, a freshly ingested USER_PROMPT must be the newest
     record — the fold summary must never leapfrog the new user message."""
@@ -117,6 +118,7 @@ async def test_user_prompt_after_trailing_fold_sorts_newest():
 # ── Fix 1: resume barrier ──────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_inject_user_reply_does_not_await_pending_observe(monkeypatch):
     """_inject_user_reply 不再等在途后台折叠——2026-09-22 拆除那道屏障。
 

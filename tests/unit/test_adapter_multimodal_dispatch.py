@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from ctx_weft.protocols.context import ProviderContext as _ProviderContext
 import base64
 import logging
 
@@ -12,6 +13,9 @@ import pytest
 
 from ctx_weft.protocols import ImagePart, LLMMessage, LLMRequest, TextPart
 from ctx_weft.providers.llm import ModelCapabilities, ModelConfig, ModelLimits
+
+
+_PROVIDER_CONTEXT = _ProviderContext(session_id="test")
 
 _PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
@@ -220,7 +224,7 @@ def test_openai_plain_text_payload_unchanged_between_classes():
 
 class _StoreStub:
     def save(self, a): ...
-    def delete(self, n):
+    def delete(self, n, *, namespace="global"):
         return True
 
     def list_all(self):
@@ -264,7 +268,7 @@ def _provider_with(style: str):
 )
 def test_build_adapter_dispatches_on_style(style, cls_name):
     p = _provider_with(style)
-    assert type(p.get_client("a")._adapter).__name__ == cls_name
+    assert type(p.get_client("a", ctx=_PROVIDER_CONTEXT)._adapter).__name__ == cls_name
 
 
 def test_unknown_style_still_rejected():

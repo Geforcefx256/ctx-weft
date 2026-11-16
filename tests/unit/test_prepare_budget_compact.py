@@ -4,9 +4,9 @@ import pytest
 
 from ctx_weft.core.loop.steps.prepare import PrepareStep
 
-pytestmark = pytest.mark.asyncio
 
 
+@pytest.mark.asyncio
 async def test_should_compact_pure_budget_true():
     state = SimpleNamespace(resolved_model=model_snapshot(context_limit=1000), agent=SimpleNamespace(
         loop_config=SimpleNamespace(compact_token_ratio=0.8),
@@ -15,6 +15,7 @@ async def test_should_compact_pure_budget_true():
     assert await PrepareStep()._should_compact(state, ctx, token_estimate=850) is True
 
 
+@pytest.mark.asyncio
 async def test_should_compact_below_ratio_false_even_with_many_messages():
     # 消息条数门控已废：token 低就不压，无论消息多少
     state = SimpleNamespace(resolved_model=model_snapshot(context_limit=1000), agent=SimpleNamespace(
@@ -24,6 +25,7 @@ async def test_should_compact_below_ratio_false_even_with_many_messages():
     assert await PrepareStep()._should_compact(state, ctx, token_estimate=200) is False
 
 
+@pytest.mark.asyncio
 async def test_should_compact_reserve_lowers_trigger_to_effective_limit():
     """spec §6：触发基线是 effective_limit = context_limit - reserved_output_tokens，
     而非原始 context_limit。
@@ -41,6 +43,7 @@ async def test_should_compact_reserve_lowers_trigger_to_effective_limit():
     assert await PrepareStep()._should_compact(state, ctx, token_estimate=64_000) is True
 
 
+@pytest.mark.asyncio
 async def test_should_compact_reserve_effective_limit_control_just_below_threshold():
     """同上参数，token_estimate=63_999（刚低于有效阈值 64_000）→ 不触发。"""
     state = SimpleNamespace(resolved_model=model_snapshot(context_limit=100_000, output_reserve=20_000), agent=SimpleNamespace(

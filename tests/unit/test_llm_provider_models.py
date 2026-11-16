@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ctx_weft.protocols.context import ProviderContext as _ProviderContext
 import base64
 import struct
 import zlib
@@ -12,6 +13,9 @@ import pytest
 from ctx_weft.protocols import ImagePart, LLMCallError, LLMChunk, TextPart
 from ctx_weft.providers.llm import ModelCapabilities, ModelLimits
 from ctx_weft.providers.llm.provider import LLMAccount, LLMProvider, ModelConfig
+
+
+_PROVIDER_CONTEXT = _ProviderContext(session_id="test")
 
 
 class _FakeStore:
@@ -68,7 +72,7 @@ async def test_fetch_models_for_account():
         ),
         persist=False,
     )
-    p.get_client("acc")._adapter._client = _mock(
+    p.get_client("acc", ctx=_PROVIDER_CONTEXT)._adapter._client = _mock(
         lambda req: httpx.Response(200, json={"data": [{"id": "gpt-4o"}, {"id": "o3"}]})
     )
     assert await p.fetch_models_for_account("acc", protocol="openai") == ["gpt-4o", "o3"]
@@ -193,7 +197,7 @@ async def test_routine_ping_uses_text_without_changing_vision_config(monkeypatch
     assert any(isinstance(part, ImagePart) for part in fake.calls[0].messages[0].content)
     assert fake.calls[1].messages[0].content == "ping"
     assert config.capabilities.input == ["text", "image"]
-    assert len(p._adapters["acc"]) == 1
+    assert len(p._adapters[p.get_account("acc").key]) == 1
 
 
 async def test_verify_model_for_account_reuses_live_adapter():
@@ -216,8 +220,8 @@ async def test_verify_model_for_account_reuses_live_adapter():
         persist=False,
     )
     fake = _FakeAdapter()
-    p.get_client("acc")
-    p._adapters["acc"][("openai", False)] = fake
+    p.get_client("acc", ctx=_PROVIDER_CONTEXT)
+    p._adapters[p.get_account("acc").key][("openai", False)] = fake
     ms = await p.verify_model_for_account("acc", "gpt-4o")
     assert isinstance(ms, float) and ms >= 0
     assert fake.calls[0].model == "gpt-4o"

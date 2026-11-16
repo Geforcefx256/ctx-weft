@@ -111,13 +111,19 @@ class SessionRegistry:
         EventType.AGENT_SPAWNED,
     })
 
+    async def detach_from_bus(self) -> None:
+        subscription = getattr(self, "_subscription", None)
+        if subscription is not None:
+            await subscription.unsubscribe()
+            self._subscription = None
+
     def attach_to_bus(self) -> None:
         """订阅。runtime 构造期调一次。
 
         ``provisional=True`` 与 ALM 同理：这是进程内登记表，成员集合要反映当下的真实，
         不受未提交窗口影响。
         """
-        self.event_bus.subscribe(None, self.handle_event, provisional=True, required=True)
+        self._subscription = self.event_bus.subscribe(None, self.handle_event, provisional=True, required=True)
 
     async def handle_event(self, ev: Event) -> None:
         """总线回调。把新登场的 agent 收进该 session 的成员集合，别的一概不管。"""
@@ -261,7 +267,7 @@ class SessionRegistry:
 
         return session, root_task, task_manager
 
-    async def resume_session(
+    async def start_next_turn(
         self,
         session_id: str,
         event_store: Any,
@@ -275,7 +281,7 @@ class SessionRegistry:
         port_key: str | None = None,
         task_manager: TaskManager | None = None,
     ) -> tuple[Session, Task, TaskManager]:
-        """Resume an existing session: recover root_agent_id from event store, push a new root task.
+        """Start a new root task after the previous turn, preserving the session owner.
 
         ``user_prompt_event_jsonable`` 同 `create_session`：由调用方从原始 content 算好。
 
@@ -284,7 +290,7 @@ class SessionRegistry:
         去顶替它；没有才新建。活 owner 的内存状态也一并参与下面的「弃轮禁止」判定：
         未提交窗口里的 task（spec 2026-09-09）还没落盘，只看事件视图会漏掉它们。"""
         if task_manager is None:
-            raise RuntimeError("resume_session requires the owner from rebuild_session")
+            raise RuntimeError("start_next_turn requires the owner from rebuild_session")
         from ctx_weft.core.control.reducers import rebuild_view
         user_prompt_event_jsonable = _event_jsonable_or_fallback(
             user_prompt, user_prompt_event_jsonable, "resume_session",
@@ -298,7 +304,7 @@ class SessionRegistry:
             )
 
         # 弃轮禁止：仍有未终结任务时不许开新轮（本方法只推一个新 root task，不续跑滞留
-        # 任务——它们会被无声遗弃,之后 recover_agent 全量重建又把它们复活重跑）。调用方应走
+        # 任务——它们会被无声遗弃,之后 recover_session 全量重建又把它们复活重跑）。调用方应走
         # 恢复路径续跑/收尾。辅助任务（compact/metadata）豁免——restore 也从不重排它们,
         # 阻塞会把会话永久锁死（与 TaskManager.restore 的跳过口径一致）。
         unfinished = [
@@ -425,6 +431,7 @@ class SessionRegistry:
         payload: dict,
         agent_id: str | None = None,
         timestamp=None,
+        *, metadata: dict | None = None,
     ) -> None:
         await emit_event(
             self.event_bus,
@@ -435,4 +442,5 @@ class SessionRegistry:
             agent_id=agent_id,
             payload=payload,
             timestamp=timestamp,
+            metadata=metadata,
         )

@@ -1,3 +1,4 @@
+
 """Crash real task dispatch and cancellation commits, retaining unrelated live work."""
 
 import asyncio
@@ -5,10 +6,12 @@ import os
 import sys
 from pathlib import Path
 
-from tests._initialization import initialize_all
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
+
+from tests._recovery import recover_fixture_session
+from tests._initialization import initialize_all
 
 import ctx_weft.core.loop.steps.observe as observe
 from ctx_weft import SessionStartParams
@@ -109,7 +112,7 @@ async def worker(path, stage, fault, recovering=False):
                     history = reduce_events([r.event for r in await store.read_range("tree-session")], "")
                     grand = next(t.id for t in history.tasks.values() if str(t.user_prompt) == target_name)
                 await initialize_all(rt)
-                await rt.recover_agent(root, session_id="tree-session")
+                await recover_fixture_session(rt, root, session_id="tree-session")
                 raise AssertionError("recovery did not reach crash boundary")
 
             original_assemble, original_execute = _SessionTaskRunner.assemble, _SessionTaskRunner.execute

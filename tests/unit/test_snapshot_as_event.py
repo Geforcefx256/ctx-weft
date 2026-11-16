@@ -32,7 +32,6 @@ from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.providers.events import InMemoryEventStore
 from tests._snapshot_helpers import latest_snapshot, seed_snapshot
 
-pytestmark = pytest.mark.asyncio
 
 _T0 = datetime(2026, 9, 20, tzinfo=UTC)
 _SID = "s1"
@@ -161,6 +160,7 @@ def test_a_non_int_cut_is_treated_as_missing() -> None:
 # ── 与恢复路径的接合 ──────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_recovery_uses_the_snapshot_event() -> None:
     """恢复走「最后一条快照事件 + 增量」，且与全量重放结果一致。"""
     store = InMemoryEventStore()
@@ -188,6 +188,7 @@ async def test_recovery_uses_the_snapshot_event() -> None:
     assert (await latest_snapshot(store, _SID)).last_commit_position == 2
 
 
+@pytest.mark.asyncio
 async def test_both_recovery_paths_exclude_snapshot_events() -> None:
     """快照事件本身**不参与折叠**——两条路都排除它。
 
@@ -301,6 +302,7 @@ def test_the_builtin_stores_have_no_snapshot_api_either() -> None:
             assert not hasattr(cls, gone), f"{cls.__name__}.{gone} 还在"
 
 
+@pytest.mark.asyncio
 async def test_writer_and_recovery_exclude_the_same_types() -> None:
     """**写入侧与恢复侧必须用同一个排除集。**
 

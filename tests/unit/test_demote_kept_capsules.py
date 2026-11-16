@@ -7,7 +7,6 @@ from ctx_weft.core.loop.task_memory_fold import task_record_kind
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from ctx_weft.protocols import MemoryEvent, MemoryEventType as T, MemoryAddress, ProviderContext
 
-pytestmark = pytest.mark.asyncio
 _BASE = datetime(2026, 7, 1, tzinfo=UTC)
 
 
@@ -15,6 +14,7 @@ def _pctx():
     return ProviderContext(session_id="s", tenant_id="tn")
 
 
+@pytest.mark.asyncio
 async def test_demote_drops_body_and_thins_finish_pair():
     mem = InMemoryMemoryProvider()
     scope = MemoryAddress(session_id="s", task_id="root", agent_id="a")

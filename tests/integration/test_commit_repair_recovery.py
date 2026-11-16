@@ -13,7 +13,6 @@ from ctx_weft.providers.memory.sql.provider import open_sqlite_memory
 from tests._snapshot_helpers import seed_snapshot
 from tests.integration.test_cancel_task_tree_recovery import recover
 
-pytestmark = pytest.mark.asyncio
 WORKER = Path(__file__).with_name("_commit_repair_worker.py")
 BASELINES = {}
 
@@ -43,6 +42,7 @@ async def reports(store, memory):
     return sorted(result)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["batch", "idle"])
 @pytest.mark.parametrize("fault", ["before", "unknown"])
 @pytest.mark.parametrize("cut", ["hot", "cold", "recover_run", "recover_finalized"])

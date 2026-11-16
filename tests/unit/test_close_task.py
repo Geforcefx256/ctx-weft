@@ -29,7 +29,6 @@ from ctx_weft.protocols.template import LoopConfig
 from ctx_weft.providers.llm.tokenizer import HeuristicTokenizer
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 
-pytestmark = pytest.mark.asyncio
 
 T = MemoryEventType
 _BASE = datetime(2026, 1, 1, tzinfo=UTC)
@@ -110,6 +109,7 @@ async def _dispatch_results(mem, scope, tcid: str) -> list:
     return [r for r in caps if (task_record_kind(r) == "result" or r.role == "tool") and task_record_group(r) == tcid]
 
 
+@pytest.mark.asyncio
 async def test_short_root_leaf_keeps_body_and_synthesizes_finish_pair() -> None:
     """task-resident：短 root 叶子 close 也合成 finish 对（取消 short 延迟），body 原样留。"""
     mem = InMemoryMemoryProvider()
@@ -130,6 +130,7 @@ async def test_short_root_leaf_keeps_body_and_synthesizes_finish_pair() -> None:
     assert residues == []
 
 
+@pytest.mark.asyncio
 async def test_long_root_leaf_supersedes_final_raw_keeps_anchor_and_finish_pair() -> None:
     """Task 2（spec 2026-06-28 §3.2）：长 root 叶子 close 写 finish 对，且 supersede 末 raw 段
     （active LLM_RESPONSE 不再 recall），USER_PROMPT 锚点保留。"""
@@ -152,6 +153,7 @@ async def test_long_root_leaf_supersedes_final_raw_keeps_anchor_and_finish_pair(
     assert await _finish_tools(mem, scope, "t1"), "expected finish-pair tool turn in agent capsule"
 
 
+@pytest.mark.asyncio
 async def test_root_close_keeps_subtree_bodies() -> None:
     """task-resident：root close 不 GC 子树——同 agent 子任务 body 留各自 task 层。"""
     mem = InMemoryMemoryProvider()
@@ -180,6 +182,7 @@ async def test_root_close_keeps_subtree_bodies() -> None:
     )
 
 
+@pytest.mark.asyncio
 async def test_cross_agent_child_bubbles_unconditionally_even_when_short() -> None:
     mem = InMemoryMemoryProvider()
     child_scope = _sc("c1", agent_id="ag2")
@@ -206,6 +209,7 @@ async def test_cross_agent_child_bubbles_unconditionally_even_when_short() -> No
     assert own != []
 
 
+@pytest.mark.asyncio
 async def test_same_agent_short_leaf_no_bubble_supersedes_orphan_dispatch() -> None:
     """§2.5（spec 2026-06-30）：same-agent 子任务 close 不再 supersede delegate 回合，改写一条
     配对的静态 tool result（_DISPATCH_ACK），timestamp back-date 到 delegate 时刻 → 与 delegate
@@ -240,6 +244,7 @@ async def test_same_agent_short_leaf_no_bubble_supersedes_orphan_dispatch() -> N
     assert own != []
 
 
+@pytest.mark.asyncio
 async def test_same_agent_nonshort_child_no_bubble_supersedes_final_raw_and_orphan() -> None:
     """§2.5 + Task 2（spec 2026-06-30 / 2026-06-28）：长 same-agent 子任务 close——
     (a) 写 _DISPATCH_ACK 配对 result、保留 delegate 回合（不再 supersede）；
@@ -273,6 +278,7 @@ async def test_same_agent_nonshort_child_no_bubble_supersedes_final_raw_and_orph
     assert await _finish_tools(mem, scope, "t2"), "nested finish pair must exist"
 
 
+@pytest.mark.asyncio
 async def test_root_close_keeps_deep_nested_subtree_bodies() -> None:
     mem = InMemoryMemoryProvider()
     scope = _sc("t1")
@@ -303,6 +309,7 @@ async def test_root_close_keeps_deep_nested_subtree_bodies() -> None:
     assert any(r.metadata.get("task_id") == "A1" for r in convs), "grandchild body must stay"
 
 
+@pytest.mark.asyncio
 async def test_intermediate_close_keeps_grandchild_body() -> None:
     mem = InMemoryMemoryProvider()
     a_scope = _sc("A", "ag1")
@@ -338,6 +345,7 @@ async def test_intermediate_close_keeps_grandchild_body() -> None:
     assert await _finish_tools(mem, a_scope, "A"), "A's nested finish pair must exist"
 
 
+@pytest.mark.asyncio
 async def test_root_close_multichild_plan_preserves_dispatch_pairs() -> None:
     mem = InMemoryMemoryProvider()
     scope = _sc("t1")
@@ -360,6 +368,7 @@ async def test_root_close_multichild_plan_preserves_dispatch_pairs() -> None:
     assert await _finish_tools(mem, scope, "t1"), "root finish pair must exist"
 
 
+@pytest.mark.asyncio
 async def test_root_close_mixed_same_and_cross_agent_children_keeps_bodies() -> None:
     mem = InMemoryMemoryProvider()
     scope = _sc("t1")
@@ -389,6 +398,7 @@ async def test_root_close_mixed_same_and_cross_agent_children_keeps_bodies() -> 
     assert any(r.metadata.get("task_id") == "S" for r in convs), "same-agent child body must stay"
 
 
+@pytest.mark.asyncio
 async def test_descendant_task_ids_multilevel_bfs() -> None:
     tm = _FakeTM({"t1": {"A", "B"}, "A": {"A1"}, "B": {"B1"}, "A1": {"A1a"}})
     assert _descendant_task_ids("t1", tm) == {"A", "B", "A1", "B1", "A1a"}

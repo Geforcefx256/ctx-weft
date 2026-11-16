@@ -1,3 +1,4 @@
+
 """Real provisional batch and derived AgentIdle failures, including late delivery."""
 
 import asyncio
@@ -5,10 +6,12 @@ import os
 import sys
 from pathlib import Path
 
-from tests._initialization import initialize_all
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
+
+from tests._recovery import recover_fixture_session
+from tests._initialization import initialize_all
 
 from ctx_weft import SessionStartParams
 from ctx_weft.protocols import LLMChunk
@@ -42,7 +45,7 @@ async def worker(path, stage, fault, cut):
                     return receipt
                 store.append_batch = recover_append
                 await initialize_all(rt)
-                await rt.recover_agent(root, session_id="tree-session")
+                await recover_fixture_session(rt, root, session_id="tree-session")
                 raise AssertionError("second recovery crash was not reached")
 
             if stage == "batch":

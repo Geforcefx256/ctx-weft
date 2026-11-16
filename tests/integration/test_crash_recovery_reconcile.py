@@ -7,6 +7,8 @@ initial_step 路由到 reconcile,由 ReconcileStep 经 gateway 重跑该工具(�
 
 from __future__ import annotations
 
+from tests._recovery import recover_fixture_session
+
 import asyncio
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
@@ -44,7 +46,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 
 class _RecordingTool(ToolCapabilityProvider):
@@ -76,6 +77,7 @@ class _RecordingTool(ToolCapabilityProvider):
         return None
 
 
+@pytest.mark.asyncio
 async def test_crash_mid_tool_reinvokes_dangling_via_reconcile() -> None:
     resolver = InlineAgentTemplateProvider()
     resolver.register(make_echo_template())
@@ -141,7 +143,7 @@ async def test_crash_mid_tool_reinvokes_dangling_via_reconcile() -> None:
     await runtime.rebuild_session(sid)
     with suppress_observe_start():
         await initialize_all(runtime)
-        await runtime.recover_agent(aid)
+        await recover_fixture_session(runtime, aid)
         for _ in range(50):
             if tool.invoked:
                 break

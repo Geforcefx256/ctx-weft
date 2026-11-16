@@ -12,7 +12,7 @@ def _content():
 
 def test_rejected_reply_keeps_image_via_prefix():
     """拒绝路径把「Human declined:」拼到回复前——必须保 parts。"""
-    from ctx_weft.core.utils.content import content_with_prefix
+    from ctx_weft.protocols.content import content_with_prefix
     out = content_with_prefix(_content(), "Human declined: ")
     assert any(not hasattr(p, "text") for p in out), "图片不得在拼接中丢失"
     assert out[0].text.startswith("Human declined: ")
@@ -20,7 +20,7 @@ def test_rejected_reply_keeps_image_via_prefix():
 
 def test_interrupt_edit_prefix_keeps_image_via_content_with_prefix():
     """① 打断续接说明拼到多模态回复前——必须保 parts，走 content_with_prefix 而非 f-string。"""
-    from ctx_weft.core.utils.content import content_with_prefix
+    from ctx_weft.protocols.content import content_with_prefix
     from ctx_weft.core.loop.steps.act import _interrupt_edit_prefix
 
     prefix = _interrupt_edit_prefix("do X")

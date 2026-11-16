@@ -19,7 +19,7 @@ import base64
 import hashlib
 from datetime import datetime, timezone
 
-from ctx_weft.core.utils.content import content_to_event_jsonable
+from ctx_weft.protocols.content import content_to_event_jsonable
 from ctx_weft.core.control.reducers import deserialize_view, rebuild_view, serialize_view
 from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.providers.events import InMemoryEventStore

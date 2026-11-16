@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """Recover real non-close folds and failed HITL commits without losing application work."""
 
 import asyncio
@@ -14,13 +16,12 @@ from tests.integration._lifecycle_crash_worker import make_lifecycle_runtime
 from tests.integration.test_lifecycle_crash_boundaries import restart, run_worker
 from tests.integration.test_observe_lifecycle_crashes import assert_lifecycles
 
-pytestmark = pytest.mark.asyncio
 
 
 async def recover_and_drain(store, memory, mode, snapshot):
     rt = await restart(store, memory, mode, snapshot)
     root = (await rt.get_session("crash-session")).data.root_agent_id
-    await rt.recover_agent(root, session_id="crash-session")
+    await recover_fixture_session(rt, root, session_id="crash-session")
     tm = rt._task_managers["crash-session"]
     while tm._background_asyncio_tasks:
         # Propagate observer failures; gathering with return_exceptions would hide them.
@@ -32,13 +33,14 @@ async def assert_cold_recovery_is_noop(store, memory, mode, root):
     head = await store.committed_head("crash-session")
     again, _ = make_lifecycle_runtime(store, memory, mode)
     await initialize_all(again)
-    await again.recover_agent(root, session_id="crash-session")
+    await recover_fixture_session(again, root, session_id="crash-session")
     tm = again._task_managers["crash-session"]
     while tm._background_asyncio_tasks:
         await asyncio.gather(*list(tm._background_asyncio_tasks))
     assert await store.committed_head("crash-session") == head
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot", [False, True])
 @pytest.mark.parametrize("cut", ["observe_completed", "segment_fold", "recovery_segment_fold"])
 async def test_non_close_completed_recovers_real_fold(tmp_path, snapshot, cut):
@@ -71,6 +73,7 @@ async def test_non_close_completed_recovers_real_fold(tmp_path, snapshot, cut):
             await assert_cold_recovery_is_noop(store, memory, mode, root)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot", [False, True])
 @pytest.mark.parametrize("cut", ["observe_completed", "segment_fold", "hitl_resolved",
                                  "task_requeued", "observe_applied"])
@@ -84,7 +87,7 @@ async def test_background_continue_recovers_and_runs_once(tmp_path, snapshot, cu
             # their accepted continuation must not call either one again.
             rt._llm.actor_count = rt._llm.judgements = 1
             root = (await rt.get_session("crash-session")).data.root_agent_id
-            await rt.recover_agent(root, session_id="crash-session")
+            await recover_fixture_session(rt, root, session_id="crash-session")
             tm = rt._task_managers["crash-session"]
             async with asyncio.timeout(10):
                 while (tm._background_asyncio_tasks or tm._dispatch_tasks
@@ -105,6 +108,7 @@ async def test_background_continue_recovers_and_runs_once(tmp_path, snapshot, cu
             await assert_cold_recovery_is_noop(store, memory, mode, root)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot", [False, True])
 @pytest.mark.parametrize("second_cut", [None, "hitl_resolved", "task_finished", "observe_applied"])
 async def test_failed_hitl_commit_keeps_completed_until_cold_recovery(tmp_path, snapshot, second_cut):

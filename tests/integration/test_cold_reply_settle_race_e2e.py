@@ -44,7 +44,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 
 class _Gate:
@@ -75,6 +74,7 @@ def _runtime(llm):
     return rt
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("gated_step", ["_commit_round_or_halt", "_flush_staged"],
                          ids=["before-commit", "after-commit"])
 async def test_reply_during_the_settle_window_still_wakes_the_task(gated_step) -> None:
@@ -154,6 +154,7 @@ async def test_reply_during_the_settle_window_still_wakes_the_task(gated_step) -
     assert not rt._task_managers[sid].open_round_task_ids
 
 
+@pytest.mark.asyncio
 async def test_parking_without_an_answer_is_not_requeued() -> None:
     """反例：没人应答的正常冷 park，收尾自检不得把它重排起来（否则判据退化成无条件重排）。"""
     llm = _ScriptedLLM([_ask("tc1", "Q1?"), _finish_call()])

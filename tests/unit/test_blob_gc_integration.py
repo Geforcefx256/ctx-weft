@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from ctx_weft.core.utils.content import normalize_content, rehydrate_content
+from ctx_weft.protocols.content import normalize_content, rehydrate_content
 from ctx_weft.protocols import (
     MemoryAddress,
     MemoryEvent,
@@ -16,7 +16,7 @@ from ctx_weft.protocols import (
     MemoryScope,
     ProviderContext,
 )
-from ctx_weft.protocols.context import ImagePart, TextPart
+from ctx_weft.protocols.content import ImagePart, TextPart
 from ctx_weft.providers.blob.fs import FsBlobStore
 from ctx_weft.providers.memory.sql import open_sqlite_memory
 

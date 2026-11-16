@@ -1,3 +1,4 @@
+
 """Crash the real delegate/observe/finalize path for same-agent children."""
 
 import asyncio
@@ -5,10 +6,12 @@ import os
 import sys
 from pathlib import Path
 
-from tests._initialization import initialize_all
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
+
+from tests._recovery import recover_fixture_session
+from tests._initialization import initialize_all
 
 from ctx_weft import SessionStartParams
 from ctx_weft.core.loop.steps.finalize import FinalizeStep
@@ -132,7 +135,7 @@ async def worker(path, order, size, cut, recovering=False):
                 view = await rebuild_view(store, "child-session")
                 children.update(t.id for t in view.tasks.values() if t.parent_task_id)
                 root = view.sessions["child-session"].root_agent_id
-                await rt.recover_agent(root, session_id="child-session")
+                await recover_fixture_session(rt, root, session_id="child-session")
                 tm = rt._task_managers["child-session"]
             else:
                 handle = await rt.start_session(SessionStartParams.create(session_id="child-session",

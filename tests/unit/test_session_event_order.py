@@ -71,7 +71,7 @@ async def test_session_created_emitted_before_task_created() -> None:
     sm = SessionRegistry(
         agent_lifecycle_manager=AgentLifecycleManager(
             template_lookup=TemplateLookup(_reg), event_bus=bus,
-            model_resolver=lambda a, m: _Client(),
+            model_resolver=lambda a, m, **_context: _Client(),
         ),
         event_bus=bus,
     )

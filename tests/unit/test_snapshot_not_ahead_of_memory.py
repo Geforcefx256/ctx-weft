@@ -31,7 +31,6 @@ from ctx_weft.providers.events import InMemoryEventStore
 from tests._snapshot_helpers import latest_snapshot
 from tests._event_helpers import append_one
 
-pytestmark = pytest.mark.asyncio
 
 _T0 = datetime(2026, 9, 20, tzinfo=UTC)
 _SID, _TID = "s1", "t1"
@@ -51,6 +50,7 @@ async def _bus():
     return InProcessEventBus()
 
 
+@pytest.mark.asyncio
 async def test_buffered_events_reach_rest_subscribers_at_flush_time() -> None:
     """缓冲里的事件在 `commit_provisional` 里就投给 rest 订阅者了。
 
@@ -77,6 +77,7 @@ async def test_buffered_events_reach_rest_subscribers_at_flush_time() -> None:
     )
 
 
+@pytest.mark.asyncio
 async def test_snapshot_writer_is_a_rest_subscriber() -> None:
     """`SnapshotWriter` 走的就是上面那条路——它不声明 `provisional`。
 
@@ -95,6 +96,7 @@ async def test_snapshot_writer_is_a_rest_subscriber() -> None:
     )
 
 
+@pytest.mark.asyncio
 async def test_head_already_covers_the_batch_when_the_writer_is_woken() -> None:
     """被叫醒的那一刻，`committed_head` 已经涵盖整批缓冲事件。
 
@@ -129,6 +131,7 @@ async def test_head_already_covers_the_batch_when_the_writer_is_woken() -> None:
 # ── 修复：写入前置条件 ────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_writer_skips_while_memory_is_unsettled() -> None:
     """谓词说「没落定」→ 不写快照。
 
@@ -151,6 +154,7 @@ async def test_writer_skips_while_memory_is_unsettled() -> None:
     assert await latest_snapshot(store, _SID) is not None, "落定之后要写得出来"
 
 
+@pytest.mark.asyncio
 async def test_skipping_still_counts_toward_the_threshold() -> None:
     """跳过的那些**仍然计数**——否则跳过会拖长重放窗口。
 
@@ -176,6 +180,7 @@ async def test_skipping_still_counts_toward_the_threshold() -> None:
     )
 
 
+@pytest.mark.asyncio
 async def test_a_throwing_predicate_blocks_the_write() -> None:
     """谓词自己炸了 → 当作「不安全」。宁可少写一张，不可写一张领先的。"""
     from ctx_weft.core.control.snapshot_writer import SnapshotWriter
@@ -192,6 +197,7 @@ async def test_a_throwing_predicate_blocks_the_write() -> None:
     assert await latest_snapshot(store, _SID) is None
 
 
+@pytest.mark.asyncio
 async def test_no_predicate_means_no_gate() -> None:
     """不注入谓词 → 行为与从前逐字一致（极简接线 / 单测不因此挡住快照）。"""
     from ctx_weft.core.control.snapshot_writer import SnapshotWriter

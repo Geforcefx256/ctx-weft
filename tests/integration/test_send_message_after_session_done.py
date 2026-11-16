@@ -40,7 +40,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 
 def _is_background_observe(request) -> bool:
@@ -102,6 +101,7 @@ def _make_runtime() -> CtxWeftRuntime:
     return rt
 
 
+@pytest.mark.asyncio
 async def test_send_message_works_after_the_session_was_released():
     rt = _make_runtime()
     await initialize_all(rt)
@@ -126,7 +126,7 @@ async def test_send_message_works_after_the_session_was_released():
     await initialize_all(rt)
     assert [a.agent_id for a in [item.data for item in await rt.list_agents(session_id=sid)]] == [aid]
     await initialize_all(rt)
-    assert (await rt.get_agent(aid)).data.status == "idle", "task 终态不是 agent 终态（spec 3.1）"
+    assert (await rt.get_agent(aid)).data.state.status == "idle", "task 终态不是 agent 终态（spec 3.1）"
 
     # ── 核心断言：这一句改造前抛 AgentNotFound ────────────────────────────────
     await initialize_all(rt)
@@ -145,6 +145,7 @@ async def test_send_message_works_after_the_session_was_released():
     await _wait_until(_second_done)
 
 
+@pytest.mark.asyncio
 async def test_send_message_self_heals_after_an_explicit_forget_session():
     """持有方显式逐出（host 的空闲淘汰）之后再发消息，必须从事件日志自愈装填回来。
 
@@ -181,6 +182,7 @@ async def test_send_message_self_heals_after_an_explicit_forget_session():
     assert sid in rt._task_managers, "TM 那一半由 _start_task_for_agent 的探测接住"
 
 
+@pytest.mark.asyncio
 async def test_send_message_without_session_id_refuses_instead_of_sweeping():
     """逐出之后不传 `session_id` 再发 → `AgentNotLoaded`，**不扫全库找**（2026-09-21）。
 
@@ -225,6 +227,7 @@ async def test_send_message_without_session_id_refuses_instead_of_sweeping():
     assert second.task_id and second.task_id != first_task
 
 
+@pytest.mark.asyncio
 async def test_truly_unknown_agent_still_raises_agent_not_found():
     """自愈是「还没喂进来」的补救，不是把 `AgentNotFound` 废掉：事件日志里也没有的
     agent_id 照常抛——`send_message` 的既有契约（upgrade doc §2）不变。"""

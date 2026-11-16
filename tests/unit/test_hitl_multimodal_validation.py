@@ -394,7 +394,7 @@ class _RoutingLLMProvider:
         self.by_key = by_key
         self.calls: list[tuple] = []
 
-    def get_client(self, account=None, model=None):
+    def get_client(self, account=None, model=None, *, ctx):
         self.calls.append((account, model))
         return self.by_key.get((account, model), self.default)
 

@@ -23,7 +23,6 @@ from ctx_weft.providers.llm.tokenizer import HeuristicTokenizer
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from tests.assembler_testkit import compiled_test_inputs, scripted_inputs
 
-pytestmark = pytest.mark.asyncio
 T = MemoryEventType
 _BASE = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -75,6 +74,7 @@ async def _run_compact(mem) -> None:
     await CompactStep().execute(state, ctx)
 
 
+@pytest.mark.asyncio
 async def test_task_compact_writes_task_summary() -> None:
     mem = InMemoryMemoryProvider()
     await mem.ingest(_ev(T.USER_PROMPT, "u", 0, "user"), _pctx())
@@ -94,6 +94,7 @@ async def test_task_compact_writes_task_summary() -> None:
     assert "a2" in [r.content for r in llm_recs]  # keep_last=1
 
 
+@pytest.mark.asyncio
 async def test_agent_compact_writes_agent_summary() -> None:
     """新格式：用 AGENT_CONVERSATION_TURN（parent=None）作 root 胶囊触发 agent 层压缩。"""
     mem = InMemoryMemoryProvider()
@@ -123,6 +124,7 @@ async def test_agent_compact_writes_agent_summary() -> None:
     assert any(r.type == T.AGENT_COMPACT_SUMMARY and r.content == "SUMMARY" for r in recs)
 
 
+@pytest.mark.asyncio
 async def test_finalize_retry_no_process_report_no_user_message() -> None:
     """retry：observe 分析结果已由折叠出的 TASK_COMPACT_SUMMARY 段摘要承载；finalize 不再写
     process_report/process_report_at，也不注入 user message（spec 2026-07-01 §3.1）。"""

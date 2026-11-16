@@ -35,6 +35,8 @@ stub LLM 只做一件真模型也会做的事：**扫 prompt 文本找占位、�
 
 from __future__ import annotations
 
+from tests._recovery import recover_fixture_session
+
 import asyncio
 import base64
 import dataclasses as _dc
@@ -46,7 +48,7 @@ import pytest
 
 from ctx_weft.core.media.refs import find_image_placeholders
 from ctx_weft.core.runtime import SessionStartParams
-from ctx_weft.core.utils.content import content_to_jsonable
+from ctx_weft.protocols.content import content_to_jsonable
 from ctx_weft.protocols import (
     BLOB_REF_PREFIX,
     ImagePart,
@@ -981,7 +983,7 @@ async def test_recovery_converts_event_refs_into_memory_refs(runtime_with_images
     await initialize_all(runtime)
     await runtime.rebuild_session(sid)
     await initialize_all(runtime)
-    await runtime.recover_agent(aid)
+    await recover_fixture_session(runtime, aid)
 
     tm = runtime._task_managers[sid]
     task = tm.get_task(tid)
@@ -1001,7 +1003,7 @@ async def test_recovery_converts_event_refs_into_memory_refs(runtime_with_images
 @pytest.mark.asyncio
 async def test_hydrate_event_content_degrades_to_placeholder_when_blob_missing() -> None:
     """event blob 取不回字节（过期 / 宿主换机 / GC 误删）→ 降级成确定性文本占位，不抛。"""
-    from ctx_weft.core.utils.content import hydrate_event_content
+    from ctx_weft.protocols.content import hydrate_event_content
 
     evt_store = _PrefixedEventBlobStore()
     # 刻意不 put：这个 ref 在 evt_store 里查无此物，get() 恒返回 None。
@@ -1025,7 +1027,7 @@ async def test_hydrate_event_content_degrades_to_placeholder_when_blob_missing()
 @pytest.mark.asyncio
 async def test_hydrate_event_content_missing_blob_placeholder_is_deterministic() -> None:
     """占位文本对同一张图必须逐字节确定（用户裁定 D2 的硬约束），不得含 ref/sha。"""
-    from ctx_weft.core.utils.content import hydrate_event_content
+    from ctx_weft.protocols.content import hydrate_event_content
 
     evt_store = _PrefixedEventBlobStore()
     missing_ref = f"{BLOB_REF_PREFIX}evt-does-not-exist"
@@ -1092,7 +1094,7 @@ async def test_restore_task_prompts_isolates_one_bad_task_and_logs_error(
     import logging
     with caplog.at_level(logging.ERROR, logger="ctx_weft.core.runtime"):
         await initialize_all(runtime)
-        await runtime.recover_agent(aid)  # 必须不抛——整场恢复不能因一个 task 坏数据而死
+        await recover_fixture_session(runtime, aid)  # 必须不抛——整场恢复不能因一个 task 坏数据而死
 
     tm = runtime._task_managers[sid]
 
@@ -1165,7 +1167,7 @@ async def test_hydrate_event_content_degrades_when_store_cannot_externalize(capl
     """`hydrate_event_content` 自身的口径：拿不到 store 与拿不回字节是同一种情形（I1）。"""
     import logging
 
-    from ctx_weft.core.utils.content import hydrate_event_content
+    from ctx_weft.protocols.content import hydrate_event_content
     from ctx_weft.protocols.events import NullEventBlobStore
 
     content = [

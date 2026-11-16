@@ -17,7 +17,6 @@ from ctx_weft.protocols import (
 )
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 
-pytestmark = pytest.mark.asyncio
 
 T = MemoryEventType
 _BASE = datetime(2026, 1, 1, tzinfo=UTC)
@@ -32,6 +31,7 @@ def _ev(type_, scope, content, t, role=None) -> MemoryEvent:
                        timestamp=_BASE + timedelta(seconds=t), role=role)
 
 
+@pytest.mark.asyncio
 async def test_inherit_copies_parent_recall_into_child_scope() -> None:
     mem = InMemoryMemoryProvider()
     parent_scope = MemoryAddress(session_id="s1", task_id="p1", agent_id="ag1")
@@ -80,6 +80,7 @@ def _child(id_: str, parent: str, t: int) -> Task:
                 created_at=_BASE + timedelta(seconds=t), settings=NormalTaskSettings())
 
 
+@pytest.mark.asyncio
 async def test_latest_prior_root_picks_most_recent_earlier_root() -> None:
     """无 parent 的根子 agent 任务，回退继承源=created_at 最近的前序根任务。"""
     root1 = _root("r1", 0)
@@ -94,6 +95,7 @@ async def test_latest_prior_root_picks_most_recent_earlier_root() -> None:
     assert picked is root2
 
 
+@pytest.mark.asyncio
 async def test_latest_prior_root_returns_none_when_no_prior_root() -> None:
     """首轮即 subagent 根任务，无前序根 → None（跳过继承，行为同现状）。"""
     current = _root("cur", 20)
@@ -103,6 +105,7 @@ async def test_latest_prior_root_returns_none_when_no_prior_root() -> None:
     assert _latest_prior_root_task(tm, current) is None
 
 
+@pytest.mark.asyncio
 async def test_inherit_presents_segment_summary_as_a_user_recap() -> None:
     """Inherited summaries match the parent's user-role recap view; source storage is unchanged."""
     mem = InMemoryMemoryProvider()

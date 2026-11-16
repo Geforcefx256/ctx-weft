@@ -26,7 +26,7 @@ from ctx_weft.protocols import (
     ProviderContext,
     load_records,
 )
-from ctx_weft.protocols.context import ImagePart, TextPart
+from ctx_weft.protocols.content import ImagePart, TextPart
 from ctx_weft.providers.memory.sql import (
     MemoryBlobRefModel,
     SqlMemoryProvider,

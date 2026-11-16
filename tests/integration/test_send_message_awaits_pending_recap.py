@@ -15,9 +15,9 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 
+@pytest.mark.asyncio
 async def test_registry_waits_until_the_pending_fold_completes():
     registry = ExecutionRegistry()
     release = asyncio.Event()
@@ -31,6 +31,7 @@ async def test_registry_waits_until_the_pending_fold_completes():
     assert registry.pending_run_id("task") is None
 
 
+@pytest.mark.asyncio
 async def test_registry_wait_is_a_noop_without_pending_work():
     registry = ExecutionRegistry()
     await asyncio.wait_for(registry.wait("task"), timeout=1)
@@ -41,6 +42,7 @@ async def test_registry_wait_is_a_noop_without_pending_work():
     assert registry.pending_run_id("task") is None
 
 
+@pytest.mark.asyncio
 async def test_old_completion_does_not_clear_new_registration():
     registry = ExecutionRegistry()
     release = asyncio.Event()
@@ -59,6 +61,7 @@ async def test_old_completion_does_not_clear_new_registration():
     assert not registry.latest
 
 
+@pytest.mark.asyncio
 async def test_new_task_run_does_not_wait_for_previous_tasks_pending_fold():
     """agent 已终态 → `send_message` 建新 task，其 run **不等**上一轮折叠落地。
 

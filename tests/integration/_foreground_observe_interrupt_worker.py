@@ -1,3 +1,4 @@
+
 """Exit immediately after real foreground-to-recap handoff commits."""
 
 import asyncio
@@ -5,9 +6,11 @@ import os
 import sys
 from pathlib import Path
 
-from tests._initialization import initialize_all
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from tests._recovery import recover_fixture_session
+from tests._initialization import initialize_all
 
 from ctx_weft import SessionStartParams
 from ctx_weft.providers.events.store.sql import open_sqlite_event_store
@@ -34,7 +37,7 @@ async def worker(path, cut, recovering):
             if recovering:
                 await rt.rebuild_session(SID, strict=True)
                 root = rt._task_managers[SID].session.root_agent_id
-                await rt.recover_agent(root, session_id=SID)
+                await recover_fixture_session(rt, root, session_id=SID)
                 await asyncio.sleep(10)
                 raise AssertionError("recovery did not reach injected crash")
             handle = await rt.start_session(SessionStartParams.create(session_id=SID,

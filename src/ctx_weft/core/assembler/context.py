@@ -10,7 +10,7 @@ from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import datetime
 from enum import Enum
 
-from ctx_weft.core.utils.content import content_to_jsonable
+from ctx_weft.protocols.content import content_to_jsonable
 from ctx_weft.protocols import MemoryAddress, MemoryRecord
 from ctx_weft.protocols.memory import MemoryEventType, MemoryKind, MemoryScope
 

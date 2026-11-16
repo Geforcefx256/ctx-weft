@@ -170,3 +170,91 @@ async def test_invoked_is_durable_before_the_provider_runs():
     tool.invoke = _probing_invoke
     await gw.invoke("fx__act", {}, state, ctx, tool_call_id=TC)
     assert seen == [True], "provider 执行时自己的 INVOKED 必须已经落库"
+
+
+@pytest.mark.asyncio
+async def test_external_metadata_is_distinct_from_control_results_and_progress():
+    gw, store, tool, authz, state, ctx = _harness()
+    extensions = {"host": {"sources": ["first"]}}
+
+    async def invoke(*args):
+        tool.calls += 1
+        yield CapabilityEvent(kind="progress", payload={"data": "working"}, metadata={"progress": 1})
+        yield CapabilityEvent(kind="result", payload={"content": "one", "metadata": {"control": 1}}, metadata=extensions)
+        extensions["host"]["sources"].append("late mutation")
+        yield CapabilityEvent(kind="result", payload={"content": "two", "metadata": {"control": 2}},
+                              metadata={"other": True})
+        yield CapabilityEvent(kind="result", payload={"content": "three"}, metadata={"host": {"sources": ["last"]}})
+
+    tool.invoke = invoke
+    result = await gw.invoke("fx__act", {}, state, ctx, tool_call_id=TC)
+    assert result.metadata == {"control": 2}
+    progress = await store.read_last_of_type("s1", EventType.CAPABILITY_PROGRESS)
+    assert progress.event.metadata == {"progress": 1}
+    finished = await store.read_last_of_type("s1", EventType.CAPABILITY_FINISHED)
+    assert finished.event.metadata == {"host": {"sources": ["last"]}, "other": True}
+    assert "metadata" not in finished.event.payload
+    await gw.invoke("fx__act", {}, state, ctx, tool_call_id=TC, reentry=True)
+    assert tool.calls == 1
+    assert (await store.read_last_of_type("s1", EventType.CAPABILITY_FINISHED)) == finished
+
+
+@pytest.mark.asyncio
+async def test_error_event_extensions_reach_finished_metadata():
+    gw, store, tool, authz, state, ctx = _harness()
+
+    async def invoke(*args):
+        yield CapabilityEvent(kind="error", payload={"message": "failed"}, metadata={"host": {"diagnostic": "x"}})
+
+    tool.invoke = invoke
+    result = await gw.invoke("fx__act", {}, state, ctx, tool_call_id=TC)
+    assert result.is_error
+    finished = await store.read_last_of_type("s1", EventType.CAPABILITY_FINISHED)
+    assert finished.event.payload["outcome"] == "error"
+    assert finished.event.metadata == {"host": {"diagnostic": "x"}}
+
+
+@pytest.mark.asyncio
+async def test_metadata_survives_memory_failure_after_event_commit():
+    from ctx_weft.core.loop.capability_gateway import confirm_tool_results
+
+    gw, store, tool, authz, state, ctx = _harness()
+    extensions = {"host": {"sources": ["original"]}}
+
+    async def invoke(*args):
+        tool.calls += 1
+        yield CapabilityEvent(kind="result", payload={"content": "ok"}, metadata=extensions)
+
+    tool.invoke = invoke
+    ingest = gw._memory.ingest
+
+    async def fail_once(*args, **kwargs):
+        if args[0].role != "tool":
+            return await ingest(*args, **kwargs)
+        gw._memory.ingest = ingest
+        raise RuntimeError("memory unavailable")
+
+    gw._memory.ingest = fail_once
+    with pytest.raises(RuntimeError, match="memory unavailable"):
+        await gw.invoke("fx__act", {}, state, ctx, tool_call_id=TC)
+    extensions["host"]["sources"].clear()
+    await confirm_tool_results(gw._pending_results, "s1")
+    finished, = await store.read_range("s1", include_types=(EventType.CAPABILITY_FINISHED,))
+    assert tool.calls == 1
+    assert finished.event.metadata == {"host": {"sources": ["original"]}}
+
+
+@pytest.mark.asyncio
+async def test_provider_exception_keeps_already_emitted_extensions():
+    gw, store, tool, authz, state, ctx = _harness()
+
+    async def invoke(*args):
+        yield CapabilityEvent(kind="result", payload={"content": "partial"}, metadata={"host": {"diagnostic": "x"}})
+        raise RuntimeError("provider failed")
+
+    tool.invoke = invoke
+    result = await gw.invoke("fx__act", {}, state, ctx, tool_call_id=TC)
+    assert result.is_error
+    finished = await store.read_last_of_type("s1", EventType.CAPABILITY_FINISHED)
+    assert finished.event.payload["outcome"] == "error"
+    assert finished.event.metadata == {"host": {"diagnostic": "x"}}

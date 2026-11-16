@@ -22,7 +22,6 @@ from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.providers.events import InMemoryEventStore
 from tests._event_helpers import append_one
 
-pytestmark = pytest.mark.asyncio
 
 _T0 = datetime(2026, 9, 20, tzinfo=UTC)
 _SID = "s1"
@@ -53,6 +52,7 @@ async def _store() -> InMemoryEventStore:
     return store
 
 
+@pytest.mark.asyncio
 async def test_narrowing_drops_only_other_tasks() -> None:
     """收窄掉的只有**明确属于别的 task** 的那些。"""
     from ctx_weft.core.control.reducers import load_events_of_types
@@ -64,6 +64,7 @@ async def test_narrowing_drops_only_other_tasks() -> None:
     assert ids == {"c_mine", "c_orphan"}
 
 
+@pytest.mark.asyncio
 async def test_unattributed_events_are_always_kept() -> None:
     """`task_id` 为空的**必须**取回。
 
@@ -80,6 +81,7 @@ async def test_unattributed_events_are_always_kept() -> None:
     assert facts["c_orphan"].invoked is True
 
 
+@pytest.mark.asyncio
 async def test_no_task_id_means_no_narrowing() -> None:
     """不传 `task_id` → 行为与从前逐字一致（全取）。"""
     from ctx_weft.core.control.reducers import load_events_of_types
@@ -89,6 +91,7 @@ async def test_no_task_id_means_no_narrowing() -> None:
     assert len(got) == 5
 
 
+@pytest.mark.asyncio
 async def test_sql_store_agrees_with_the_in_memory_one(tmp_path) -> None:
     """两个内置 store 的收窄口径必须一致——不一致会让「本机能跑、线上重跑工具」。"""
     from ctx_weft.core.control.reducers import load_events_of_types

@@ -35,7 +35,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 
 def _ev(**kw) -> Event:
@@ -48,11 +47,13 @@ def _ev(**kw) -> Event:
     return Event(**base)
 
 
+@pytest.mark.asyncio
 async def test_handle_has_no_run_id_field():
     """结构性守卫：run_id 不在对外句柄上。"""
     assert "run_id" not in TurnHandle.__dataclass_fields__
 
 
+@pytest.mark.asyncio
 async def test_events_filters_by_agent_and_task():
     bus = InProcessEventBus()
     h = TurnHandle(session_id="s1", agent_id="agt_1", task_id="tsk_1",
@@ -76,6 +77,7 @@ async def test_events_filters_by_agent_and_task():
     assert got == ["e1", "e4"]
 
 
+@pytest.mark.asyncio
 async def test_wait_for_finish_returns_on_task_terminal_event():
     bus = InProcessEventBus()
     h = TurnHandle(session_id="s1", agent_id="agt_1", task_id="tsk_1",
@@ -86,6 +88,7 @@ async def test_wait_for_finish_returns_on_task_terminal_event():
     await asyncio.wait_for(waiter, timeout=2.0)
 
 
+@pytest.mark.asyncio
 async def test_wait_for_finish_ignores_run_finished():
     """RunFinished 不再是判据——一轮 run 结束不等于这条 task 结束（可能还要 finalize）。"""
     bus = InProcessEventBus()
@@ -98,6 +101,7 @@ async def test_wait_for_finish_ignores_run_finished():
         await asyncio.wait_for(waiter, timeout=2.0)
 
 
+@pytest.mark.asyncio
 async def test_wait_for_finish_ignores_an_earlier_overlapping_launchs_recap_done():
     """二轮修复的回归守卫（2026-09-04）：`_task_pending` 只挂最新一次 launch，但同一个
     task 一生里可能有多次 fire-and-forget 后台 observe（`interrupt`/`mechanical`/
@@ -151,6 +155,7 @@ async def test_wait_for_finish_ignores_an_earlier_overlapping_launchs_recap_done
         h._pending_observe = None
 
 
+@pytest.mark.asyncio
 async def test_wait_for_finish_matches_observe_applied_by_value_not_identity():
     """三轮修复的回归守卫（2026-09-04）：`ev2.type` 与 `EventType.OBSERVE_APPLIED` 的
     匹配必须用 `==`（值相等），不能用 `is`（身份相等）。
@@ -204,6 +209,7 @@ async def test_wait_for_finish_matches_observe_applied_by_value_not_identity():
         h._pending_observe = None
 
 
+@pytest.mark.asyncio
 async def test_wait_for_finish_does_not_hang_when_recap_done_arrives_before_terminal():
     """终审 IMPORTANT 3 回归：`ObserveApplied` 先于终态事件到达时不能挂住。
 
@@ -282,6 +288,7 @@ class _CloseFoldLLM(MockLLMAdapter):
         return self._stream(MockResponse(text="done", tool_calls=[]), request)
 
 
+@pytest.mark.asyncio
 async def test_wait_for_finish_returns_after_deferred_fold_lands():
     """回归守卫（2026-09-04）：root task 收尾会 fire-and-forget 一个后台 observe 去折叠/
     胶囊化本段 raw（spec 2026-07-20 延迟折叠）。这个折叠任务的登记先于 TaskFinished 发出
@@ -336,6 +343,7 @@ async def test_wait_for_finish_returns_after_deferred_fold_lands():
         f"wait_for_finish 返回时，本段 raw 应已被折掉/胶囊化，实得 {[r.content for r in raws]}"
 
 
+@pytest.mark.asyncio
 async def test_start_session_returns_turn_handle():
     """裁定 A（控制方 2026-09-04）：brief 原版 setup（`template_id="echo"` + 未注册
     memory provider）在本仓库跑不起来——`start_session` 会在模板解析阶段先炸。改用

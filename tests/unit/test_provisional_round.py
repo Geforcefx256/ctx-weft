@@ -20,7 +20,6 @@ import pytest
 from ctx_weft.protocols.events import Event, EventType
 from ctx_weft.providers.events.bus.in_process.bus import InProcessEventBus
 
-pytestmark = pytest.mark.asyncio
 _TS = datetime(2026, 9, 9, tzinfo=UTC)
 
 
@@ -43,6 +42,7 @@ def _collector() -> tuple[list[Event], object]:
 # ── 总线层 ────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("origin", ["runtime", "loop.background_observe", "loop.recognize_intent"])
 async def test_new_round_cannot_retract_an_already_started_background_run(origin):
     bus = InProcessEventBus()
@@ -63,6 +63,7 @@ async def test_new_round_cannot_retract_an_already_started_background_run(origin
     assert not bus._background_runs
 
 
+@pytest.mark.asyncio
 async def test_durable_recap_started_during_new_round_survives_retraction():
     bus = InProcessEventBus()
     seen, handler = _collector()
@@ -77,6 +78,7 @@ async def test_durable_recap_started_during_new_round_survives_retraction():
     assert not bus._background_runs
 
 
+@pytest.mark.asyncio
 async def test_window_holds_events_from_ordinary_subscribers_but_not_provisional_ones():
     bus = InProcessEventBus()
     inside, h_inside = _collector()
@@ -95,6 +97,7 @@ async def test_window_holds_events_from_ordinary_subscribers_but_not_provisional
     assert outside == [], "窗口里的事件不得落盘、不得到达 host"
 
 
+@pytest.mark.asyncio
 async def test_commit_replays_in_order_and_does_not_double_deliver():
     bus = InProcessEventBus()
     inside, h_inside = _collector()
@@ -114,6 +117,7 @@ async def test_commit_replays_in_order_and_does_not_double_deliver():
     assert len(inside) == 2, "provisional 订阅者在 emit 时已收过，提交不得再投一遍"
 
 
+@pytest.mark.asyncio
 async def test_discard_drops_everything_and_closes_the_window():
     bus = InProcessEventBus()
     outside, h_outside = _collector()
@@ -129,6 +133,7 @@ async def test_discard_drops_everything_and_closes_the_window():
     assert [e.type for e in outside] == [EventType.TASK_FINISHED]
 
 
+@pytest.mark.asyncio
 async def test_window_only_holds_its_own_task():
     bus = InProcessEventBus()
     outside, h_outside = _collector()
@@ -143,6 +148,7 @@ async def test_window_only_holds_its_own_task():
     )
 
 
+@pytest.mark.asyncio
 async def test_begin_is_idempotent_and_keeps_the_buffer():
     bus = InProcessEventBus()
     outside, h_outside = _collector()
@@ -159,6 +165,7 @@ async def test_begin_is_idempotent_and_keeps_the_buffer():
     )
 
 
+@pytest.mark.asyncio
 async def test_commit_and_discard_on_an_unopened_window_are_noops():
     bus = InProcessEventBus()
     outside, h_outside = _collector()
@@ -189,6 +196,7 @@ def _task(task_id: str = "tsk_1"):
                 description="hi", user_prompt="hi")
 
 
+@pytest.mark.asyncio
 async def test_push_task_provisional_holds_task_created():
     bus = InProcessEventBus()
     outside, h_outside = _collector()
@@ -208,6 +216,7 @@ async def test_push_task_provisional_holds_task_created():
     assert not tm.is_round_open("tsk_1")
 
 
+@pytest.mark.asyncio
 async def test_ordinary_push_task_is_unaffected():
     bus = InProcessEventBus()
     outside, h_outside = _collector()
@@ -219,6 +228,7 @@ async def test_ordinary_push_task_is_unaffected():
     assert not tm.is_round_open("tsk_child")
 
 
+@pytest.mark.asyncio
 async def test_discard_settles_the_agent_in_memory_but_writes_nothing_to_the_log():
     """丢弃的核心不变式：`TASK_CANCELED` 必须在**关窗之前**发。
 
@@ -247,6 +257,7 @@ async def test_discard_settles_the_agent_in_memory_but_writes_nothing_to_the_log
     assert not tm.is_round_open("tsk_1")
 
 
+@pytest.mark.asyncio
 async def test_discard_is_idempotent():
     bus = InProcessEventBus()
     outside, h_outside = _collector()

@@ -7,7 +7,8 @@
 
 from __future__ import annotations
 
-import pytest
+from tests._recovery import recover_fixture_session
+
 
 from ctx_weft.core.orchestrator.task.disposition import RunOutcome, RunOutcomeKind
 from ctx_weft.core.orchestrator.task.hooks import TaskManagerHooks
@@ -15,8 +16,6 @@ from tests._event_helpers import append_one
 from tests._initialization import initialize_all
 from tests.unit._legacy_recover import rebuild_all_active
 from tests.unit._stub_runner import StubRunner
-
-pytestmark = pytest.mark.asyncio
 
 
 def test_restore_keeps_hitl_parked_task_suspended() -> None:
@@ -94,7 +93,7 @@ async def test_recover_agent_rebuilds_pending_hitl_and_parks() -> None:
     await initialize_all(runtime)
     await runtime.rebuild_session("ses_1")
     await initialize_all(runtime)
-    await runtime.recover_agent("agt_root")
+    await recover_fixture_session(runtime, "agt_root")
     await asyncio.sleep(0)
 
     pend = runtime.hitl_registry.list_pending(session_id="ses_1")
@@ -388,7 +387,7 @@ async def test_recover_does_not_redispatch_task_running_in_live_tm() -> None:
     await initialize_all(runtime)
     await runtime.rebuild_session("ses_1")
     await initialize_all(runtime)
-    await runtime.recover_agent("agt_root")
+    await recover_fixture_session(runtime, "agt_root")
     await asyncio.sleep(0)
 
     assert runtime._task_managers["ses_1"] is old_tm, "活 owner 不得被新建的 TM 顶替"
@@ -459,7 +458,7 @@ async def test_cold_answer_reuses_live_owner_instead_of_rebuilding(monkeypatch) 
     runtime._initialized_sessions.add("ses_1")  # Already-live synthetic owner.
 
     await initialize_all(runtime)
-    await runtime.recover_agent("agt", resumed_task_id="tsk_A")
+    await recover_fixture_session(runtime, "agt", resumed_task_id="tsk_A")
     for _ in range(10):
         await asyncio.sleep(0)
 

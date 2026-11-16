@@ -20,7 +20,6 @@ from ctx_weft.protocols import (
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from tests.assembler_testkit import history_messages
 
-pytestmark = pytest.mark.asyncio
 
 T = MemoryEventType
 _BASE = datetime(2026, 1, 1, tzinfo=UTC)
@@ -50,6 +49,7 @@ async def _collect(mem, scope) -> list:
     return blocks
 
 
+@pytest.mark.asyncio
 async def test_open_tasks_of_agent_all_visible() -> None:
     mem = InMemoryMemoryProvider()
     # task tA (open) and sibling tB (open), same agent ag1
@@ -62,6 +62,7 @@ async def test_open_tasks_of_agent_all_visible() -> None:
     assert {"do A", "A reply", "do B"} <= contents  # sibling tA conversation visible
 
 
+@pytest.mark.asyncio
 async def test_closed_task_shows_dispatch_pair_and_hides_unpaired() -> None:
     mem = InMemoryMemoryProvider()
     # paired dispatch (closed sub-task residue)
@@ -83,6 +84,7 @@ async def test_closed_task_shows_dispatch_pair_and_hides_unpaired() -> None:
     assert "d2" not in tool_call_ids   # unpaired dispatch hidden
 
 
+@pytest.mark.asyncio
 async def test_composer_merges_open_conv_and_residue_by_timestamp() -> None:
     mem = InMemoryMemoryProvider()
     await mem.ingest(_ev(T.USER_PROMPT, _sc("t1"), "root prompt", 0, role="user"), _ctx())

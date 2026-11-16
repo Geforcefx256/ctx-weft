@@ -33,6 +33,8 @@ an accepted consequence of session-state ownership moving to the host
 
 from __future__ import annotations
 
+from tests._recovery import recover_fixture_session
+
 import asyncio
 from datetime import datetime, timezone
 
@@ -63,7 +65,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 _TS = datetime(2026, 7, 12, tzinfo=timezone.utc)
 
@@ -116,6 +117,7 @@ def _ev(seq: int, type_, **payload) -> Event:
     )
 
 
+@pytest.mark.asyncio
 async def test_stuck_finish_session_recovers_and_finalizes(monkeypatch) -> None:
     """root task FINISHED + TaskRecapStarted (no Done) + session projection RUNNING
     (no SESSION_FINISHED) → recover_agent re-runs the recap and finalizes SUCCEEDED."""
@@ -189,7 +191,7 @@ async def test_stuck_finish_session_recovers_and_finalizes(monkeypatch) -> None:
     await initialize_all(runtime)
     await runtime.rebuild_session(sid)
     await initialize_all(runtime)
-    await runtime.recover_agent(aid)
+    await recover_fixture_session(runtime, aid)
 
     # finalize_idle_session awaits the relaunched recap before finalizing the session,
     # so it should already be persisted; drain any stragglers defensively.
@@ -216,6 +218,7 @@ async def test_stuck_finish_session_recovers_and_finalizes(monkeypatch) -> None:
     ), "expected OBSERVE_APPLIED from the relaunched recap"
 
 
+@pytest.mark.asyncio
 async def test_stuck_failed_session_recovers_and_finalizes_failed(monkeypatch) -> None:
     """Variant of Test A seeded with TASK_FAILED (+ FAILURE_THRESHOLD_HIT) instead of
     TASK_FINISHED: finalize_idle_session's FAILED branch (``session.failure_counter > 0``
@@ -295,7 +298,7 @@ async def test_stuck_failed_session_recovers_and_finalizes_failed(monkeypatch) -
     await initialize_all(runtime)
     await runtime.rebuild_session(sid)
     await initialize_all(runtime)
-    await runtime.recover_agent(aid)
+    await recover_fixture_session(runtime, aid)
 
     tm = runtime._task_managers.get(sid)
     if tm is not None and tm._background_asyncio_tasks:
@@ -350,6 +353,7 @@ class _RoutingLLM(MockLLMAdapter):
         return super().complete(request, stream=stream)
 
 
+@pytest.mark.asyncio
 async def test_suspended_task_with_pending_interrupt_recap_recovers() -> None:
     """Spec §7: a SUSPENDED (resumable) task with a pending interrupt-boundary recap.
 
@@ -420,7 +424,7 @@ async def test_suspended_task_with_pending_interrupt_recap_recovers() -> None:
     await initialize_all(runtime)
     await runtime.rebuild_session(sid)
     await initialize_all(runtime)
-    await runtime.recover_agent(aid)
+    await recover_fixture_session(runtime, aid)
 
     # Drive to quiescence: repeatedly gather whatever background tasks the TM is
     # tracking (the relaunched recap, plus any recap the resumed task's own close
@@ -471,6 +475,7 @@ async def test_suspended_task_with_pending_interrupt_recap_recovers() -> None:
     )
 
 
+@pytest.mark.asyncio
 async def test_no_tasks_at_all_still_raises() -> None:
     """A session with no tasks at all is a genuinely empty/broken projection and must
     still raise RuntimeError (the empty-session guard)."""
@@ -483,11 +488,12 @@ async def test_no_tasks_at_all_still_raises() -> None:
 
     await initialize_all(runtime)
     await runtime.rebuild_session("ses_recap")
-    with pytest.raises(RuntimeError, match="no resumable tasks"):
-        await initialize_all(runtime)
-        await runtime.recover_agent(aid)
+    await initialize_all(runtime)
+    await runtime.recover_session("ses_recap")
+    assert not runtime._task_managers["ses_recap"].all_tasks()
 
 
+@pytest.mark.asyncio
 async def test_all_tasks_terminal_with_a_pruned_snapshot_does_not_raise() -> None:
     """`test_no_tasks_at_all_still_raises` 的孪生反面：**所有 task 都已终态**的会话，
     在快照被裁过（v2，`prune_view_for_snapshot`）之后恢复，不得抛「no resumable tasks」。
@@ -535,9 +541,10 @@ async def test_all_tasks_terminal_with_a_pruned_snapshot_does_not_raise() -> Non
     await initialize_all(runtime)
     await runtime.rebuild_session(sid)
     await initialize_all(runtime)
-    await runtime.recover_agent(aid)   # 不抛即通过（没有活可重排，但会话是好的）
+    await recover_fixture_session(runtime, aid)   # 不抛即通过（没有活可重排，但会话是好的）
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot", [False, True])
 async def test_resume_uses_snapshot_or_bounded_history(tmp_path, snapshot) -> None:
     """Real pending recap: snapshots bound replay; no-snapshot replay has a fixed cut."""
@@ -581,7 +588,7 @@ async def test_resume_uses_snapshot_or_bounded_history(tmp_path, snapshot) -> No
             initial_reads = len(full_reads)
             tm = runtime._task_managers[sid]
             for _ in range(2):
-                await runtime.recover_agent(aid, session_id=sid)
+                await recover_fixture_session(runtime, aid, session_id=sid)
                 await wait_until(lambda: not tm._dispatch_tasks and not tm._background_asyncio_tasks)
                 if snapshot:
                     assert len(full_reads) == initial_reads

@@ -382,6 +382,6 @@ async def test_reader_background_observe_recap_does_not_crash_on_parts(fake_stat
 
 
 async def test_reader_content_to_text_skips_images():
-    from ctx_weft.core.utils.content import content_to_text
+    from ctx_weft.protocols.content import content_to_text
     res, _, _ = await _run(_Prov("only text survives", [_img()]))
     assert content_to_text(res.content) == "only text survives"

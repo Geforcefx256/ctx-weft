@@ -37,7 +37,6 @@ from tests.integration.test_minimal_loop import (
     make_runtime,
 )
 
-pytestmark = pytest.mark.asyncio
 
 _MOCK_CONTEXT_LIMIT = 100_000
 
@@ -111,6 +110,7 @@ async def _wait_for_wait_bubble(rt, session_id: str, timeout: float = 5.0):
     raise TimeoutError("暂停之后没有出现 wait 气泡——会话没有续跑点，卡死了")
 
 
+@pytest.mark.asyncio
 async def test_pause_on_the_very_first_message_parks_and_stays_usable() -> None:
     llm = _StallsFirstActLLM(
         responses=[MockResponse(text=f"answer {i}") for i in range(8)],
@@ -175,6 +175,7 @@ async def test_pause_on_the_very_first_message_parks_and_stays_usable() -> None:
     )
 
 
+@pytest.mark.asyncio
 async def test_pause_immediately_after_start_before_the_run_is_dispatched() -> None:
     """更早的时刻：`start_session` 刚返回、run 还没派发就按停。
 
@@ -219,6 +220,7 @@ async def test_pause_immediately_after_start_before_the_run_is_dispatched() -> N
     assert EventType.HITL_RESOLVED in types, "续跑没起来"
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("pause_before_commit", [False, True])
 async def test_new_task_branch_recognizes_intent_after_commit(pause_before_commit) -> None:
     """Each new user task gets metadata; a discarded turn never launches recognition."""

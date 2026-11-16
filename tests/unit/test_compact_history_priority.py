@@ -25,7 +25,6 @@ from tests.assembler_testkit import compiled_test_inputs, recalled_blocks, scrip
 from tests.unit.test_compact_step_transitions import ScriptedLLM
 from tests.unit.test_llm_event_convergence import _prepare_compact_transition
 
-pytestmark = pytest.mark.asyncio
 BASE = datetime(2026, 1, 1, tzinfo=UTC)
 
 
@@ -81,6 +80,7 @@ async def setup(monkeypatch, *, target=0.58, llm=None):
     return state, ctx, bus
 
 
+@pytest.mark.asyncio
 async def test_writer_separates_child_parent_from_origin_parent(monkeypatch):
     state, ctx, _ = await setup(monkeypatch)
     child = NS(id="child", parent_task_id="old", title="child", description="",
@@ -94,6 +94,7 @@ async def test_writer_separates_child_parent_from_origin_parent(monkeypatch):
     assert 'parent_task_id="old"' in records[0].content
 
 
+@pytest.mark.asyncio
 async def test_legacy_starts_do_not_hide_roots_or_detach_nested_children(monkeypatch):
     state, ctx, _ = await setup(monkeypatch)
     await capsule(state, ctx, "old", 0, dispatch="child")
@@ -108,6 +109,7 @@ async def test_legacy_starts_do_not_hide_roots_or_detach_nested_children(monkeyp
     assert {r.id for r in body if r.id.endswith("-body")} == {"newer-body"}
 
 
+@pytest.mark.asyncio
 async def test_closed_cross_agent_result_does_not_block_history_demotion(monkeypatch):
     state, ctx, _ = await setup(monkeypatch)
     await capsule(state, ctx, "old", 0, dispatch="remote")
@@ -123,6 +125,7 @@ async def test_closed_cross_agent_result_does_not_block_history_demotion(monkeyp
         ctx.memory, cm._agent_half(state.scope), MemoryScope.TASK, ctx.provider_ctx))
 
 
+@pytest.mark.asyncio
 async def test_running_descendant_is_protected_from_whole_history_fold(monkeypatch):
     state, ctx, _ = await setup(monkeypatch)
     await capsule(state, ctx, "old", 0, dispatch="running-child")
@@ -135,6 +138,7 @@ async def test_running_descendant_is_protected_from_whole_history_fold(monkeypat
     assert not any(r.id == "newer-body" for r in body)
 
 
+@pytest.mark.asyncio
 async def test_unclosed_history_is_not_demoted_as_a_completed_task(monkeypatch):
     state, ctx, _ = await setup(monkeypatch)
     await ctx.memory.ingest(MemoryEvent(
@@ -146,6 +150,7 @@ async def test_unclosed_history_is_not_demoted_as_a_completed_task(monkeypatch):
     assert await cm.demote_kept_capsules(state, ctx, {"unfinished"}) == 0
 
 
+@pytest.mark.asyncio
 async def test_l2_selection_excludes_rich_history_and_current_task(monkeypatch):
     state, ctx, _ = await setup(monkeypatch)
     await capsule(state, ctx, "rich", 0)
@@ -166,6 +171,7 @@ async def test_l2_selection_excludes_rich_history_and_current_task(monkeypatch):
     assert any(r.address.task_id == state.scope.task_id for r in body)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("current_is_parent", [False, True])
 async def test_completed_branches_of_live_task_tree_are_compacted_first(monkeypatch, current_is_parent):
     state, ctx, _ = await setup(monkeypatch, target=0.01)
@@ -200,6 +206,7 @@ async def test_completed_branches_of_live_task_tree_are_compacted_first(monkeypa
     assert any(cm.capsule_origin(r) == parent for r in turns)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("history_kind", ["lean", "summary"])
 @pytest.mark.parametrize("old_count", [1, 6])
 async def test_condensed_history_is_summarized_before_current_task(monkeypatch, history_kind, old_count):
@@ -234,6 +241,7 @@ async def test_condensed_history_is_summarized_before_current_task(monkeypatch, 
         "root_experience", "collapse"]
 
 
+@pytest.mark.asyncio
 async def test_l2_stops_before_current_task_when_history_digest_meets_target(monkeypatch):
     state, ctx, _ = await setup(monkeypatch, target=0.58)
     await capsule(state, ctx, "old", 0)
@@ -252,6 +260,7 @@ async def test_l2_stops_before_current_task_when_history_digest_meets_target(mon
     assert not any(r.metadata.get("collapsed") for r in current)
 
 
+@pytest.mark.asyncio
 async def test_late_lean_replacement_during_l2_blocks_current_compaction(monkeypatch):
     state, ctx, _ = await setup(monkeypatch, target=0.01)
     await capsule(state, ctx, "old", 0)
@@ -278,6 +287,7 @@ async def test_late_lean_replacement_during_l2_blocks_current_compaction(monkeyp
     assert not any(r.metadata.get("collapsed") for r in current)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("collapse_current", [False, True])
 async def test_act_compact_removes_old_history_before_current_window(monkeypatch, collapse_current):
     from ctx_weft.core.loop.capability_gateway import DISPATCH_TOOLS
@@ -360,6 +370,7 @@ async def test_act_compact_removes_old_history_before_current_window(monkeypatch
     assert ("history 1" in sent) is not collapse_current
 
 
+@pytest.mark.asyncio
 async def test_missing_summary_is_regenerated_before_current_task(monkeypatch):
     state, ctx, _ = await setup(monkeypatch, target=0.01)
     await capsule(state, ctx, "old", 0, summary=False)
@@ -381,6 +392,7 @@ async def test_missing_summary_is_regenerated_before_current_task(monkeypatch):
         "root_experience", "collapse"]
 
 
+@pytest.mark.asyncio
 async def test_late_observer_replacement_keeps_one_digest_and_folds_only_selected_ids(monkeypatch):
     state, ctx, _ = await setup(monkeypatch)
     await capsule(state, ctx, "old", 0)
@@ -415,6 +427,7 @@ async def test_late_observer_replacement_keeps_one_digest_and_folds_only_selecte
     assert any(r.id == "newer-body" for r in body)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("old_count", [1, 8])
 async def test_new_history_during_digest_is_retained_and_blocks_current_compaction(monkeypatch, old_count):
     state, ctx, _ = await setup(monkeypatch, target=0.01)

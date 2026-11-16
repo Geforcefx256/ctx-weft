@@ -39,7 +39,6 @@ from tests.assembler_testkit import compiled_test_inputs, scripted_inputs
 from tests.hitl_env import make_hitl
 from tests.step_helpers import patch_observe_start
 
-pytestmark = pytest.mark.asyncio
 
 
 class _RecordingBus:
@@ -112,6 +111,7 @@ def _completed(bus) -> list[str]:
 
 # ── ① 无人值守 + 纯文本回合：零副作用，且只发一条 stop ──────────────────────
 
+@pytest.mark.asyncio
 async def test_unattended_plain_text_turn_emits_exactly_one_completed_event(monkeypatch):
     launched = _spy_observe(monkeypatch)
     state, ctx, task, reg, bus = _env(unattended=True)
@@ -124,6 +124,7 @@ async def test_unattended_plain_text_turn_emits_exactly_one_completed_event(monk
     assert reg.list_pending() == [], "不让位就不该有任何等人回答的登记"
 
 
+@pytest.mark.asyncio
 async def test_unattended_park_await_user_returns_with_no_side_effects(monkeypatch):
     """函数级：`_park_await_user` 自己就是零副作用返回，不靠调用方兜底。"""
     launched = _spy_observe(monkeypatch)
@@ -137,6 +138,7 @@ async def test_unattended_park_await_user_returns_with_no_side_effects(monkeypat
 
 # ── ② 有人值守 + 纯文本回合：照常让位 ───────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_attended_plain_text_turn_parks_and_never_reaches_stop(monkeypatch):
     launched = _spy_observe(monkeypatch)
     state, ctx, task, reg, bus = _env(unattended=False)
@@ -153,6 +155,7 @@ async def test_attended_plain_text_turn_parks_and_never_reaches_stop(monkeypatch
 
 # ── ③ 无人值守 + 人按暂停：豁免生效，照常 park ─────────────────────────────
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("edit", "preface"),
     [(False, PREFACE_AFTER_INTERRUPT), (True, PREFACE_AFTER_INTERRUPT_EDIT)],
@@ -171,6 +174,7 @@ async def test_unattended_interrupt_still_parks(edit, preface):
 
 # ── ④ 手工越过设置点不变式：unattended=True 且 interactive ─────────────────
 
+@pytest.mark.asyncio
 async def test_unattended_interactive_task_runs_to_stop_end_to_end(monkeypatch):
     """整条 act 跑下来不崩、不 park——上一个提交遗留的那个口子。
 

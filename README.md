@@ -34,7 +34,7 @@ Host 应在执行前同步恢复报告到自己的投影；投影失败后的重
 
 ```python
 result = await runtime.get_session(session_id)
-print(result.data.status, result.source, result.loaded)
+print(result.data.state, result.source, result.loaded)
 task = (await runtime.get_task(session_id, task_id)).data
 agents = await runtime.list_agents(session_id=session_id)
 ```
@@ -43,12 +43,15 @@ agents = await runtime.list_agents(session_id=session_id)
 `source` 为 `memory` / `events`，事件结果带 `committed_position`。
 不指定 Session 的列表只枚举已装填对象；冷 Agent 查询需要 `session_id` 定址。
 恢复快照可能裁掉终态任务，历史任务查询会补读原始任务事件。
+`get_session().data.state` 是完整会话查询快照：`root_agent` 和按 Agent ID 排序的 `agents` 复用 `AgentDetail`，`root_task` 和 `AgentState.current_task` 复用 `TaskDetail`，`pending_hitl` 复用完整 `HitlRequestView`；同时包含 `goal`、失败计数和熔断标记。任务包含正文、输出、错误码、错误正文、失败时重试次数、阻塞任务和收尾标记，无需再补查根任务。保留全部 Agent 的中断原因，宿主选择展示方式；原因未知为空字符串，旧日志没有任务记录时任务对象为 `None`。
+
+`get_agent().data.state` 使用同一 `AgentState`；模型选择仍在详情的 `llm_account`、`llm_model`、`llm_config` 中。`initialize()` 返回同一完整 state，冷恢复与实时查询共用公开对象构造逻辑。`TaskDetail` 定义在 `ctx_weft.protocols.task`，也可从顶层包导入。旧的扁平根任务字段和 HITL 计数没有兼容别名。会话级聊天路由和状态到界面的映射由宿主实现。RoundCommitted/RoundDiscarded 仍是瞬态通知，不参与恢复重放。
 
 `rebuild_session()` 是已有会话唯一装填入口，只装填、不执行。同一会话的 owner
 TaskManager 只创建一份。`start_session(resume=True)`、`send_message`、`dispatch_task`、
-`recover_agent` 和需续跑的 HITL 应答会在会话锁内自动确保装填，不要求宿主提前装填。
-冷 `reply_to_hitl(reply, session_id=...)` 和 `recover_agent(agent_id, session_id=...)`
-需要 Session 定址信息。`rebuild_hitl`、`prepare_agent` 保留为统一装填的兼容入口。
+`recover_session` 和需续跑的 HITL 应答会在会话锁内自动确保装填，不要求宿主提前装填。
+冷 `reply_to_hitl(reply, session_id=...)` 和 `recover_session(session_id)`
+需要 Session 定址信息。`recover_agent`、`rebuild_hitl`、`prepare_agent` 兼容入口已删除；装填统一使用 `rebuild_session`。
 
 `TurnHandle.wait_for_finish()` 只在任务终态且相关收尾完成后正常返回，超时抛
 `TimeoutError`；人工等待不是完成。稳定的任务状态和产出请通过 `get_task()` 读取。
@@ -586,7 +589,7 @@ runtime = CtxWeftRuntime(
 | `send_message(agent_id, content, ...)` | 继续对话，按需自动装填 | `TurnHandle` |
 | `dispatch_task(session_id, content, ...)` | 派发新任务，按需自动装填 | `TurnHandle` |
 | `rebuild_session(id)` | 装填冷会话的 HITL、agent 与 TaskManager（**只装填，不跑**） | `int` |
-| `recover_agent(agent_id)` | 复用准备好的 owner，激活任务并 drain（缺 owner 时先统一冷准备） | `None` |
+| `recover_session(session_id)` | 复用准备好的 owner，激活任务并 drain（缺 owner 时先统一冷准备） | `None` |
 | `cancel_session(id)` | 取消会话范围工作 | `bool` |
 
 ### run_single_task() — 单任务直跑
@@ -730,7 +733,7 @@ n = await runtime.rebuild_session(session_id, strict=True)  # 返回装填的 ag
 
 # ② 之后才谈操作这条会话里的 agent：
 await runtime.send_message(agent_id, "继续", session_id=session_id)   # 接着聊
-await runtime.recover_agent(agent_id)                                 # 续跑被打断的
+await runtime.recover_session(session_id)                                 # 续跑被打断的
 ```
 
 `rebuild_session` 中的 `TaskManager.restore(..., enqueue=False)` 保留持久化任务状态，
@@ -743,7 +746,7 @@ await runtime.recover_agent(agent_id)                                 # 续跑�
 是扫全部会话。所以：
 
 - `send_message` 撞上 miss 时，**带了 `session_id` 就自愈**（精确装填那一个 session），没带就抛 `AgentNotLoaded`。
-- `recover_agent` 没有 session 语境，撞上 miss 一律抛 `AgentNotLoaded`。宿主该先 `rebuild_session`。
+- `recover_session(session_id)` 自行确保该会话已初始化、装填和存储提交确认，再恢复已有工作。它不创建新任务，也不替人回答 HITL。
 
 `AgentNotLoaded` 是 `AgentNotFound` 的子类，既有的 `except AgentNotFound` 照样接住；想区分「没装填」与
 「真不存在」的再按它分支。
@@ -1448,6 +1451,43 @@ uv run --no-sync --with Cython==3.2.4 --with setuptools --with wheel python scri
 固定使用 Cython 3.2.4；3.3.0 会对 `tuple[str, ...]` 中的 `StrEnum` 元素施加额外类型检查，
 即使关闭注解类型推断也会改变事件存储的 Python 语义。
 
+## 实例关闭与 prompt 诊断
+
+实例关闭和命令准入由 `CtxWeftRuntime` 直接持有，不通过 lifecycle mixin 继承。
+prompt 诊断保留在独立的内部模块，只接收事件存储、记忆、模板查询器和能力索引，
+返回诊断数据及同一已提交切面的位置；公开入口由 runtime 包装成 `QueryResult`。
+
+```python
+from ctx_weft import RuntimeShutdownError
+
+view = await runtime.inspect_prompt(session_id, prompt_event_id, trim=True)
+print(view.data.system_prompt, view.data.messages)
+
+try:
+    report = await runtime.close(timeout=30.0)
+except RuntimeShutdownError as exc:
+    # quiescent=False：清理仍在运行，应继续 await close()，保留外部资源。
+    # quiescent=True, durable=False：执行已退出，但恢复事实未全部确认落盘。
+    print(exc.report)
+    raise
+```
+
+`close()` 属于单个 runtime 实例，重复和并发调用共用一次关闭。它拒绝新命令、冻结派发与自治重排、
+停止并等待在途执行（包括工具、observe、metadata），确认已开始的提交，丢弃未提交回合，
+将剩余已提交工作记录为可恢复中断。已完成的终态和待处理 HITL 的 ID、内容保持不变。
+超时或调用方取消不会放弃清理；关闭后的查询仍可读取已提交事件。
+外部数据库、MCP、LLM 客户端等 Provider 资源由宿主在 SDK 停止、宿主投影排空后关闭。
+`best_effort` 提交策略不能保证恢复持久性，会在有执行会话时报告关闭失败。
+
+`inspect_prompt()` 只接受所属会话的已提交 `LlmPromptSent` 事件 ID，并校验输入版本和 scope。
+它使用持久化租户身份读取模板、记忆和能力描述，返回脱敏的公开 DTO，不装填执行缓存、不调用模型或执行工具。
+`source="recompiled"` 表示依据保存的输入和当前可用模板/Provider 重编译，不保证等于历史线上请求字节；
+`trim=False` 可查看未按预算裁剪的版本。宿主保留 SSE 下标与旧版完整记录的展示兼容。
+
+恢复时原始输入的核对和幂等补写由 SDK 的 `rebuild_session(..., strict=True)` 负责，
+包括已有 HITL 回答但缺少原始提问、多模态输入与旧版宿主 `userprompt:<task_id>` 记录。
+严格重建遇到记忆存储错误会失败，允许重试，不应在宿主重复实现补写。
+
 ## 限制与约束
 
 - **单进程**：EventBus 是进程内实现，不跨进程。多进程需替换为 Redis Streams 等外部总线。
@@ -1460,3 +1500,32 @@ uv run --no-sync --with Cython==3.2.4 --with setuptools --with wheel python scri
 ---
 
 > 更深入的内部实现（循环引擎、Step 流水线、上下文装配、任务编排、崩溃恢复）见 [ARCHITECTURE.md](./ARCHITECTURE.md)。
+
+
+## 内容处理的公开接口
+
+从 `ctx_weft.protocols.content` 导入 `TextPart`、`ImagePart`、`ContentPart` 及
+`parse_content`、`validate_content`、`content_has_image`、`content_to_text`、
+`content_to_jsonable`、`externalize_content`。输入解析拒绝未知 part；读取历史的
+`normalize_content_parts` 继续容错未知类型。`InvalidContentError` 和
+`BlobStoreRequiredError` 同时从该模块与 ctx_weft 顶层公开。
+
+```python
+from ctx_weft.protocols import ProviderContext
+from ctx_weft.protocols.content import (
+    parse_content, validate_content, externalize_content, content_to_jsonable,
+)
+
+content = parse_content(raw_input)
+store = runtime.providers.get_event_blob_store()
+validate_content(content, event_blob_store=store)  # 不写库、不修改输入
+prepared = await externalize_content(
+    content, blob_store=store, ctx=ProviderContext(session_id="s", tenant_id="tenant"),
+)
+record_content = content_to_jsonable(prepared)
+```
+
+输入已有图片引用时，必须明确传 `source_blob_store`；外部化会读取该来源，必要时
+复制到目标存储，不能假设记忆和事件的引用空间相同。展示记录使用准备后的内容，
+引擎执行仍传原始 content。外部化成功不代表执行已接受；调用方负责自己的记录
+提交及 blob 保留策略。ModelCallConfig 和其 codec 的既有使用方式保持。

@@ -25,7 +25,6 @@ from tests.integration.test_minimal_loop import (
 )
 from tests.unit._legacy_recover import rebuild_all_active
 
-pytestmark = pytest.mark.asyncio
 _TS = datetime(2026, 6, 13, tzinfo=UTC)
 
 
@@ -46,6 +45,7 @@ def _runtime():
     return rt
 
 
+@pytest.mark.asyncio
 async def test_task_created_updates_the_assigned_agents_current_task():
     rt = _runtime()
     sid, aid = "A", "agt_1"
@@ -65,6 +65,7 @@ async def test_task_created_updates_the_assigned_agents_current_task():
     assert view.agents[aid].current_task_id == "tsk_new"
 
 
+@pytest.mark.asyncio
 async def test_load_no_longer_rewinds_current_task_id(monkeypatch):
     """端到端形态：`send_message` push 完新 task，此刻发生一次热重装，路由判据不得倒回。"""
     from ctx_weft.core.orchestrator.task.manager import TaskManager

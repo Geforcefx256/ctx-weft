@@ -1,3 +1,4 @@
+from ctx_weft.protocols.context import ProviderContext as _ProviderContext
 from dataclasses import asdict
 
 import httpx
@@ -12,11 +13,14 @@ from ctx_weft.providers.llm import (
 )
 
 
+_PROVIDER_CONTEXT = _ProviderContext(session_id="test")
+
+
 class Store:
     def save(self, account):
         self.saved = asdict(account)
 
-    def delete(self, name):
+    def delete(self, name, *, namespace="global"):
         return True
 
     def list_all(self):
@@ -54,37 +58,37 @@ def provider(*models):
 )
 def test_dispatch_is_per_model(protocol, image, expected):
     p = provider(model(), model("other", protocol, image))
-    client = p.get_client("gateway", "other")
+    client = p.get_client("gateway", "other", ctx=_PROVIDER_CONTEXT)
     assert type(client._adapter).__name__ == expected
     assert client.context_limit == 200_000
     assert client.output_ceiling == 32_000
     assert client.output_reserve == 0
-    assert (client.account, client.model) == ("gateway", "other")
+    assert (client.account, client.model) == (p.get_account("gateway").resource_id, "other")
 
 
 def test_cache_reuses_type_but_keeps_model_tokenizers_separate():
     p = provider(model("a"), model("b"), model("c", "anthropic"))
-    a, b, c = (p.get_client("gateway", name) for name in ("a", "b", "c"))
+    a, b, c = (p.get_client("gateway", name, ctx=_PROVIDER_CONTEXT) for name in ("a", "b", "c"))
     assert a._adapter is b._adapter
     assert a.tokenizer is not b.tokenizer
     assert a._adapter is not c._adapter
     p.get_account("gateway").api_key = "replacement"
-    assert p.get_client("gateway", "a")._adapter is not a._adapter
+    assert p.get_client("gateway", "a", ctx=_PROVIDER_CONTEXT)._adapter is not a._adapter
 
 
 def test_config_query_is_lazy_and_unknown_model_is_rejected():
     p = provider(model())
-    assert p.get_model_config().name == "m"
+    assert p.get_model_config(ctx=_PROVIDER_CONTEXT).name == "m"
     assert not p._adapters
     with pytest.raises(ValueError, match="not in account"):
-        p.get_client(model="missing")
+        p.get_client(model="missing", ctx=_PROVIDER_CONTEXT)
 
 
 def test_update_changes_next_client_and_preserves_previous_client():
     p = provider(model())
-    old = p.get_client()
+    old = p.get_client(ctx=_PROVIDER_CONTEXT)
     p.update_model("gateway", model(protocol="anthropic", image=True))
-    assert type(p.get_client()._adapter).__name__ == "AnthropicMultimodalAdapter"
+    assert type(p.get_client(ctx=_PROVIDER_CONTEXT)._adapter).__name__ == "AnthropicMultimodalAdapter"
     assert type(old._adapter).__name__ == "OpenAICompatibleAdapter"
     assert p._store.saved["models"][0]["limit"]["output"] == 32_000
     p.delete_account("gateway")

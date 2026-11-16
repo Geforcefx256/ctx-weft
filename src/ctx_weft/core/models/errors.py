@@ -5,21 +5,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from ctx_weft.core.models.discriminators import InterruptReason, TaskErrorCode
+from ctx_weft.protocols.errors import CtxWeftError
+from ctx_weft.protocols.content import InvalidContentError as InvalidContentError, BlobStoreRequiredError as BlobStoreRequiredError
 
 if TYPE_CHECKING:
     from ctx_weft.core.orchestrator.task.disposition import RunOutcome
 
 
-class CtxWeftError(Exception):
-    """所有 ctx-weft 异常的基类。"""
-
-    code: str = "CTX_WEFT_ERROR"
-
-    def __init__(self, message: str = "", *, code: str | None = None) -> None:
-        super().__init__(message)
-        self.message = message
-        if code is not None:
-            self.code = code
 
 
 # ── 状态相关 ───────────────────────────────────────────────────────────────────
@@ -213,23 +205,8 @@ def crash_run_outcome(exc: BaseException) -> "RunOutcome":
 # ── 入口内容校验 ───────────────────────────────────────────────────────────────
 
 
-class InvalidContentError(CtxWeftError):
-    """入口内容格式非法：未知 media_type / base64 畸形 / 单图超限。
-
-    入口即拒，不落库——比让畸形内容流到 provider 侧再 400 更早、更可诊断。
-    """
-
-    code = "INVALID_CONTENT"
 
 
-class BlobStoreRequiredError(CtxWeftError):
-    """携图内容要求宿主注册 EventBlobStore（spec 2026-08-27 双 blob store §7）。
-
-    事件库的口径是**恒不含字节、恒可回读**，没有例外分支——没有 event blob store 就
-    无处放字节，只能在入口拒绝。纯文本会话不受影响。
-    """
-
-    code = "BLOB_STORE_REQUIRED"
 
 
 # ── Loop 控制流 ────────────────────────────────────────────────────────────────
@@ -280,8 +257,8 @@ class UnfinishedTasksError(CtxWeftError):
     """开新一轮（resume_session）被拒：事件里仍有未终结任务。
 
     弃轮（不恢复、直接开新轮）会把滞留的非终态任务永久遗弃在事件库,之后任何
-    recover_agent 全量重建又会把它们复活重跑（僵尸重跑）。调用方应引导用户走
-    恢复路径（/resume → recover_agent）续跑或收尾这些任务。"""
+    recover_session 全量重建又会把它们复活重跑（僵尸重跑）。调用方应引导用户走
+    恢复路径（/resume → recover_session）续跑或收尾这些任务。"""
 
     code = "SESSION_HAS_UNFINISHED_TASKS"
 

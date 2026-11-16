@@ -38,7 +38,6 @@ from tests.integration.test_minimal_loop import (
 )
 from tests.runtime_helpers import wait_for_park
 
-pytestmark = pytest.mark.asyncio
 
 
 def _assert_no_duplicate_sequence(events):
@@ -164,6 +163,7 @@ async def bus_after_recap_run() -> _RecapRun:
     return _RecapRun(events=seen, main_run_id=main_run_started.run_id)
 
 
+@pytest.mark.asyncio
 async def test_background_observe_does_not_reuse_main_run_sequence(bus_after_recap_run):
     """A4：recap 的 run_id 必须换新号，且它名下的事件序列内部不重号。
 
@@ -183,6 +183,7 @@ async def test_background_observe_does_not_reuse_main_run_sequence(bus_after_rec
     _assert_no_duplicate_sequence(recap_events)
 
 
+@pytest.mark.asyncio
 async def test_every_run_id_has_start_and_finish(bus_after_recap_run):
     """C5：每个 run_id（含主 run、recognize_intent、background recap）都有起止。
 
@@ -192,6 +193,7 @@ async def test_every_run_id_has_start_and_finish(bus_after_recap_run):
     _assert_every_run_has_start_and_finish(bus_after_recap_run.events)
 
 
+@pytest.mark.asyncio
 async def test_compact_agent_run_has_start_and_finish():
     """C5 的第三种孤儿 run：`compact_agent` 手动压缩，不经 `_run_loop`。"""
     resolver = InlineAgentTemplateProvider()

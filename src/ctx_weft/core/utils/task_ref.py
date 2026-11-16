@@ -68,7 +68,7 @@ def task_label_parts(task_id: str, title: str, user_prompt=None) -> str:
     """Render the same label from persisted prompt fields without a Task object."""
     title = (title or "").strip()
     if not title:
-        from ctx_weft.core.utils.content import content_to_text
+        from ctx_weft.protocols.content import content_to_text
 
         prompt = content_to_text(user_prompt or "").strip()
         if prompt:

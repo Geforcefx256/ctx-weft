@@ -13,7 +13,6 @@ from ctx_weft.protocols import (
 )
 from ctx_weft.protocols.events import EventType
 
-pytestmark = pytest.mark.asyncio
 
 _BASE = datetime(2026, 7, 1, tzinfo=UTC)
 
@@ -34,6 +33,7 @@ async def _ingest(mem, scope, typ, content, i, role="user"):
                                  metadata={"task_id": scope.task_id}), _ctx())
 
 
+@pytest.mark.asyncio
 async def test_collapse_folds_early_keeps_recent():
     mem = InMemoryBlackboard()
     scope = MemoryAddress(session_id="s", task_id="t1", agent_id="a")
@@ -59,6 +59,7 @@ async def test_collapse_folds_early_keeps_recent():
     assert by_type[2] == (T.TOOL_RESULT, "r2")
 
 
+@pytest.mark.asyncio
 async def test_collapse_noop_when_within_keep_last():
     mem = InMemoryBlackboard()
     scope = MemoryAddress(session_id="s", task_id="t1", agent_id="a")
@@ -69,6 +70,7 @@ async def test_collapse_noop_when_within_keep_last():
     assert n == 0
 
 
+@pytest.mark.asyncio
 async def test_recollapse_keeps_original_bounded():
     mem = InMemoryBlackboard()
     scope = MemoryAddress(session_id="s", task_id="t1", agent_id="a")
@@ -86,6 +88,7 @@ async def test_recollapse_keeps_original_bounded():
     assert "新摘要含 step3" in newest
 
 
+@pytest.mark.asyncio
 async def test_escalating_compact_l3_uses_collapse_keep_last(monkeypatch):
     """迁移自旧 _compact_scope 用例（双阈值并行折已废）：只有 task 层可折（无 agent 层派发对）
     → L1/L2 天然跳过（无 root residue / 无 kept origin），落到 L3 用 collapse_keep_last(2)。"""
@@ -132,6 +135,7 @@ async def test_escalating_compact_l3_uses_collapse_keep_last(monkeypatch):
     assert any(e.payload.get("source") == "collapse" for e in events)
 
 
+@pytest.mark.asyncio
 async def test_escalating_l3_fires_on_segment_only_accumulation(monkeypatch):
     """回归 Fix 2：retry 累积后 task 层只有 USER_PROMPT + 段摘要（无 raw）。L3 守卫须用
     _TASK_LAYER_TYPES 计数（含 TASK_COMPACT_SUMMARY）才会触发；旧守卫用 TASK_COMPACT_TYPES
@@ -169,9 +173,10 @@ async def test_escalating_l3_fires_on_segment_only_accumulation(monkeypatch):
     assert len(segs) == 2, "坍缩后段摘要保留 collapse_keep_last=2 条"
 
 
+@pytest.mark.asyncio
 async def test_collapsed_user_prompt_gets_current_task_frame():
     from ctx_weft.core.assembler.sources._history import record_to_history_block
-    from ctx_weft.core.utils.content import content_to_text
+    from ctx_weft.protocols.content import content_to_text
     from ctx_weft.protocols import MemoryKind, MemoryRecord, MemoryScope
     from tests.assembler_testkit import compile_prompt, prompt_request
 

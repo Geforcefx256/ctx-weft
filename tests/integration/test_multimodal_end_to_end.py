@@ -20,7 +20,9 @@ import pytest
 
 from ctx_weft.core.assembler.assembler import ContextRequest
 from ctx_weft.core.runtime import SessionStartParams
-from ctx_weft.core.utils.content import _IMAGE_PART_TOKENS, _IMAGE_PLACEHOLDER_TMPL, content_to_text
+from ctx_weft.core.utils.content import _IMAGE_PART_TOKENS
+from ctx_weft.protocols.content import _IMAGE_PLACEHOLDER_TMPL
+from ctx_weft.protocols.content import content_to_text
 from ctx_weft.protocols import (
     ImagePart,
     LLMChunk,

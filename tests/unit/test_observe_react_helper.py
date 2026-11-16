@@ -14,7 +14,6 @@ from ctx_weft.protocols.events import EventOrigin, EventType
 from ctx_weft.providers.llm.tokenizer import HeuristicTokenizer
 from tests.assembler_testkit import compiled_test_inputs, scripted_inputs
 
-pytestmark = pytest.mark.asyncio
 
 
 # ── minimal fakes ─────────────────────────────────────────────────────────────
@@ -142,6 +141,7 @@ def _make_ctx(tool_content: str, event_bus=None, gateway=None):
 # ── tests ─────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_helper_returns_tool_content_when_control_tool_called(monkeypatch):
     """Round 1 produces a tool_call; gateway returns ControlResult('REPORT').
     Helper must return ('REPORT', last_text)."""
@@ -162,6 +162,7 @@ async def test_helper_returns_tool_content_when_control_tool_called(monkeypatch)
     assert tool_content.content == "REPORT"
 
 
+@pytest.mark.asyncio
 async def test_plain_text_round_nudged_then_terminal(monkeypatch):
     """round 0 纯文本（无 tool call）→ 不应立即放弃：追加催促消息再试一轮；
     round 1 调 terminal 工具 → 返回其 ControlResult。
@@ -197,6 +198,7 @@ async def test_plain_text_round_nudged_then_terminal(monkeypatch):
         "催促消息须点名 terminal 工具"
 
 
+@pytest.mark.asyncio
 async def test_helper_returns_none_when_no_tool_called(monkeypatch):
     """LLM returns only text (no tool_calls) every round; helper exhausts max_rounds
     then returns (None, last_text)."""
@@ -216,6 +218,7 @@ async def test_helper_returns_none_when_no_tool_called(monkeypatch):
     assert last_text == "just text"
 
 
+@pytest.mark.asyncio
 async def test_helper_last_text_from_final_round(monkeypatch):
     """When the control tool is called, last_text is the text from that round."""
 
@@ -236,6 +239,7 @@ async def test_helper_last_text_from_final_round(monkeypatch):
     assert last_text == "final thinking"
 
 
+@pytest.mark.asyncio
 async def test_helper_token_accounting(monkeypatch):
     """session.token_used is accumulated from usage chunks."""
 
@@ -253,6 +257,7 @@ async def test_helper_token_accounting(monkeypatch):
     assert state.session.token_used == 28  # 20 + 8
 
 
+@pytest.mark.asyncio
 async def test_ask_user_does_not_terminate_loop(monkeypatch):
     """ask_user（非 terminal 工具）被调用时不应终止循环、不返回其 ControlResult。
 
@@ -286,6 +291,7 @@ async def test_ask_user_does_not_terminate_loop(monkeypatch):
     assert last_text == "thinking about user question"
 
 
+@pytest.mark.asyncio
 async def test_response_finished_type_and_origin_follow_state_origin(monkeypatch):
     """Task 5：不再有 event_types 参数区分前台/后台——run_observe_react 自己只发一种类型
     （LLM_RESPONSE_FINISHED，其它 4 个「流式侧」事件由 gateway 发，这里 stream_llm_resilient
@@ -311,6 +317,7 @@ async def test_response_finished_type_and_origin_follow_state_origin(monkeypatch
         assert bus.events[0].origin == origin
 
 
+@pytest.mark.asyncio
 async def test_run_observe_react_returns_terminal_controlresult(monkeypatch):
     """Terminal tool call returns the full ControlResult (not just content string)."""
 
@@ -403,6 +410,7 @@ class _AlwaysErrorGateway:
         return SimpleNamespace(content=self._error, is_error=True, metadata={})
 
 
+@pytest.mark.asyncio
 async def test_terminal_tool_error_does_not_terminate_loop(monkeypatch):
     """terminal 工具首调失败（is_error=True）→ 循环不终止；错误回灌后次调成功 →
     返回成功结果，错误文案不进入结果。"""
@@ -432,6 +440,7 @@ async def test_terminal_tool_error_does_not_terminate_loop(monkeypatch):
     assert any(m.role == "tool" and ERR in str(m.content) for m in requests[1].messages)
 
 
+@pytest.mark.asyncio
 async def test_terminal_tool_error_exhausts_rounds_returns_none(monkeypatch):
     """terminal 工具连续失败直至轮次耗尽 → 返回 (None, last_text) 兜底，
     不把错误文案当终止结果。"""
@@ -454,6 +463,7 @@ async def test_terminal_tool_error_exhausts_rounds_returns_none(monkeypatch):
     assert last_text == "trying"
 
 
+@pytest.mark.asyncio
 async def test_response_finished_payload_carries_usage_split(monkeypatch):
     """LLM_RESPONSE_FINISHED 的 payload["usage"] 经 asdict 自动携带七字段拆分。"""
 

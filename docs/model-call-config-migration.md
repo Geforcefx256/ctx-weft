@@ -43,7 +43,7 @@ await runtime.set_agent_llm(
     agent_id, llm_account=current_account, llm_model=current_model,
     llm_config=ModelCallConfig(reasoning_effort="high"),
 )
-await runtime.recover_agent(agent_id)
+await runtime.recover_session(session_id)
 ```
 
 省略 `llm_config` 或传 `None` 的设置命令会清除配置覆盖。宿主若提供 PATCH API，应先

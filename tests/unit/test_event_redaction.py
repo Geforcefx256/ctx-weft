@@ -2,7 +2,8 @@
 from tests.model_testkit import model_snapshot
 import json
 
-from ctx_weft.core.utils.content import content_to_text, redact_content_for_event
+from ctx_weft.core.utils.content import redact_content_for_event
+from ctx_weft.protocols.content import content_to_text
 from ctx_weft.protocols import ImagePart, LLMMessage, TextPart
 from tests.assembler_testkit import compiled_test_inputs, scripted_inputs
 

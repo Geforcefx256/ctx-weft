@@ -118,5 +118,5 @@ async def test_turn_limits_continue_until_an_explicit_capability_failure():
     assert failed.payload["error_code"] == "TASK_FAILED_BY_OBSERVER"
     assert task.retry_count == 0 and tm.session.failure_counter == 1
     assert tm.is_done() and not tm.running_task_ids()
-    assert (await runtime.get_agent(handle.agent_id)).data.status == "idle"
+    assert (await runtime.get_agent(handle.agent_id)).data.state.status == "idle"
     await subscription.unsubscribe()

@@ -24,7 +24,6 @@ from ctx_weft.protocols.hitl import (
 from ctx_weft.providers.events import InProcessEventBus
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 
-pytestmark = pytest.mark.asyncio
 
 
 class _PassthroughNormalizer:
@@ -79,6 +78,7 @@ async def _run_interrupt(state, ctx, *, edit: bool):
     await act._park_for_interrupt(state, ctx, edit=edit)
 
 
+@pytest.mark.asyncio
 async def test_plain_text_pause_opens_a_user_turn_request():
     state, ctx, reg = _act_env(interactive=True)
     with pytest.raises(HitlPark):
@@ -88,6 +88,7 @@ async def test_plain_text_pause_opens_a_user_turn_request():
     assert req.tool_call_id == ""                      # 纯文本暂停没有 tool_call
 
 
+@pytest.mark.asyncio
 async def test_interrupt_uses_the_after_interrupt_preface():
     state, ctx, reg = _act_env(interactive=True)
     with pytest.raises(HitlPark):
@@ -95,6 +96,7 @@ async def test_interrupt_uses_the_after_interrupt_preface():
     assert reg.list_pending()[0].delivery.preface == PREFACE_AFTER_INTERRUPT
 
 
+@pytest.mark.asyncio
 async def test_interrupt_edit_uses_its_own_preface():
     state, ctx, reg = _act_env(interactive=True)
     with pytest.raises(HitlPark):
@@ -102,6 +104,7 @@ async def test_interrupt_edit_uses_its_own_preface():
     assert reg.list_pending()[0].delivery.preface == PREFACE_AFTER_INTERRUPT_EDIT
 
 
+@pytest.mark.asyncio
 async def test_park_leaves_no_wait_slot_so_the_reply_goes_cold():
     """冷 park：不建槽，应答必然走冷续跑（等价于旧的 request_parked）。"""
     state, ctx, reg = _act_env(interactive=True)
@@ -110,6 +113,7 @@ async def test_park_leaves_no_wait_slot_so_the_reply_goes_cold():
     assert reg.list_pending()[0].slot is None
 
 
+@pytest.mark.asyncio
 async def test_act_no_longer_references_the_wait_for_user_sentinel():
     import inspect
 

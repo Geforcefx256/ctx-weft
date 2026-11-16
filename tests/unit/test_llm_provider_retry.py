@@ -1,5 +1,6 @@
 """Direct provider calls (including settings probes) perform one HTTP attempt."""
 
+from ctx_weft.protocols.context import ProviderContext as _ProviderContext
 import httpx
 import pytest
 
@@ -8,9 +9,12 @@ from ctx_weft.providers.llm import ModelCapabilities, ModelLimits
 from ctx_weft.providers.llm.provider import LLMAccount, LLMProvider, ModelConfig
 
 
+_PROVIDER_CONTEXT = _ProviderContext(session_id="test")
+
+
 class _MemStore:
     def save(self, account): ...
-    def delete(self, name): ...
+    def delete(self, name, *, namespace="global"): ...
     def list_all(self):
         return []
 
@@ -42,7 +46,7 @@ def _acct(style):
 async def test_provider_direct_request_has_no_hidden_retry(protocol, entry):
     p = LLMProvider(_MemStore())
     p.register_account(_acct(protocol), persist=False)
-    client = p.get_client("a")
+    client = p.get_client("a", ctx=_PROVIDER_CONTEXT)
     adapter = client._adapter
     await adapter._client.aclose()
     calls = []

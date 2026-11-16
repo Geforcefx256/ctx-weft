@@ -7,7 +7,6 @@ from ctx_weft.core.models.session import Session
 from ctx_weft.core.models.task import Task
 from ctx_weft.core.utils.clock import now_utc
 
-pytestmark = pytest.mark.asyncio
 
 
 class _StubRunner:
@@ -35,6 +34,7 @@ def _tm_with_session() -> tuple[TaskManager, Session]:
     return tm, sess
 
 
+@pytest.mark.asyncio
 async def test_abandon_pending_cancels_queue_without_touching_session():
     tm, sess = _tm_with_session()
     await tm.push_task(_task("t1"))
@@ -47,6 +47,7 @@ async def test_abandon_pending_cancels_queue_without_touching_session():
     assert tm.is_done() is True          # 队列已空、无在跑
 
 
+@pytest.mark.asyncio
 async def test_abandon_pending_keeps_root_agent_queued_task():
     # keep_agent：root agent scope 的排队条目保留（不随全清取消），供 pause 补 drain 派发。
     tm, sess = _tm_with_session()   # root_agent_id="agr"
@@ -63,6 +64,7 @@ async def test_abandon_pending_keeps_root_agent_queued_task():
     assert tm.get_task("t_other").status == "CANCELED"
 
 
+@pytest.mark.asyncio
 async def test_abandon_pending_resumes_suspended_parent_of_queued_children():
     # 队列弃子不经 on_task_finished，不会自动触发父任务重排：若 SUSPENDED 父任务的
     # 子任务在暂停瞬间**全部**还在排队（无一在途），无人调用 _try_resume_parent →
@@ -84,6 +86,7 @@ async def test_abandon_pending_resumes_suspended_parent_of_queued_children():
     assert any(e.task_id == "tp" for e in tm._queue.peek_all())
 
 
+@pytest.mark.asyncio
 async def test_abandon_pending_no_resume_while_sibling_still_running():
     # 兄弟仍在途：弃子只清排队的那部分，父任务重排留给在途兄弟的 on_task_finished 接力。
     tm = TaskManager(session_id="s1", max_concurrent=0)
@@ -105,6 +108,7 @@ async def test_abandon_pending_no_resume_while_sibling_still_running():
     assert tm.get_task("tp").status == "SUSPENDED"   # 在途兄弟未终态 → 不得提前重排
 
 
+@pytest.mark.asyncio
 async def test_pause_abandon_guard_keeps_session_status_on_cancel():
     tm, sess = _tm_with_session()
     tm.register_task(_task("t1", status="ACTIVE"))
@@ -114,6 +118,7 @@ async def test_pause_abandon_guard_keeps_session_status_on_cancel():
     assert not hasattr(sess, "status")     # pause 弃子 ≠ 用户取消
 
 
+@pytest.mark.asyncio
 async def test_cancel_without_pause_abandon_still_cancels_session():
     tm, sess = _tm_with_session()
     tm.register_task(_task("t1", status="ACTIVE"))
@@ -121,6 +126,7 @@ async def test_cancel_without_pause_abandon_still_cancels_session():
     assert not hasattr(sess, "status")     # 既有语义不回归
 
 
+@pytest.mark.asyncio
 async def test_flush_staged_dropped_under_pause_abandon():
     tm, _ = _tm_with_session()
     tm.register_task(_task("tp", status="ACTIVE"))

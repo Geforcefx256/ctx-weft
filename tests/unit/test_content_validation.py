@@ -4,7 +4,7 @@ import base64
 import pytest
 
 from ctx_weft.core.models.errors import InvalidContentError
-from ctx_weft.core.utils.content import content_has_image, validate_content
+from ctx_weft.protocols.content import content_has_image, validate_content
 from ctx_weft.protocols import ImagePart, TextPart
 from tests._initialization import initialize_all
 
@@ -147,7 +147,7 @@ async def test_run_single_task_rejects_image_before_persisting_anything_without_
     runtime.providers.register_memory(memory)
     runtime.providers.register_llm_provider(
         SimpleNamespace(
-            get_client=lambda account=None, model=None: _FixedModelClient(
+            get_client=lambda account=None, model=None, *, ctx: _FixedModelClient(
                 MockLLMAdapter(responses=[]), model or "mock-model", 128_000, 8_192,
                 account=account or "acct-main",
             ),

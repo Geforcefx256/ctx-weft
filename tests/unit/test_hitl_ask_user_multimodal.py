@@ -40,7 +40,6 @@ from ctx_weft.protocols.hitl import HitlReply
 from ctx_weft.providers.events import InProcessEventBus
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 
-pytestmark = pytest.mark.asyncio
 
 REF = "blob:" + "a" * 64
 _AGENT_ID = "agt_1"
@@ -123,6 +122,7 @@ def _text(content) -> str:
     return "".join(p.text for p in content if hasattr(p, "text"))
 
 
+@pytest.mark.asyncio
 async def test_accepted_answer_with_image_carries_the_part():
     """🔴 本文件存在的理由：图进最终 content，不再被展平掉。"""
     result = await _ask_and_respond(
@@ -132,6 +132,7 @@ async def test_accepted_answer_with_image_carries_the_part():
     assert [p.data for p in _images(result.content)] == [REF]
 
 
+@pytest.mark.asyncio
 async def test_rejected_answer_with_image_keeps_the_part_and_the_prefix():
     """拒绝路径的前缀必须并进首个 TextPart，不能用 f-string 把 parts 拍成 repr；
     也不能干脆不加前缀——那会把「人不同意」降级成「人说了句话」。"""
@@ -141,6 +142,7 @@ async def test_rejected_answer_with_image_keeps_the_part_and_the_prefix():
     assert [p.data for p in _images(result.content)] == [REF]
 
 
+@pytest.mark.asyncio
 async def test_plain_text_answer_is_byte_identical_and_has_no_parts_key():
     """纯文本路径逐字节不变（Global Constraint 第一条）。"""
     result = await _ask_and_respond({"outcome": "accepted", "message": "use postgres"})
@@ -148,12 +150,14 @@ async def test_plain_text_answer_is_byte_identical_and_has_no_parts_key():
     assert _images(result.content) == []
 
 
+@pytest.mark.asyncio
 async def test_rejected_without_message_uses_default_sentence():
     result = await _ask_and_respond({"outcome": "rejected"})
     assert result.content == "Human rejected the request."
     assert _images(result.content) == []
 
 
+@pytest.mark.asyncio
 async def test_accepted_empty_answer_falls_back_to_tool_confirmation_text():
     """空答复用工具自己的确认文案兜底，而不是把空字符串当答案送回模型
     （空串在 gateway 出口会变成 `(no output)`，读起来像工具坏了）。"""

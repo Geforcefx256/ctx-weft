@@ -19,12 +19,9 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Literal, Protocol, runtime_checkable
 
-from ctx_weft.protocols.context import (
-    BLOB_REF_PREFIX,  # noqa: F401  # 刻意的 re-export：既有调用点仍从这里取
-    ContentPart,
-    ProviderContext,
-    normalize_content_parts,
-)
+from ctx_weft.protocols import content as content_protocol
+from ctx_weft.protocols.context import ProviderContext
+from ctx_weft.protocols.content import BLOB_REF_PREFIX, ContentPart
 
 # ── Event types ───────────────────────────────────────────────────────────────
 
@@ -228,9 +225,9 @@ class MemoryEvent:
         # core 构造（都是 dataclass），但宿主直接 ingest(MemoryEvent(content=[dict]))
         # 时 dict 会原样落库、读侧再归一回来——结果正确，只是往返多绕一圈，且写读两侧
         # 语义不对称。放在全部校验**之后**：content=None 等既有报错路径不得被归一抢先。
-        # 共用实现见 core.content.normalize_content_parts（经 protocols.context 的惰性
+        # 共用实现见 protocols.content.normalize_content_parts（经 protocols.context 的惰性
         # 绑定转调，层序 + 热路径理由同 MemoryRecord.__post_init__）。
-        self.content = normalize_content_parts(self.content)
+        self.content = content_protocol.normalize_content_parts(self.content)
 
 
 @dataclass
@@ -273,13 +270,13 @@ class MemoryRecord:
         腐化；而任何 provider——含未来的第三方——都必须构造 MemoryRecord。判据
         ``not hasattr(p,"text")`` 因此保持冻结（用户裁定 D1），不为违规形态解冻。
 
-        归一实现是三处边界共用的 ``core.content.normalize_content_parts``
+        归一实现是三处边界共用的 ``protocols.content.normalize_content_parts``
         （Phase 3c Task E2 抽取；另两处是 ``MemoryEvent`` 与 ``LLMMessage``）——spec §3①
         要求形态转换收在归一层，三处各抄一份正是它要防的散点。快路径与「已合规不重建」
-        的性能性质由该函数保证。经 ``protocols.context.normalize_content_parts`` 这个
+        的性能性质由该函数保证。经 ``protocols.content.normalize_content_parts`` 这个
         **惰性绑定**转调（层序 + 热路径理由见该绑定的 docstring）。
         """
-        self.content = normalize_content_parts(self.content)
+        self.content = content_protocol.normalize_content_parts(self.content)
 
 
 @dataclass

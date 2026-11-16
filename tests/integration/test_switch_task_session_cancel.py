@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """Whole-session cancellation must settle either side of a real goal switch."""
 
 import asyncio
@@ -117,7 +119,7 @@ async def test_cancel_session_during_goal_switch_settles_before_hot_and_cold_rec
 
             # Recovery alone must preserve the completed cancellation. Do not
             # hide a stranded successor by canceling the whole session again.
-            await rt.recover_agent(handle.agent_id, session_id=handle.session_id)
+            await recover_fixture_session(rt, handle.agent_id, session_id=handle.session_id)
             await _drained(tm, timeout=5)
             hot = await rebuild_view(rt.event_store, handle.session_id)
             assert {tid: task.status for tid, task in hot.tasks.items()} == expected
@@ -126,12 +128,12 @@ async def test_cancel_session_during_goal_switch_settles_before_hot_and_cold_rec
             if backend == "sqlite":
                 rt = _runtime(llm, memory, rt.event_store)
                 await initialize_all(rt)
-                await rt.recover_agent(handle.agent_id, session_id=handle.session_id)
+                await recover_fixture_session(rt, handle.agent_id, session_id=handle.session_id)
                 tm = rt._task_managers[handle.session_id]
                 owners.append(tm)
                 await _drained(tm, timeout=5)
                 await rt.cancel_session(handle.session_id)
-                await rt.recover_agent(handle.agent_id, session_id=handle.session_id)
+                await recover_fixture_session(rt, handle.agent_id, session_id=handle.session_id)
                 await _drained(tm, timeout=5)
             final = await rebuild_view(rt.event_store, handle.session_id)
             assert {tid: task.status for tid, task in final.tasks.items()} == expected

@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """Public-entry regressions for interrupted reviews, immutable input and hot recovery."""
 
 import asyncio
@@ -18,7 +20,6 @@ from tests._initialization import initialize_all
 from tests.integration._session_cancel_worker import wait_until
 from tests.integration.test_foreground_observe_interrupt import SID, InterruptedReviewLLM, runtime
 
-pytestmark = pytest.mark.asyncio
 _NORMAL_SEGMENTS = {}
 
 
@@ -86,6 +87,7 @@ async def request_turn(rt, handle, entry, text="NEW REQUEST SECRET"):
                                        outcome="accepted", message=text))
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("unknown", [False, True])
 @pytest.mark.parametrize("entry", ["send", "reply"])
 async def test_handoff_hot_retries_complete_stopped_actor(tmp_path, unknown, entry):
@@ -117,7 +119,7 @@ async def test_handoff_hot_retries_complete_stopped_actor(tmp_path, unknown, ent
             assert not rt.clear_storage_isolation(SID)
             # Resume now runs the bounded storage coordinator before taking the
             # session guard, confirming the same envelopes across all attempts.
-            await rt.recover_agent(handle.agent_id, session_id=SID)
+            await recover_fixture_session(rt, handle.agent_id, session_id=SID)
             store.append_batch = original
             await drained(rt)
             assert llm.review_closed.is_set()
@@ -132,7 +134,7 @@ async def test_handoff_hot_retries_complete_stopped_actor(tmp_path, unknown, ent
             waiting, = [r for r in rows if r.event.type == "TaskAwaitingHuman"]
             assert opened.position < actor_finish.position < waiting.position
             head = await store.committed_head(SID)
-            await rt.recover_agent(handle.agent_id, session_id=SID)
+            await recover_fixture_session(rt, handle.agent_id, session_id=SID)
             assert await store.committed_head(SID) == head
             await request_turn(rt, handle, entry)
             await wait_until(lambda: tm.get_task(handle.task_id).status == "FINISHED")
@@ -143,6 +145,7 @@ async def test_handoff_hot_retries_complete_stopped_actor(tmp_path, unknown, ent
                        and "OLD REQUEST" in str(r.content) for r in records)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("entry", ["send", "reply"])
 async def test_late_recap_assembly_cannot_read_new_turn(tmp_path, monkeypatch, entry):
     from ctx_weft.core.assembler.assembler import ContextAssembler
@@ -193,6 +196,7 @@ async def test_late_recap_assembly_cannot_read_new_turn(tmp_path, monkeypatch, e
             await drained(rt)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("stop", ["pause", "cancel"])
 async def test_recovered_foreground_has_real_cancel_lifecycle(tmp_path, stop):
     worker = Path(__file__).with_name("_lifecycle_crash_worker.py")
@@ -209,7 +213,7 @@ async def test_recovered_foreground_has_real_cancel_lifecycle(tmp_path, stop):
             await rt.rebuild_session(sid, strict=True)
             tm = rt._task_managers[sid]
             aid = tm.session.root_agent_id
-            await rt.recover_agent(aid, session_id=sid)
+            await recover_fixture_session(rt, aid, session_id=sid)
             await asyncio.wait_for(llm.review_started.wait(), 10)
             assert rt._agent_lifecycle_manager.status_of(aid) == "running"
             assert rt._run_tokens.get(sid)
@@ -226,6 +230,7 @@ async def test_recovered_foreground_has_real_cancel_lifecycle(tmp_path, stop):
             assert task.status == ("AWAITING_HUMAN" if stop == "pause" else "CANCELED")
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("unknown", [False, True])
 @pytest.mark.parametrize("stage", ["TaskStarted", "RunStarted", "RunFinished"])
 async def test_recovered_foreground_retries_original_run_envelopes(tmp_path, unknown, stage):
@@ -254,13 +259,13 @@ async def test_recovered_foreground_retries_original_run_envelopes(tmp_path, unk
                         raise OSError("recovered actor receipt unavailable")
                 return await original(session_id, bid, events, *args, **kwargs)
             store.append_batch = append
-            await rt.recover_agent(aid, session_id=sid)
+            await recover_fixture_session(rt, aid, session_id=sid)
             if stage == "RunFinished":
                 await asyncio.wait_for(llm.review_started.wait(), 10)
                 await rt.pause_agent(aid)
             await wait_until(lambda: rt.storage_health(sid) is not None and not tm._dispatch_tasks)
             assert not rt.clear_storage_isolation(sid)
-            await rt.recover_agent(aid, session_id=sid)
+            await recover_fixture_session(rt, aid, session_id=sid)
             store.append_batch = original
             assert len(signatures) >= 4 and all(s == signatures[0] for s in signatures[:4])
             if stage != "RunFinished":
@@ -275,10 +280,11 @@ async def test_recovered_foreground_retries_original_run_envelopes(tmp_path, unk
                 assert started.position < finished.position
             assert not (await rebuild_view(store, sid)).open_runs
             head = await store.committed_head(sid)
-            await rt.recover_agent(aid, session_id=sid)
+            await recover_fixture_session(rt, aid, session_id=sid)
             assert await store.committed_head(sid) == head
 
 
+@pytest.mark.asyncio
 async def test_cancel_during_recovered_foreground_registration_is_not_lost(tmp_path):
     worker = Path(__file__).with_name("_lifecycle_crash_worker.py")
     proc = await asyncio.to_thread(subprocess.run,
@@ -303,7 +309,7 @@ async def test_cancel_during_recovered_foreground_registration_is_not_lost(tmp_p
                     await release.wait()
                 return result
             store.append_batch = append
-            await rt.recover_agent(aid, session_id=sid)
+            await recover_fixture_session(rt, aid, session_id=sid)
             await asyncio.wait_for(entered.wait(), 10)
             await rt.cancel_agent(aid)
             release.set()
@@ -315,6 +321,7 @@ async def test_cancel_during_recovered_foreground_registration_is_not_lost(tmp_p
             assert not view.open_runs and not view.pending_observe
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("short", [False, True])
 @pytest.mark.parametrize("entry", ["send", "reply"])
 @pytest.mark.parametrize("report_first", [False, True])
@@ -406,6 +413,7 @@ async def test_same_agent_child_has_durable_recap_and_new_turn(tmp_path, monkeyp
             assert any("NEW REQUEST SECRET" in text and "do the delegated work" in text for text in users)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("entry", ["send", "reply"])
 async def test_replacement_before_first_chunk_can_be_retracted_twice(tmp_path, entry):
     async with open_sqlite_event_store(tmp_path / "e.db") as store:
@@ -451,6 +459,7 @@ async def test_replacement_before_first_chunk_can_be_retracted_twice(tmp_path, e
             assert not any("RETRACT THIS" in text for text in users)
 
 
+@pytest.mark.asyncio
 async def test_reply_on_open_notification_does_not_commit_the_next_round(tmp_path):
     """The host can answer a confirmed bubble before the old actor releases its slot."""
     async with open_sqlite_event_store(tmp_path / "e.db") as store:
@@ -493,6 +502,7 @@ async def test_reply_on_open_notification_does_not_commit_the_next_round(tmp_pat
             await drained(rt)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("short", [False, True])
 @pytest.mark.parametrize("first,second", [
     ("before", "recover_handoff"), ("handoff", None),
@@ -522,7 +532,7 @@ async def test_handoff_process_crashes_and_legacy_snapshot(tmp_path, tmp_path_fa
             await rt.rebuild_session(SID, strict=True)
             tm = rt._task_managers[SID]
             tm._max_concurrent = 0
-            await rt.recover_agent(tm.session.root_agent_id, session_id=SID)
+            await recover_fixture_session(rt, tm.session.root_agent_id, session_id=SID)
             await drained(rt)
             assert all("NEW REQUEST SECRET" not in text for text in seen)
             view = await rebuild_view(store, SID)
@@ -545,7 +555,7 @@ async def test_handoff_process_crashes_and_legacy_snapshot(tmp_path, tmp_path_fa
             await initialize_all(cold)
             await cold.rebuild_session(SID, strict=True)
             cold._task_managers[SID]._max_concurrent = 0
-            await cold.recover_agent(tm.session.root_agent_id, session_id=SID)
+            await recover_fixture_session(cold, tm.session.root_agent_id, session_id=SID)
             await drained(cold)
             assert await store.committed_head(SID) == head
             assert await content(memory, view.tasks.values()) == before

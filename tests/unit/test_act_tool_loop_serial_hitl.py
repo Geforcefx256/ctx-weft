@@ -26,7 +26,6 @@ from ctx_weft.core.models.task import Task
 from ctx_weft.protocols import MemoryAddress
 from ctx_weft.protocols.llm import ToolCall
 
-pytestmark = pytest.mark.asyncio
 
 
 class _ParkingGateway:
@@ -51,6 +50,7 @@ def _state() -> LoopState:
     )
 
 
+@pytest.mark.asyncio
 async def test_only_the_first_parking_tool_call_is_invoked() -> None:
     from ctx_weft.core.loop.steps.act import _execute_tool_calls
 

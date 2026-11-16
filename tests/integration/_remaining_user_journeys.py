@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """Real user journeys; only external model, tool, and storage I/O are controlled."""
 import asyncio
 import base64
@@ -436,7 +438,7 @@ async def finish_journey(rt, llm, path, provider, store, memory, data, scenario,
                 assert len(provider.attempts) >= 3
                 assert all(a == provider.attempts[0] for a in provider.attempts)
         else:
-            await rt.recover_agent(data["root"], session_id=SID)
+            await recover_fixture_session(rt, data["root"], session_id=SID)
         assert await rt.recover_storage(SID)
         await task_finished(rt, data["task"])
         assert effects(path) == [APPROVED_ARGS]
@@ -444,7 +446,7 @@ async def finish_journey(rt, llm, path, provider, store, memory, data, scenario,
         assert any("TOOL_OUTPUT_MARKER" in t for t in actors)
     else:
         if variant == "message_crash":
-            await rt.recover_agent(data["root"], session_id=SID)
+            await recover_fixture_session(rt, data["root"], session_id=SID)
         else:
             await rt.send_message(data["root"], screenshot("SCREENSHOT_ACCEPTED", SCREENSHOT), session_id=SID)
         await task_finished(rt, data["task"])
@@ -488,7 +490,7 @@ async def next_tasks(rt, llm, data, scenario, marker):
 async def verify(rt, llm, path, store, memory, data, scenario):
     for _ in range(2):
         for agent in data["agents"]:
-            await rt.recover_agent(agent, session_id=SID)
+            await recover_fixture_session(rt, agent, session_id=SID)
         await drained(rt)
         assert await store.committed_head(SID) == data["head"]
         assert await memory_state(memory, data["agents"]) == data["memory"]

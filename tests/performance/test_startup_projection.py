@@ -20,9 +20,9 @@ from ctx_weft.protocols.events import EventType
 from ctx_weft.providers.events.store.sql import open_sqlite_event_store
 from ctx_weft.providers.events.store.sql import store as sql_store
 
-pytestmark = pytest.mark.asyncio
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot", [False, True], ids=["full-replay", "compact-snapshot"])
 async def test_sqlite_startup_discards_large_bodies(tmp_path, monkeypatch, record_property, snapshot):
     async with open_sqlite_event_store(tmp_path / "large.db") as store:

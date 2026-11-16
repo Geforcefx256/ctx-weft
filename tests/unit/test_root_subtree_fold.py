@@ -15,7 +15,6 @@ from ctx_weft.protocols import MemoryEvent, MemoryEventType, MemoryAddress, Prov
 from ctx_weft.protocols.template import LoopConfig
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 
-pytestmark = pytest.mark.asyncio
 T = MemoryEventType
 _BASE = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -100,6 +99,7 @@ async def _alive(mem, scope, type_, role=None):
 # 既有测试（已迁移到 Task-6 真实格式）
 # ──────────────────────────────────────────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_folded_capsule_conversation_turns_superseded():
     """被折胶囊（最旧）的所有 AGENT_CONVERSATION_TURN 被 superseded，不落单。"""
     mem = InMemoryMemoryProvider()
@@ -114,6 +114,7 @@ async def test_folded_capsule_conversation_turns_superseded():
     assert alive_tasks == {"task2"}  # 只剩最新胶囊的 turns
 
 
+@pytest.mark.asyncio
 async def test_kept_capsule_intact():
     """保留胶囊（最新 keep_last 个）的所有 AGENT_CONVERSATION_TURN 完整存活。"""
     mem = InMemoryMemoryProvider()
@@ -126,6 +127,7 @@ async def test_kept_capsule_intact():
     assert alive_tasks == {"task1", "task2"}
 
 
+@pytest.mark.asyncio
 async def test_compact_summary_sorts_before_kept_capsule():
     """新 AGENT_COMPACT_SUMMARY 的 timestamp 早于最旧保留胶囊所有元素（anchor − 1µs）。"""
     mem = InMemoryMemoryProvider()
@@ -140,6 +142,7 @@ async def test_compact_summary_sorts_before_kept_capsule():
     assert summ[0].timestamp < kept_min_ts
 
 
+@pytest.mark.asyncio
 async def test_nothing_to_fold_returns_zero():
     """root 残留 ≤ keep_last → 不折，conversation turns 全留。"""
     mem = InMemoryMemoryProvider()
@@ -151,6 +154,7 @@ async def test_nothing_to_fold_returns_zero():
     assert {r.metadata.get("origin_task_id") for r in turns} == {"task0"}
 
 
+@pytest.mark.asyncio
 async def test_anchor_ts_covers_all_kept_capsule_elements():
     """anchor_ts 必须扫描保留胶囊的全部回合（最早 user 回合），不能只看最晚回合。
 
@@ -178,6 +182,7 @@ async def test_anchor_ts_covers_all_kept_capsule_elements():
 # 新增测试（Task 12：§3.11 新判据）
 # ──────────────────────────────────────────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_count_root_residues_detection():
     """_count_root_residues 数「结束顶层单元（胶囊）」（spec 2026-06-29）。
 
@@ -207,6 +212,7 @@ async def test_count_root_residues_detection():
     assert summ[0].role == "user"
 
 
+@pytest.mark.asyncio
 async def test_no_l1_capsule_keeps_body_until_folded_to_summary():
     """删 L1 后只剩 3 级（执行中 / 胶囊 / 总结）：胶囊（task 层 body + finish 对）一直完整保留,
     直到超 keep_last 才**整体**折成摘要。不存在「body 删了但 finish 对还在」的 L1 中间态。
@@ -238,6 +244,7 @@ async def test_no_l1_capsule_keeps_body_until_folded_to_summary():
     assert len(summ) == 1
 
 
+@pytest.mark.asyncio
 async def test_same_agent_nested_child_folded_with_parent():
     """折顶层 R 时，同 agent 内嵌子胶囊 C1（origin=C1, parent=R）也被 supersede。"""
     mem = InMemoryMemoryProvider()
@@ -275,6 +282,7 @@ def _seed_dispatch_pair(mem_ingest_coros, scope, origin, tc, t0, result="child r
     ]
 
 
+@pytest.mark.asyncio
 async def test_legacy_dispatch_pair_folds_with_unit_via_adapter():
     """§5.5：存量 legacy TASK_DISPATCH/RESULT 经读侧适配归一化后，作为 R0 单元的 conversation turn
     随单元 L2 一并折——验证 fold 已接入 normalize_legacy_dispatch（旧数据不丢、行为与新数据一致）。"""
@@ -305,6 +313,7 @@ async def test_legacy_dispatch_pair_folds_with_unit_via_adapter():
     assert "R1" in {r.metadata.get("origin_task_id") for r in alive}
 
 
+@pytest.mark.asyncio
 async def test_cross_agent_dispatch_pair_folded_with_parent():
     """§2.3：折顶层 R0 到 L2 时，其 dispatch 对（delegate + result conversation turn, origin=R0）
     作为 R0 对话里的一组普通 message，与 finish 对同命运一起被 supersede。"""
@@ -335,6 +344,7 @@ async def test_cross_agent_dispatch_pair_folded_with_parent():
     assert "R1" in {r.metadata.get("origin_task_id") for r in alive}
 
 
+@pytest.mark.asyncio
 async def test_kept_dispatch_capsule_retains_body_no_l1():
     """spec 2026-06-29：删 L1 后，未超 keep_last 的胶囊**完整保留**——含 dispatch 对的单元,其
     task 层 body + dispatch 对 + finish 对都不动（不存在「body 删、对话留」的 L1 黑盒态）。"""
@@ -363,6 +373,7 @@ async def test_kept_dispatch_capsule_retains_body_no_l1():
     assert await _alive(mem, scope, T.AGENT_COMPACT_SUMMARY) == []
 
 
+@pytest.mark.asyncio
 async def test_cross_agent_child_counts_as_top_level_in_own_scope():
     """在 child agent 的 scope 内，胶囊 origin=C2, parent=R（R 不在该 scope origin 集）→ 算 1 顶层单元。
 
@@ -390,6 +401,7 @@ async def test_cross_agent_child_counts_as_top_level_in_own_scope():
     )
 
 
+@pytest.mark.asyncio
 async def test_anchor_ordering_before_all_kept_capsule_elements():
     """AGENT_COMPACT_SUMMARY.timestamp < min timestamp of ALL kept capsule elements（§3.11 anchor）。"""
     mem = InMemoryMemoryProvider()

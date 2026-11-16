@@ -28,10 +28,10 @@ from ctx_weft.core.orchestrator.task.disposition import (
 from ctx_weft.core.orchestrator.task.queue import QueueEntry, TaskQueue
 from ctx_weft.core.utils.task_ref import task_ref, task_ref_parts
 from ctx_weft.core.utils.verdict import VERDICT_CONTINUE, VERDICT_SUCCESS, VERDICT_WAITING, normalize_verdict
-from ctx_weft.core.orchestrator.task.runner import AgentBinding, TaskRunner, effective_agent_id
+from ctx_weft.core.orchestrator.task.runner import TaskRunner, effective_agent_id
 from ctx_weft.core.models.session import Session
 from ctx_weft.core.models.status import TaskStatus
-from ctx_weft.core.models.task import PORT_MAIN, CompactTaskSettings, MetadataFillerTaskSettings, NormalTaskSettings, Task
+from ctx_weft.core.models.task import PORT_MAIN, CompactTaskSettings, MetadataFillerTaskSettings, Task
 from ctx_weft.core.utils.clock import now_utc
 from ctx_weft.protocols.events import PersistenceUnavailableError
 from ctx_weft.protocols.events import Event, EventOrigin, EventType
@@ -272,6 +272,7 @@ class TaskManager:
         parked_task_ids: set[str] | None = None,
         *,
         enqueue: bool = True,
+        threshold_tripped: bool = False,
     ) -> None:
         """Rebuild task registry and re-queue resumable tasks after a crash.
 
@@ -294,6 +295,7 @@ class TaskManager:
         task found in a replayed event stream is skipped (never re-queued). Recovery is
         condition-based.
         """
+        self._threshold_tripped = threshold_tripped
         parked = parked_task_ids or set()
 
         for t in all_tasks:
@@ -619,6 +621,19 @@ class TaskManager:
         # The run started before this reply. Its finish must survive retraction.
         await self.abandon_round(task_id)
 
+    shutdown_requested = False
+
+    def begin_shutdown(self) -> None:
+        """Freeze dispatch without recording user cancellation or resolving HITL."""
+        self.shutdown_requested = True
+
+    def owned_executions(self) -> set[asyncio.Task]:
+        tasks = (set(self._dispatch_tasks.values()) | set(self._background_asyncio_tasks)
+                 | set(self._autonomous_requeue_timers.values()))
+        if self._session_done_waiter is not None:
+            tasks.add(self._session_done_waiter)
+        return tasks
+
     def begin_cancel(self) -> None:
         """Stop dispatch before signaling executions or retracting their rounds."""
         self._cancelled = True
@@ -917,19 +932,19 @@ class TaskManager:
         **`max_concurrent <= 0` 仍是总闸**：一个都不派，交互 task 也不例外。这条既有
         语义刻意保留——它是「这个 session 暂不派发」的表达方式，被多处依赖。
         """
-        if self._cancelled or self._recovery_pending:
+        if self._cancelled or self.shutdown_requested or self._recovery_pending:
             return
         if self._runner is None:
             raise RuntimeError("No task runner registered")
 
         while True:
-            # 被同一 session 上更新的 TM 顶替（recover_agent 覆盖了 _task_managers 映射）→
+            # 被同一 session 上更新的 TM 顶替（recover_session 覆盖了 _task_managers 映射）→
             # 立即停止派发，无声（不发事件、不改状态）。避免重叠 resume 下两套 drain 并行派发
             # 同一批任务；在跑协程照旧靠 _fire_session_done 处的 _is_current 收敛（spec/07 §9）。
             if self._hooks.is_current is not None and not self._hooks.is_current():
                 return
             async with self._lock:
-                if self._recovery_pending:
+                if self.shutdown_requested or self._recovery_pending:
                     return
                 if self._max_concurrent <= 0:
                     break       # 总闸（见 docstring）：一个都不派，交互 task 也不例外
@@ -2102,7 +2117,7 @@ class TaskManager:
             return False            # 有对端的 task：那个 /resume 有人会按
         if task.status != "INTERRUPTED":
             return False            # 已被别的路径改写（重排 / 取消 / 终态）→ 不插手
-        if self._cancelled:
+        if self._cancelled or self.shutdown_requested:
             return False
         if task.interrupt_requeue_count >= self._autonomous_requeue_max:
             # 预算耗尽 → 响亮失败。**不能**停在 INTERRUPTED：那是个没有对端会来碰的
@@ -2142,7 +2157,7 @@ class TaskManager:
         """
         try:
             await asyncio.sleep(delay)
-            if self._cancelled:
+            if self._cancelled or self.shutdown_requested:
                 return
             if self._hooks.is_current is not None and not self._hooks.is_current():
                 return
@@ -2376,6 +2391,7 @@ class TaskManager:
                     "error_code": TaskErrorCode.BLOCKED_BY_FAILED_DEP,
                     "blocked_by_task_id": dep_id, "reason": f"dependency_failed:{dep_id}"})
                 task.error_code = TaskErrorCode.BLOCKED_BY_FAILED_DEP
+                task.blocked_by_task_id = dep_id
                 self._queue.cancel(task_id)
                 await self.on_task_finished(task_id, status="CANCELED")
         finally:
@@ -2577,6 +2593,7 @@ class TaskManager:
         agent_id: str | None = None,
         committed: bool = False,
         on_committed: Callable[[], None] | None = None,
+        metadata: dict | None = None,
     ) -> Event:
         """构造并发出一个 session/task 级别的事件（无 LoopState）。
 
@@ -2593,7 +2610,22 @@ class TaskManager:
                 origin=_ORIGIN, task_id=task_id,
                 agent_id=agent_id if agent_id is not None else (
                     self._agent_id_of(task_id) if task_id is not None else None),
-                payload=payload)
+                payload=payload, metadata=metadata)
+            if task_id is not None and event_type in (EventType.TASK_FAILED, EventType.TASK_INTERRUPTED):
+                publish_state = on_committed
+
+                def publish_failure():
+                    if publish_state is not None:
+                        publish_state()
+                    task = self._tasks.get(task_id)
+                    if task is not None:
+                        task.failure_retry_count = event.payload.get("retry_count")
+                        if event_type == EventType.TASK_FAILED:
+                            task.error_code = event.payload.get("error_code") or task.error_code
+                            if "error_message" in event.payload:
+                                task.error = event.payload["error_message"] or None
+
+                on_committed = publish_failure
             pending = _PendingEmission(event, on_committed)
             self._pending_emissions[key] = pending
         await self._publish_emission(key, pending, committed=committed)
@@ -2876,7 +2908,7 @@ class TaskManager:
     def is_alive(self) -> bool:
         """本 TM 是否仍是该 session 的当前 owner。
 
-        供 recover_agent 判断"是否有活 TM"，以决定复用还是重建。session 的 TM 是单例，
+        供 recover_session 判断"是否有活 TM"，以决定复用还是重建。session 的 TM 是单例，
         活 owner 只会被复用、不会被顶替；它返回 False 只有一种情形：本 TM 已被逐出
         （forget/purge）。
 

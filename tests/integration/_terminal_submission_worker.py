@@ -1,3 +1,4 @@
+
 """Crash at the atomic queued cancellation boundary, or during its recovery."""
 
 import asyncio
@@ -5,9 +6,11 @@ import os
 import sys
 from pathlib import Path
 
-from tests._initialization import initialize_all
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from tests._recovery import recover_fixture_session
+from tests._initialization import initialize_all
 
 from ctx_weft.core.control.reducers import rebuild_view
 from ctx_weft.providers.events.store.sql import open_sqlite_event_store
@@ -44,7 +47,7 @@ async def worker(path, cut):
             if cut == "recover_finalized":
                 await initialize_all(rt)
                 await rt.rebuild_session(SID, strict=True)
-                await rt.recover_agent(owner, session_id=SID)
+                await recover_fixture_session(rt, owner, session_id=SID)
             else:
                 await rt.pause_session(SID)
             await asyncio.sleep(10)

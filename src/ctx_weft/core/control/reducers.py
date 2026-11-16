@@ -18,10 +18,7 @@ from ctx_weft.core.hitl.registry import HITL_STAGE_AUTHZ, HITL_STAGE_TOOL, Pendi
 from ctx_weft.core.hitl.snapshot import HitlSnapshot
 from ctx_weft.core.models.status import TERMINAL_TASK_STATUSES, TaskStatus
 from ctx_weft.core.models.task import default_port_for
-from ctx_weft.core.utils.content import (
-    content_from_jsonable,
-    content_to_jsonable,
-)
+from ctx_weft.protocols.content import content_from_jsonable, content_to_jsonable
 from ctx_weft.protocols.events import Event, EventType, ProjectedEvent, ProjectedStoredEvent
 from ctx_weft.protocols.hitl import (
     HITL_FORM_QUESTION,
@@ -390,6 +387,7 @@ def serialize_view(view: RunStateView) -> dict[str, Any]:
                 "outputs": t.outputs,
                 "error": t.error,
                 "error_code": getattr(t, "error_code", None),
+                "failure_retry_count": t.failure_retry_count,
                 "blocked_by_task_id": getattr(t, "blocked_by_task_id", None),
                 "created_at": _dt(t.created_at),
                 "finished_at": _dt(t.finished_at),
@@ -406,6 +404,7 @@ def serialize_view(view: RunStateView) -> dict[str, Any]:
                 "llm_account": a.llm_account,
                 "llm_model": a.llm_model,
                 "llm_config": deepcopy(a.llm_config),
+                "created_at": _dt(a.created_at),
                 "status": a.status,
                 "status_reason": a.status_reason,
                 "current_task_id": a.current_task_id,
@@ -442,7 +441,9 @@ def deserialize_view(data: dict[str, Any]) -> RunStateView:
         tasks[tid] = TaskView(
             id=t["id"],
             session_id=t.get("session_id", ""),
-            details_complete=t.get("details_complete", True),
+            # Older full snapshots predate the failure annotation. Reuse the
+            # existing task hydration path instead of presenting an unloaded None.
+            details_complete=t.get("details_complete", True) and "failure_retry_count" in t,
             status=t.get("status", "UNKNOWN"),
             title=t.get("title", ""),
             description=t.get("description", ""),
@@ -467,6 +468,7 @@ def deserialize_view(data: dict[str, Any]) -> RunStateView:
             outputs=t.get("outputs"),
             error=t.get("error"),
             error_code=t.get("error_code"),
+            failure_retry_count=t.get("failure_retry_count"),
             blocked_by_task_id=t.get("blocked_by_task_id"),
             created_at=_dt(t.get("created_at")),
             finished_at=_dt(t.get("finished_at")),
@@ -485,6 +487,7 @@ def deserialize_view(data: dict[str, Any]) -> RunStateView:
             llm_account=a.get("llm_account", ""),
             llm_model=a.get("llm_model", ""),
             llm_config=deepcopy(a.get("llm_config")),
+            created_at=_dt(a.get("created_at")),
             # 旧快照无该键 → 回落默认值 "idle"/None，与其余字段同口径（零数据迁移）。
             status=a.get("status", "idle"),
             status_reason=a.get("status_reason", ""),
@@ -1146,6 +1149,10 @@ def _apply(view: RunStateView, ev: Event) -> None:
     # ── Task projection ───────────────────────────────────────────────────────
     # ── Agent projection ──────────────────────────────────────────────────────
     elif t == EventType.AGENT_INSTANTIATED and ev.agent_id:
+        created_at = p.get("created_at")
+        _agent_slot(view, ev.agent_id).created_at = (
+            datetime.fromisoformat(created_at) if created_at else ev.timestamp
+        )
         # 事件流里唯一记录「该 agent 用的哪个模板」的地方：树形推算得不出模板。
         # 授权按模板做策略（AllowListAuthorizer 读 ctx.agent_template_id），冷 resume
         # 若拿不到就只能回落 session 模板，子 agent 会顶着 root 的模板身份。
@@ -1214,7 +1221,8 @@ def _apply(view: RunStateView, ev: Event) -> None:
                 priority=task_data.get("priority", 5),
                 max_retries=task_data.get("max_retries", 3),
                 tenant_id=ev.tenant_id or "default",
-                created_at=ev.timestamp,
+                created_at=(datetime.fromisoformat(task_data["created_at"])
+                            if task_data.get("created_at") else ev.timestamp),
             )
             if task_id not in view.tasks:
                 view.tasks_total += 1      # 只数「新建」，重放同一条事件不重复计
@@ -1324,8 +1332,11 @@ def _apply(view: RunStateView, ev: Event) -> None:
                 if "outputs" in p:
                     task.outputs = p.get("outputs")
             elif t in (EventType.TASK_FAILED, EventType.TASK_INTERRUPTED):
+                task.failure_retry_count = p.get("retry_count")
                 task.error_code = p.get("error_code") or task.error_code
                 msg = p.get("error_message")
+                if t == EventType.TASK_FAILED and "error_message" in p:
+                    task.error = msg or None
                 from ctx_weft.core.orchestrator.lifecycle.agent_state import AGENT_CANCEL_REASON
                 explicit_cancel = (t == EventType.TASK_INTERRUPTED and p.get("reason") == "crash_recovery"
                                          and (task.error or "").startswith(AGENT_CANCEL_REASON))
@@ -1353,7 +1364,8 @@ def _apply(view: RunStateView, ev: Event) -> None:
             # 供 host 落 tasks 表与 CLI 打印），但这里刻意不折：投影的 outputs/error 只认
             # TaskFinished/TaskFailed/TaskInterrupted 一个来源（总账 A1）——两处都写会让
             # 先到的 TaskFinalized 覆盖或清空后到的成果，正是 A1 当初要治的那个漂移。
-            task.finished_at = ev.timestamp
+            task.finished_at = (datetime.fromisoformat(p["finished_at"])
+                                if p.get("finished_at") else ev.timestamp)
             task.finalized = True
 
     # ── 段 recap（被崩溃打断的 background observe）──────────────────────────────

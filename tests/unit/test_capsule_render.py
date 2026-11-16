@@ -31,7 +31,6 @@ from ctx_weft.protocols.capability import qualify
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from tests.assembler_testkit import history_messages, recalled_blocks
 
-pytestmark = pytest.mark.asyncio
 
 T = MemoryEventType
 _BASE = datetime(2026, 1, 1, tzinfo=UTC)
@@ -77,6 +76,7 @@ async def _collect(mem, scope) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_agent_recall_renders_finish_pair() -> None:
     """AgentRecallSource 能把 AGENT_CONVERSATION_TURN finish 对渲染为两块。"""
     mem = InMemoryMemoryProvider()
@@ -142,6 +142,7 @@ async def test_agent_recall_renders_finish_pair() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_composer_renders_finish_pair_as_llm_messages() -> None:
     """PromptBuilder 把 finish 对投影成 assistant(tool_calls) + tool(tool_call_id)。"""
     mem = InMemoryMemoryProvider()
@@ -181,6 +182,7 @@ async def test_composer_renders_finish_pair_as_llm_messages() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_drop_orphan_preserves_finish_pair() -> None:
     """配对完整时，drop_orphan_tool_results 不应丢弃 tool 块。"""
     mem = InMemoryMemoryProvider()
@@ -241,6 +243,7 @@ def test_drop_orphan_removes_unmatched_tool_message() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 async def test_finish_pair_survives_alongside_conversation() -> None:
     """finish 对与普通对话混合时，finish 对不被孤儿清理误删。"""
     mem = InMemoryMemoryProvider()

@@ -23,7 +23,6 @@ from ctx_weft.protocols import (
 )
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 
-pytestmark = pytest.mark.asyncio
 
 T = MemoryEventType
 _BASE = datetime(2026, 1, 1, tzinfo=UTC)
@@ -46,6 +45,7 @@ def _ev(type_: MemoryEventType, scope: MemoryAddress, content: str, t: int = 0) 
     )
 
 
+@pytest.mark.asyncio
 async def test_task_layer_isolated_per_task() -> None:
     m = InMemoryMemoryProvider()
     await m.ingest(_ev(T.USER_PROMPT, _sc("tA"), "promptA"), _ctx())
@@ -55,6 +55,7 @@ async def test_task_layer_isolated_per_task() -> None:
     assert [r.content for r in recs_a] == ["promptA"]  # 不含 tB
 
 
+@pytest.mark.asyncio
 async def test_agent_layer_accumulates_across_tasks() -> None:
     m = InMemoryMemoryProvider()
     # agent 层按 agent_id 归集，忽略 task_id
@@ -65,6 +66,7 @@ async def test_agent_layer_accumulates_across_tasks() -> None:
     assert sorted(r.content for r in recs) == ["r1", "r2"]
 
 
+@pytest.mark.asyncio
 async def test_task_fold_leaves_agent_layer_untouched() -> None:
     """v2 P4a：keep_last 策展上移框架侧——测试改为显式 id 集 fold + 层隔离断言。"""
     from ctx_weft.protocols.memory_compat import MemoryKind
@@ -95,6 +97,7 @@ async def test_task_fold_leaves_agent_layer_untouched() -> None:
     assert [r.content for r in ag] == ["agent-exp"]
 
 
+@pytest.mark.asyncio
 async def test_agent_segment_fold_writes_agent_summary() -> None:
     """v2 P4a：AGENT 层折叠经 segment_fold（半址）；摘要跨 task 可见。"""
     from tests.segment_fold_testkit import segment_fold
@@ -113,6 +116,7 @@ async def test_agent_segment_fold_writes_agent_summary() -> None:
     assert any(r.type == T.AGENT_COMPACT_SUMMARY and r.content == "AGSUM" for r in recs)
 
 
+@pytest.mark.asyncio
 async def test_mixed_layer_recall_merges_by_timestamp() -> None:
     m = InMemoryMemoryProvider()
     sc = _sc("tA")

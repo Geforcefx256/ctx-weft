@@ -1,3 +1,5 @@
+
+from tests._recovery import recover_fixture_session
 """Compare persisted memory with normal execution across both close-report orderings."""
 import pytest
 
@@ -10,7 +12,6 @@ from tests.integration.test_lifecycle_crash_boundaries import run_worker
 from tests.integration.test_observe_application_recovery import recover_and_drain, assert_cold_recovery_is_noop
 from tests.integration.test_observe_lifecycle_crashes import assert_lifecycles
 
-pytestmark = pytest.mark.asyncio
 _BASELINES = {}
 
 
@@ -80,6 +81,7 @@ CASES += [(order, "long", snapshot, "raw_folded")
           for order in ("early", "late") for snapshot in (False, True)]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("order,size,snapshot,cut", CASES)
 async def test_report_and_raw_match_normal_execution(tmp_path, tmp_path_factory, order, size, snapshot, cut):
     mode = f"handoff_{order}_{size}"
@@ -115,7 +117,7 @@ async def test_report_and_raw_match_normal_execution(tmp_path, tmp_path_factory,
             view = await rebuild_view(store, "crash-session")
             assert not view.pending_observe and not view.open_runs
             head = await store.committed_head("crash-session")
-            await rt.recover_agent(root, session_id="crash-session")
+            await recover_fixture_session(rt, root, session_id="crash-session")
             assert await store.committed_head("crash-session") == head
             await assert_cold_recovery_is_noop(store, memory, mode, root)
             assert await memory_result(store, memory) == actual

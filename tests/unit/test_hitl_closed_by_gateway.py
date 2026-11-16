@@ -29,7 +29,6 @@ from ctx_weft.core.hitl.registry import (
 from ctx_weft.protocols.events import EventType
 from ctx_weft.protocols.hitl import HitlDecision, ToolResultDelivery
 
-pytestmark = pytest.mark.asyncio
 
 _T0 = datetime(2026, 9, 20, tzinfo=UTC)
 _SID, _TCID = "s1", "call_7"

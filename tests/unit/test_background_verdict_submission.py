@@ -10,10 +10,9 @@ from types import SimpleNamespace
 
 from ctx_weft.core.capabilities.control_tools import ControlMetaKey as K
 from ctx_weft.core.loop.driver import make_event
+from ctx_weft.core.loop.steps.observe import judges, submit_verdict
 from ctx_weft.core.models.task import Task
 from ctx_weft.protocols.events import EventType
-from ctx_weft.core.loop.steps.observe import judges
-from ctx_weft.core.loop.steps.observe import submit_verdict
 
 
 class _RecordingTM:
@@ -265,6 +264,11 @@ class _Bus:
 
     async def emit(self, event) -> None:
         self.emitted.append(event)
+
+    async def emit_batch(self, events, *, on_committed=None) -> None:
+        self.emitted.extend(events)
+        if on_committed is not None:
+            on_committed()
 
 
 async def test_out_of_band_finalize_runs_close_and_emits_its_events(monkeypatch, fake_state_ctx) -> None:

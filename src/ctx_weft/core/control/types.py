@@ -81,6 +81,7 @@ class TaskView:
     # spec: task-handoff——终态事件的结局码（当前唯一写入者：依赖阻塞取消
     # BLOCKED_BY_FAILED_DEP）与阻塞源任务 id。存量事件无此键 → None。
     error_code: str | None = None
+    failure_retry_count: int | None = None
     blocked_by_task_id: str | None = None
     created_at: datetime | None = None
     finished_at: datetime | None = None
@@ -92,6 +93,7 @@ class AgentView:
     """Agent 的轻量投影，从 task 层级推算而来。"""
 
     id: str
+    created_at: datetime | None = None
     spawn_depth: int = 0
     parent_agent_id: str | None = None
     # 该 agent 实例化时用的模板 id，来自 AgentInstantiated 事件（唯一记录它的地方——

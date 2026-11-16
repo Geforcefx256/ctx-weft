@@ -43,7 +43,6 @@ from ctx_weft.providers.llm.tokenizer import HeuristicTokenizer
 from ctx_weft.providers.memory.in_memory import InMemoryMemoryProvider
 from tests.assembler_testkit import recalled_blocks
 
-pytestmark = pytest.mark.asyncio
 
 T = MemoryEventType
 _BASE = datetime(2026, 1, 1, tzinfo=UTC)
@@ -121,6 +120,7 @@ def _has_finish_call(rec) -> bool:
 
 # ─── 三槽形态 ────────────────────────────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_close_writes_recap_then_reply_then_report() -> None:
     mem = InMemoryMemoryProvider()
     scope = _sc("t1")
@@ -141,6 +141,7 @@ async def test_close_writes_recap_then_reply_then_report() -> None:
     assert recap.timestamp < anchor.timestamp <= report.timestamp
 
 
+@pytest.mark.asyncio
 async def test_anchor_preserves_plain_reply() -> None:
     mem = InMemoryMemoryProvider()
     scope = _sc("t1")
@@ -154,6 +155,7 @@ async def test_anchor_preserves_plain_reply() -> None:
 
 
 
+@pytest.mark.asyncio
 async def test_root_task_without_title_keeps_identity_in_metadata() -> None:
     mem = InMemoryMemoryProvider()
     scope = _sc("t1")
@@ -166,11 +168,13 @@ async def test_root_task_without_title_keeps_identity_in_metadata() -> None:
     assert anchor.metadata["origin_task_id"] == "t1"
 
 
+@pytest.mark.asyncio
 async def test_untitled_record_keeps_its_kind() -> None:
     assert render_task_record("final_reply", body="x") == "x"
 
 
 
+@pytest.mark.asyncio
 async def test_task_layer_keeps_no_anchor_record() -> None:
     """答复归 agent 层的 finish 对；task 层仍是纯遗忘（只剩 USER_PROMPT + 段摘要）。"""
     mem = InMemoryMemoryProvider()
@@ -187,6 +191,7 @@ async def test_task_layer_keeps_no_anchor_record() -> None:
 
 # ─── 退回两槽：短任务 / 无产出 ────────────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_short_leaf_keeps_two_slot_shape() -> None:
     """short leaf 不折末段 raw（原文即胶囊），再塞锚点等于答复出现两遍。"""
     mem = InMemoryMemoryProvider()
@@ -201,6 +206,7 @@ async def test_short_leaf_keeps_two_slot_shape() -> None:
     assert await mem.recall_recent(scope, [T.LLM_RESPONSE], 100, _pctx()), "短任务 raw 照留"
 
 
+@pytest.mark.asyncio
 async def test_empty_outputs_keeps_two_slot_shape() -> None:
     mem = InMemoryMemoryProvider()
     scope = _sc("t1")
@@ -214,6 +220,7 @@ async def test_empty_outputs_keeps_two_slot_shape() -> None:
 
 # ─── 延迟折叠：占位两槽 → bg 真报告落地后升三槽 ──────────────────────────────
 
+@pytest.mark.asyncio
 async def test_deferred_close_upgrades_to_three_slots_on_bg_report() -> None:
     """占位 close 时末段 raw 还在（答复还在 raw 里）→ 先两槽；bg 真报告落地、raw 补删的
     同时升成三槽，锚点补位。"""
@@ -237,6 +244,7 @@ async def test_deferred_close_upgrades_to_three_slots_on_bg_report() -> None:
     assert _REPLY in anchor.content and _has_finish_call(anchor)
 
 
+@pytest.mark.asyncio
 async def test_bg_replacement_does_not_clobber_the_anchor() -> None:
     """bg 事后重写 finish 对时锚点不能被当成 recap 槽冲掉——它才是挂着 finish_task 的那条，
     按 tool_call_id 找 assistant 会先命中它。"""
@@ -263,6 +271,7 @@ async def test_bg_replacement_does_not_clobber_the_anchor() -> None:
 
 # ─── 渲染 ────────────────────────────────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_rendered_messages_put_finish_call_on_the_reply() -> None:
     from ctx_weft.core.assembler.assembler import AssemblerDeps, ContextRequest
     from tests.assembler_testkit import history_messages
@@ -286,6 +295,7 @@ async def test_rendered_messages_put_finish_call_on_the_reply() -> None:
     assert "<task_finish" in str(tail[2].content)
 
 
+@pytest.mark.asyncio
 async def test_dispatch_ack_points_at_the_final_reply() -> None:
     """同 agent 派发 ack 是内联执行的导读：末尾是 finish_task 与它带的最终回复。"""
     from ctx_weft.core.loop.steps.finalize import _dispatch_ack
@@ -293,6 +303,7 @@ async def test_dispatch_ack_points_at_the_final_reply() -> None:
     assert "final reply" in ack.lower(), f"导读须提到最终回复；实得 {ack!r}"
 
 
+@pytest.mark.asyncio
 async def test_segment_summary_keeps_its_task_identity_as_a_user_recap() -> None:
     """Current and historical task summaries use user recaps with their source task ID."""
     from ctx_weft.core.assembler.sources._history import record_to_history_block
@@ -321,6 +332,7 @@ async def test_segment_summary_keeps_its_task_identity_as_a_user_recap() -> None
 
 # ─── recap 槽的收束尾注 ──────────────────────────────────────────────────────
 
+@pytest.mark.asyncio
 async def test_recap_slot_carries_closing_note() -> None:
     """recap 槽是 agent 层普通 assistant 回合，拿不到段摘要那条尾注
     （annotate_assistant_summary 只贴 TASK_COMPACT_SUMMARY）。它形似「我上一轮就是这么答的」，
@@ -336,6 +348,7 @@ async def test_recap_slot_carries_closing_note() -> None:
     assert recap.content.endswith("</task_recap>")
 
 
+@pytest.mark.asyncio
 async def test_two_slot_recap_also_carries_the_note() -> None:
     """两槽形态下 recap 槽同样会被模仿（它还挂着 finish_task），一视同仁。"""
     mem = InMemoryMemoryProvider()
@@ -349,6 +362,7 @@ async def test_two_slot_recap_also_carries_the_note() -> None:
     assert turns[0].content.endswith("</task_recap>")
 
 
+@pytest.mark.asyncio
 async def test_bg_rewritten_recap_keeps_the_note() -> None:
     """bg 事后用真报告重写 recap 槽时，注解不能丢（两处形态共用 build_finish_slots）。"""
     from ctx_weft.core.loop.task_memory_fold import (
