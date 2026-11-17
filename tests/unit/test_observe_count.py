@@ -15,6 +15,7 @@ from ctx_weft.core.control.reducers import (
     serialize_view,
 )
 from ctx_weft.core.control.startup_view import rebuild_startup_view
+from ctx_weft.core.control.snapshot_writer import SnapshotWriter
 from ctx_weft.core.events.commit_gate import CommitGate
 from ctx_weft.core.loop.driver import ExecutionMode, StepDriver, StepExecution, make_event
 from ctx_weft.core.loop.steps.observe import begin
@@ -22,7 +23,7 @@ from ctx_weft.core.models.task import Task
 from ctx_weft.core.orchestrator.task.manager import TaskManager
 from ctx_weft.protocols.events import EventType, PersistenceUnavailableError
 from ctx_weft.providers.events import InMemoryEventStore, InProcessEventBus
-from tests._snapshot_helpers import seed_snapshot
+from tests._snapshot_helpers import latest_snapshot, seed_snapshot
 
 
 async def setup_owner(state, ctx):
@@ -128,7 +129,7 @@ async def test_next_review_confirms_uncertain_predecessor_before_allocating(fake
     assert (await rebuild_view(store, "s1")).tasks["t1"].observe_count == 2
 
 
-@pytest.mark.parametrize("snapshot", [False, True, "old"])
+@pytest.mark.parametrize("snapshot", [False, True, "v10", "v11"])
 async def test_cold_count_and_pending_ordinal_survive_snapshot_and_retry(fake_state_ctx, snapshot):
     state, ctx = fake_state_ctx
     store, bus, _ = await setup_owner(state, ctx)
@@ -142,17 +143,33 @@ async def test_cold_count_and_pending_ordinal_survive_snapshot_and_retry(fake_st
     if snapshot:
         view = await rebuild_view(store, "s1")
         overrides = None
-        if snapshot == "old":
+        if isinstance(snapshot, str):
             blob = serialize_view(view)
             blob["tasks"]["t1"].pop("observe_count")
-            overrides = {"projection_version": 11, "state_blob": blob}
+            blob["pending_observe"][pending_id].pop("observe_index")
+            overrides = {"projection_version": int(snapshot[1:]), "state_blob": blob,
+                         "startup_state_blob": None, "startup_projection_version": 1}
         await seed_snapshot(store, "s1", view, cut=await store.committed_head("s1"), overrides=overrides)
+    expected = 0 if isinstance(snapshot, str) else 3
+    original_read, reads = store.read_range, []
+
+    async def capture(*args, **kwargs):
+        reads.append(kwargs)
+        return await original_read(*args, **kwargs)
+
+    store.read_range = capture
     view = await rebuild_view(store, "s1")
-    assert view.tasks["t1"].observe_count == 3
-    assert view.pending_observe[pending_id]["observe_index"] == 3
-    assert (await read_task_view(store, "s1", "t1", through_position=await store.committed_head("s1"))).observe_count == 3
+    assert view.tasks["t1"].observe_count == expected
+    assert view.pending_observe[pending_id]["observe_index"] == expected
+    assert (await read_task_view(store, "s1", "t1", through_position=await store.committed_head("s1"))).observe_count == expected
     startup = await rebuild_startup_view(store, "s1", through_position=await store.committed_head("s1"))
-    assert startup.tasks["t1"].observe_count == 3
+    assert startup.tasks["t1"].observe_count == expected
+    if isinstance(snapshot, str):
+        for read in reads:
+            if read.get("after_position", 0) == 0:
+                # v10 retains its existing task-cancellation compatibility repair.
+                assert snapshot == "v10"
+                assert set(read["include_types"]) == {EventType.TASK_CANCELED, EventType.TASK_FINALIZED}
 
     # A fresh owner loads the projection rather than retaining any hot object.
     cold_tm = TaskManager("s1", max_concurrent=0, event_bus=bus)
@@ -162,13 +179,13 @@ async def test_cold_count_and_pending_ordinal_survive_snapshot_and_retry(fake_st
     ctx.execution = StepExecution(options=dict(view.pending_observe[pending_id]))
     head = await store.committed_head("s1")
     await begin(state, ctx, "plain_text", True)
-    assert cold_task.observe_count == 3
-    assert ctx.execution.options["observe_index"] == 3
+    assert cold_task.observe_count == expected
+    assert ctx.execution.options["observe_index"] == expected
     assert await store.committed_head("s1") == head
     ctx.execution = StepExecution()
     await begin(state, ctx, "plain_text", True)
-    assert cold_task.observe_count == ctx.execution.options["observe_index"] == 4
-    assert (await rebuild_view(store, "s1")).tasks["t1"].observe_count == 4
+    assert cold_task.observe_count == ctx.execution.options["observe_index"] == expected + 1
+    assert (await rebuild_view(store, "s1")).tasks["t1"].observe_count == expected + 1
 
 
 async def test_cold_task_count_reads_only_observe_metadata(fake_state_ctx):
@@ -193,6 +210,54 @@ async def test_cold_task_count_reads_only_observe_metadata(fake_state_ctx):
     assert task.observe_count == 1
     assert "private historical form" not in str(projected)
     assert "large context" not in str(projected)
+
+
+@pytest.mark.parametrize("version", [10, 11])
+@pytest.mark.parametrize("missing_count", [False, True])
+async def test_legacy_snapshot_keeps_unstarted_review_and_upgrades_incrementally(fake_state_ctx, version, missing_count):
+    state, ctx = fake_state_ctx
+    store, bus, tm = await setup_owner(state, ctx)
+    await bus.emit(make_event(state, EventType.OBSERVE_REQUESTED, {
+        "task_id": "t1", "observe_id": "pending", "judge_task": True}))
+    view = await rebuild_view(store, "s1")
+    blob = serialize_view(view)
+    if missing_count:
+        blob["tasks"]["t1"].pop("observe_count")
+    else:
+        blob["tasks"]["t1"]["observe_count"] = 7
+    cut = await store.committed_head("s1")
+    await seed_snapshot(store, "s1", view, cut=cut, overrides={
+        "projection_version": version, "state_blob": blob,
+        "startup_projection_version": 1, "startup_state_blob": None})
+    original_read = store.read_range
+
+    async def bounded(*args, **kwargs):
+        if kwargs.get("after_position", 0) < cut:
+            assert version == 10
+            assert set(kwargs["include_types"]) == {EventType.TASK_CANCELED, EventType.TASK_FINALIZED}
+        return await original_read(*args, **kwargs)
+
+    store.read_range = bounded
+    restored = await rebuild_view(store, "s1")
+    expected = 0 if missing_count else 7
+    assert restored.tasks["t1"].observe_count == expected
+    assert "observe_index" not in restored.pending_observe["pending"]
+    state.task = task_from_projection(restored.tasks["t1"])
+    tm.restore([state.task], terminal_ids=set(), enqueue=False)
+    ctx.execution = StepExecution(options=restored.pending_observe["pending"])
+    await begin(state, ctx, "plain_text", True)
+    assert state.task.observe_count == ctx.execution.options["observe_index"] == expected + 1
+
+    writer = SnapshotWriter(store, bus, every_n_events=1)
+    try:
+        await bus.emit(make_event(state, EventType.RUN_FINISHED, {"outcome": "interrupted"}))
+    finally:
+        await writer.detach()
+    snapshot = await latest_snapshot(store, "s1")
+    assert snapshot.projection_version == 12
+    assert snapshot.last_commit_position > cut
+    assert snapshot.state_blob["tasks"]["t1"]["observe_count"] == expected + 1
+    assert snapshot.state_blob["pending_observe"]["pending"]["observe_index"] == expected + 1
 
 
 def test_existing_unnumbered_starts_use_request_judging_flag_and_deduplicate(fake_state_ctx):

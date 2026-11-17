@@ -496,6 +496,15 @@ def deserialize_view(data: dict[str, Any]) -> RunStateView:
             current_task_id=a.get("current_task_id"),
         )
 
+    pending_observe = {}
+    for oid, info in (data.get("pending_observe") or {}).items():
+        restored = dict(info)
+        # Already-started legacy reviews keep their identity without being counted again.
+        # Unstarted requests must still allocate the next ordinal when they begin.
+        if restored.get("started") and restored.get("observe_index") is None:
+            restored["observe_index"] = 0
+        pending_observe[oid] = restored
+
     return RunStateView(
         run_id=data.get("run_id", ""),
         session_id=data.get("session_id", ""),
@@ -514,10 +523,7 @@ def deserialize_view(data: dict[str, Any]) -> RunStateView:
         # 走全量回放（全量回放会正确折出它），所以这里的回落只是形态完整性——**这正是
         # bump 版本号换来的东西**：不必为「老快照里没有这个字段」另留一条兜底查询。
         hitl=_hitl_from_blob(data.get("hitl") or {}),
-        pending_observe={
-            tid: dict(v)
-            for tid, v in (data.get("pending_observe") or {}).items()
-        },
+        pending_observe=pending_observe,
         open_runs={rid: dict(info) for rid, info in (data.get("open_runs") or {}).items()},
         sessions=sessions,
         tasks=tasks,
@@ -556,8 +562,8 @@ def deserialize_view(data: dict[str, Any]) -> RunStateView:
 # v10: retain terminal current tasks until missing agent settlement is repaired.
 # v11: retain every unfinished cancellation closure, independent of its reason.
 # v10 upgrades read task facts only; their run projection is already complete.
-# v12: task observe counts and per-observation ordinals. Older snapshots must
-# replay Started facts, rather than silently restarting the count at zero.
+# v12: task observe counts and per-observation ordinals. v10/v11 remain usable;
+# missing counts and already-started ordinals default to zero without historical replay.
 _PROJECTION_VERSION = 12
 
 
@@ -686,7 +692,7 @@ def snapshot_is_usable(
 
     1. 有快照；
     2. 带 ``last_commit_position``——缺它就是改造前的存量快照，位置不可猜；
-    3. ``projection_version`` 与当前实现一致——apply 语义变过则旧 blob 不可复用；
+    3. ``projection_version`` 属于兼容版本（v10/v11 缺失的 Observe 计数默认为 0）；
     4. 位置不超前于 ``head``——引用未来位置说明数据异常。
 
     ``max_chain_depth``：仅**写入侧**传。快照链每增量一次深一层，达到上限即强制一次
@@ -697,7 +703,7 @@ def snapshot_is_usable(
         return False
     if getattr(snapshot, "last_commit_position", None) is None:
         return False
-    if getattr(snapshot, "projection_version", 1) != _PROJECTION_VERSION:
+    if getattr(snapshot, "projection_version", 1) not in (10, 11, _PROJECTION_VERSION):
         return False
     if snapshot.last_commit_position > head:
         return False
