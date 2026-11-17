@@ -24,11 +24,13 @@ class ScriptedVerdicts(_NamesTasksLLM):
         self.verdicts = iter(verdicts)
         self.actor_count = 0
         self.tool_first = tool_first
+        self.review_prompts = []
 
     def complete(self, request, stream=True):
         if self._is_sidecar(request):
             return super().complete(request, stream)
         if any(t.name == "control__report_observation" for t in request.tools):
+            self.review_prompts.append(request.system + "\n" + "\n".join(str(m.content) for m in request.messages))
             verdict = next(self.verdicts)
             return self._stream(MockResponse(tool_calls=[ToolCall(
                 id="review", name="control__report_observation",
@@ -86,6 +88,22 @@ async def test_background_continue_runs_without_user_input_then_closes(last):
                      and r.event.payload.get("action") == "continue"]
     requeue, = [r for r in rows if r.event.type == EventType.TASK_REQUEUED]
     assert continuation.position < requeue.position
+
+
+@pytest.mark.asyncio
+async def test_observe_validation_retry_keeps_original_review_number():
+    rt, llm, handle = await start([None, "success"])
+    try:
+        task = await quiescent(rt, handle)
+        assert task.status == "FINISHED" and task.observe_count == 1
+        assert llm.actor_count == 1 and len(llm.review_prompts) == 2
+        assert all("Observe review 1" in text for text in llm.review_prompts)
+        rows = await rt.event_store.read_range(handle.session_id)
+        starts = [r.event for r in rows if r.event.type == EventType.OBSERVE_STARTED]
+        assert len(starts) == 1 and starts[0].payload["observe_index"] == 1
+        assert (await rebuild_view(rt.event_store, handle.session_id)).tasks[task.id].observe_count == 1
+    finally:
+        await rt.close()
 
 
 @pytest.mark.asyncio

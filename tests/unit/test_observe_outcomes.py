@@ -363,6 +363,12 @@ def _mech_state_ctx(*, exit_reason="normal", transcript=None, has_role=False,
         async def emit(self, event):
             self.emitted.append(event)
 
+        async def emit_batch(self, events, *, on_committed=None):
+            if on_committed is not None:
+                on_committed()
+            for event in events:
+                await self.emit(event)
+
     tok = CancelToken()
     if cancelled:
         tok.cancel()

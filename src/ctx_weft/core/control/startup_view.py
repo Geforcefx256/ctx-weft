@@ -38,7 +38,7 @@ def _fields(*keys):
 _TASK_FIELDS = _fields("id", "status", "session_id", "assigned_agent_id", "creator_agent_id",
                        "parent_task_id", "dag_deps", "finalized", "error", "error_code",
                        "failure_retry_count", "blocked_by_task_id", "created_at", "finished_at",
-                       "details_complete")
+                       "details_complete", "observe_count")
 _TASK_FIELDS += (("settings", "use_subagent"), ("settings_raw", "use_subagent"))
 _SESSION_FIELDS = _fields("id", "root_agent_id", "tenant_id", "goal", "failure_counter",
                           "threshold_tripped", "threshold_root_task_ids", "threshold_cancel_task_ids")
@@ -47,6 +47,7 @@ _AGENT_FIELDS = _fields("id", "status", "status_reason", "current_task_id", "tem
                         "llm_config", "created_at")
 _HITL_FIELDS = _fields("id", "hitl_id", "form", "session_id", "task_id", "agent_id", "tenant_id",
                        "delivery", "tool_call_id", "stage", "outcome")
+_OBSERVE_FIELDS = _fields("task_id", "observe_id", "judge_task", "observe_index", "started")
 
 _PAYLOAD_FIELDS = {
     EventType.SESSION_CREATED: _fields("root_agent_id", "tenant_id"),
@@ -64,7 +65,11 @@ _PAYLOAD_FIELDS = {
                     "blocked_by_task_id", "finished_at") for kind in TASK_STATUS_BY_EVENT
        if kind != EventType.TASK_REVIEWING},
     **{kind: _fields("reason") for kind in _AGENT_STATUS_BY_EVENT},
-    EventType.HITL_OPENED: _HITL_FIELDS,
+    EventType.OBSERVE_REQUESTED: _OBSERVE_FIELDS,
+    EventType.OBSERVE_STARTED: _OBSERVE_FIELDS,
+    EventType.OBSERVE_APPLIED: _OBSERVE_FIELDS,
+    EventType.HITL_OPENED: (*_HITL_FIELDS,
+                          *tuple(("observe_request", *path) for path in _OBSERVE_FIELDS)),
     EventType.HITL_REQUIRED: _HITL_FIELDS,
     EventType.HITL_RESOLVED: _fields("hitl_id", "outcome"),
     **{kind: _fields("hitl_id") for kind in (
@@ -78,6 +83,7 @@ _BLOB_PATHS = _fields("run_id", "session_id", "task_id", "agent_id",
 _BLOB_PATHS += tuple(("sessions", "*", *path) for path in _SESSION_FIELDS)
 _BLOB_PATHS += tuple(("tasks", "*", *path) for path in _TASK_FIELDS)
 _BLOB_PATHS += tuple(("agents", "*", *path) for path in _AGENT_FIELDS)
+_BLOB_PATHS += tuple(("pending_observe", "*", *path) for path in _OBSERVE_FIELDS)
 _BLOB_PATHS += tuple(("hitl", group, "*", *path)
                      for group in ("pending", "resolved") for path in _HITL_FIELDS)
 _PAYLOAD_FIELDS[EventType.STATE_SNAPSHOT] = (
@@ -85,7 +91,7 @@ _PAYLOAD_FIELDS[EventType.STATE_SNAPSHOT] = (
     *tuple(("state_blob", *path) for path in _BLOB_PATHS),
 )
 STARTUP_PROJECTION = EventReadProjection(_PAYLOAD_FIELDS)
-STARTUP_SNAPSHOT_VERSION = 3
+STARTUP_SNAPSHOT_VERSION = 4
 STARTUP_SNAPSHOT_PROJECTION = EventReadProjection({EventType.STATE_SNAPSHOT: _fields(
     "cut_position", "projection_version", "chain_depth", "reason",
     "startup_state_blob", "startup_projection_version",

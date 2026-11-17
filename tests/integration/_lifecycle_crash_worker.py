@@ -48,7 +48,8 @@ class LifecycleLLM(_FinishEveryTaskLLM):
                     raise RuntimeError("observer unavailable")
                     yield
                 return unavailable()
-            verdict = ("continue" if self.mode == "background_continue" and self.actor_count == 1 and self.judgements == 1 else
+            verdict = ("continue" if self.mode == "review_count" and self.judgements <= 3 else
+                       "continue" if self.mode == "background_continue" and self.actor_count == 1 and self.judgements == 1 else
                        "waiting" if self.mode == "background_waiting" else
                        "continue" if self.mode in { "parked_cancel_retry", "parked_interrupt_retry"} or
                        self.mode in {"retry", "mechanical_retry"} and self.judgements == 1 else
@@ -65,7 +66,7 @@ class LifecycleLLM(_FinishEveryTaskLLM):
                     yield LLMChunk(kind="token", text="working ")
                     await asyncio.sleep(0.01)
             return hold_root()
-        if self.mode.startswith("exhausted_") or self.mode in {"plain_text", "background_waiting", "parked_cancel_retry", "parked_interrupt_retry"} or (self.mode in {"mechanical_retry", "background_continue"} and self.actor_count == 1):
+        if self.mode.startswith("exhausted_") or self.mode in {"review_count", "plain_text", "background_waiting", "parked_cancel_retry", "parked_interrupt_retry"} or (self.mode in {"mechanical_retry", "background_continue"} and self.actor_count == 1):
             return self._stream(MockResponse(text="completed answer"), request)
         return super().complete(request, stream)
 
@@ -75,7 +76,7 @@ def make_lifecycle_runtime(store, memory, mode):
     template = make_echo_template()
     if mode in {"mechanical", "mechanical_retry"} or mode.startswith(("handoff_", "exhausted_")):
         template.identity.pop("observe")
-    if mode in {"background_waiting", "background_continue"}:
+    if mode in {"background_waiting", "background_continue", "review_count"}:
         template.loop_config = dataclasses.replace(template.loop_config, short_segment_token_threshold=0)
     if mode.startswith("handoff_"):
         template.loop_config = dataclasses.replace(
@@ -112,6 +113,8 @@ async def worker(directory, mode, cut, recovering=False):
             producer_settled = asyncio.Event()
             report_waiting = asyncio.Event()
             observe_calls = []
+            review_requests = set()
+            fourth_review_id = None
             if mode == "mechanical" or handoff:
                 from ctx_weft.core.loop.driver import ExecutionMode
                 from ctx_weft.core.loop.steps.observe import ObserveStep
@@ -253,7 +256,7 @@ async def worker(directory, mode, cut, recovering=False):
             memory.ingest = crash_after_memory_write
 
             async def crash_after_commit(sid, batch_id, events, *args, **kwargs):
-                nonlocal observation_completed, hitl_commit_failed
+                nonlocal observation_completed, hitl_commit_failed, fourth_review_id
                 if cut == "before_summary_applied" and any(
                         e.type == EventType.OBSERVE_APPLIED and e.payload.get("observe_id") in recap_ids
                         for e in events):
@@ -264,6 +267,22 @@ async def worker(directory, mode, cut, recovering=False):
                     raise OSError("injected HitlResolved SQLite commit failure")
                 receipt = await original(sid, batch_id, events, *args, **kwargs)
                 for event in events:
+                    if mode == "review_count":
+                        intent = (event.payload.get("observe_request", {})
+                                  if event.type == EventType.HITL_OPENED else
+                                  event.payload if event.type == EventType.OBSERVE_REQUESTED else {})
+                        if intent.get("judge_task"):
+                            review_requests.add(intent["observe_id"])
+                            if len(review_requests) == 4 and cut == "fourth_requested":
+                                os._exit(73)
+                        if event.type == EventType.OBSERVE_STARTED and event.payload.get("observe_index") == 4:
+                            fourth_review_id = event.payload["observe_id"]
+                            if cut == "fourth_started":
+                                os._exit(73)
+                        if (event.type == EventType.OBSERVE_COMPLETED
+                                and event.payload.get("observe_id") == fourth_review_id
+                                and cut == "fourth_completed"):
+                            os._exit(73)
                     if event.type == EventType.OBSERVE_REQUESTED and event.payload.get("verdict"):
                         assert event.payload["judge_task"] is False
                     if cut == "agent_terminated" and event.type == EventType.AGENT_TERMINATED and event.payload.get("reason", "").startswith("cancel_agent:"):

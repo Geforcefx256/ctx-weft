@@ -23,6 +23,9 @@
 {%- endmacro %}
 
 {% macro judge(ctx) -%}
+{% if ctx.observe_index %}这是当前任务的第 {{ ctx.observe_index }} 次 Observe 复核，此前已进行 {{ ctx.observe_index - 1 }} 次。{% endif %}
+请结合历次尝试、实际进展和阻塞原因，重新评估任务是否在当前可用能力范围内。若反复尝试仍无法突破，且明确缺少完成任务所需的能力，应判 `fail` 并说明原因。不要仅凭复核次数判失败。{% if not ctx.terminal_only %}若判 `continue`，请在 `next_step_hint` 中说明下一步可行的推进路径。{% endif %}
+
 {% if ctx.terminal_only %}{% if ctx.switch_reason %}目标替换原因：{{ ctx.switch_reason }}
 {% endif %}本次为终态复核：只评估旧目标；`task_status` 只能填 `success` 或 `fail`。旧任务不会继续执行。本次切换复核不要求另有最终答复。失败时在 `task_failure_reason` 中说明目标切换背景。`next_step_hint` 留空。
 {% elif ctx.boundary_kind == "max_turns" %}本段{% if ctx.act_turns %}已执行 {{ ctx.act_turns }} 轮并{% endif %}达到回合上限。本次 `task_status` 只能填 `continue` 或 `fail`，不得填 `waiting` 或 `success`。

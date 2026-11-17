@@ -104,6 +104,12 @@ def _make_observe_state_ctx(task: Task, act_exit_reason: str):
         async def emit(self, event: Any) -> None:
             self.emitted.append(event)
 
+        async def emit_batch(self, events, *, on_committed=None):
+            if on_committed is not None:
+                on_committed()
+            for event in events:
+                await self.emit(event)
+
     class _FakeAssembler:
         async def compile(self, inputs, **kwargs):
             return await compiled_test_inputs(inputs, **kwargs)

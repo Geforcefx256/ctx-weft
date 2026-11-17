@@ -19,7 +19,7 @@ from ctx_weft.core.hitl.snapshot import HitlSnapshot
 from ctx_weft.core.models.status import TERMINAL_TASK_STATUSES, TaskStatus
 from ctx_weft.core.models.task import default_port_for
 from ctx_weft.protocols.content import content_from_jsonable, content_to_jsonable
-from ctx_weft.protocols.events import Event, EventType, ProjectedEvent, ProjectedStoredEvent
+from ctx_weft.protocols.events import Event, EventReadProjection, EventType, ProjectedEvent, ProjectedStoredEvent
 from ctx_weft.protocols.hitl import (
     HITL_FORM_QUESTION,
     HITL_FORM_WAIT,
@@ -383,6 +383,7 @@ def serialize_view(view: RunStateView) -> dict[str, Any]:
                 # blocked_by_task_id）；旧快照无键 → deserialize 落缺省。
                 "priority": t.priority,
                 "max_retries": t.max_retries,
+                "observe_count": t.observe_count,
                 "tenant_id": t.tenant_id,
                 "outputs": t.outputs,
                 "error": t.error,
@@ -464,6 +465,7 @@ def deserialize_view(data: dict[str, Any]) -> RunStateView:
             dag_deps=t.get("dag_deps", []),
             priority=t.get("priority", 5),
             max_retries=t.get("max_retries", 3),
+            observe_count=t.get("observe_count", 0),
             tenant_id=t.get("tenant_id", "default"),
             outputs=t.get("outputs"),
             error=t.get("error"),
@@ -554,7 +556,9 @@ def deserialize_view(data: dict[str, Any]) -> RunStateView:
 # v10: retain terminal current tasks until missing agent settlement is repaired.
 # v11: retain every unfinished cancellation closure, independent of its reason.
 # v10 upgrades read task facts only; their run projection is already complete.
-_PROJECTION_VERSION = 11
+# v12: task observe counts and per-observation ordinals. Older snapshots must
+# replay Started facts, rather than silently restarting the count at zero.
+_PROJECTION_VERSION = 12
 
 
 #: 全量重放要排掉的类型：状态快照事件本身。
@@ -693,7 +697,7 @@ def snapshot_is_usable(
         return False
     if getattr(snapshot, "last_commit_position", None) is None:
         return False
-    if getattr(snapshot, "projection_version", 1) not in (10, _PROJECTION_VERSION):
+    if getattr(snapshot, "projection_version", 1) != _PROJECTION_VERSION:
         return False
     if snapshot.last_commit_position > head:
         return False
@@ -945,13 +949,26 @@ async def read_task_view(event_store, session_id: str, task_id: str, *, through_
         if task is not None and task.details_complete:
             view = base
             after = snapshot.last_commit_position
+    task_types = {EventType.TASK_CREATED, EventType.TASK_FINALIZED,
+                  EventType.RECOGNIZE_INTENT_TOOL_CALL, *TASK_STATUS_BY_EVENT}
+    count_fields = tuple((name,) for name in ("task_id", "observe_id", "judge_task", "observe_index"))
+    count_types = (EventType.OBSERVE_REQUESTED, EventType.OBSERVE_STARTED, EventType.OBSERVE_APPLIED)
+    # Count old parked requests without loading historical HITL forms/answers or
+    # observation context bodies. Existing task-detail events still need full data.
+    projection = EventReadProjection({
+        **{kind: ((),) for kind in task_types},
+        **dict.fromkeys(count_types, count_fields),
+        EventType.HITL_OPENED: tuple(("observe_request", *path) for path in count_fields),
+    })
     rows = await event_store.read_range(
         session_id, after_position=after, through_position=through_position,
-        include_types=tuple({EventType.TASK_CREATED, EventType.TASK_FINALIZED,
-                             EventType.RECOGNIZE_INTENT_TOOL_CALL, *TASK_STATUS_BY_EVENT}),
-        related_task_id=task_id,
+        include_types=tuple({*task_types, *count_types, EventType.HITL_OPENED}),
+        related_task_id=task_id, projection=projection,
     )
-    apply_events([row.event for row in rows], view)
+    # This scoped reader selects complete task bodies plus only the observation
+    # metadata consumed by _apply. Do not pass partial DTOs to the full replayer.
+    for row in rows:
+        _apply(view, row.event)
     return view.tasks.get(task_id)
 
 
@@ -1220,6 +1237,7 @@ def _apply(view: RunStateView, ev: Event) -> None:
                 dag_deps=task_data.get("dag_deps", []),
                 priority=task_data.get("priority", 5),
                 max_retries=task_data.get("max_retries", 3),
+                observe_count=task_data.get("observe_count", 0),
                 tenant_id=ev.tenant_id or "default",
                 created_at=(datetime.fromisoformat(task_data["created_at"])
                             if task_data.get("created_at") else ev.timestamp),
@@ -1388,10 +1406,20 @@ def _apply(view: RunStateView, ev: Event) -> None:
                 info = view.pending_observe.setdefault(key, {})
                 for name in ("task_id", "observe_id", "boundary", "agent_id", "segment_end_at",
                              "judge_task", "execution_mode", "verdict", "disposition",
-                             "report_boundary", "short_leaf", "context_record_ids", "waiting_hitl_id", "act_turns"):
+                             "report_boundary", "short_leaf", "context_record_ids", "waiting_hitl_id", "act_turns",
+                             "observe_index"):
                     if name in p:
                         info[name] = p[name]
                 if t == EventType.OBSERVE_STARTED and p.get("observe_id"):
+                    task = view.tasks.get(rtid)
+                    if info.get("judge_task") and task is not None:
+                        # Unnumbered existing events inherit judge_task from the
+                        # original request; repeated Started keeps the same index.
+                        index = info.get("observe_index")
+                        if index is None:
+                            index = task.observe_count + 1
+                            info["observe_index"] = index
+                        task.observe_count = max(task.observe_count, index)
                     info["started"] = True
                 if t == EventType.OBSERVE_COMPLETED:
                     info["completion"] = dict(p)

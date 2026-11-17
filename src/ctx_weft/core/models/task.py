@@ -193,6 +193,9 @@ class Task:
     #: 运行异常的重试次数；observer 判 continue 重排不递增、不受 max_retries 限制。
     retry_count: int = 0
     max_retries: int = 3
+    #: Distinct judging observations started for this task, including failed reviews.
+    #: ObserveStarted persists the ordinal; retries reuse it across runs/recovery.
+    observe_count: int = 0
     #: 自治作业从 `INTERRUPTED` 被自动退避重排过几次（见
     #: `TaskManager._schedule_autonomous_requeue`）。与 `retry_count` **不同源**：那个数
     #: 的是 run 内的原地重试，这个数的是「停下来、退避、再起一次」的轮数，而后者的触发

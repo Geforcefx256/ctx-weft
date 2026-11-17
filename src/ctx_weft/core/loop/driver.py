@@ -84,6 +84,7 @@ class ExecutionRegistry:
     recovering_observe_tasks: set[str] = field(default_factory=set)
     metadata_stops: dict[str, tuple[str, Callable[[], None]]] = field(default_factory=dict)
     metadata_commits: dict[str, list[Event]] = field(default_factory=dict)
+    observe_start_commits: dict[str, tuple[Event, Callable[[], None]]] = field(default_factory=dict)
     _guards: dict[tuple[str, str], tuple[asyncio.Lock, int]] = field(default_factory=dict)
 
     _finish_waiters: dict[str, set[asyncio.Event]] = field(default_factory=dict)

@@ -75,6 +75,7 @@ class TaskView:
     dag_deps: list[str] = field(default_factory=list)
     priority: int = 5
     max_retries: int = 3
+    observe_count: int = 0
     tenant_id: str = "default"
     outputs: Any = None
     error: str | None = None

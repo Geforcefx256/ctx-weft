@@ -199,6 +199,13 @@ ALM 是 Agent 状态和模型选择的唯一住所；TaskManager 应用任务处
 
 前后台 observe 共用 `ObserveRequested → ObserveStarted → ObserveCompleted → ObserveApplied`。
 
+任务的 `observe_count` 累计已启动的独立判决型 Observe（含本次及启动后失败的复核），
+前后台 `judge_task=True` 都计入，report-only 不计入。Observe 在 Started 提交前固定
+`observe_index`，确认提交后发布内存计数；同一 observe_id 的重试沿用原事件和序号。
+reducers 以 Started 序号的最大值恢复累计计数，快照保留任务计数和待恢复 Observe 的序号；
+旧快照回退日志重放，未编号 Started 从原请求判决标记重建。提示词展示本次序号，
+提醒结合进展重新评估能力范围；次数本身不是失败或停止条件。
+
 `report_observation.task_status` 使用四态：`success` / `fail` 结束任务，`continue`
 一律自动重新入队执行，`waiting` 停在 `AWAITING_HUMAN` 等待用户回复。`continue`
 不消耗运行异常重试预算，也不兼容为旧的等待语义。交互任务的纯文本回合先临时 park，

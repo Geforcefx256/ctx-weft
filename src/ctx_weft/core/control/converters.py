@@ -89,6 +89,7 @@ def task_from_projection(proj: TaskView) -> Task:
         dag_deps=list(proj.dag_deps),
         priority=proj.priority,
         max_retries=proj.max_retries,
+        observe_count=proj.observe_count,
         settings=deserialize_settings(proj.settings_raw),
         unattended=proj.unattended,
         port_key=proj.port_key,

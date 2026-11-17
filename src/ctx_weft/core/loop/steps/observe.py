@@ -201,6 +201,7 @@ class ObserveStep(Step):
         # Session-global control tools survive per-agent cache eviction.
         bound = cache.get(state.agent.id) if cache is not None else []
         extra = {"observe_boundary": boundary,
+                 "observe_index": execution.options.get("observe_index"),
                  "observe_act_turns": execution.options.get("act_turns")}
         record_ids = execution.options.get("context_record_ids")
         if record_ids is not None:
@@ -1118,14 +1119,40 @@ async def begin(state, ctx, boundary, judging):
     state.extra.pop("observe_completion", None)
     if options.get("completion"):
         state.extra["observe_completion"] = options["completion"]
-    if options.get("started"):
-        return
-    await ctx.event_bus.emit(make_event(state, EventType.OBSERVE_STARTED, {
-        "task_id": state.task.id, "agent_id": state.agent.id,
-        "observe_id": options["observe_id"], "boundary": boundary,
-        "segment_end_at": options.get("segment_end_at"), "execution_mode": mode,
-        "judge_task": judging}))
-    options["started"] = True
+    # Serialise ordinal allocation with commit publication, including concurrent
+    # foreground/background reviews of the same task. Never hold a task-manager
+    # lock while delivering events (subscribers can call back into that manager).
+    executions = StepDriver.for_context(ctx).executions
+    async with executions.task_guard(state.task.id, "observe_start"):
+        pending = executions.observe_start_commits.get(state.task.id)
+        if pending is not None:
+            # A different observer may arrive after an uncertain start. Confirm
+            # that original batch before allocating the next task ordinal.
+            event, publish = pending
+            await ctx.event_bus.emit_batch((event,), on_committed=publish)
+            executions.observe_start_commits.pop(state.task.id, None)
+        if options.get("started"):
+            return
+        get_task = getattr(ctx.task_manager, "get_task", None)
+        task = (get_task(state.task.id) if callable(get_task) else None) or state.task
+        if judging:
+            options.setdefault("observe_index", task.observe_count + 1)
+        index = options.get("observe_index")
+        event = make_event(state, EventType.OBSERVE_STARTED, {
+            "task_id": state.task.id, "agent_id": state.agent.id,
+            "observe_id": options["observe_id"], "boundary": boundary,
+            "segment_end_at": options.get("segment_end_at"), "execution_mode": mode,
+            "judge_task": judging,
+            **({"observe_index": index} if judging else {})})
+
+        def publish_started():
+            if judging:
+                task.observe_count = max(task.observe_count, index)
+            options["started"] = True
+
+        executions.observe_start_commits[state.task.id] = (event, publish_started)
+        await ctx.event_bus.emit_batch((event,), on_committed=publish_started)
+        executions.observe_start_commits.pop(state.task.id, None)
 
 
 def restore_result(completion):

@@ -42,7 +42,7 @@ def test_turn_limit_prompt_limits_verdicts_and_shows_rounds(monkeypatch, locale,
     monkeypatch.setattr(prompts, "render_purpose", partial(prompts.render_purpose, locale=locale))
     request = NS(resolved_model=model_snapshot(100000, 0), purpose="observe",
         intent=ReviewIntent(judge_task=judge_task),
-        extra={"observe_boundary": boundary, "observe_act_turns": 37},
+        extra={"observe_boundary": boundary, "observe_act_turns": 37, "observe_index": 4},
         task=Task(id="t1", session_id="s1", status="ACTIVE", user_prompt_in_memory=True),
         agent=NS(id="a1"), template=None, token_counter=len,
         session=NS(context_limit=100000, reserved_output_tokens=0))
@@ -54,6 +54,13 @@ def test_turn_limit_prompt_limits_verdicts_and_shows_rounds(monkeypatch, locale,
                    if locale == "en" else
                    "本次 `task_status` 只能填 `continue` 或 `fail`")
     assert (instruction in text) == (judge_task and boundary == "max_turns")
+    assert ("Observe review 4" in text if locale == "en" else "第 4 次 Observe 复核" in text) == judge_task
+    assert ("3 previous reviews" in text if locale == "en" else "此前已进行 3 次" in text) == judge_task
+    assert ("currently available capabilities" in text if locale == "en" else "当前可用能力范围" in text) == judge_task
+    if judge_task:
+        assert ("Do not judge failure based on the review count alone" in text if locale == "en" else
+                "不要仅凭复核次数判失败" in text)
+        assert ("concrete, feasible next step" in text if locale == "en" else "下一步可行的推进路径" in text)
     if judge_task and boundary == "max_turns":
         assert ("37 actor turns" if locale == "en" else "37 轮") in text
         assert "task_failure_reason" in text
@@ -66,11 +73,12 @@ def test_turn_limit_prompt_limits_verdicts_and_shows_rounds(monkeypatch, locale,
 async def test_same_tool_and_purpose_with_optional_judgement(monkeypatch, standalone, judge_task):
     current = state()
     before = dataclasses.asdict(current.task)
+    during_review = {**before, "observe_count": int(judge_task and not standalone)}
     calls, requests = [], []
 
     class Gateway:
         async def invoke(self, **kwargs):
-            assert dataclasses.asdict(current.task) == before
+            assert dataclasses.asdict(current.task) == during_review
             calls.append(kwargs)
             submitted = report_observation(
                 act_recap="incremental", task_summary="whole task", task_status="success",

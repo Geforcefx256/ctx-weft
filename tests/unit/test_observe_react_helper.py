@@ -23,8 +23,14 @@ class _FakeEventBus:
     async def emit(self, event) -> None:
         pass
 
+    async def emit_batch(self, events, *, on_committed=None):
+        if on_committed is not None:
+            on_committed()
+        for event in events:
+            await self.emit(event)
 
-class _RecordingEventBus:
+
+class _RecordingEventBus(_FakeEventBus):
     """Records emitted events (and their types) so tests can assert which fired."""
 
     def __init__(self):
@@ -90,6 +96,7 @@ def _make_state():
         status="RUNNING",
         observer_outcome=None,
         process_report=None,
+        observe_count=0,
     )
     scope = MemoryAddress(session_id="s1", task_id="t1", agent_id="a1")
 

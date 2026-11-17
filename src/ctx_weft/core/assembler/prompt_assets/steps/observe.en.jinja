@@ -23,6 +23,9 @@ These markers locate the source range only; they are not recap content. In `act_
 {%- endmacro %}
 
 {% macro judge(ctx) -%}
+{% if ctx.observe_index %}This is Observe review {{ ctx.observe_index }} for the current task; {{ ctx.observe_index - 1 }} previous reviews have been started.{% endif %}
+Reassess whether the task is within the currently available capabilities, considering previous attempts, actual progress and blockers. If repeated attempts cannot overcome a blocker and a required capability is clearly unavailable, report `fail` and explain why. Do not judge failure based on the review count alone.{% if not ctx.terminal_only %}If reporting `continue`, describe a concrete, feasible next step in `next_step_hint`.{% endif %}
+
 {% if ctx.terminal_only %}{% if ctx.switch_reason %}Reason for goal replacement: {{ ctx.switch_reason }}
 {% endif %}This review is terminal: assess only the OLD goal; `task_status` must be `success` or `fail`. The old task will not resume. No separate final reply is required for this switch review. Include the switch context in `task_failure_reason` when reporting failure. Leave `next_step_hint` empty.
 {% elif ctx.boundary_kind == "max_turns" %}This segment{% if ctx.act_turns %} used {{ ctx.act_turns }} actor turns and{% endif %} reached the turn limit. Allowed `task_status` values for this review are `continue` and `fail`; do not return `waiting` or `success`.
