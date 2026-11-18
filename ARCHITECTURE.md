@@ -4,6 +4,8 @@
 > SDK 调用参考见 [README.md](./README.md)，公开契约以 `src/ctx_weft/__init__.py`、`protocols/` 和对应回归测试交叉核对。
 > 文档使用模块路径和符号定位，不保存易过期的源码行号或分支名。
 
+配套图解：[模块架构与依赖图](docs/architecture-map.md)，包含编排、Step、提示词／能力及提交恢复的内部关系。
+
 ## 0. Agent 修改前必读
 
 - 先读本仓 `AGENTS.md`、本文件及待改模块的测试，再检查 `git status --short`。工作区可能包含进行中的重构；未提交文件和新增模块都是当前实现的一部分，不得用 HEAD 覆盖。
