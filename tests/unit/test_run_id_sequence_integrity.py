@@ -130,37 +130,47 @@ async def bus_after_recap_run() -> _RecapRun:
     runtime.providers.register_memory(InMemoryMemoryProvider())
 
     seen: list = []
-    orig_emit = runtime._event_bus.emit
 
-    async def _spy(ev):
+    async def collect(ev):
         seen.append(ev)
-        return await orig_emit(ev)
 
-    runtime._event_bus.emit = _spy
+    # ObserveStarted uses emit_batch so its receipt and count publish together.
+    # Observe committed delivery rather than intercepting one producer method.
+    subscription = runtime.event_bus.subscribe(None, collect)
 
-    await initialize_all(runtime)
-    handle = await runtime.start_session(SessionStartParams.create(
-        template_id="agent:tpl_echo", user_prompt="hi",
-    ))
-    state = await wait_for_park(handle, timeout=5.0)
-    assert state is not None and state.task.status == "AWAITING_HUMAN"
+    try:
+        await initialize_all(runtime)
+        handle = await runtime.start_session(SessionStartParams.create(
+            template_id="agent:tpl_echo", user_prompt="hi",
+        ))
+        state = await wait_for_park(handle, timeout=5.0)
+        assert state is not None and state.task.status == "AWAITING_HUMAN"
 
-    # background recap 与 recognize_intent 都是 fire-and-forget：wait_for_finish
-    # 只等主 run 的 RunFinished，还要等它们各自的 RunFinished 落地才算收齐。
-    await _poll(lambda: sum(1 for e in seen if e.type == EventType.RUN_FINISHED) >= 3)
+        # Wait for the actor, metadata and background observation run envelopes.
+        # Counting arbitrary RunFinished events can hide a missing producer.
+        def runs_finished():
+            starts = [e for e in seen if e.type == EventType.RUN_STARTED]
+            modes = {e.payload.get("initial_step") for e in starts}
+            finished = {e.run_id for e in seen if e.type == EventType.RUN_FINISHED}
+            return ({"prepare", "recognize_intent", "background_observe"} <= modes
+                    and {e.run_id for e in starts} <= finished)
 
-    # `TurnHandle` 不再带 `run_id`（Task 5，句柄改轴成 agent+task）——主 run 的 run_id
-    # 从事件信封里读：`_run_loop` 发 RunStarted 时把 origin 显式钉成 RUNTIME
-    # （runtime.py，`await self._event_bus.emit(make_event(..., origin=EventOrigin.RUNTIME))`），
-    # 而 recap（LOOP_BACKGROUND_OBSERVE）与 recognize_intent（LOOP_RECOGNIZE_INTENT）两条
-    # 孤儿 run 都不做这个覆盖、各自沿用自己快照的 origin。本 fixture 不触发
-    # compact_agent（唯一另一处同样显式钉 RUNTIME 的路径），故 origin=RUNTIME 在这里
-    # 无歧义地唯一指向主 run。
-    main_run_started = next(
-        e for e in seen
-        if e.type == EventType.RUN_STARTED and e.origin == EventOrigin.RUNTIME
-    )
-    return _RecapRun(events=seen, main_run_id=main_run_started.run_id)
+        await _poll(runs_finished)
+        started = [e for e in seen if e.type == EventType.OBSERVE_STARTED]
+        assert len(started) == 1
+        assert started[0].payload["execution_mode"] == "background"
+        stored = await runtime.event_store.read_range(
+            handle.session_id, include_types=(EventType.OBSERVE_STARTED,))
+        assert [row.event.id for row in stored] == [started[0].id]
+
+        main_run_started = next(
+            e for e in seen
+            if e.type == EventType.RUN_STARTED and e.origin == EventOrigin.RUNTIME
+        )
+        yield _RecapRun(events=seen, main_run_id=main_run_started.run_id)
+    finally:
+        await subscription.unsubscribe()
+        await runtime.close()
 
 
 @pytest.mark.asyncio
@@ -174,7 +184,7 @@ async def test_background_observe_does_not_reuse_main_run_sequence(bus_after_rec
         e.run_id for e in bus_after_recap_run.events
         if e.type == EventType.OBSERVE_STARTED
     }
-    assert recap_run_ids, "fixture 没有触发 background observe（TaskRecapStarted 缺失）"
+    assert recap_run_ids, "fixture 没有触发 background observe（ObserveStarted 缺失）"
     for rid in recap_run_ids:
         assert rid != bus_after_recap_run.main_run_id, (
             f"recap 复用了主 run 的 run_id: {rid}（A4 未修好）"
