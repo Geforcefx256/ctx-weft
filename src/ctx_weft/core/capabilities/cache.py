@@ -6,9 +6,8 @@
 （AgentLifecycleManager.instantiate）」，那条线早已搬去 PrepareStep，文件与注释都没跟着走
 （同批还查出 `TaskManager._session_registry` 的 docstring 也在描述一个已不存在的关系）。
 
-对象本身由 `runtime` 在装配期构造**一次**（runtime 单例，不是 per-session），跨 run 存活；
-per-agent 快照可被 `evict` 逐出，`register_global` 存的控制工具不随之逐出（那个槽既不分
-agent 也不分 session——见 `_global_by_name` 的字段注释）。
+runtime 按 (tenant_id, session_id) 注入独立缓存分区，分区跨 run 存活；
+per-agent 快照可被 `evict` 逐出，分区内 `register_global` 存的控制工具不随之逐出。
 """
 
 from __future__ import annotations
@@ -17,6 +16,7 @@ import logging
 from dataclasses import dataclass, field
 
 from ctx_weft.protocols.capability import Capability, qualify
+from ctx_weft.protocols.context import ProviderContext
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ class CapabilityCache:
 
     三个槽，按生命周期分：
       _store / _by_*     per-agent，每个 run 由 prepare 重写（put）、run 收尾逐出（evict）
-      _global_by_*       全局控制工具（不分 agent、不分 session），register_global 写入，
+      _global_by_*       当前 tenant/session 内共享的控制工具，register_global 写入，
                          不随 evict 逐出；per-agent 的模板禁用在**读的出口**裁（_globals_for）
       _pinned            per-task，运行期 pin 进来的能力，跨同 task 的多个 run 存活
 
@@ -54,9 +54,7 @@ class CapabilityCache:
     # 只要另一个不禁它的 agent 跑过一轮就会被原样补回来。per-agent 的差别一律在**出口**
     # 按 _forbidden 裁，见 _globals_for。
     #
-    # 生命周期是 **runtime**，不是 session：CapabilityCache 是 runtime 单例
-    # （`CtxWeftRuntime.__init__` 只构造一次），全局区因此跨 session 共享。今天没问题
-    # 只因为控制工具集对所有 session 一样；哪天它按 session 分化，这个槽要先分区。
+    # CapabilityCachePool 按 tenant/session 分区；本槽只在该分区内跨 agent/run 共享。
     _global_by_name: dict[str, Capability] = field(default_factory=dict)
     _global_by_qualified: dict[str, Capability] = field(default_factory=dict)
     # per-task pin 区：运行期由 provider 经 CapabilityEvent(kind="pin") 加进来的能力
@@ -127,19 +125,24 @@ class CapabilityCache:
         `forbidden_ids` 是模板声明的禁用集合，记下来供 pin() 就地过滤。
 
         **绝不碰 _pinned**：put 是每次 run 的 prepare 都跑的，同一 task 的 retry 会再跑一遍；
-        在这里清 pin 就等于「agent 每次重试都要重新发现同一批工具」。pin 的清理只有两个
-        出口：task 落终态（TaskManagerHooks.on_task_terminal）与 context_limit 退出（ActStep）。
+        在这里清 pin 就等于「agent 每次重试都要重新发现同一批工具」。pin 在 task
+        落终态或整个会话分区逐出时回收。
         """
-        if forbidden_ids is not None:
-            self._forbidden[agent_id] = set(forbidden_ids)
         seen_ids: set[str] = set()
+        seen_names: set[str] = set()
         for cap in capabilities:
-            if cap.id in seen_ids:
+            qname = qualify(cap.id)
+            if cap.id in seen_ids or qname in seen_names:
                 raise DuplicateCapabilityName(
                     f"Duplicate capability id '{cap.id}' for agent {agent_id}"
                 )
             seen_ids.add(cap.id)
+            seen_names.add(qname)
 
+        # Validate the entire replacement before changing any live index or policy.
+        self.evict(agent_id)
+        if forbidden_ids is not None:
+            self._forbidden[agent_id] = set(forbidden_ids)
         self._store[agent_id] = list(capabilities)
         for cap in capabilities:
             self._by_name[(agent_id, cap.name)] = cap          # bare: skill lookup / display
@@ -277,3 +280,20 @@ class CapabilityCache:
 
     def has_agent(self, agent_id: str) -> bool:
         return agent_id in self._store
+
+
+@dataclass
+class CapabilityCachePool:
+    """Runtime-owned tenant/session partitions; never resolve a scope by agent ID."""
+
+    _scopes: dict[tuple[str, str], CapabilityCache] = field(default_factory=dict)
+
+    def for_context(self, ctx: ProviderContext) -> CapabilityCache:
+        key = (ctx.tenant_id, ctx.session_id)
+        if key not in self._scopes:
+            self._scopes[key] = CapabilityCache()
+        return self._scopes[key]
+
+    def forget_session(self, session_id: str) -> None:
+        for key in [key for key in self._scopes if key[1] == session_id]:
+            del self._scopes[key]

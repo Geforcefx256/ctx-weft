@@ -312,7 +312,7 @@ class ContextAssembler:
         if reuse and (inputs.appended_messages or inputs.tools is not None):
             raise ValueError("only base prompt inputs can reuse compilation")
         resolved, errors = await resolve_capabilities(inputs.capabilities + (selected_tools or []), self.deps)
-        capabilities = capability_blocks(inputs.capabilities, resolved, self.deps)
+        capabilities = await capability_blocks(inputs.capabilities, resolved, self.deps)
         cached = inputs._compiled_base
         if reuse and cached is not None:
             owner, memory, cached_template, counter, prompt = cached

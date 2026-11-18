@@ -60,7 +60,6 @@ def _fake_runtime_self():
         _closing=False,
         _event_bus=_FakeBus(),
         _pending_actor_runs={},
-        _capability_cache=SimpleNamespace(evict=lambda agent_id: None),
     )
 
 
@@ -79,7 +78,7 @@ async def test_run_start_does_not_wait_for_pending_observe():
     driver.executions.register("recap-run", task.id, "observe", recap, agent_id=agent.id)
 
     await CtxWeftRuntime._run_loop(
-        _fake_runtime_self(), state, SimpleNamespace(task_manager=None), driver,
+        _fake_runtime_self(), state, SimpleNamespace(task_manager=None, capability_cache=None), driver,
         "r1", "prepare", task, agent,
     )
 
@@ -97,7 +96,7 @@ async def test_run_start_passthrough_without_pending():
     driver = _RecordingDriver(order)
 
     await CtxWeftRuntime._run_loop(
-        _fake_runtime_self(), state, SimpleNamespace(task_manager=None), driver,
+        _fake_runtime_self(), state, SimpleNamespace(task_manager=None, capability_cache=None), driver,
         "r1", "prepare", task, agent,
     )
 
@@ -122,7 +121,7 @@ async def test_run_start_unaffected_by_errored_recap():
     driver.executions.register("recap-run", task.id, "observe", recap, agent_id=agent.id)
 
     await CtxWeftRuntime._run_loop(
-        _fake_runtime_self(), state, SimpleNamespace(task_manager=None), driver,
+        _fake_runtime_self(), state, SimpleNamespace(task_manager=None, capability_cache=None), driver,
         "r1", "prepare", task, agent,
     )
 

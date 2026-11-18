@@ -254,7 +254,8 @@ class CapabilityProvider(ABC):
     name: str
     # 可选：描述本 provider 的 capability 集合能做什么、应当如何使用。
     # 内置 provider 可在定义时由用户自定义；MCP provider 用 server 的
-    # initialize.instructions 填充。装配时按 provider 分块写入 LLM prompt。
+    # initialize.instructions 填充。上下文装配读取 describe(ctx).description；
+    # 按上下文路由的 provider 应在 describe 中返回对应作用域的描述。
     description: str = ""
 
     @abstractmethod

@@ -159,6 +159,7 @@ ALM 保存 `ModelChoice(account, model, config)`，派发时解析为 `ResolvedM
 
 - 模板 identity facets（SOUL/ROLE 等）表达身份与质量原则；Jinja 表达提示词内容、顺序、调用指令和裁剪优先级；Python 负责事实、参数与机械预算。不要在 Source、Step、工具 schema 中复制另一套提示词程序。
 - 工具定义有独立预留预算，不作为普通文本任意裁掉。当前任务和工具调用/结果等受保护分组必须保持完整。
+- Runtime 通过 CapabilityCachePool 按 `(tenant_id, session_id)` 注入能力缓存；分区内保留 per-agent 快照、per-task pin 与共享控制工具。run 收尾只逐出 Agent 快照，task 终结清 pin，会话逐出回收整个分区。Provider 的集合描述通过 `describe(ctx).description` 按当前上下文读取，不从共享 `description` 属性猜作用域。
 - 已关闭任务的 full / lean 胶囊是装配时的可选视图。预算选择不等于持久折叠；真正 demotion 才修改记录。无可用摘要时保留 raw 证据，不造空胶囊。
 - 更改提示词先读 `core/assembler/prompt_assets/README.md`，同时核对 en / zh 资源及渲染、预算和协议测试。
 

@@ -39,10 +39,10 @@ def harness(**config):
     rt = runtime(store, **config)
     rt.providers.register_memory(ctx.memory)
     rt.providers.register_capability(tool)
-    rt._capability_cache = old._cache
+    rt._capability_cache._scopes[(ctx.provider_ctx.tenant_id, ctx.provider_ctx.session_id)] = old._cache
     ctx.event_bus = rt.event_bus
     ctx.task_manager._bus = rt.event_bus
-    gateway = rt._build_gateway(ctx.memory)
+    gateway = rt._build_gateway(ctx.memory, ctx.provider_ctx)
     gateway._spill_threshold = 0
     ctx.capability_gateway = gateway
     return rt, gateway, store, tool, state, ctx
@@ -193,8 +193,8 @@ async def test_receipt_recovery_does_not_repeat_external_process_side_effect(tmp
     rt = runtime(store)
     rt.providers.register_memory(memory)
     rt.providers.register_capability(tool)
-    rt._capability_cache = ctx.capability_gateway._cache
-    gateway = rt._build_gateway(memory)
+    rt._capability_cache._scopes[(ctx.provider_ctx.tenant_id, ctx.provider_ctx.session_id)] = ctx.capability_gateway._cache
+    gateway = rt._build_gateway(memory, ctx.provider_ctx)
     ctx.event_bus = rt.event_bus
     ctx.event_store = store
     original = store.append_batch

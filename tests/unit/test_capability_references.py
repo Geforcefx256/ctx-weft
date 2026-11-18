@@ -50,6 +50,30 @@ async def test_compile_lists_each_provider_once_and_uses_saved_order():
     provider.retrieve.assert_not_called()
 
 
+async def test_provider_description_uses_context_and_invalidates_compiled_base():
+    from ctx_weft.protocols.capability import CapabilityProviderInfo
+
+    inputs, state, ctx, _ = await setup()
+    provider = ctx.assembler.deps.capability_provider_index["test"]
+    provider.description = "shared description must not be used"
+    version = ["first"]
+    calls = []
+
+    async def describe(pctx):
+        calls.append((pctx.tenant_id, pctx.session_id))
+        return CapabilityProviderInfo(name="test", description=f"instructions:{pctx.tenant_id}:{version[0]}")
+
+    provider.describe = describe
+    first = await build_llm_request(ctx, state, inputs)
+    assert f"instructions:{ctx.provider_ctx.tenant_id}:first" in text(first)
+    assert provider.description not in text(first)
+    version[0] = "second"
+    second = await build_llm_request(ctx, state, inputs)
+    assert f"instructions:{ctx.provider_ctx.tenant_id}:second" in text(second)
+    assert f"instructions:{ctx.provider_ctx.tenant_id}:first" not in text(second)
+    assert calls == [(ctx.provider_ctx.tenant_id, ctx.provider_ctx.session_id)] * 2
+
+
 async def test_historical_compile_reads_current_definitions_and_skill_body():
     inputs, state, ctx, _ = await setup()
     payload = inputs.for_request([], [ref("test:read")]).to_payload()

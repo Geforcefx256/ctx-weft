@@ -22,6 +22,12 @@ class ListedCapabilities:
         self.calls += 1
         return list(self.capabilities)
 
+    async def describe(self, ctx):
+        from ctx_weft.protocols.capability import CapabilityProviderInfo
+
+        return CapabilityProviderInfo(name="test", description=self.description,
+                                      capability_count=len(self.capabilities))
+
     async def load_definition(self, name, ctx):
         return self.definitions.get(name)
 

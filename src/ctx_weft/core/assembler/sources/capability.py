@@ -70,18 +70,31 @@ async def resolve_capabilities(refs: list[dict], deps: AssemblerDeps):
     return resolved, errors
 
 
-def capability_blocks(refs, resolved, deps):
+async def provider_descriptions(names, deps):
+    """Read descriptions in the same explicit context as capability discovery."""
+    index = getattr(deps, "capability_provider_index", None) or {}
+    descriptions = {}
+    for name in dict.fromkeys(names):
+        provider = index.get(name)
+        if provider is not None:
+            info = await provider.describe(deps.provider_ctx)
+            descriptions[name] = info.description or ""
+    return descriptions
+
+
+async def capability_blocks(refs, resolved, deps):
     """Transient rendering facts, excluded from PromptContext's event payload."""
     from ctx_weft.core.assembler.context import json_value
 
+    descriptions = await provider_descriptions(
+        [ref["provider"] for ref in refs if (ref["provider"], ref["id"]) in resolved], deps)
     blocks = []
     for ref in refs:
         cap = resolved.get((ref["provider"], ref["id"]))
         if cap is not None:
-            provider = deps.capability_provider_index[ref["provider"]]
             blocks.append({"definition": json_value(cap), "metadata": {
                 "provider_name": ref["provider"],
-                "provider_description": getattr(provider, "description", ""),
+                "provider_description": descriptions.get(ref["provider"], ""),
             }})
     return blocks
 
@@ -148,14 +161,14 @@ class CapabilitySource:
 
         # ── kind="tool" → LLMTool ────────────────────────────────────────────
         # provider_name → description（live：MCP connect 后才有；deps 持有 provider 对象）
-        provider_index = getattr(deps, "capability_provider_index", None) or {}
+        descriptions = await provider_descriptions(
+            [cap.id.rsplit(":", 1)[0] for cap in capabilities], deps)
 
         def _provider_meta(cap_id: str) -> tuple[str, str]:
             # provider 名 = cap.id 去掉末段（mcp:github:create_issue → mcp:github，
             # local_skill:pdf → local_skill），与 provider.name 对齐；描述 live 读取。
             pname = cap_id.rsplit(":", 1)[0]
-            provider = provider_index.get(pname)
-            return pname, (getattr(provider, "description", "") if provider else "")
+            return pname, descriptions.get(pname, "")
 
         for cap in tools:
             qname = qualify(cap.id)

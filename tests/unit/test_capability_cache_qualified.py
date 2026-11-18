@@ -6,6 +6,7 @@ import pytest
 
 from ctx_weft.core.capabilities.cache import (
     CapabilityCache,
+    CapabilityCachePool,
     DuplicateCapabilityName,
 )
 from ctx_weft.protocols.capability import ToolCapability
@@ -33,6 +34,44 @@ def test_duplicate_cap_id_still_raises() -> None:
     cache = CapabilityCache()
     with pytest.raises(DuplicateCapabilityName):
         cache.put("agt_1", [_cap("mcp:a:search", "search"), _cap("mcp:a:search", "dup")])
+
+
+def test_replacement_removes_old_indexes_and_failed_replacement_is_atomic():
+    cache = CapabilityCache()
+    old = _cap("mcp:a:search", "search")
+    cache.put("a", [old], forbidden_ids={"mcp:a:blocked"})
+    with pytest.raises(DuplicateCapabilityName):
+        cache.put("a", [old, old], forbidden_ids=set())
+    assert cache.get_by_qualified_name("a", "mcp__a__search") is old
+    cache.pin("a", "t", [_cap("mcp:a:blocked", "blocked")])
+    assert cache.available("a", "t") == [old]
+    cache.put("a", [_cap("mcp:a:fetch", "fetch")])
+    assert cache.get_by_name("a", "search") is None
+    assert cache.get_by_qualified_name("a", "mcp__a__search") is None
+
+
+def test_same_agent_task_and_tool_names_are_isolated_by_tenant_and_session():
+    from ctx_weft.protocols import ProviderContext
+
+    pool = CapabilityCachePool()
+    contexts = [ProviderContext(session_id=sid, tenant_id=tenant)
+                for tenant, sid in (("u1:alpha", "s"), ("u2:alpha", "s"), ("u1:alpha", "other"))]
+    caches = [pool.for_context(ctx) for ctx in contexts]
+    for i, cache in enumerate(caches):
+        cap = _cap("mcp:knowledge:search", "search")
+        cap.description = str(i)
+        cache.put("a", [cap], forbidden_ids={"mcp:knowledge:denied"} if i == 0 else set())
+        cache.pin("a", "t", [_cap("mcp:knowledge:denied", "denied")])
+    assert [c.get_by_qualified_name("a", "mcp__knowledge__search").description for c in caches] == ["0", "1", "2"]
+    assert len(caches[0].available("a", "t")) == 1
+    assert len(caches[1].available("a", "t")) == 2
+    caches[1].clear_pins("t")
+    caches[0].evict("a")
+    assert len(caches[2].available("a", "t")) == 2
+    assert pool.for_context(contexts[0]) is caches[0]
+    pool.forget_session("s")
+    assert pool.for_context(contexts[0]).available("a", "t") == []
+    assert pool.for_context(contexts[2]) is caches[2]
 
 
 # ─── session 全局区（控制工具）──────────────────────────────────────────────────

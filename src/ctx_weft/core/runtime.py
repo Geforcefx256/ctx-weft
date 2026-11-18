@@ -67,7 +67,7 @@ from ctx_weft.core.loop.steps import (
 from ctx_weft.core.loop.steps.compact import CompactStep
 from ctx_weft.core.loop.steps.reconcile import ReconcileStep
 from ctx_weft.core.loop.steps.suspend import SuspendStep
-from ctx_weft.core.capabilities.cache import CapabilityCache
+from ctx_weft.core.capabilities.cache import CapabilityCachePool
 from ctx_weft.core.capabilities.control_tools import ControlCapabilityProvider
 from ctx_weft.core.orchestrator.lifecycle.agent_manager import AgentLifecycleManager
 from ctx_weft.core.orchestrator.model import ModelChoice, ResolvedModel
@@ -734,7 +734,7 @@ class CtxWeftRuntime:
         # 消费对方发出的事件（docs/events-v2.md §2.1.1，Task 12）。
 
         # Capability cache (per-session, shared across all agents in runtime)
-        self._capability_cache = CapabilityCache()
+        self._capability_cache = CapabilityCachePool()
 
         # Per-run 控制信号 registry：session_id → {task_id → RunTokens}。随派发登记、随 run
         # 注销（_SessionTaskRunner.execute）——pause/cancel 经 registry 必达全部在途 run
@@ -2310,7 +2310,7 @@ class CtxWeftRuntime:
             # task 落终态 → 两件事，见 `_on_task_terminal`。挂在终态而非 run 收尾，因为同一个
             # task 可以跑多个 run（retry/resume）：pin 要跨得过重试（run 收尾的 evict 已明确
             # 不碰 pin 区，见 CapabilityCache.evict），HITL 决定同理——重试时它还要用。
-            on_task_terminal=lambda tid, sid=session.id: self._on_task_terminal(sid, tid),
+            on_task_terminal=lambda tid, sid=session.id, tenant=session.tenant_id: self._on_task_terminal(sid, tid, tenant),
         ))
 
         self._initialized_sessions.add(session.id)
@@ -2318,7 +2318,7 @@ class CtxWeftRuntime:
         if start_tasks:
             self._spawn(task_manager.drain())
 
-    async def _on_task_terminal(self, session_id: str, task_id: str) -> None:
+    async def _on_task_terminal(self, session_id: str, task_id: str, tenant_id: str) -> None:
         """`on_task_terminal` 钩子：task 落终态时回收挂在它身上的东西。
 
         1. 清掉该 task 运行期 pin 进来的能力（`CapabilityCache`）。
@@ -2336,7 +2336,8 @@ class CtxWeftRuntime:
         best-effort：钩子在 `TaskManager.on_task_finished` 里已被 try/except 包住，这里不再
         自己吞——盖章本身也不抛（见 `HitlService.close`）。
         """
-        self._capability_cache.clear_pins(task_id)
+        self._capability_cache.for_context(ProviderContext(
+            session_id=session_id, tenant_id=tenant_id)).clear_pins(task_id)
         await self.hitl.close_resolved(session_id, task_id=task_id)
 
     def _memory_settled(self, session_id: str) -> bool:
@@ -2596,6 +2597,7 @@ class CtxWeftRuntime:
             tm.drop_round_buffer(_tid)
         self._release_round(session_id)
         self._task_managers.pop(session_id, None)
+        self._capability_cache.forget_session(session_id)
         self._loaded_sessions.discard(session_id)
         self._prepared_recoveries.pop(session_id, None)
         self._agent_lifecycle_manager.forget_session(session_id)
@@ -3223,7 +3225,7 @@ class CtxWeftRuntime:
             provider_ctx = self._build_provider_ctx(session, task, agent)
             assembler = self._build_assembler(
                 memory, provider_ctx, task_manager=task_manager)
-            gateway = self._build_gateway(memory)
+            gateway = self._build_gateway(memory, provider_ctx)
             llm = rm.client
             loop_ctx = self._build_loop_ctx(
                 assembler, llm, memory, provider_ctx, gateway, None, task_manager,
@@ -3641,7 +3643,7 @@ class CtxWeftRuntime:
             memory = self.providers.get_memory()
             provider_ctx = self._build_provider_ctx(session, task, agent)
             assembler = self._build_assembler(memory, provider_ctx)
-            gateway = self._build_gateway(memory)
+            gateway = self._build_gateway(memory, provider_ctx)
             llm = rm.client
             loop_ctx = self._build_loop_ctx(
                 assembler, llm, memory, provider_ctx, gateway, token, None,
@@ -5533,7 +5535,7 @@ class CtxWeftRuntime:
             knowledge_providers=self.providers.get_knowledge_providers(),
             template_lookup=self._template_lookup,
             provider_ctx=provider_ctx,
-            capability_cache=self._capability_cache,
+            capability_cache=self._capability_cache.for_context(provider_ctx),
             task_manager=task_manager,
             capability_provider_index={
                 p.name: p for p in self.providers.get_capability_providers()
@@ -5553,7 +5555,7 @@ class CtxWeftRuntime:
             deps=deps,
         )
 
-    def _build_gateway(self, memory: MemoryProvider) -> CapabilityGateway:
+    def _build_gateway(self, memory: MemoryProvider, provider_ctx: ProviderContext) -> CapabilityGateway:
         """本方法只在**派发时**被调（`_execute_task` / 恢复路径），不在 `__init__`——
         故此处现取 blob store 是安全的：宿主 `register_memory_blob_store()` 无论排在
         构造之前还是之后，跑到这里时都已经接上（同 `media/capability.py` 记的那个
@@ -5561,7 +5563,7 @@ class CtxWeftRuntime:
         文档化为从不抛，未注册回落 `NullMemoryBlobStore`（`can_externalize` 恒 False）。
         """
         return CapabilityGateway(
-            capability_cache=self._capability_cache,
+            capability_cache=self._capability_cache.for_context(provider_ctx),
             capability_providers=self.providers.get_capability_providers(),
             memory=memory,
             event_bus=self._event_bus,
@@ -5620,7 +5622,7 @@ class CtxWeftRuntime:
             memory=memory,
             event_bus=self._event_bus,
             provider_ctx=provider_ctx,
-            capability_cache=self._capability_cache,
+            capability_cache=self._capability_cache.for_context(provider_ctx),
             capability_providers=self.providers.get_capability_providers(),
             capability_gateway=gateway,
             cancel_token=cancel_token,
@@ -5842,7 +5844,8 @@ class CtxWeftRuntime:
                     "error_message": str(exc),
                 }, origin=EventOrigin.RUNTIME))
         finally:
-            self._capability_cache.evict(agent.id)
+            if loop_ctx.capability_cache is not None:
+                loop_ctx.capability_cache.evict(agent.id)
             canceled_event = None
             # RunCanceled describes the execution, not the task's terminal outcome.
             # Existing terminal tasks are sticky. A pending threshold failure is
@@ -5918,7 +5921,7 @@ class CtxWeftRuntime:
         provider_ctx = self._build_provider_ctx(session, task, agent)
         assembler = self._build_assembler(
             memory, provider_ctx, task_manager=task_manager)
-        gateway = self._build_gateway(memory)
+        gateway = self._build_gateway(memory, provider_ctx)
         # 这次 run 实际用的 client——调用方（AgentBinding.model / run_single_task 的
         # resolved_model）已经解好，这里不再自己解析。三样东西各归各位：选择住
         # agent record，身份/窗口住这份 ResolvedModel，都不回填进 session
