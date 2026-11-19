@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from ctx_weft.core.models.errors import UnfinishedTasksError
 from ctx_weft.protocols.events import Event, EventBus, EventOrigin, EventType
 from ctx_weft.core.models.status import TERMINAL_TASK_STATUSES
-from ctx_weft.core.utils.event import emit_event
+from ctx_weft.core.utils.event import emit_event, new_event
 from ctx_weft.core.orchestrator.lifecycle.agent_manager import AgentLifecycleManager
 from ctx_weft.core.orchestrator.model import ModelChoice
 from ctx_weft.core.orchestrator.task.manager import TaskManager
@@ -139,6 +139,30 @@ class SessionRegistry:
         st = self._states.get(session_id)
         return set(st.agent_ids) if st is not None else set()
 
+    async def prepare_container_events(self, *, session_id: str, agent_id: str,
+                                       tenant_id: str, template_id: str,
+                                       llm: ModelChoice) -> tuple[Event, Event]:
+        """Prepare a detached empty container; publish members only after commit/load."""
+        ctx = ProviderContext(session_id=session_id, tenant_id=tenant_id)
+        template = await self.agent_lifecycle_manager.template_lookup.get_template(
+            template_id, None, ctx=ctx)
+        ts = now_utc()
+        return (
+            self.creation_event(session_id=session_id, tenant_id=tenant_id,
+                                agent_id=agent_id, user_prompt="", llm=llm, timestamp=ts),
+            self.agent_lifecycle_manager.instantiation_event(
+                template=template, template_id=template.id, session_id=session_id,
+                tenant_id=tenant_id, agent_id=agent_id, llm=llm, created_at=ts),
+        )
+
+    @staticmethod
+    def creation_event(*, session_id, tenant_id, agent_id, user_prompt, llm, timestamp):
+        return new_event(EventType.SESSION_CREATED, session_id=session_id,
+                         tenant_id=tenant_id, origin=_ORIGIN, timestamp=timestamp,
+                         payload={"user_prompt": user_prompt, "root_agent_id": agent_id,
+                                  "llm_model": llm.model, "llm_account": llm.account,
+                                  "tenant_id": tenant_id})
+
     async def create_session(
         self,
         template_id: str,
@@ -234,13 +258,11 @@ class SessionRegistry:
         # 流上——宿主自己的 sessions 表一直有带索引的 cowork_id 列，建会话时就写好了，只是
         # 运行期没人读。代价是修归属得去改**历史事件**（host 的 m010 就是这么干的），而那
         # 本该是一条 UPDATE。宿主已改为直接读那一列，这里就没有读者了。
-        await self._emit(EventType.SESSION_CREATED, sid, tenant_id, timestamp=ts, payload={
-            "user_prompt": user_prompt_event_jsonable,
-            "root_agent_id": agent_id,
-            "llm_model": llm_model or "",
-            "llm_account": llm_account or "",
-            "tenant_id": tenant_id,
-        })
+        await self.event_bus.emit(self.creation_event(
+            session_id=sid, tenant_id=tenant_id, agent_id=agent_id,
+            user_prompt=user_prompt_event_jsonable,
+            llm=ModelChoice(account=llm_account or "", model=llm_model or "", config=config),
+            timestamp=ts))
         # 登记 record + 发 AgentInstantiated（root 没有 parent_agent_id，
         # AgentLifecycleManager.instantiate 内部只发这一条，不发 AgentSpawned）。
         # template=template：复用上面已经解析过的对象，全程只解析一次。

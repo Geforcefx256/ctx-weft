@@ -879,7 +879,7 @@ class AgentLifecycleManager:
             llm = parent_rec.llm if parent_agent_id is not None else ModelChoice()
 
         llm = deepcopy(llm)
-        llm_payload = serialize_call_config(llm.config)
+        serialize_call_config(llm.config)
         self._agents[agent_id] = _AgentRecord(
             session_id=session_id,
             tenant_id=tenant_id,
@@ -932,24 +932,24 @@ class AgentLifecycleManager:
         # 事件流里唯一记录「该 agent 用的哪个模板」的地方——`_rebuild_agents` 从
         # session/task 树推算 AgentView，推得出 parent/depth，推不出模板。root 与
         # 子 agent 现在共用同一条发射路径，不再分落 session_registry 与 runtime 两处。
-        await emit_event(
-            self.event_bus, EventType.AGENT_INSTANTIATED,
-            session_id=session_id,
-            tenant_id=tenant_id,
-            origin=_ORIGIN,
-            task_id=task_id,
-            agent_id=agent_id,
-            payload={
-            "template_id": routable_template_id,
-            "template_version": template.version,
-            "llm_account": llm.account,
-            "llm_model": llm.model,
-            "llm_config": llm_payload,
-            "created_at": self._agents[agent_id].created_at.isoformat(),
-            },
-        )
+        await self.event_bus.emit(self.instantiation_event(
+            template=template, template_id=routable_template_id, session_id=session_id,
+            tenant_id=tenant_id, agent_id=agent_id, task_id=task_id, llm=llm,
+            created_at=self._agents[agent_id].created_at))
 
         return agent, template
+
+    @staticmethod
+    def instantiation_event(*, template, template_id, session_id, tenant_id,
+                            agent_id, llm, created_at, task_id=None) -> Event:
+        """Build the same birth fact for immediate and atomic container creation."""
+        return new_event(
+            EventType.AGENT_INSTANTIATED, session_id=session_id, tenant_id=tenant_id,
+            origin=_ORIGIN, task_id=task_id, agent_id=agent_id, timestamp=created_at,
+            payload={"template_id": template_id, "template_version": template.version,
+                     "llm_account": llm.account, "llm_model": llm.model,
+                     "llm_config": serialize_call_config(llm.config),
+                     "created_at": created_at.isoformat()})
 
     async def set_agent_llm(
         self, agent_id: str, choice: ModelChoice, *,

@@ -15,6 +15,23 @@ T = TypeVar("T")
 
 
 @dataclass(frozen=True)
+class SessionForkResult:
+    """A committed, memory-initialized container; no task has been dispatched."""
+
+    session_id: str
+    root_agent_id: str
+    seed_id: str
+    source_session_id: str
+    response_event_id: str
+    prompt_event_id: str
+    record_count: int
+
+
+class MemorySeedConflictError(ValueError):
+    """An existing target, record or receipt disagrees with its frozen seed."""
+
+
+@dataclass(frozen=True)
 class ShutdownReport:
     """Execution quiescence and confirmed recoverability are separate guarantees."""
 

@@ -334,6 +334,7 @@ def serialize_view(view: RunStateView) -> dict[str, Any]:
         "sessions": {
             sid: {
                 "id": s.id,
+                "context_seed": deepcopy(s.context_seed),
                 # 保 ref 形态（裁定 2026-08-27）：session prompt 与 task 侧同为
                 # 状态源，拍扁会让重放后「曾有一张图」无痕。同步的 content_to_jsonable
                 # 即可——view 从事件还原，本就是 ref 形态，无 base64 可外部化，不需要
@@ -424,6 +425,7 @@ def deserialize_view(data: dict[str, Any]) -> RunStateView:
     for sid, s in data.get("sessions", {}).items():
         sessions[sid] = SessionView(
             id=s["id"],
+            context_seed=deepcopy(s.get("context_seed")),
             user_prompt=content_from_jsonable(s.get("user_prompt", "")),
             goal=s.get("goal", ""),
             root_agent_id=s.get("root_agent_id", ""),
@@ -564,7 +566,9 @@ def deserialize_view(data: dict[str, Any]) -> RunStateView:
 # v10 upgrades read task facts only; their run projection is already complete.
 # v12: task observe counts and per-observation ordinals. v10/v11 remain usable;
 # missing counts and already-started ordinals default to zero without historical replay.
-_PROJECTION_VERSION = 12
+# v13: target-owned memory seed descriptors survive both pending and applied snapshots.
+# Older versions predate seeding and remain usable for their existing sessions.
+_PROJECTION_VERSION = 13
 
 
 #: 全量重放要排掉的类型：状态快照事件本身。
@@ -703,7 +707,7 @@ def snapshot_is_usable(
         return False
     if getattr(snapshot, "last_commit_position", None) is None:
         return False
-    if getattr(snapshot, "projection_version", 1) not in (10, 11, _PROJECTION_VERSION):
+    if getattr(snapshot, "projection_version", 1) not in (10, 11, 12, _PROJECTION_VERSION):
         return False
     if snapshot.last_commit_position > head:
         return False
@@ -1152,6 +1156,32 @@ def _apply(view: RunStateView, ev: Event) -> None:
                EventType.SESSION_FINISHED):
         # Legacy envelopes remain readable, but core has no session lifecycle state.
         pass
+
+    elif t in (EventType.AGENT_MEMORY_SEED_REQUESTED, EventType.AGENT_MEMORY_SEED_APPLIED):
+        from ctx_weft.protocols.runtime import MemorySeedConflictError
+
+        sess = view.sessions.get(ev.session_id)
+        if sess is None or ev.agent_id != sess.root_agent_id or ev.tenant_id != sess.tenant_id:
+            raise MemorySeedConflictError("Seed does not belong to the session root")
+        if t == EventType.AGENT_MEMORY_SEED_REQUESTED:
+            descriptor = {key: deepcopy(p[key]) for key in (
+                "seed_id", "request_fingerprint", "manifest_hash", "record_count", "source")}
+            descriptor.update(target_agent_id=ev.agent_id, requested_event_id=ev.id,
+                              applied_event_id=None)
+            previous = sess.context_seed
+            if previous is not None:
+                if any(previous[key] != value for key, value in descriptor.items()
+                       if key != "applied_event_id"):
+                    raise MemorySeedConflictError("Conflicting memory seed request")
+            else:
+                sess.context_seed = descriptor
+        else:
+            descriptor = sess.context_seed
+            if descriptor is None or any(descriptor[key] != p[key] for key in (
+                    "seed_id", "manifest_hash", "record_count")):
+                raise MemorySeedConflictError("Memory seed acknowledgement does not match")
+            if descriptor["applied_event_id"] is None:
+                descriptor["applied_event_id"] = ev.id
 
     elif t == EventType.RECOGNIZE_INTENT_TOOL_CALL:
         goal = p.get("session_goal", "")

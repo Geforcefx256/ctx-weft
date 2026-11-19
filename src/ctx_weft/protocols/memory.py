@@ -447,6 +447,8 @@ class MemoryProvider(Protocol):
         including any associated image blobs, even after folding/supersession.
         Assistant records referenced by LLMResponseFinished must likewise remain
         addressable by ID after supersession; snapshot verification trusts these IDs.
+        Records initialized by AgentMemorySeedRequested retain the same immutable
+        ID readability for the lifetime of the target session, even after folding.
         Providers that archive folded records must keep them addressable by ID.
         Return each existing requested ID once, ordered by (timestamp, seq_no),
         retaining request order for exact ties.

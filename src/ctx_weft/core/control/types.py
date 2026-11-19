@@ -21,6 +21,8 @@ class SessionView:
     """Session 的轻量投影，从事件流 reduce 而来。"""
 
     id: str
+    # Only a descriptor; immutable seed bodies stay in the target request event.
+    context_seed: dict | None = None
     user_prompt: "str | list[ContentPart]" = ""
     # **没有 template_id**（2026-10-07）：「会话的模板」这个概念不存在。模板是 per-agent
     # 的（见 `AgentView.template_id`）——一个 session 里同时跑着不同型号的 agent 是常态。

@@ -1488,6 +1488,31 @@ except RuntimeShutdownError as exc:
 包括已有 HITL 回答但缺少原始提问、多模态输入与旧版宿主 `userprompt:<task_id>` 记录。
 严格重建遇到记忆存储错误会失败，允许重试，不应在宿主重复实现补写。
 
+## 从纯文本回复创建分支会话
+
+```python
+fork = await runtime.fork_session_from_response(
+    source_session_id="ses_source",
+    response_event_id="evt_actor_response",
+    session_id="ses_my_branch",  # 重试必须使用同一个目标 ID 和相同参数
+)
+# 创建不调用模型、不执行工具；目标 root 处于 idle，没有 Task。
+turn = await runtime.send_message(
+    fork.root_agent_id, "沿这个思路继续", session_id=fork.session_id,
+)
+```
+
+仅支持已提交、非空且不带 tool_calls 的 Act 回复，并要求对应的结构化 v1 prompt
+inputs 及其引用记录可读。旧版只有渲染文本的 prompt 不会被猜测性转换。默认采用来源
+Agent 的模板及该次调用实际使用的账号、模型和配置；可用 `template_id`、`llm_account`、
+`llm_model`、`llm_config` 显式覆盖。创建固定的目标身份后，配置修改走既有模型设置入口。
+
+复制内容为当次 prompt 保存的全部 memory 候选、内联输入及所选回复；预算裁掉的候选
+仍保留，继承结构经既有 history 规则归一。不会复制 UI/SSE 历史或原执行任务。
+返回 `SessionForkResult`；同一目标 ID 与不同请求参数冲突时抛 `MemorySeedConflictError`。
+该入口要求 `event_commit_policy="required"`。失败重试及冷重建从目标自己的持久材料
+补齐，已有或已 superseded 的记录不重复写入。目标事件侧 blob 引用应与其会话共同保留。
+
 ## 限制与约束
 
 - **单进程**：EventBus 是进程内实现，不跨进程。多进程需替换为 Redis Streams 等外部总线。

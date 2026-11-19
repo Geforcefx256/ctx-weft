@@ -41,7 +41,8 @@ _TASK_FIELDS = _fields("id", "status", "session_id", "assigned_agent_id", "creat
                        "details_complete", "observe_count")
 _TASK_FIELDS += (("settings", "use_subagent"), ("settings_raw", "use_subagent"))
 _SESSION_FIELDS = _fields("id", "root_agent_id", "tenant_id", "goal", "failure_counter",
-                          "threshold_tripped", "threshold_root_task_ids", "threshold_cancel_task_ids")
+                          "threshold_tripped", "threshold_root_task_ids", "threshold_cancel_task_ids",
+                          "context_seed")
 _AGENT_FIELDS = _fields("id", "status", "status_reason", "current_task_id", "template_id",
                         "parent_agent_id", "spawn_depth", "llm_account", "llm_model",
                         "llm_config", "created_at")
@@ -50,6 +51,9 @@ _HITL_FIELDS = _fields("id", "hitl_id", "form", "session_id", "task_id", "agent_
 _OBSERVE_FIELDS = _fields("task_id", "observe_id", "judge_task", "observe_index", "started")
 
 _PAYLOAD_FIELDS = {
+    EventType.AGENT_MEMORY_SEED_REQUESTED: _fields(
+        "seed_id", "request_fingerprint", "manifest_hash", "record_count", "source"),
+    EventType.AGENT_MEMORY_SEED_APPLIED: _fields("seed_id", "manifest_hash", "record_count"),
     EventType.SESSION_CREATED: _fields("root_agent_id", "tenant_id"),
     EventType.RECOGNIZE_INTENT_TOOL_CALL: _fields("session_goal"),
     EventType.FAILURE_THRESHOLD_HIT: _fields("root_task_ids", "cancel_task_ids"),
@@ -91,7 +95,7 @@ _PAYLOAD_FIELDS[EventType.STATE_SNAPSHOT] = (
     *tuple(("state_blob", *path) for path in _BLOB_PATHS),
 )
 STARTUP_PROJECTION = EventReadProjection(_PAYLOAD_FIELDS)
-STARTUP_SNAPSHOT_VERSION = 4
+STARTUP_SNAPSHOT_VERSION = 5
 STARTUP_SNAPSHOT_PROJECTION = EventReadProjection({EventType.STATE_SNAPSHOT: _fields(
     "cut_position", "projection_version", "chain_depth", "reason",
     "startup_state_blob", "startup_projection_version",

@@ -12,6 +12,7 @@ import ctx_weft
 def test_agent_centric_types_are_exported():
     for name in (
         "CtxWeftRuntime", "TurnHandle", "SessionStartParams",
+        "SessionForkResult", "MemorySeedConflictError",
         "AgentSummary", "AgentDetail", "CompactReceipt",
         "HitlReply", "HitlRequestView",
         "AgentNotFound", "AgentNotRunningError",

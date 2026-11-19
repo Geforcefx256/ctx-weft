@@ -252,6 +252,31 @@ memory；首字前撤销仍丢弃整批，并恢复原气泡。
 
 ## 8. 记忆、回合与收尾
 
+### 从回复创建独立会话
+
+`fork_session_from_response(source_session_id=..., response_event_id=..., session_id=...)`
+仅接受带 v1 prompt inputs 的已提交 Act 纯文本回复。目标 `session_id` 是调用方的
+持久幂等键；参数指纹不一致或目标已被其他创建命令占用时拒绝。来源查询不装填或执行。
+复制 prompt 保存的全部 memory 候选及内联输入，不重新召回当前视图、不按 token
+预算裁剪；共享 history 程序仅做继承语义归一。追加所选回复后，重新编码成目标 root
+Agent 的独立 AGENT 对话记忆，保留工具配对但不复制 Task/HITL/Observe 或 UI 历史。
+
+SessionRegistry / ALM 组装创建事实，与 `AgentMemorySeedRequested` 在一个批次提交。
+Requested 持有目标自有的不可变复制材料和事件侧 blob 引用；原会话删除不影响恢复。
+`core/memory_seed.py` 使用固定记录 ID 和 `memory.fold([], replacements)` 原子写入，
+回读核对后才提交 `AgentMemorySeedApplied`。未知提交确认原事件封套及原批次；重试
+读取已保存的计划，不重新解析来源。图片跨存储按内容核对，不要求 Provider 的 ref 稳定。
+
+reducers 仅维护 SessionView.context_seed 的轻量描述，不写 memory。v13 快照保留
+Requested/Applied 身份及摘要，不复制 seed 正文；旧 v10/v11/v12 会话快照仍可作基底。
+每会话只允许一次 root seed，因此恢复通过 `read_last_of_type` 精确取得并校验原请求，
+无需在 reducer 保存不存在于 Event 封套中的存储 position。排序及快照切面仍使用
+EventStore position。启动轻量投影保留相同描述，查询及 initialize 不触发补写。
+
+`rebuild_session` 在发布执行 owner 前核对并补齐 seed；已确认的 superseded 记录不复活。
+seed 尚未完成的快照仍可恢复，因为待办描述不会被裁掉。成功创建的是空闲容器，未派发
+任何任务；后续消息沿现有执行通路启动。未确认 seed 不允许进入执行。
+
 MemoryRecord 的 kind / scope / role 和关联 ID 是事实模型；渲染标题不是恢复协议。InMemory 与 SQL Provider 必须遵守同一归一、scope、序号、fold 和 organize 契约。
 
 用户原文、多模态 part 与工具结果通过统一路径写入。新用户回合在 provisional 窗口暂存，装配可见；确认后才写入持久 memory 和普通事件流，弃轮丢掉暂存。不能为简化 UI 提前确认，也不能把独立后台观察误归进新回合而一起丢弃。
@@ -307,6 +332,7 @@ MemoryRecord 的 kind / scope / role 和关联 ID 是事实模型；渲染标题
 | 修改范围 | 优先核对的回归测试（相对仓根） |
 | --- | --- |
 | 公开接口与分层 | `tests/unit/test_public_exports.py`、`test_runtime_public_api.py`、`test_provider_layer_boundary.py`、`test_protocols_imports.py` |
+| 回复分支、记忆初始化与幂等补写 | `tests/unit/test_session_memory_seed.py`；并核对初始化、快照及 memory conformance 回归 |
 | 初始化、查询、恢复 | `tests/unit/test_runtime_initialization_queries.py`、`test_public_session_recovery.py`、`test_session_initialization.py`；`tests/integration/test_session_lifecycle_forget_rebuild.py` |
 | 模型配置与流 | `tests/unit/test_model_call_config.py`、`test_agent_llm_replay.py`、`test_llm_stream_layering.py`、`test_llm_request_identity.py` |
 | 任务/Agent 状态 | `tests/unit/test_task_disposition.py`、`test_same_agent_serialization.py`、`test_agent_state_machine.py` |

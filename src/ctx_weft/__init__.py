@@ -32,6 +32,7 @@ from ctx_weft.protocols.events import EventStore
 from ctx_weft.protocols.hitl import HitlReply, HitlRequestView
 from ctx_weft.protocols.runtime import InitializationReport, PromptDiagnostic, QueryResult, RuntimeClosedError, RuntimeShutdownError, ShutdownReport, SessionDetail, SessionInitializationResult, SessionStateSummary
 from ctx_weft.protocols.task import TaskDetail
+from ctx_weft.protocols.runtime import SessionForkResult, MemorySeedConflictError
 from ctx_weft.providers.events import InMemoryEventStore
 
 __all__ = [
@@ -41,6 +42,8 @@ __all__ = [
     "SessionStartParams",
     "TurnHandle",
     "SessionHandle",
+    "SessionForkResult",
+    "MemorySeedConflictError",
     "InitializationReport",
     "PromptDiagnostic",
     "RuntimeClosedError",

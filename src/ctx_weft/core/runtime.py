@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 from ctx_weft.core.assembler import ContextAssembler
 from ctx_weft.core.control.reducers import read_task_view, rebuild_view, reduce_events
 from ctx_weft.core.models.config import RuntimeConfig
-from ctx_weft.protocols.runtime import PromptDiagnostic, QueryResult, RuntimeClosedError, RuntimeShutdownError, SessionDetail, ShutdownReport, SessionInitializationResult
+from ctx_weft.protocols.runtime import PromptDiagnostic, QueryResult, RuntimeClosedError, RuntimeShutdownError, SessionDetail, ShutdownReport, SessionInitializationResult, SessionForkResult
 from ctx_weft.protocols.task import TaskDetail
 from ctx_weft.core.assembler.assembler import AssemblerDeps
 from ctx_weft.core.assembler.prompts import runtime_prompt
@@ -776,6 +776,9 @@ class CtxWeftRuntime:
         self._assistant_agent_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
         self._assistant_pending: dict[tuple[str, str, str], dict[str, _PendingAssistantMemory]] = {}
         self._assistant_memory_ready: dict[tuple[str, str], tuple[MemoryProvider, int]] = {}
+        self._memory_seed_ready: dict[tuple[str, str], MemoryProvider] = {}
+        # Frozen envelopes survive cancellation/unknown receipts in this process.
+        self._fork_creations: dict[str, tuple[str, tuple[Event, ...]]] = {}
         self._session_lock_owners: dict[str, asyncio.Task] = {}
         self._loaded_sessions: set[str] = set()
         self._initialized_sessions: set[str] = set()
@@ -2018,6 +2021,64 @@ class CtxWeftRuntime:
     # ── Phase 4 full session ─────────────────────────────────────────────────
 
     @runtime_command
+    async def fork_session_from_response(
+        self, *, source_session_id: str, response_event_id: str, session_id: str,
+        template_id: str | None = None, llm_account: str | None = None,
+        llm_model: str | None = None, llm_config: ModelCallConfig | None = None,
+    ) -> "SessionForkResult":
+        """Create an idle root with the saved prompt memories and selected text reply.
+
+        session_id is the caller's durable idempotency key. No source execution is
+        loaded; retries use target-owned materials even after source deletion.
+        """
+        from ctx_weft.core.memory_seed import digest, identity, prepare_seed, fork_result
+        from ctx_weft.core.control.reducers import rebuild_view
+        from ctx_weft.protocols.llm import serialize_call_config
+        from ctx_weft.protocols.runtime import MemorySeedConflictError
+
+        if not session_id or session_id == source_session_id:
+            raise ValueError("A distinct target session_id is required")
+        if self._config.event_commit_policy != "required":
+            raise ValueError("Memory seeding requires confirmed event persistence")
+        llm_config = deepcopy(llm_config)
+        fingerprint = digest({"source_session_id": source_session_id,
+            "response_event_id": response_event_id, "template_id": template_id,
+            "llm_account": llm_account, "llm_model": llm_model,
+            "llm_config": serialize_call_config(llm_config) if llm_config is not None else None,
+            "format_version": 1})
+        if self.storage_health(session_id) is not None:
+            if not await self.recover_storage(session_id):
+                raise PersistenceUnavailableError(self.storage_health(session_id))
+        async with self._session_guard(session_id):
+            pending = self._fork_creations.get(session_id)
+            if pending is not None:
+                if pending[0] != fingerprint:
+                    raise MemorySeedConflictError("Target session has another fork request")
+                await self.event_bus.emit_batch(pending[1])
+            if not await self.event_store.committed_head(session_id):
+                events = await prepare_seed(self, source_session_id=source_session_id,
+                    response_event_id=response_event_id, session_id=session_id,
+                    agent_id=identity(session_id, "root-agent"), fingerprint=fingerprint,
+                    template_id=template_id, llm_account=llm_account,
+                    llm_model=llm_model, llm_config=llm_config)
+                self._fork_creations[session_id] = (fingerprint, events)
+                await self.event_bus.emit_batch(events)
+            view = await rebuild_view(self.event_store, session_id)
+            session = view.sessions.get(session_id)
+            if (session is None or session.context_seed is None
+                    or session.context_seed["request_fingerprint"] != fingerprint):
+                raise MemorySeedConflictError("Target session has another creation request")
+            await self._ensure_memory_seed(session)
+            await self._rebuild_session_locked(session_id, strict=True)
+            self._fork_creations.pop(session_id, None)
+            return fork_result(session)
+
+    async def _ensure_memory_seed(self, session_view) -> None:
+        from ctx_weft.core.memory_seed import restore_seed
+
+        await restore_seed(self, session_view)
+
+    @runtime_command
     async def create_session(
         self,
         *,
@@ -2575,6 +2636,7 @@ class CtxWeftRuntime:
         self.hitl_registry.forget_session(session_id)
         self._evict_session_memory(session_id)
         self._initialized_sessions.discard(session_id)
+        self._fork_creations.pop(session_id, None)
 
     def _evict_session_memory(self, session_id: str) -> None:
         """无条件把该 session 的运行时内存摘干净。`forget_session`（过判据之后）与
@@ -2600,6 +2662,9 @@ class CtxWeftRuntime:
         self._capability_cache.forget_session(session_id)
         self._loaded_sessions.discard(session_id)
         self._prepared_recoveries.pop(session_id, None)
+        for key in list(self._memory_seed_ready):
+            if key[0] == session_id:
+                self._memory_seed_ready.pop(key, None)
         self._agent_lifecycle_manager.forget_session(session_id)
         self._step_executions.pop(session_id, None)
         self._session_registry.forget_session(session_id)
@@ -2642,6 +2707,12 @@ class CtxWeftRuntime:
         from ctx_weft.core.models.errors import SessionNotFound
 
         existing = self._task_managers.get(session_id)
+        # Loaded owners also pass this guard: a failed hot seed must not be
+        # bypassed by the normal already-loaded fast return.
+        if session_id in self._fork_creations:
+            seed_view = await rebuild_view(self.event_store, session_id)
+            if session_id in seed_view.sessions:
+                await self._ensure_memory_seed(seed_view.sessions[session_id])
         if self._session_is_loaded(session_id):
             return len(self._agent_lifecycle_manager.agent_ids_of_session(session_id))
         view = await rebuild_view(self.event_store, session_id)
@@ -2649,6 +2720,7 @@ class CtxWeftRuntime:
             if strict:
                 raise SessionNotFound(session_id)
             return 0
+        await self._ensure_memory_seed(view.sessions[session_id])
         if existing is not None:
             # An owner is never replaced. Repair only missing members, not live records.
             if not existing.session.root_agent_id:
