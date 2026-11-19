@@ -292,9 +292,29 @@ class ObserveStep(Step):
                                 idle_timeout.reschedule(loop.time() + idle_seconds)
                             stream.accept_current()
             except TimeoutError as exc:
+                usage_payload = dataclasses.asdict(stream.partial_result().usage)
+                if any(value is not None for value in usage_payload.values()):
+                    await ctx.event_bus.emit_batch((make_event(
+                        state, EventType.LLM_RESPONSE_DISCARDED, payload={
+                            "request_id": req_id, "reason": "timeout", "error": str(exc),
+                            "error_code": 0, "will_retry": False,
+                            "usage": usage_payload, "usage_known": True,
+                            "llm_model": model, "llm_account": llm_account}),))
                 if idle_timeout.expired():
                     raise TimeoutError(
                         f"Observe LLM made no progress for {idle_seconds:g} seconds") from exc
+                raise
+            except asyncio.CancelledError:
+                usage_payload = dataclasses.asdict(stream.partial_result().usage)
+                if any(value is not None for value in usage_payload.values()):
+                    pause = getattr(ctx, "pause_token", None)
+                    tok = getattr(ctx, "cancel_token", None)
+                    paused = pause is not None and pause.is_paused and not (tok and tok.is_cancelled)
+                    await ctx.event_bus.emit_batch((make_event(
+                        state, EventType.LLM_RESPONSE_FINISHED, payload={
+                            "request_id": req_id, "content": "", "reasoning": "", "tool_calls": [],
+                            "usage": usage_payload, "llm_model": model, "llm_account": llm_account,
+                            "finish_reason": "paused" if paused else "cancelled", "turn": round_num}),))
                 raise
             result = stream.get_final_result()
             accumulated_text, reasoning_text = result.text, result.reasoning
@@ -313,13 +333,13 @@ class ObserveStep(Step):
                 ]
 
             # 更新 loop_guard（对齐 miniAgents _run_observer：取 actor/observer 的最大值）
-            if usage.prompt_tokens > 0:
+            if (usage.prompt_tokens or 0) > 0:
                 agent.loop_guard.context_tokens = max(
                     agent.loop_guard.context_tokens, usage.prompt_tokens
                 )
                 baseline_msg_count = sent_msg_count  # 真实刷新才前移基线（否则下轮退回整份估算）
             # 同步累加 session.token_used
-            state.session.token_used += usage.prompt_tokens + usage.completion_tokens
+            state.session.token_used += (usage.prompt_tokens or 0) + (usage.completion_tokens or 0)
 
             await ctx.event_bus.emit(make_event(
                 state, EventType.LLM_RESPONSE_FINISHED,

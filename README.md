@@ -1144,6 +1144,8 @@ class MyLLMAdapter(LLMClient):
         return len(text) // 4
 ```
 
+`LLMUsage` 的七个计数字段默认均为 `None`（未报告）；明确报告为零时传 `0`。已知值必须是非负整数。只有相关操作数全部已知时才派生 total / 未缓存输入，不把未知缓存量填零。core 只能保留适配器已经通过现有 usage chunk 报告的用量；未报告的消耗保持未知。
+
 ---
 
 ## 在测试中使用

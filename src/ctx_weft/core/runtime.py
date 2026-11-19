@@ -16,7 +16,7 @@ import inspect
 import logging
 from collections.abc import AsyncIterator, Callable
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -3250,7 +3250,8 @@ class CtxWeftRuntime:
                     _synthesize_final_outputs(state, transcript)
                     state.extra["restored_transcript"] = transcript
                     return state.extra
-            elif ev.task_id == task.id and ev.origin == EventOrigin.LOOP_ACT:
+            elif (ev.task_id == task.id and ev.origin == EventOrigin.LOOP_ACT
+                  and ev.payload.get("finish_reason") not in {"paused", "cancelled"}):
                 responses.append(ev)
         raise RuntimeError(f"Missing observe scheduling intent: {observe_id}")
 
@@ -5037,25 +5038,38 @@ class CtxWeftRuntime:
         """Track before emitting; serialize only this memory owner's final write."""
         from ctx_weft.core.loop.driver import ingest_or_stage
 
-        await self._ensure_assistant_memory(state.session)
-        if ctx.memory is not self.providers.get_memory():
-            raise RuntimeError("Assistant memory provider changed during the run")
-        key = self._assistant_key(ctx.provider_ctx, event.address)
-        after_position = self._assistant_memory_ready.get(key[:2], (ctx.memory, 0))[1]
-        async with self._assistant_agent_lock(key):
-            tm = ctx.task_manager
-            provisional = bool(tm is not None and tm.is_round_open(state.task.id))
-            entry = _PendingAssistantMemory(
-                finished, event, ctx.provider_ctx,
-                after_position, provisional=provisional)
-            self._assistant_pending.setdefault(key, {})[event.id] = entry
-            # Cancellation and uncertain receipts deliberately leave the entry.
-            await ctx.event_bus.emit(finished)
-            entry.committed = not provisional and self._config.event_commit_policy == "required"
-            await ingest_or_stage(ctx.memory, event, ctx.provider_ctx,
-                                  task_manager=tm, task_id=state.task.id)
-            if not provisional:
-                self._assistant_pending[key].pop(event.id, None)
+        entry = None
+        try:
+            await self._ensure_assistant_memory(state.session)
+            if ctx.memory is not self.providers.get_memory():
+                raise RuntimeError("Assistant memory provider changed during the run")
+            key = self._assistant_key(ctx.provider_ctx, event.address)
+            after_position = self._assistant_memory_ready.get(key[:2], (ctx.memory, 0))[1]
+            async with self._assistant_agent_lock(key):
+                tm = ctx.task_manager
+                provisional = bool(tm is not None and tm.is_round_open(state.task.id))
+                entry = _PendingAssistantMemory(
+                    finished, event, ctx.provider_ctx,
+                    after_position, provisional=provisional)
+                self._assistant_pending.setdefault(key, {})[event.id] = entry
+                # Cancellation and uncertain receipts deliberately leave the entry.
+                await ctx.event_bus.emit(finished)
+                entry.committed = not provisional and self._config.event_commit_policy == "required"
+                await ingest_or_stage(ctx.memory, event, ctx.provider_ctx,
+                                      task_manager=tm, task_id=state.task.id)
+                if not provisional:
+                    self._assistant_pending[key].pop(event.id, None)
+        except asyncio.CancelledError:
+            # Before registration no response was submitted. Retain only its
+            # usage, using the same envelope; after registration the existing
+            # pending entry owns confirmation and must never be emitted twice.
+            usage = finished.payload.get("usage", {})
+            if entry is None and any(value is not None for value in usage.values()):
+                payload = dict(finished.payload)
+                payload.pop("memory_id", None)
+                payload.update(content="", reasoning="", tool_calls=[], finish_reason="cancelled")
+                await ctx.event_bus.emit_batch((replace(finished, payload=payload),))
+            raise
 
     async def _settle_storage_assistant_memory(self, session):
         for key, entries in list(self._assistant_pending.items()):

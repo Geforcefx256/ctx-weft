@@ -30,6 +30,9 @@ class Bus:
     async def emit(self, event):
         self.events.append(event)
 
+    async def emit_batch(self, events):
+        self.events.extend(events)
+
 
 def context(client, **config):
     return SimpleNamespace(
@@ -179,7 +182,7 @@ async def test_discard_reports_observed_usage_without_a_finished_response():
             stream.accept_current()
     event = next(e for e in ctx.event_bus.events if e.type == EventType.LLM_RESPONSE_DISCARDED)
     assert event.payload["usage_known"] and event.payload["usage"]["total_tokens"] == 12
-    assert stream.get_final_result().usage.total_tokens == 0
+    assert stream.get_final_result().usage.total_tokens is None
     assert loop_state.session.token_used == 12
 
 

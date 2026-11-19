@@ -155,6 +155,8 @@ ALM 保存 `ModelChoice(account, model, config)`，派发时解析为 `ResolvedM
 
 `core/loop/llm_gateway.py` 负责请求构造、消息合法化、动态输出预算和请求自愈；`core/loop/llm_stream.py` 拥有流的收集。Adapter 只解释自己的 wire 格式，经 protocols 接入，不能把收集器搬回默认 Provider。网络自愈不能重做已执行的工具副作用；LLM outage 最终走可恢复中断，不按普通任务失败消耗原地重试预算。
 
+`LLMUsage` 的七个计数以 `None` 区分未报告，以非负整数（含零）承载有效值。流收集器按字段保留本次尝试最新已知 usage，后续未知字段不抹掉旧值，累计计数替换而不相加；不依赖正文的 accepted position，每次重试从空状态开始。已有 Discarded 承载失败尝试用量，Finished 承载完成及暂停/取消时已收到的用量；纯用量中断事件通过现有 `EventBus.emit_batch` 保留，不提交或恢复成 assistant 正文。SDK 不猜测未报告的消耗，不引入独立计量事件或账本。字段与事件语义见 `docs/events-v2.md`。
+
 ## 5. 上下文装配与提示词职责
 
 `ContextRequest` 用 purpose 选择 act / observe / compact / recognize_intent，并用匹配的 Intent 携带参数。Source 从 Memory、Knowledge、能力和模板取事实，装配成 `PromptContext`；`prompts.py` 执行 `prompt_assets/steps/*.jinja`，`PromptBuilder` 执行预算、原子分组裁剪和合法消息输出。

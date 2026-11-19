@@ -203,6 +203,60 @@ async def test_read_but_unaccepted_chunk_is_excluded_after_close(kind):
     assert stream.state._reasoning == []
 
 
+@pytest.mark.parametrize("finish", [False, True])
+async def test_unaccepted_usage_survives_without_accepting_unaccepted_content(finish):
+    from ctx_weft.protocols import LLMUsage
+
+    usage = LLMUsage(prompt_tokens=0, completion_tokens=3)
+
+    async def source():
+        yield LLMChunk(kind="token", text="accepted")
+        yield LLMChunk(kind="token", text="hidden")
+        yield LLMChunk(kind="usage", usage=usage)
+
+    stream = CollectedLLMStream(source())
+    await anext(stream)
+    stream.accept_current()
+    await anext(stream)
+    await anext(stream)
+    if finish:
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
+    await stream.aclose()
+    result = stream.partial_result()
+    assert result.text == "accepted"
+    assert result.usage.prompt_tokens == 0 and result.usage.total_tokens == 3
+    assert result.usage.cache_read_tokens is None
+    usage.completion_tokens = 100
+    assert result.usage.completion_tokens == 3
+
+
+async def test_usage_updates_keep_known_fields_and_replace_cumulative_counts():
+    from ctx_weft.protocols import LLMUsage
+
+    async def source():
+        for usage in [
+            LLMUsage(prompt_tokens=10, cache_read_tokens=2, cache_write_tokens=0),
+            LLMUsage(completion_tokens=3),
+            LLMUsage(completion_tokens=7),
+            LLMUsage(cache_read_tokens=0),
+            LLMUsage(),
+        ]:
+            yield LLMChunk(kind="usage", usage=usage)
+
+    stream = CollectedLLMStream(source())
+    async with stream:
+        async for _ in stream:
+            stream.accept_current()
+    usage = stream.get_final_result().usage
+    assert usage.prompt_tokens == 10
+    assert usage.completion_tokens == 7
+    assert usage.total_tokens == 17
+    assert usage.cache_read_tokens == 0 and usage.cache_write_tokens == 0
+    assert usage.input_tokens == 10
+    assert usage.reasoning_tokens is None
+
+
 async def test_native_raw_text_does_not_leak_past_accepted_position():
     body = b"".join(sse({"choices": [{"delta": {"content": t}}]}) for t in ["第一段", "第二段"])
     adapter = offline_adapter("openai", body)

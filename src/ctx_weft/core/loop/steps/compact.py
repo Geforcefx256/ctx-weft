@@ -291,9 +291,22 @@ async def _summarize(
         stream = ensure_collected_stream(
             stream_llm_resilient(ctx, state, llm_request, inputs=inputs)
         )
-        async with aclosing(stream):
-            async for _ in stream:
-                stream.accept_current()
+        try:
+            async with aclosing(stream):
+                async for _ in stream:
+                    stream.accept_current()
+        except asyncio.CancelledError:
+            usage_payload = dataclasses.asdict(stream.partial_result().usage)
+            if should_emit_finished and any(value is not None for value in usage_payload.values()):
+                pause = getattr(ctx, "pause_token", None)
+                tok = getattr(ctx, "cancel_token", None)
+                paused = pause is not None and pause.is_paused and not (tok and tok.is_cancelled)
+                await bus.emit_batch((make_event(
+                    state, EventType.LLM_RESPONSE_FINISHED, payload={
+                        "request_id": req_id, "content": "", "reasoning": "", "tool_calls": [],
+                        "usage": usage_payload, "llm_model": model, "llm_account": llm_account,
+                        "finish_reason": "paused" if paused else "cancelled", "turn": 0}),))
+            raise
         result = stream.get_final_result()
         if should_emit_finished:
             await bus.emit(

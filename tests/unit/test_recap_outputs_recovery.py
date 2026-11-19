@@ -50,3 +50,18 @@ async def test_missing_intent_does_not_use_unrelated_response():
     with pytest.raises(RuntimeError, match="Missing observe scheduling intent"):
         await CtxWeftRuntime._restore_observe_outputs(runtime, "session", task, {"observe_id": "missing"})
     assert task.outputs is None
+
+
+@pytest.mark.parametrize("reason", ["paused", "cancelled"])
+async def test_usage_only_completion_is_not_restored_as_actor_output(reason):
+    intent = {"observe_id": "obs"}
+    aborted = response("", summary="must not become an output")
+    aborted.event.payload.update(finish_reason=reason, usage={"prompt_tokens": 5})
+    rows = [response("actual answer"), aborted, NS(position=42, event=NS(
+        type=EventType.OBSERVE_REQUESTED, run_id="actor", payload=intent))]
+    runtime = NS(event_store=NS(read_range=AsyncMock(return_value=rows)),
+                 _historical_task_view=AsyncMock(return_value=NS(tasks={})))
+    task = NS(id="task", outputs=None)
+    extra = await CtxWeftRuntime._restore_observe_outputs(runtime, "session", task, intent)
+    assert task.outputs == "actual answer"
+    assert len(extra["restored_transcript"]) == 1

@@ -59,7 +59,7 @@ from ctx_weft.core.utils.estimate import (
     estimate_message_tokens,
 )
 from ctx_weft.protocols import LLMMessage, LLMOutageError, TextPart
-from ctx_weft.protocols.events import EventType
+from ctx_weft.protocols.events import EventType, PersistenceUnavailableError
 
 if TYPE_CHECKING:
     from ctx_weft.core.assembler.context import PromptContext
@@ -803,42 +803,54 @@ async def _stream_llm_resilient(owner, ctx, state, request, *, inputs=None,
                 finally:
                     await source.aclose()
             return  # success
-        except TimeoutError as e:
-            if first_timeout is None or not first_timeout.expired():
-                raise
-            logger.warning("LLM recovery deadline exceeded after %d attempt(s)", attempt)
-            raise LLMOutageError(
-                str(last_error) if last_error is not None else "LLM recovery deadline exceeded",
-                status_code=getattr(last_error, "status_code", 0),
-            ) from e
-        except LLMCallError as e:
-            if not getattr(e, "retriable", True) or not _is_outage(e):
-                raise  # 永久错 / 非 outage retriable → 原样抛出
-            if tok is not None:
-                tok.raise_if_cancelled()
-            last_error = e
-            if yielded_anything and midstream_deadline is None:
+        except PersistenceUnavailableError:
+            raise  # Confirm the original pending batch; never turn storage failure into LLM failure.
+        except Exception as e:
+            recovery_timeout = (isinstance(e, TimeoutError) and first_timeout is not None
+                                and first_timeout.expired())
+            retry_outage = isinstance(e, LLMCallError) and e.retriable and _is_outage(e)
+            if retry_outage and yielded_anything and midstream_deadline is None:
                 midstream_deadline = monotonic() + midstream_duration
                 deadline = midstream_deadline
             remaining = deadline - monotonic()
-            will_retry = attempt < max_attempts and remaining > 0
-            if yielded_anything:
-                usage = source.partial_result().usage
+            will_retry = retry_outage and attempt < max_attempts and remaining > 0
+            usage = source.partial_result().usage
+            usage_payload = dataclasses.asdict(usage)
+            usage_known = any(value is not None for value in usage_payload.values())
+            if usage_known or (retry_outage and yielded_anything):
                 session = getattr(state, "session", None)
-                if session is not None and hasattr(session, "token_used"):
-                    session.token_used += usage.prompt_tokens + usage.completion_tokens
+                if retry_outage and session is not None and hasattr(session, "token_used"):
+                    session.token_used += (usage.prompt_tokens or 0) + (usage.completion_tokens or 0)
                 # The finally above has closed every underlying stream before
                 # we revoke its output. Detach even if no further retry is allowed.
                 owner.discard_result()
                 if emit_stream_events:
-                    await bus.emit(make_event(state, EventType.LLM_RESPONSE_DISCARDED, payload={
-                        "request_id": request_id, "reason": InterruptReason.LLM_OUTAGE,
+                    discarded = make_event(state, EventType.LLM_RESPONSE_DISCARDED, payload={
+                        "request_id": request_id,
+                        "reason": (InterruptReason.LLM_OUTAGE if retry_outage or recovery_timeout
+                                   else "timeout" if isinstance(e, TimeoutError) else "error"),
                         "error": str(e), "error_code": getattr(e, "status_code", 0),
-                        "will_retry": will_retry, "usage": dataclasses.asdict(usage),
-                        "usage_known": usage.total_tokens > 0 or usage.prompt_tokens > 0
-                                       or usage.completion_tokens > 0,
+                        "will_retry": will_retry, "usage": usage_payload,
+                        "usage_known": usage_known,
                         "llm_model": model, "llm_account": llm_account,
-                    }))
+                    })
+                    if usage_known:
+                        # The request cost survives even if its business round
+                        # is still provisional and subsequently discarded.
+                        await bus.emit_batch((discarded,))
+                    else:
+                        await bus.emit(discarded)
+            if recovery_timeout:
+                logger.warning("LLM recovery deadline exceeded after %d attempt(s)", attempt)
+                raise LLMOutageError(
+                    str(last_error) if last_error is not None else "LLM recovery deadline exceeded",
+                    status_code=getattr(last_error, "status_code", 0),
+                ) from e
+            if not retry_outage:
+                raise  # 永久错 / 非 outage retriable / 外部超时 → 原样抛出
+            if tok is not None:
+                tok.raise_if_cancelled()
+            last_error = e
             if not will_retry:
                 logger.warning("LLM retry budget exhausted after %d attempt(s): %s", attempt, e)
                 raise LLMOutageError(

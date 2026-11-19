@@ -30,7 +30,7 @@ from ctx_weft.core.loop.llm_gateway import (
 )
 from ctx_weft.core.loop.llm_stream import ensure_collected_stream, stream_until_cancel
 from ctx_weft.protocols.capability import ToolCapability
-from ctx_weft.protocols.events import EventType
+from ctx_weft.protocols.events import EventType, PersistenceUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +130,8 @@ class RecognizeIntentStep(Step):
                              "llm_model": model, "llm_account": llm_account,
                              "finish_reason": "cancelled"}))
             raise
+        except PersistenceUnavailableError:
+            raise  # The original response event is retained by the bus for confirmation.
         except Exception as exc:
             partial = stream.partial_result()
             if getattr(exc, "retriable", False):

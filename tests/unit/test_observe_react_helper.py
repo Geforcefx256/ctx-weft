@@ -498,4 +498,4 @@ async def test_response_finished_payload_carries_usage_split(monkeypatch):
     assert u["cache_read_tokens"] == 100
     assert u["cache_write_tokens"] == 20
     assert u["input_tokens"] == 7
-    assert u["reasoning_tokens"] == 0
+    assert u["reasoning_tokens"] is None

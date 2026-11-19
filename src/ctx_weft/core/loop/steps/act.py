@@ -142,7 +142,7 @@ class ActStep(Step):
                 context_limit_hit = await _account_tokens(state, ctx, turn.usage)
                 # 仅当本轮真实刷新了 context_tokens（usage>0）才前移基线；否则保持旧值/None，
                 # 让下一轮退回整份估算（更保守），避免基线与陈旧 context_tokens 错配。
-                if turn.usage.prompt_tokens > 0:
+                if (turn.usage.prompt_tokens or 0) > 0:
                     baseline_msg_count = len(turn.messages_sent)
 
                 # 3) assistant 回合落 memory + 接回 message 历史 + 记 transcript
@@ -423,34 +423,50 @@ async def _run_llm_turn(
 
     # A stop and a chunk can arrive together. A body exception/break does not
     # close an async generator automatically; await closure before run unwind.
-    async with aclosing(_stream_until_stop(stream, ctx)) as chunks:
-        async for chunk in chunks:
-            tok = ctx.cancel_token
-            if _interrupt_pending(ctx):
-                interrupted = True
-                break
-            if tok is not None and tok.is_cancelled:
-                tok.raise_if_cancelled()
-            # Any first chunk commits the round, including a tool call with no text.
-            await commit_round(state, ctx)
-            if chunk.kind == "token":
-                ctx.run_phase.produced = True
-            stream.accept_current()
+    try:
+        async with aclosing(_stream_until_stop(stream, ctx)) as chunks:
+            async for chunk in chunks:
+                tok = ctx.cancel_token
+                if _interrupt_pending(ctx):
+                    interrupted = True
+                    break
+                if tok is not None and tok.is_cancelled:
+                    tok.raise_if_cancelled()
+                # Any first chunk commits the round, including a tool call with no text.
+                await commit_round(state, ctx)
+                if chunk.kind == "token":
+                    ctx.run_phase.produced = True
+                stream.accept_current()
 
-    result = stream.partial_result()
-    text, reasoning, usage = result.text, result.reasoning, result.usage
-    tool_calls = list(result.tool_calls)
+        result = stream.partial_result()
+        text, reasoning, usage = result.text, result.reasoning, result.usage
+        tool_calls = list(result.tool_calls)
 
-    # 流在**首个 chunk 到达之前**被停止信号掐断时，上面的循环体一次都没执行到——
-    # 判定必须补在循环之后，否则一次 TTFT 窗口里的暂停会被当成「流正常结束」。
-    if not interrupted and _interrupt_pending(ctx):
-        interrupted = True
-    tok = ctx.cancel_token
-    if tok is not None and tok.is_cancelled:
-        tok.raise_if_cancelled()
+        # A stop before the first chunk never enters the loop body.
+        if not interrupted and _interrupt_pending(ctx):
+            interrupted = True
+        tok = ctx.cancel_token
+        if tok is not None:
+            tok.raise_if_cancelled()
+    except asyncio.CancelledError:
+        usage_payload = dataclasses.asdict(stream.partial_result().usage)
+        if any(value is not None for value in usage_payload.values()):
+            await ctx.event_bus.emit_batch((make_event(
+                state, EventType.LLM_RESPONSE_FINISHED, payload={
+                    "request_id": req_id, "content": "", "reasoning": "", "tool_calls": [],
+                    "usage": usage_payload, "llm_model": model, "llm_account": llm_account,
+                    "finish_reason": "cancelled", "turn": turn_num}),))
+        raise
 
     if interrupted:
-        # ⓪ 一个 chunk 都没到就被中止 → 整轮丢弃，不 park、不留任何痕迹。
+        usage_payload = dataclasses.asdict(usage)
+        if any(value is not None for value in usage_payload.values()):
+            await ctx.event_bus.emit_batch((make_event(
+                state, EventType.LLM_RESPONSE_FINISHED, payload={
+                    "request_id": req_id, "content": "", "reasoning": "", "tool_calls": [],
+                    "usage": usage_payload, "llm_model": model, "llm_account": llm_account,
+                    "finish_reason": "paused", "turn": turn_num}),))
+        # 尚未提交的业务轮次沿既有规则丢弃；已收到的用量事实保留在上面的事件中。
         await discard_uncommitted_round(state, ctx)   # 命中则 raises RoundDiscarded
         # ② 已吐 token：把半截 assistant 文本入 memory 并标注「被用户打断」；
         # ① 已开口但本回合没吐正文（纯工具调用后被打断）：不留记录。随后 park 待用户续接。
@@ -476,7 +492,7 @@ async def _run_llm_turn(
     # 上一轮真实值，拿 floor 后的值回喂会产出 ratio≈1 的假样本，把伺服系统性拖向 1。
     base = llm_request.metadata.get(PROMPT_EST_BASE_KEY)
     est_seg = llm_request.metadata.get(PROMPT_EST_SEG_KEY)
-    if usage.prompt_tokens > 0 and est_seg is not None and base is not None:
+    if (usage.prompt_tokens or 0) > 0 and est_seg is not None and base is not None:
         ctx.llm.tokenizer.observe(est_seg, usage.prompt_tokens - base)
         # spec: tool-schema-budget——偏差留痕（SHALL）：工具面分项（指纹/估算）与实测同现，
         # 供校准与回归分析（R4「偏差可归因」）。
@@ -558,7 +574,7 @@ async def _account_tokens(state: LoopState, ctx: LoopContext, usage: LLMUsage) -
     对齐 miniAgents actor.py context_limit_hit 逻辑。
     """
     agent = state.agent
-    if usage.prompt_tokens > 0:
+    if (usage.prompt_tokens or 0) > 0:
         agent.loop_guard.context_tokens = usage.prompt_tokens
         try:
             from ctx_weft.protocols import MemoryKind, MemoryScope
@@ -575,13 +591,13 @@ async def _account_tokens(state: LoopState, ctx: LoopContext, usage: LLMUsage) -
             logger.debug("load_records count for loop_guard failed: %s", exc)
 
     # Accumulate actual usage for reporting; sessions have no token spending limit.
-    state.session.token_used += usage.prompt_tokens + usage.completion_tokens
+    state.session.token_used += (usage.prompt_tokens or 0) + (usage.completion_tokens or 0)
 
     eff = state.resolved_model.effective_input_limit
     ratio = getattr(agent.loop_config, "context_limit_stop_ratio", 0.8)
     return (
         eff > 0
-        and usage.prompt_tokens > 0
+        and (usage.prompt_tokens or 0) > 0
         and usage.prompt_tokens >= int(eff * ratio)
     )
 

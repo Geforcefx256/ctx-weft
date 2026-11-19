@@ -183,36 +183,42 @@ class LLMUsage:
       输入侧：prompt_tokens      — 本次请求的全部输入（含缓存读/写部分）
              cache_read_tokens  — 输入中命中缓存的部分
              cache_write_tokens — 输入中本次写入缓存的部分
-                                  （Anthropic cache_creation；OpenAI 系恒 0）
+                                  （如 Anthropic cache_creation）
              input_tokens       — 实际未缓存输入（全价计费部分）。
                                   ⚠ 与 prompt_tokens 的区分：prompt 是「总输入」，
                                   input 是「实际输入」；命名对齐 Anthropic API 的
                                   input_tokens（其原生口径即未缓存部分）。
       输出侧：completion_tokens  — 全部输出
              reasoning_tokens   — 输出中属于推理/thinking 的子集
-                                  （OpenAI/DeepSeek 单列；Anthropic 无单列恒 0）
-    不变式：
+    相关值已知且口径一致时的关系：
       prompt_tokens = input_tokens + cache_read_tokens + cache_write_tokens
       reasoning_tokens ≤ completion_tokens
       total_tokens = prompt_tokens + completion_tokens
-    input_tokens 未显式给出（哨兵 -1）时在 __post_init__ 按不变式自动派生
-    （异常账钳 0），保证任何构造写法下账目自洽；显式传入的值原样保留、不钳制。
+    None 表示未报告，0 表示明确报告为零。已报告的值必须是非负整数。
+    仅在全部操作数已知时派生 total_tokens / input_tokens；无法成立的输入拆分
+    保持未知，不把缺失值或负的派生结果伪装成零。显式提供的值原样保留。
     """
 
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    total_tokens: int = 0
-    cache_read_tokens: int = 0
-    cache_write_tokens: int = 0
-    input_tokens: int = -1  # 实际输入；未显式给出时自动派生
-    reasoning_tokens: int = 0
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    input_tokens: int | None = None
+    reasoning_tokens: int | None = None
 
     def __post_init__(self) -> None:
-        if self.input_tokens < 0:
-            self.input_tokens = max(
-                0,
-                self.prompt_tokens - self.cache_read_tokens - self.cache_write_tokens,
-            )
+        for name, value in asdict(self).items():
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(f"{name} must be a non-negative integer or None")
+        if (self.total_tokens is None and self.prompt_tokens is not None
+                and self.completion_tokens is not None):
+            self.total_tokens = self.prompt_tokens + self.completion_tokens
+        if (self.input_tokens is None and self.prompt_tokens is not None
+                and self.cache_read_tokens is not None and self.cache_write_tokens is not None):
+            uncached = self.prompt_tokens - self.cache_read_tokens - self.cache_write_tokens
+            if uncached >= 0:
+                self.input_tokens = uncached
 
 
 # ── Request / 流式 chunk ──────────────────────────────────────────────────────

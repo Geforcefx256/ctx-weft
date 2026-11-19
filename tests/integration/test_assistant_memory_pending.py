@@ -164,6 +164,7 @@ async def test_cancelled_writer_leaves_pending_for_the_next_checkpoint(monkeypat
     values = turn(runtime, memory)
     entered = asyncio.Event()
     real = memory.ingest
+    values[2].payload["usage"] = {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
 
     async def blocked(*args):
         entered.set()
@@ -179,6 +180,49 @@ async def test_cancelled_writer_leaves_pending_for_the_next_checkpoint(monkeypat
     monkeypatch.setattr(memory, "ingest", real)
     async with runtime._assistant_memory_checkpoint(SESSION, values[0].scope):
         assert await memory.read_records([values[3].id], values[1].provider_ctx)
+    responses = [row.event for row in await runtime.event_store.read_range(SESSION.id)
+                 if row.event.type == EventType.LLM_RESPONSE_FINISHED]
+    assert len(responses) == 1 and responses[0].id == values[2].id
+    assert responses[0].payload["usage"]["total_tokens"] == 5
+
+
+@pytest.mark.parametrize("stage", ["initialization", "agent_lock"])
+async def test_cancel_before_assistant_event_registration_keeps_only_usage(monkeypatch, stage):
+    runtime, memory = setup()
+    await runtime._ensure_assistant_memory(SESSION)
+    state, ctx, finished, event = turn(runtime, memory)
+    finished.payload["usage"] = {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
+    entered = asyncio.Event()
+    if stage == "initialization":
+        async def blocked(*args):
+            entered.set()
+            await asyncio.Event().wait()
+        monkeypatch.setattr(runtime, "_ensure_assistant_memory", blocked)
+    lock = runtime._assistant_agent_lock(runtime._assistant_key(ctx.provider_ctx, event.address))
+    if stage == "agent_lock":
+        await lock.acquire()
+    try:
+        writer = asyncio.create_task(runtime._persist_assistant_turn(state, ctx, finished, event))
+        if stage == "initialization":
+            await asyncio.wait_for(entered.wait(), 1)
+        else:
+            await asyncio.sleep(0)
+        assert not writer.done()
+        writer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(writer, 1)
+        responses = [row.event for row in await runtime.event_store.read_range(SESSION.id)
+                     if row.event.type == EventType.LLM_RESPONSE_FINISHED]
+        response, = responses
+        assert response.id == finished.id
+        assert response.payload["usage"]["total_tokens"] == 5
+        assert response.payload["finish_reason"] == "cancelled"
+        assert response.payload["content"] == "" and not response.payload.get("memory_id")
+        assert await memory.read_records([event.id], ctx.provider_ctx) == []
+        assert not any(runtime._assistant_pending.values())
+    finally:
+        if stage == "agent_lock":
+            lock.release()
 
 
 @pytest.mark.asyncio

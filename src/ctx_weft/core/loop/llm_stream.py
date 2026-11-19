@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 
 from ctx_weft.protocols.llm import (
@@ -29,7 +29,6 @@ class _Position:
     text: int = 0
     reasoning: int = 0
     tools: int = 0
-    usage: LLMUsage | None = None
     finish_reason: str | None = None
 
 
@@ -42,6 +41,7 @@ class StreamState:
         self._extensions: dict[str, Any] = {}
         self._reasoning: list[tuple[int | None, str]] = []
         self._tools: list[ToolCall] = []
+        self._usage = LLMUsage()
         self._delivered = _Position()
         self._accepted = _Position()
         self._final: LLMStreamResult | None = None
@@ -57,11 +57,10 @@ class StreamState:
 
     def record(self, chunk: LLMChunk) -> None:
         p = self._delivered
-        text, reasoning, tools, usage, finish = (
+        text, reasoning, tools, finish = (
             p.text,
             p.reasoning,
             p.tools,
-            p.usage,
             p.finish_reason,
         )
         if chunk.kind == "token":
@@ -79,10 +78,28 @@ class StreamState:
             self._tools.append(chunk.tool_call)
             tools += 1
         elif chunk.kind == "usage" and chunk.usage is not None:
-            usage = chunk.usage
+            # Usage is an already-received request fact, independent of whether
+            # the business consumer accepts the current output position.
+            reported = {name: value for name, value in asdict(chunk.usage).items()
+                        if value is not None}
+            values = asdict(self._usage)
+            # Counters are cumulative within an attempt: replace known values,
+            # never add snapshots or erase a known value with an absent field.
+            # Re-derive dependent counts only when their operands change and
+            # are all known; LLMUsage remains the owner of the arithmetic.
+            for target, operands in (
+                ("total_tokens", ("prompt_tokens", "completion_tokens")),
+                ("input_tokens", ("prompt_tokens", "cache_read_tokens", "cache_write_tokens")),
+            ):
+                if (target not in reported
+                        and any(name in reported and reported[name] != values[name] for name in operands)
+                        and all(reported.get(name, values[name]) is not None for name in operands)):
+                    values[target] = None
+            values.update(reported)
+            self._usage = LLMUsage(**values)
         if getattr(chunk, "finish_reason", None) is not None:
             finish = chunk.finish_reason
-        self._delivered = _Position(text, reasoning, tools, usage, finish)
+        self._delivered = _Position(text, reasoning, tools, finish)
 
     def accept_current(self) -> None:
         self._accepted = self._delivered
@@ -118,7 +135,7 @@ class StreamState:
             text=visible[: position.text],
             reasoning=reasoning_text,
             tool_calls=tools,
-            usage=position.usage or LLMUsage(),
+            usage=replace(self._usage),
             finish_reason=position.finish_reason,
             provider_state=provider_state,
         )
@@ -135,7 +152,7 @@ class StreamState:
                 text=full.text[: p.text],
                 reasoning=full.reasoning[: p.reasoning],
                 tool_calls=full.tool_calls[: p.tools],
-                usage=p.usage or LLMUsage(),
+                usage=full.usage,
                 finish_reason=p.finish_reason,
             )
         return self._result(self._accepted)

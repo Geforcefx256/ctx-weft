@@ -570,13 +570,15 @@ TM 区分前两者靠的是 **task 状态**，那本来就是它自己的领域�
 | `LLMPromptSent` | `request_id` `turn`/`round` `system` `messages:[{role, content}]` `tool_names` | 完整 prompt，供调试。`content` 经 `redact_content_for_event` 变成**带截断的预览串，不可回读** |
 | `LLMTokenStreamed` ⚡ | `request_id` `delta` | 正文 token delta |
 | `LLMReasoningStreamed` ⚡ | `request_id` `delta` | extended thinking delta |
-| `LLMResponseFinished` | `request_id` `memory_id?` `content` `reasoning` `tool_calls:[{id,name,arguments}]` `usage` `llm_model` `llm_account` `finish_reason` `turn`/`round` | 本轮完整结果。act 的 `memory_id` 指向该 assistant 回合的预铸 memory 记录 ID；不直接保存消息的调用及旧事件可缺省。`llm_model`/`llm_account` 是**实际用的**那个（host 计账按此，不受切换竞态影响） |
-| `LLMResponseDiscarded` | `request_id` `reason` `error_code` `error` `will_retry` `usage` `usage_known` `llm_model` `llm_account` | 中途 outage 的生成作废；旧流已关闭。消费方清空此 request 的临时正文/思考，下一段从空状态开始。无正文和工具声明，不摄入 memory；已知 usage 是实际消耗，未知不推算 |
+| `LLMResponseFinished` | `request_id` `memory_id?` `content` `reasoning` `tool_calls:[{id,name,arguments}]` `usage` `llm_model` `llm_account` `finish_reason` `turn`/`round` | 正常完成承载本轮完整结果；Act/Observe/Compact 暂停/取消且已有用量时，`finish_reason=paused/cancelled` 仅保留用量，正文、思考与工具声明为空，不带 `memory_id`。RecognizeIntent 沿用原有部分结果收尾。act 正常完成的 `memory_id` 指向 assistant 回合记录；不直接保存消息的调用及旧事件可缺省。`llm_model`/`llm_account` 为实际调用值 |
+| `LLMResponseDiscarded` | `request_id` `reason` `error_code` `error` `will_retry` `usage` `usage_known` `llm_model` `llm_account` | outage 作废生成，或调用失败/超时且已有用量；旧流已关闭。消费方清空此 request 的临时正文/思考，下一段从空状态开始。无正文和工具声明，不摄入 memory；已知 usage 是实际消耗，未知不推算 |
 | `LLMRetryTriggered` ⚡ | `request_id` `attempt` `max_attempts` `next_delay_sec` `error_code` `error` | outage 类故障退避重试。中途故障先发 `LLMResponseDiscarded`。所有重试共用 request_id，没有 attempt_id；`attempt` 仅为次数预算/进度 |
 
 流式恢复：`LLMRequestStarted`/`LLMPromptSent` 每次逻辑调用只发一次。重试严格串行，旧流关闭并解除结果引用后才发废弃事件，再退避并创建全新累积状态。失败正文、思考、工具参数和 provider_state 不传入下一次请求，不写入业务 memory、不执行工具。正常结果仍由调用方发一次 `LLMResponseFinished`。次数共用 `llm_self_heal_max_attempts`；首次中途断流另启 `llm_midstream_recovery_max_duration_sec` 窗口，后续不刷新，只限制下一次首包等待和退避，不中断正常持续输出。预算耗尽沿原有 LLM outage 路径进入 INTERRUPTED。会话用户输入/HITL 的提交不随生成废弃回滚。
 
-`LLMResponseFinished.memory_id` 与 `MemoryRecord.id` 相等；再按该回复事件的 `request_id` 关联 `LLMPromptSent`，即可串起 memory、回复与生成它的 prompt。memory metadata 不额外保存 `request_id`。回复事件先于 memory 写入发出，缺失时由 Runtime 从事件幂等补写；正常写入和补写共用 assistant 记录构造逻辑，并使用事件时间。事件中没有的 `raw_tool_call_id` 不猜测补造，已有内部工具调用 ID 保持原样。用户打断保存的半截回复没有此 finished 事件，沿用原有行为。
+`usage` 的七个计数字段均为非负整数或 `null`：`null` 表示未报告，`0` 表示明确报告为零。仅在操作数全部已知时派生 total / 未缓存输入；不把缺失值填零。已有 `usage_known` 表示至少一个字段已知，包括明确的零。同一尝试按字段保留最新已知值：后续 null 不抹掉旧值，明确的 0 可以覆盖旧值；累计计数替换而不相加。相关操作数更新且齐全时重新派生 total / 未缓存输入，显式上报的对应值优先。重试不继承这些值。已收到的 usage 不受正文接收位置影响；失败尝试由 Discarded 承载后解除结果引用，后续重试和 Finished 不重复携带这份用量。没有收到任何用量时不会为了暂停/取消新增 Finished。中断用量事件走现有 `emit_batch`，不随未提交业务轮次一起撤销，不提交该轮正文或用户输入。恢复输出时忽略 `finish_reason=paused/cancelled` 的用量事件。正常 Act 完成后，若在等待记忆初始化/写锁时被取消且尚未登记原回复，则以原事件 ID 保留纯用量；原回复一旦登记，继续由既有 pending/batch 确认，不另发一份用量。存储失败不转成模型失败，不另造完成事件。
+
+`LLMResponseFinished.memory_id` 与 `MemoryRecord.id` 相等；再按该回复事件的 `request_id` 关联 `LLMPromptSent`，即可串起 memory、回复与生成它的 prompt。memory metadata 不额外保存 `request_id`。回复事件先于 memory 写入发出，缺失时由 Runtime 从事件幂等补写；正常写入和补写共用 assistant 记录构造逻辑，并使用事件时间。事件中没有的 `raw_tool_call_id` 不猜测补造，已有内部工具调用 ID 保持原样。用户打断保存的半截回复不关联上述用量事件，沿用原有 memory 行为。
 
 `StateSnapshot.payload.assistant_memory_verified_position` 是独立的 assistant memory 核对水位 P；显式为 0 或非法值时从 0 检查。兼容例外：可用旧快照完全缺少此字段时，以其 `cut_position` 作为迁移基线，跳过切面之前的历史 memory 核对；这部分旧缺口不追补。存在水位字段的新快照始终按该字段核对，不能用更大的状态切面或已裁剪的 task 集合跳过 assistant 补写。写快照时按固定 C、分批检查 `(P, C]` 内 finished 的 memory ID（包含已 superseded 记录）：全部存在则推进到 C，发现首个缺失位置 Q 则只推进到 Q-1；读取失败保留原水位。快照只核对，不执行补写。未接 memory provider 的快照写入方不能自行推进水位。
 
