@@ -1502,16 +1502,21 @@ turn = await runtime.send_message(
 )
 ```
 
-仅支持已提交、非空且不带 tool_calls 的 Act 回复，并要求对应的结构化 v1 prompt
-inputs 及其引用记录可读。旧版只有渲染文本的 prompt 不会被猜测性转换。默认采用来源
+仅支持已提交、非空且不带 tool_calls 的 Act 回复，并要求对应 ObserveApplied 已提交
+固定 fork checkpoint。在此之前调用会抛 `ForkCheckpointUnavailableError`，不等待 Observe，
+也不创建目标会话；checkpoint 就绪后可用相同参数重试。旧回复缺少明确绑定或 checkpoint
+时不可分支，不根据“最后一次 Observe”猜测关联。默认采用来源
 Agent 的模板及该次调用实际使用的账号、模型和配置；可用 `template_id`、`llm_account`、
 `llm_model`、`llm_config` 显式覆盖。创建固定的目标身份后，配置修改走既有模型设置入口。
 
-复制内容为当次 prompt 保存的全部 memory 候选、内联输入及所选回复；预算裁掉的候选
-仍保留，继承结构经既有 history 规则归一。不会复制 UI/SSE 历史或原执行任务。
+复制内容为固定 checkpoint 引用的 AGENT scope 记忆及所选回复，不复制 TASK scope
+正文、段摘要或内联任务输入。保留 SUMMARY / CONVERSATION_TURN 类型及历史分组，
+复制不经过 prompt 的预算裁剪或 history 渲染。所选回复已有 final_reply 时不重复追加。
+不会复制 UI/SSE 历史或原执行任务；创建完成后只有空闲 root Agent。
 返回 `SessionForkResult`；同一目标 ID 与不同请求参数冲突时抛 `MemorySeedConflictError`。
 该入口要求 `event_commit_policy="required"`。失败重试及冷重建从目标自己的持久材料
 补齐，已有或已 superseded 的记录不重复写入。目标事件侧 blob 引用应与其会话共同保留。
+已创建的 v1 分支仍按原持久计划恢复；新创建采用保留 memory 类型的 v2 计划。
 
 ## 限制与约束
 

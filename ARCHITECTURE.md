@@ -1,6 +1,6 @@
 # ctx-weft 内部架构与改动边界
 
-> 核对日期：2026-11-16。本文描述当前工作区实现，供维护引擎与后续 agent 定位职责。
+> 核对日期：2026-11-19。本文描述当前工作区实现，供维护引擎与后续 agent 定位职责。
 > SDK 调用参考见 [README.md](./README.md)，公开契约以 `src/ctx_weft/__init__.py`、`protocols/` 和对应回归测试交叉核对。
 > 文档使用模块路径和符号定位，不保存易过期的源码行号或分支名。
 
@@ -255,11 +255,26 @@ memory；首字前撤销仍丢弃整批，并恢复原气泡。
 ### 从回复创建独立会话
 
 `fork_session_from_response(source_session_id=..., response_event_id=..., session_id=...)`
-仅接受带 v1 prompt inputs 的已提交 Act 纯文本回复。目标 `session_id` 是调用方的
-持久幂等键；参数指纹不一致或目标已被其他创建命令占用时拒绝。来源查询不装填或执行。
-复制 prompt 保存的全部 memory 候选及内联输入，不重新召回当前视图、不按 token
-预算裁剪；共享 history 程序仅做继承语义归一。追加所选回复后，重新编码成目标 root
-Agent 的独立 AGENT 对话记忆，保留工具配对但不复制 Task/HITL/Observe 或 UI 历史。
+仅接受已提交且具备 ObserveApplied fork checkpoint 的 Act 纯文本回复。尚未绑定
+Observe、只有 Completed/Prepared 或旧日志缺 checkpoint 时抛公开的
+`ForkCheckpointUnavailableError`，不等待、不装填来源、不创建目标。目标 `session_id`
+是调用方的持久幂等键；参数指纹不一致或目标已被其他创建命令占用时拒绝。
+
+Act 显式传递 `reply_anchor={response_event_id,response_memory_id}`；普通路径存入
+ObserveRequested，park 路径存入 HitlOpened.observe_request。请求同时固定 AGENT 输入
+ID。前台暂停交接将 anchor 和 replaces_observe_id 交给新的 recap 请求；旧 Applied 只
+退休旧判断，不开放分支。pending_observe、完整快照和启动轻量投影保留这些关联。
+
+`core/fork_checkpoint.py` 在移交下一轮前，将请求时的 AGENT 输入与本 Observe 明确
+拥有的 AGENT 写入及分组成员合并，持久化 ReplyForkCheckpointPrepared。后来的 Agent
+写入不会混进旧回复。前后台均仅在 ObserveApplied 提交时通过其 fork_checkpoint 字段
+开放这份固定 ID 集；Prepared/Applied 使用稳定封套，冷恢复不重新选择当前视图。
+短段免折或报告为空可以保留原 AGENT 记忆，不编造摘要。TASK 段摘要和原始工具过程均
+不转入分支；所选回复显式补入，已有 final_reply 时去重。
+
+只复制 checkpoint 引用的 AGENT 记录，保留 kind、role、历史任务关系和胶囊元数据；
+重映射记录、工具配对及历史分组 ID。目标没有 TASK 正文，因此保留策略不再声称原始
+正文仍存在。复制不经过 history 渲染，不复制 Task/HITL/Observe 执行对象或 UI 历史。
 
 SessionRegistry / ALM 组装创建事实，与 `AgentMemorySeedRequested` 在一个批次提交。
 Requested 持有目标自有的不可变复制材料和事件侧 blob 引用；原会话删除不影响恢复。
@@ -267,8 +282,10 @@ Requested 持有目标自有的不可变复制材料和事件侧 blob 引用；�
 回读核对后才提交 `AgentMemorySeedApplied`。未知提交确认原事件封套及原批次；重试
 读取已保存的计划，不重新解析来源。图片跨存储按内容核对，不要求 Provider 的 ref 稳定。
 
-reducers 仅维护 SessionView.context_seed 的轻量描述，不写 memory。v13 快照保留
-Requested/Applied 身份及摘要，不复制 seed 正文；旧 v10/v11/v12 会话快照仍可作基底。
+reducers 仅维护 SessionView.context_seed 和 pending_observe 的描述，不写 memory。
+v14 快照保留待发布 checkpoint 和 reply_anchor；已发布 checkpoint 保存在 Applied
+事件，不新增无界快照索引。旧 v10/v11/v12/v13 会话快照仍可作基底。新 seed 使用 v2
+载荷保存原 kind；已有 v1 seed 沿原指纹和材料恢复，不重新解释其历史或读取来源。
 每会话只允许一次 root seed，因此恢复通过 `read_last_of_type` 精确取得并校验原请求，
 无需在 reducer 保存不存在于 Event 封套中的存储 position。排序及快照切面仍使用
 EventStore position。启动轻量投影保留相同描述，查询及 initialize 不触发补写。
@@ -332,7 +349,7 @@ MemoryRecord 的 kind / scope / role 和关联 ID 是事实模型；渲染标题
 | 修改范围 | 优先核对的回归测试（相对仓根） |
 | --- | --- |
 | 公开接口与分层 | `tests/unit/test_public_exports.py`、`test_runtime_public_api.py`、`test_provider_layer_boundary.py`、`test_protocols_imports.py` |
-| 回复分支、记忆初始化与幂等补写 | `tests/unit/test_session_memory_seed.py`；并核对初始化、快照及 memory conformance 回归 |
+| 回复分支、记忆初始化与幂等补写 | `tests/unit/test_session_memory_seed.py`、`tests/integration/test_reply_fork_checkpoint.py`；并核对 Observe、暂停交接、初始化、快照及 memory conformance 回归 |
 | 初始化、查询、恢复 | `tests/unit/test_runtime_initialization_queries.py`、`test_public_session_recovery.py`、`test_session_initialization.py`；`tests/integration/test_session_lifecycle_forget_rebuild.py` |
 | 模型配置与流 | `tests/unit/test_model_call_config.py`、`test_agent_llm_replay.py`、`test_llm_stream_layering.py`、`test_llm_request_identity.py` |
 | 任务/Agent 状态 | `tests/unit/test_task_disposition.py`、`test_same_agent_serialization.py`、`test_agent_state_machine.py` |

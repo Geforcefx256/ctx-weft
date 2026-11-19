@@ -134,7 +134,7 @@ from ctx_weft.protocols.memory import (
     load_records,
 )
 from ctx_weft.protocols.agent import AgentState
-from ctx_weft.protocols.runtime import InitializationReport, QueryResult, SessionDetail, SessionInitializationResult, SessionStateSummary, SessionForkResult, MemorySeedConflictError
+from ctx_weft.protocols.runtime import InitializationReport, QueryResult, SessionDetail, SessionInitializationResult, SessionStateSummary, SessionForkResult, MemorySeedConflictError, ForkCheckpointUnavailableError
 from ctx_weft.protocols.task import TaskDetail
 from ctx_weft.protocols.template import (
     AgentTemplate,
@@ -274,4 +274,4 @@ from ctx_weft.protocols.runtime import (
 )
 
 __all__ += ["PromptDiagnostic", "RuntimeClosedError", "RuntimeShutdownError", "ShutdownReport",
-            "SessionForkResult", "MemorySeedConflictError"]
+            "SessionForkResult", "MemorySeedConflictError", "ForkCheckpointUnavailableError"]

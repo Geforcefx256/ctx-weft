@@ -60,6 +60,7 @@ class RunOutcome:
     observe_id: str = ""
     observe_disposition: dict | None = None
     observe_report_pending: bool = False
+    fork_checkpoint: dict | None = None
     spawn_titles: tuple[str, ...] = ()   # SUSPENDED_ON_CHILDREN
 
 

@@ -92,6 +92,14 @@ async def test_observe_pause_closes_stream_and_replaces_prompt(tmp_path, short, 
             assert completed.event.payload["accepted"] is False
             assert opened.event.payload["observe_request"]["judge_task"] is False
             assert opened.event.payload["observe_request"]["boundary"] == "interrupt"
+            anchor = old_request.event.payload["reply_anchor"]
+            handoff = opened.event.payload["observe_request"]
+            assert handoff["reply_anchor"] == anchor
+            assert handoff["replaces_observe_id"] == old_id
+            assert "fork_checkpoint" not in applied.event.payload
+            recap_applied, = [r for r in rows if r.event.type == "ObserveApplied"
+                              and r.event.payload["observe_id"] == handoff["observe_id"]]
+            assert recap_applied.event.payload["fork_checkpoint"]["reply_anchor"] == anchor
             if cold:
                 # Rebuild twice before input: no duplicate judgement/report or slots.
                 llm = _FinishEveryTaskLLM()

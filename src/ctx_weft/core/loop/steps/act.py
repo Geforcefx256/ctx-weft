@@ -110,6 +110,7 @@ class ActStep(Step):
         # `_mechanical_verdict` 空 transcript → fail、background_observe 的 total_turns）。
         transcript: list[TurnRecord] = list(state.transcript)
         exit_reason = "normal"
+        reply_anchor = None
 
         # 运行时态势 guidance（任务树/已完成子任务/收尾提醒）已随装配管线注入
         # （PrepareStep → GuidanceSource → composer 末条 user 尾部），此处不再修饰。
@@ -167,7 +168,11 @@ class ActStep(Step):
                 # 把一次正常收尾误报成机械退出，经 observe 强制改判 retry、白吃一次重试预算。
                 if not turn.tool_calls:
                     transcript.append(turn_record)
-                    await _finish_plain_text_turn(state, ctx, turn_num, transcript)
+                    reply_anchor = ({"response_event_id": getattr(turn, "response_event_id", ""),
+                                     "response_memory_id": persisted_turn.record_id}
+                                    if turn.text.strip() and getattr(turn, "response_event_id", "") else None)
+                    await _finish_plain_text_turn(state, ctx, turn_num, transcript,
+                                                  reply_anchor=reply_anchor)
                     break
 
                 compact_options = _predispatch_compact_options(state, turn.tool_calls, turn.usage)
@@ -278,7 +283,8 @@ class ActStep(Step):
 
         return StepOutcome(
             next_step=next_step,
-            next_step_options=({"boundary": exit_reason, "judge_task": True}
+            next_step_options=({"boundary": exit_reason, "judge_task": True,
+                                **({"reply_anchor": reply_anchor} if reply_anchor else {})}
                                if next_step == "observe" else {}),
             state_patch={
                 "transcript": transcript,
@@ -379,6 +385,7 @@ class _LLMTurnOutput:
     # 摄入锚（预铸的 assistant 记录 id，ingest 按 MemoryEvent.id 采纳）与铸造伴随。
     # tool_calls 内的 id 已是内部标识；minted 保留原始 wire id / ordinal 供落库伴随字段。
     anchor: str = ""
+    response_event_id: str = ""
     minted: list[MintedCall] = dataclasses.field(default_factory=list)
     provider_state: dict[str, Any] = dataclasses.field(default_factory=dict)
     messages_sent: list[LLMMessage] = dataclasses.field(default_factory=list)
@@ -506,6 +513,7 @@ async def _run_llm_turn(
 
     return _LLMTurnOutput(
         text=text, reasoning=reasoning, tool_calls=tool_calls, usage=usage,
+        response_event_id=finished.id,
         anchor=anchor, minted=minted, provider_state=result.provider_state,
         messages_sent=llm_request.messages, memory_timestamp=finished.timestamp,
         persisted_turn=persisted_turn)
@@ -793,6 +801,7 @@ def _synthesize_final_outputs(state: LoopState, transcript: list) -> None:
 
 async def _finish_plain_text_turn(
     state: LoopState, ctx: LoopContext, turn_num: int, transcript: list,
+    *, reply_anchor=None,
 ) -> None:
     """纯文本回合（无 tool call）收尾。
 
@@ -819,7 +828,7 @@ async def _finish_plain_text_turn(
         and not state.task.unattended
         and ctx.hitl is not None
     ):
-        await _park_await_user(state, ctx, turn_num)
+        await _park_await_user(state, ctx, turn_num, reply_anchor=reply_anchor)
     await ctx.event_bus.emit(make_event(state, EventType.ACT_TURN_COMPLETED, payload={
         "turn": turn_num, "reason": "stop"}))
 
@@ -967,6 +976,7 @@ async def _cold_park(
     observe_boundary: str | None = None, await_user_turn: int | None = None,
     preceding_events: tuple = (),
     replace_user_turn_id: str = "",
+    reply_anchor=None, replaces_observe_id="",
 ) -> None:
     """起 wait_for_user 冷 park：登记 HITL 请求 + 抛 HitlPark（task 落 AWAITING_HUMAN
     由 TaskManager 据 RunOutcome 定）。
@@ -993,7 +1003,8 @@ async def _cold_park(
         await commit_round(state, ctx)
         observe_request = make_observe_request(
             state, observe_boundary,
-            observe_boundary in {"plain_text", "finish_park", "task_switch"})
+            observe_boundary in {"plain_text", "finish_park", "task_switch"},
+            reply_anchor=reply_anchor, replaces_observe_id=replaces_observe_id)
         await capture_context(state, ctx, observe_request)
     req = await ctx.hitl.open(
         HitlAsk(
@@ -1024,6 +1035,7 @@ async def _cold_park(
 async def _park_for_interrupt(
     state: LoopState, ctx: LoopContext, *, edit: bool = False, preceding_events: tuple = (),
     replace_user_turn_id: str = "",
+    reply_anchor=None, replaces_observe_id="",
 ) -> None:
     """人按了暂停键 → park 等他续接。**对无人值守守卫豁免**（`unattended=False`）。
 
@@ -1038,11 +1050,13 @@ async def _park_for_interrupt(
     preface = PREFACE_AFTER_INTERRUPT_EDIT if edit else PREFACE_AFTER_INTERRUPT
     await _cold_park(state, ctx, preface, unattended=False,
                      observe_boundary="interrupt",
+                     reply_anchor=reply_anchor, replaces_observe_id=replaces_observe_id,
                      preceding_events=preceding_events, replace_user_turn_id=replace_user_turn_id)
 
 
 async def _park_await_user(
     state: LoopState, ctx: LoopContext, turn_num: int, *, boundary: str = "plain_text",
+    reply_anchor=None,
 ) -> None:
     """Yield a prose reply for background judgement when a user is present.
 
@@ -1063,10 +1077,11 @@ async def _park_await_user(
     # 并发不会因此失控：单交互线闸门保证一个 session 同时只有一条非 unattended 的线
     # （见 `TaskManager._interactive_line_held`）。
     await _cold_park(state, ctx, PREFACE_NORMAL, unattended=state.task.unattended,
-                     observe_boundary=boundary, await_user_turn=turn_num)
+                     observe_boundary=boundary, await_user_turn=turn_num,
+                     reply_anchor=reply_anchor)
 
 
-async def _interrupt_checkpoint(state: LoopState, ctx: LoopContext) -> None:
+async def _interrupt_checkpoint(state: LoopState, ctx: LoopContext, *, reply_anchor=None) -> None:
     """协作式停止点：软打断（pause）→ park；硬取消（cancel）→ CancelledError。
 
     提交点之前命中（act 第一轮的循环顶部，LLM 还没被调用过）→ 整轮丢弃而非 park，
@@ -1075,7 +1090,7 @@ async def _interrupt_checkpoint(state: LoopState, ctx: LoopContext) -> None:
     if _interrupt_pending(ctx):
         await discard_uncommitted_round(state, ctx)   # 命中则 raises RoundDiscarded
         edit = not ctx.run_phase.produced and not ctx.run_phase.in_tool_loop
-        await _park_for_interrupt(state, ctx, edit=edit)  # raises HitlPark
+        await _park_for_interrupt(state, ctx, edit=edit, reply_anchor=reply_anchor)  # raises HitlPark
     tok = ctx.cancel_token
     if tok is not None and tok.is_cancelled:
         tok.raise_if_cancelled()

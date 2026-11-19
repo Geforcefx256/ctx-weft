@@ -9,8 +9,7 @@ from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timedelta
 
-from ctx_weft.core.assembler.builder import history_records
-from ctx_weft.core.assembler.context import PromptContext, record_from_json
+from ctx_weft.core.assembler.context import PromptContext
 from ctx_weft.core.control.reducers import REPLAY_BATCH
 from ctx_weft.core.control.startup_view import rebuild_startup_view
 from ctx_weft.core.orchestrator.model import ModelChoice
@@ -25,7 +24,11 @@ from ctx_weft.protocols.content import (
 )
 from ctx_weft.protocols.events import EventOrigin, EventReadProjection, EventType
 from ctx_weft.protocols.llm import deserialize_call_config
-from ctx_weft.protocols.runtime import MemorySeedConflictError, SessionForkResult
+from ctx_weft.protocols.runtime import (
+    ForkCheckpointUnavailableError,
+    MemorySeedConflictError,
+    SessionForkResult,
+)
 
 
 def digest(value) -> str:
@@ -133,17 +136,18 @@ async def prepare_seed(
             matches.extend(row for row in rows if predicate(row.event))
         return matches
 
+    async def full(row):
+        (result,) = await store.read_range(
+            source_session_id, after_position=row.position - 1, through_position=row.position
+        )
+        return result
+
     responses = await find(
         EventType.LLM_RESPONSE_FINISHED, lambda ev: ev.id == response_event_id, head, ()
     )
-    response_row = responses[0] if responses else None
-    if response_row is None:
+    if not responses:
         raise ValueError("Source response is not committed in this session")
-    (response_row,) = await store.read_range(
-        source_session_id,
-        after_position=response_row.position - 1,
-        through_position=response_row.position,
-    )
+    response_row = await full(responses[0])
     response, p = response_row.event, response_row.event.payload
     if (
         response.origin != EventOrigin.LOOP_ACT
@@ -155,7 +159,34 @@ async def prepare_seed(
         raise ValueError(
             "Fork requires a completed, nonempty actor text response without tool calls"
         )
-    matches = await find(
+    checkpoints = await find(
+        EventType.OBSERVE_APPLIED,
+        lambda ev: (
+            ev.payload.get("fork_checkpoint", {}).get("reply_anchor", {}).get("response_event_id")
+            == response_event_id
+        ),
+        head,
+        (("fork_checkpoint", "reply_anchor", "response_event_id"),),
+    )
+    if len(checkpoints) != 1:
+        raise ForkCheckpointUnavailableError(
+            "Reply has no unique committed ObserveApplied fork checkpoint"
+        )
+    applied_row = await full(checkpoints[0])
+    checkpoint = applied_row.event.payload["fork_checkpoint"]
+    if (
+        checkpoint.get("version") != 1
+        or checkpoint.get("reply_anchor")
+        != {"response_event_id": response.id, "response_memory_id": p["memory_id"]}
+        or checkpoint.get("observe_id") != applied_row.event.payload.get("observe_id")
+        or applied_row.event.agent_id != response.agent_id
+        or applied_row.event.task_id != response.task_id
+        or applied_row.event.tenant_id != response.tenant_id
+        or checkpoint.get("agent_id") != response.agent_id
+        or checkpoint.get("task_id") != response.task_id
+    ):
+        raise MemorySeedConflictError("Reply checkpoint has inconsistent ownership")
+    prompts = await find(
         EventType.LLM_PROMPT_SENT,
         lambda ev: (
             ev.payload.get("request_id") == p.get("request_id")
@@ -166,19 +197,16 @@ async def prepare_seed(
         response_row.position,
         (("request_id",),),
     )
-    if len(matches) != 1 or not p.get("request_id"):
+    if len(prompts) != 1 or not p.get("request_id"):
         raise ValueError("Source response does not identify one saved prompt")
-    (prompt_row,) = await store.read_range(
-        source_session_id,
-        after_position=matches[0].position - 1,
-        through_position=matches[0].position,
-    )
-    prompt = prompt_row.event
+    prompt = (await full(prompts[0])).event
     inputs = PromptContext.from_payload(prompt.payload)
     if inputs.purpose != "act" or prompt.tenant_id != response.tenant_id:
         raise ValueError("Source prompt scope is inconsistent")
+    # The lightweight reducer validates Requested -> Prepared -> Applied, including
+    # after source snapshots. No conversation body is replayed or execution loaded.
     view = await rebuild_startup_view(
-        store, source_session_id, through_position=response_row.position
+        store, source_session_id, through_position=applied_row.position
     )
     source_session = view.sessions.get(source_session_id)
     source_agent = view.agents.get(response.agent_id)
@@ -207,136 +235,146 @@ async def prepare_seed(
     )
     memory_blobs = runtime.providers.get_memory_blob_store()
     event_blobs = runtime.providers.get_event_blob_store()
-    records = {r.id: r for r in await memory.read_records(inputs.memory_ids(), source_ctx)}
-    record_stores = {}
-    # Inline staged records in prompt events belong to the event blob namespace.
-    for index, block in enumerate(inputs.memory_blocks):
-        if "record" in block:
-            record = record_from_json(block["record"])
-            if not record.id:
-                record = replace(record, id=f"inline-memory:{index}")
-                block["memory_id"] = record.id
-            elif block.get("memory_id") not in (None, "", record.id):
-                raise ValueError("Inline source memory identity does not match its reference")
-            block["memory_id"] = record.id
-            records[record.id] = record
-            record_stores[record.id] = event_blobs
-    missing = set(inputs.memory_ids()) - records.keys()
-    if missing:
-        raise ValueError(f"Source prompt memories are unavailable: {sorted(missing)}")
-    history_ids = list(
-        dict.fromkeys(
-            b["memory_id"]
-            for b in inputs.memory_blocks
-            if b.get("kind") == "history" and b.get("memory_id")
-        )
-    )
-    # Shared inheritance projection: semantic normalization, with no token-budget trim.
-    history = history_records([records[rid] for rid in history_ids])
-    used = set(history_ids)
-    items = [
-        (r.content, r.role, r.metadata, r.blob_refs, record_stores.get(r.id, memory_blobs), r.id)
-        for r in history
-    ]
-    base_ids = [b["memory_id"] for b in inputs.memory_blocks if b.get("memory_id")]
-    base_ids += [
-        inputs.task[k] for k in ("user_prompt_memory_id", "outputs_memory_id") if inputs.task.get(k)
-    ]
-    for rid in base_ids:
-        if rid in used:
-            continue
-        record = records[rid]
-        items.append(
-            (
-                record.content,
-                record.role or "user",
-                record.metadata,
-                record.blob_refs,
-                record_stores.get(rid, memory_blobs),
-                rid,
-            )
-        )
-        used.add(rid)
-    # The task instruction precedes request-local appended messages.
-    if not inputs.task.get("user_prompt_memory_id") and not inputs.task.get(
-        "user_prompt_in_memory"
+    ids = checkpoint["agent_memory_ids"]
+    records = {r.id: r for r in await memory.read_records(ids, source_ctx)}
+    if set(ids) != records.keys():
+        raise ValueError("Checkpoint AGENT memories are unavailable")
+    ordered = [records[rid] for rid in ids]
+    if any(
+        r.scope != MemoryScope.AGENT
+        or r.address.session_id != source_session_id
+        or r.address.agent_id != response.agent_id
+        or r.kind not in (MemoryKind.CONVERSATION_TURN, MemoryKind.SUMMARY)
+        for r in ordered
     ):
-        content = content_from_jsonable(inputs.task.get("user_prompt"))
-        if content:
-            items.append((content, "user", {}, [], event_blobs, "task:user_prompt"))
-    for index, message in enumerate(inputs.appended_messages):
-        if message.get("memory_id"):
-            rid = message["memory_id"]
-            if rid not in used:
-                record = records[rid]
-                items.append(
-                    (
-                        record.content,
-                        message["role"],
-                        record.metadata,
-                        record.blob_refs,
-                        record_stores.get(rid, memory_blobs),
-                        rid,
-                    )
-                )
-                used.add(rid)
-            continue
-        items.append(
-            (
-                content_from_jsonable(message["content"]),
-                message["role"],
-                message,
-                [],
-                event_blobs,
-                f"inline:{index}",
-            )
+        raise MemorySeedConflictError("Checkpoint contains memory outside its AGENT scope")
+    items = [
+        dict(
+            source_id=r.id,
+            kind=str(r.kind),
+            role=r.role,
+            content=r.content,
+            metadata=deepcopy(r.metadata),
+            blob_refs=list(r.blob_refs),
         )
-    items.append((p["content"], "assistant", {}, [], memory_blobs, p["memory_id"]))
+        for r in ordered
+    ]
+    reply_present = any(
+        r.role == "assistant"
+        and (
+            r.metadata.get("final_reply")
+            or r.metadata.get("task_memory", {}).get("kind") == "final_reply"
+        )
+        and r.metadata.get("origin_task_id") == response.task_id
+        and isinstance(r.content, str)
+        and r.content.strip() == p["content"].strip()
+        for r in ordered
+    )
+    if not reply_present:
+        metadata = {}
+        closing = next(
+            (
+                r
+                for r in reversed(ordered)
+                if r.metadata.get("origin_task_id") == response.task_id
+                and r.metadata.get("task_memory", {}).get("kind") == "finish"
+            ),
+            None,
+        )
+        if closing is not None:
+            metadata = deepcopy(closing.metadata)
+            metadata["task_memory"]["kind"] = "final_reply"
+            metadata["final_reply"] = True
+            group = metadata["task_memory"]["group_id"]
+            for item in items:
+                if item["metadata"].get("task_memory", {}).get("group_id") == group:
+                    policy = item["metadata"].setdefault("finish_policy", {})
+                    policy["slot_count"] = (
+                        sum(
+                            i["metadata"].get("task_memory", {}).get("group_id") == group
+                            for i in items
+                        )
+                        + 1
+                    )
+            metadata["finish_policy"] = deepcopy(
+                next(
+                    i["metadata"]["finish_policy"]
+                    for i in items
+                    if i["metadata"].get("task_memory", {}).get("group_id") == group
+                )
+            )
+        reply = dict(
+            source_id=p["memory_id"],
+            kind=str(MemoryKind.CONVERSATION_TURN),
+            role="assistant",
+            content=p["content"],
+            metadata=metadata,
+            blob_refs=[],
+        )
+        if closing is None:
+            items.append(reply)
+        else:
+            items.insert(
+                next(i for i, item in enumerate(items) if item["source_id"] == closing.id), reply
+            )
     seed_id = identity(session_id, "root-memory")
-    frozen = []
+    record_ids = {item["source_id"]: identity(seed_id, i) for i, item in enumerate(items)}
     call_ids = {}
-    for _, role, metadata, _, _, _ in items:
-        if role == "assistant":
-            for call in metadata.get("tool_calls", []):
-                old = call["id"]
-                if old in call_ids:
-                    raise ValueError("Source memories have ambiguous tool call identities")
-                call_ids[old] = identity(seed_id, ["call", old])
     results = set()
-    for ordinal, (content, role, metadata, refs, blob_source, source_id) in enumerate(items):
-        md = {
-            "memory_seed": {"seed_id": seed_id, "ordinal": ordinal, "source_memory_id": source_id}
-        }
-        if role == "assistant" and metadata.get("tool_calls"):
-            md["tool_calls"] = deepcopy(metadata["tool_calls"])
-            for call in md["tool_calls"]:
+    for item in items:
+        if item["role"] == "assistant":
+            for call in item["metadata"].get("tool_calls", []):
+                if call["id"] in call_ids:
+                    raise ValueError("Source memories have ambiguous tool call identities")
+                call_ids[call["id"]] = identity(seed_id, ["call", call["id"]])
+    frozen = []
+    for ordinal, item in enumerate(items):
+        md = item["metadata"]
+        for key in ("seq_no", "topic_seq_no", "task_id"):
+            md.pop(key, None)  # Provider-derived coordinates belong to the new scope.
+        marker = md.get("task_memory")
+        if marker and marker.get("group_id"):
+            marker["group_id"] = identity(seed_id, ["group", marker["group_id"]])
+        policy = md.get("finish_policy")
+        if policy is not None:
+            policy["preserve_raw"] = False  # No TASK body is imported into this session.
+            original_reply = policy.pop("final_reply_record_id", None)
+            if original_reply in record_ids:
+                policy["final_reply_record_id"] = record_ids[original_reply]
+        md["memory_seed"] = dict(
+            seed_id=seed_id, ordinal=ordinal, source_memory_id=item["source_id"]
+        )
+        if item["role"] == "assistant":
+            for call in md.get("tool_calls", []):
                 call["id"] = call_ids[call["id"]]
-        if role == "tool":
-            old = metadata.get("tool_call_id")
+        if item["role"] == "tool":
+            old = md.get("tool_call_id")
             if old not in call_ids or old in results:
                 raise ValueError("Source memories contain an unpaired tool result")
             results.add(old)
             md["tool_call_id"] = call_ids[old]
-        content = await transfer_content(content, blob_source, event_blobs, source_ctx, target_ctx)
+        content = await transfer_content(
+            item["content"], memory_blobs, event_blobs, source_ctx, target_ctx
+        )
         retained = []
-        for ref in refs:
+        for ref in item["blob_refs"]:
             got = await memory_blobs.get(ref, source_ctx)
             if got is None:
                 raise ValueError(f"Retained seed blob is unavailable: {ref}")
             raw, media_type = got
             retained.append(
-                {"source_ref": ref, "event_ref": await event_blobs.put(raw, media_type, target_ctx)}
+                dict(source_ref=ref, event_ref=await event_blobs.put(raw, media_type, target_ctx))
             )
         frozen.append(
-            {
-                "id": identity(seed_id, ordinal),
-                "role": role,
-                "content": content_to_jsonable(content),
-                "metadata": md,
-                "retained_blobs": retained,
-                # A new contiguous timeline avoids sorting across unrelated source scopes.
-                "timestamp": (response.timestamp + timedelta(microseconds=ordinal)).isoformat(),
-            }
+            dict(
+                id=record_ids[item["source_id"]],
+                kind=item["kind"],
+                role=item["role"],
+                content=content_to_jsonable(content),
+                metadata=md,
+                retained_blobs=retained,
+                timestamp=(response.timestamp + timedelta(microseconds=ordinal)).isoformat(),
+            )
         )
     if set(call_ids) != results:
         raise ValueError("Source memories contain an unfinished tool call")
@@ -362,20 +400,22 @@ async def prepare_seed(
         tenant_id=response.tenant_id,
         agent_id=agent_id,
         origin=EventOrigin.RUNTIME,
-        payload={
-            "format_version": 1,
-            "seed_id": seed_id,
-            "request_fingerprint": fingerprint,
-            "record_count": len(frozen),
-            "manifest_hash": digest(frozen),
-            "records": frozen,
-            "source": {
-                "session_id": source_session_id,
-                "prompt_event_id": prompt.id,
-                "response_event_id": response.id,
-                "response_position": response_row.position,
-            },
-        },
+        payload=dict(
+            format_version=2,
+            seed_id=seed_id,
+            request_fingerprint=fingerprint,
+            record_count=len(frozen),
+            manifest_hash=digest(frozen),
+            records=frozen,
+            source=dict(
+                session_id=source_session_id,
+                prompt_event_id=prompt.id,
+                response_event_id=response.id,
+                response_position=response_row.position,
+                observe_id=checkpoint["observe_id"],
+                checkpoint_event_id=applied_row.event.id,
+            ),
+        ),
     )
     return (*creation, requested)
 
@@ -398,7 +438,7 @@ async def restore_seed(runtime, session_view):
     if (
         event.tenant_id != session_view.tenant_id
         or event.agent_id != session_view.root_agent_id
-        or payload.get("format_version") != 1
+        or payload.get("format_version") not in (1, 2)
         or digest(payload["records"]) != descriptor["manifest_hash"]
         or len(payload["records"]) != descriptor["record_count"]
         or any(
@@ -429,7 +469,7 @@ async def restore_seed(runtime, session_view):
                 actual.scope != MemoryScope.AGENT
                 or actual.address != address
                 or actual.role != item["role"]
-                or actual.kind != MemoryKind.CONVERSATION_TURN
+                or actual.kind != MemoryKind(item.get("kind", MemoryKind.CONVERSATION_TURN))
                 or actual.timestamp != datetime.fromisoformat(item["timestamp"])
                 or any(md.get(k) != v for k, v in item["metadata"].items())
             ):
@@ -465,7 +505,7 @@ async def restore_seed(runtime, session_view):
             events.append(
                 MemoryEvent(
                     id=item["id"],
-                    kind=MemoryKind.CONVERSATION_TURN,
+                    kind=MemoryKind(item.get("kind", MemoryKind.CONVERSATION_TURN)),
                     scope=MemoryScope.AGENT,
                     address=address,
                     role=item["role"],

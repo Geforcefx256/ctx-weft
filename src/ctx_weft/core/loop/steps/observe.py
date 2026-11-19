@@ -787,6 +787,8 @@ async def foreground_stop_checkpoint(state, ctx):
         "task_id": state.task.id, "observe_id": identity,
         "reason": "foreground_interrupted"}))
     await _park_for_interrupt(state, ctx, edit=True, preceding_events=tuple(closure),
+                              reply_anchor=_execution(ctx).options.get("reply_anchor"),
+                              replaces_observe_id=identity,
                               replace_user_turn_id=state.extra.get("waiting_hitl_id", ""))
 
 
@@ -1007,6 +1009,11 @@ def effect_key(event):
 
 
 async def emit_effect(state, ctx, event):
+    if event.type == EventType.TASK_FINALIZED:
+        from ctx_weft.core.fork_checkpoint import prepare_checkpoint
+        draft = await prepare_checkpoint(state, ctx)
+        if draft is not None and getattr(state, "run_outcome", None) is not None:
+            state.run_outcome = dataclasses.replace(state.run_outcome, fork_checkpoint=draft)
     observed_effect = event.type in EFFECT_TYPES and state.extra.get("observe_id")
     if observed_effect:
         event.causation_id = state.extra["observe_id"]
@@ -1114,8 +1121,16 @@ async def begin(state, ctx, boundary, judging):
             datetime.fromisoformat(options["segment_end_at"]) if options.get("segment_end_at") else now_utc()))
     if options.get("verdict"):
         state.extra["observe_decision"] = options
+    else:
+        state.extra.pop("observe_decision", None)
+    if state.extra.get("observe_id") != options["observe_id"]:
+        state.extra.pop("fork_checkpoint", None)
+        state.extra.pop("fork_checkpoint_prepared_event", None)
     state.extra.update(observe_id=options["observe_id"],
                        observe_effects=list(options.get("effects", [])))
+    state.extra["observe_fork_options"] = options
+    if options.get("fork_checkpoint"):
+        state.extra["fork_checkpoint"] = dict(options["fork_checkpoint"])
     state.extra.pop("observe_completion", None)
     if options.get("completion"):
         state.extra["observe_completion"] = options["completion"]
@@ -1209,15 +1224,22 @@ async def applied(state, ctx, *, reason=""):
                 for req in hitl.registry.list_pending(state.session.id):
                     if req.task_id == state.task.id:
                         await hitl.cancel(req.id, message=CancelReason.USER_CANCEL)
-    await ctx.event_bus.emit(make_event(state, EventType.OBSERVE_APPLIED, {
-        "task_id": state.task.id, "observe_id": state.extra["observe_id"],
-        **({"reason": reason} if reason else {})}))
+    from ctx_weft.core.fork_checkpoint import prepare_checkpoint, applied_event
+    draft = await prepare_checkpoint(state, ctx) if not reason else None
+    event = applied_event(state, ctx, draft, reason=reason)
+    if draft is None:
+        await ctx.event_bus.emit(event)
+    else:
+        await ctx.event_bus.emit_batch((event,))
 
 
 async def capture_context(state, ctx, options):
     """Pin immutable input records before the request becomes visible to another turn."""
     from ctx_weft.core.loop.driver import assistant_memory_checkpoint
     checked = options.get("observe_id")
+    if options.get("reply_anchor") is not None:
+        from ctx_weft.core.fork_checkpoint import validate_reply_anchor
+        options["reply_anchor"] = validate_reply_anchor(options["reply_anchor"])
     if checked and state.extra.get("assistant_context_checked") == checked:
         return
     fixed = options.get("context_record_ids")
@@ -1245,6 +1267,9 @@ async def capture_context(state, ctx, options):
             if options.get("completion"):
                 state.extra["observe_keep_raw"] = True  # Legacy summary has no proven input set.
             options["context_record_ids"] = record_ids
+        if options.get("reply_anchor") is not None and "fork_base_record_ids" not in options:
+            rows = await ctx.memory.read_records(options["context_record_ids"], ctx.provider_ctx)
+            options["fork_base_record_ids"] = [r.id for r in rows if r.scope == MemoryScope.AGENT]
     state.extra["assistant_context_checked"] = checked
     from copy import copy
     # Recovery already reconstructed outputs from immutable actor facts; the
@@ -1274,12 +1299,15 @@ def act_turns(state):
     return state.extra.get(ACT_TURNS_USED_KEY, getattr(state.agent.loop_config, "max_turns_per_act", 0))
 
 
-def make_observe_request(state, boundary, judging, *, mode="background"):
+def make_observe_request(state, boundary, judging, *, mode="background", reply_anchor=None,
+                         replaces_observe_id=""):
     """Build an intent, also embedded atomically in HitlOpened for park."""
     return {"observe_id": generate_id("obs"), "task_id": state.task.id,
             "agent_id": state.agent.id, "boundary": boundary,
             "segment_end_at": now_utc().isoformat(), "execution_mode": mode,
             "judge_task": judging,
+            **({"reply_anchor": dict(reply_anchor)} if reply_anchor else {}),
+            **({"replaces_observe_id": replaces_observe_id} if reply_anchor and replaces_observe_id else {}),
             **({"act_turns": act_turns(state)} if boundary == "max_turns" else {})}
 
 
@@ -1290,11 +1318,13 @@ async def request_background_observe(state, ctx, options):
     boundary = options.get("boundary", "")
     judging = options.get("judge_task", boundary == "task_switch" or
                           judges(boundary))
-    intent = make_observe_request(state, boundary, judging)
+    intent = make_observe_request(state, boundary, judging, reply_anchor=options.get("reply_anchor"))
     options.update({key: value for key, value in intent.items()
                     if key not in {"task_id", "agent_id"}})
     await capture_context(state, ctx, options)
     intent.update(context_record_ids=options["context_record_ids"])
+    if "fork_base_record_ids" in options:
+        intent["fork_base_record_ids"] = list(options["fork_base_record_ids"])
     await ctx.event_bus.emit(make_event(state, EventType.OBSERVE_REQUESTED, intent))
 
 
@@ -1302,7 +1332,8 @@ async def finish_observe(outcome, task_id, emit):
     """Called after foreground run/task settlement, using its original envelope emitter."""
     if outcome.observe_id and not outcome.observe_report_pending:
         await emit(EventType.OBSERVE_APPLIED, task_id=task_id,
-                   payload={"task_id": task_id, "observe_id": outcome.observe_id})
+                   payload={"task_id": task_id, "observe_id": outcome.observe_id,
+                            **({"fork_checkpoint": outcome.fork_checkpoint} if outcome.fork_checkpoint else {})})
 
 
 def blocks_actor_recovery(info):

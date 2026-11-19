@@ -568,7 +568,8 @@ def deserialize_view(data: dict[str, Any]) -> RunStateView:
 # missing counts and already-started ordinals default to zero without historical replay.
 # v13: target-owned memory seed descriptors survive both pending and applied snapshots.
 # Older versions predate seeding and remain usable for their existing sessions.
-_PROJECTION_VERSION = 13
+# v14: pending Observe retains explicit reply anchors and prepared fork checkpoints.
+_PROJECTION_VERSION = 14
 
 
 #: 全量重放要排掉的类型：状态快照事件本身。
@@ -707,7 +708,7 @@ def snapshot_is_usable(
         return False
     if getattr(snapshot, "last_commit_position", None) is None:
         return False
-    if getattr(snapshot, "projection_version", 1) not in (10, 11, 12, _PROJECTION_VERSION):
+    if getattr(snapshot, "projection_version", 1) not in (10, 11, 12, 13, _PROJECTION_VERSION):
         return False
     if snapshot.last_commit_position > head:
         return False
@@ -1430,20 +1431,48 @@ def _apply(view: RunStateView, ev: Event) -> None:
     #
     # 键取 payload 的 `task_id` 而不是 `ev.task_id`：这两个事件把它写在 payload 里，
     # 事件头上的 task_id 在段边界上可能是父任务。
-    elif t in (EventType.OBSERVE_REQUESTED, EventType.OBSERVE_STARTED,
+    elif t in (EventType.OBSERVE_REQUESTED, EventType.OBSERVE_STARTED, EventType.REPLY_FORK_CHECKPOINT_PREPARED,
                EventType.OBSERVE_COMPLETED, EventType.OBSERVE_APPLIED):
         rtid = p.get("task_id", "")
         # Old foreground Completed events carry no recoverable observation identity.
         if rtid and (p.get("observe_id") or t != EventType.OBSERVE_COMPLETED):
             key = p.get("observe_id") or rtid
             if t == EventType.OBSERVE_APPLIED:
+                checkpoint = p.get("fork_checkpoint")
+                if checkpoint is not None:
+                    from ctx_weft.protocols.runtime import MemorySeedConflictError
+                    pending = view.pending_observe.get(key)
+                    if pending is None or pending.get("fork_checkpoint") != checkpoint:
+                        raise MemorySeedConflictError("Applied fork checkpoint was not prepared by this Observe")
                 view.pending_observe.pop(key, None)
             else:
+                if t == EventType.REPLY_FORK_CHECKPOINT_PREPARED:
+                    from ctx_weft.protocols.runtime import MemorySeedConflictError
+                    pending = view.pending_observe.get(key)
+                    checkpoint = p.get("fork_checkpoint") or {}
+                    if (pending is None or pending.get("reply_anchor") != checkpoint.get("reply_anchor")
+                            or checkpoint.get("observe_id") != key
+                            or checkpoint.get("agent_id") != pending.get("agent_id")
+                            or checkpoint.get("task_id") != rtid
+                            or checkpoint.get("version") != 1
+                            or not pending.get("reply_anchor")
+                            or not isinstance(checkpoint.get("agent_memory_ids"), list)
+                            or any(not isinstance(rid, str) or not rid for rid in checkpoint["agent_memory_ids"])
+                            or len(set(checkpoint["agent_memory_ids"])) != len(checkpoint["agent_memory_ids"])
+                            or (pending.get("fork_checkpoint") is not None
+                                and pending["fork_checkpoint"] != checkpoint)):
+                        raise MemorySeedConflictError("Fork checkpoint does not match its Observe binding")
                 info = view.pending_observe.setdefault(key, {})
+                if p.get("reply_anchor") is not None:
+                    from ctx_weft.core.fork_checkpoint import validate_reply_anchor
+                    anchor = validate_reply_anchor(p["reply_anchor"])
+                    if info.get("reply_anchor") is not None and info["reply_anchor"] != anchor:
+                        raise ValueError("Observe reply binding cannot change")
                 for name in ("task_id", "observe_id", "boundary", "agent_id", "segment_end_at",
                              "judge_task", "execution_mode", "verdict", "disposition",
                              "report_boundary", "short_leaf", "context_record_ids", "waiting_hitl_id", "act_turns",
-                             "observe_index"):
+                             "observe_index", "reply_anchor", "replaces_observe_id", "fork_base_record_ids",
+                             "fork_checkpoint"):
                     if name in p:
                         info[name] = p[name]
                 if t == EventType.OBSERVE_STARTED and p.get("observe_id"):

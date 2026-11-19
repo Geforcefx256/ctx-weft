@@ -209,6 +209,7 @@ async def _put_dispatch_result(memory, parent_scope, task, content: str, ts, pro
             metadata={"origin_task_id": task.parent_task_id,
                       "child_task_id": task.id,
                       "dispatch_state": "closed" if replace else "running",
+                      **({"observe_id": operation_id} if operation_id else {}),
                       "task_memory": task_record_metadata("result", tool_call_id)},
         ),
     ], provider_ctx)

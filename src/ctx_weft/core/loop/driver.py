@@ -553,7 +553,11 @@ class StepDriver:
         state.origin = _STEP_ORIGIN.get(name, EventOrigin.LOOP_DRIVER)
         if name == "observe":
             from ctx_weft.core.loop.steps.act import _interrupt_checkpoint
-            await _interrupt_checkpoint(state, local_ctx)
+            if local_ctx.execution.options.get("reply_anchor"):
+                await _interrupt_checkpoint(state, local_ctx,
+                    reply_anchor=local_ctx.execution.options["reply_anchor"])
+            else:
+                await _interrupt_checkpoint(state, local_ctx)
             from ctx_weft.core.loop.steps.observe import prepare_foreground_observe
             boundary = local_ctx.execution.options.get("boundary") or state.act_exit_reason or "normal"
             await prepare_foreground_observe(state, local_ctx, boundary,
@@ -585,6 +589,10 @@ class StepDriver:
         from ctx_weft.core.loop.steps.observe import emit_effect
         for event in outcome.events:
             await emit_effect(state, ctx, event)
+        if "run_outcome" in outcome.state_patch:
+            # Finalization's durable effect hook can attach its prepared fork
+            # checkpoint. The runtime consumes this same patch after the yield.
+            outcome.state_patch["run_outcome"] = state.run_outcome
         if foreground:
             await ctx.event_bus.emit(make_event(
                 state, EventType.STEP_COMPLETED,

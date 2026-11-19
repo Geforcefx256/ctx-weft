@@ -449,6 +449,9 @@ class MemoryProvider(Protocol):
         addressable by ID after supersession; snapshot verification trusts these IDs.
         Records initialized by AgentMemorySeedRequested retain the same immutable
         ID readability for the lifetime of the target session, even after folding.
+        AGENT records referenced by an ObserveApplied fork_checkpoint (or a pending
+        ReplyForkCheckpointPrepared) likewise retain their immutable kinds,
+        metadata and associated image blobs for the lifetime of that session.
         Providers that archive folded records must keep them addressable by ID.
         Return each existing requested ID once, ordered by (timestamp, seq_no),
         retaining request order for exact ties.

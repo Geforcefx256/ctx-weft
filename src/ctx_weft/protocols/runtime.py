@@ -31,6 +31,10 @@ class MemorySeedConflictError(ValueError):
     """An existing target, record or receipt disagrees with its frozen seed."""
 
 
+class ForkCheckpointUnavailableError(ValueError):
+    """The reply has no committed ObserveApplied fork checkpoint."""
+
+
 @dataclass(frozen=True)
 class ShutdownReport:
     """Execution quiescence and confirmed recoverability are separate guarantees."""

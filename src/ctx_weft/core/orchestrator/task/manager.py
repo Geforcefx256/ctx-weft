@@ -1299,6 +1299,9 @@ class TaskManager:
 
     async def finish_observe(self, outcome, task_id):
         from ctx_weft.core.loop.steps.observe import finish_observe
+        if self._tasks.get(task_id) is not None and self._tasks[task_id].status == "CANCELED":
+            from dataclasses import replace
+            outcome = replace(outcome, fork_checkpoint=None)
         await finish_observe(outcome, task_id, self._emit)
 
     async def _apply_task_switch(self, caller_id: str) -> str:
@@ -2611,6 +2614,9 @@ class TaskManager:
                 agent_id=agent_id if agent_id is not None else (
                     self._agent_id_of(task_id) if task_id is not None else None),
                 payload=payload, metadata=metadata)
+            if event_type == EventType.OBSERVE_APPLIED and event.payload.get("fork_checkpoint"):
+                from ctx_weft.core.fork_checkpoint import stabilize_applied
+                event = stabilize_applied(event, event.payload["fork_checkpoint"])
             if task_id is not None and event_type in (EventType.TASK_FAILED, EventType.TASK_INTERRUPTED):
                 publish_state = on_committed
 

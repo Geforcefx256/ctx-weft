@@ -2026,10 +2026,11 @@ class CtxWeftRuntime:
         template_id: str | None = None, llm_account: str | None = None,
         llm_model: str | None = None, llm_config: ModelCallConfig | None = None,
     ) -> "SessionForkResult":
-        """Create an idle root with the saved prompt memories and selected text reply.
+        """Create an idle root from the reply's committed AGENT-memory checkpoint.
 
         session_id is the caller's durable idempotency key. No source execution is
         loaded; retries use target-owned materials even after source deletion.
+        Raises ForkCheckpointUnavailableError until ObserveApplied is committed.
         """
         from ctx_weft.core.memory_seed import digest, identity, prepare_seed, fork_result
         from ctx_weft.core.control.reducers import rebuild_view
@@ -2041,11 +2042,12 @@ class CtxWeftRuntime:
         if self._config.event_commit_policy != "required":
             raise ValueError("Memory seeding requires confirmed event persistence")
         llm_config = deepcopy(llm_config)
-        fingerprint = digest({"source_session_id": source_session_id,
+        request_identity = {"source_session_id": source_session_id,
             "response_event_id": response_event_id, "template_id": template_id,
             "llm_account": llm_account, "llm_model": llm_model,
-            "llm_config": serialize_call_config(llm_config) if llm_config is not None else None,
-            "format_version": 1})
+            "llm_config": serialize_call_config(llm_config) if llm_config is not None else None}
+        fingerprint = digest({**request_identity, "format_version": 2})
+        legacy_fingerprint = digest({**request_identity, "format_version": 1})
         if self.storage_health(session_id) is not None:
             if not await self.recover_storage(session_id):
                 raise PersistenceUnavailableError(self.storage_health(session_id))
@@ -2066,7 +2068,7 @@ class CtxWeftRuntime:
             view = await rebuild_view(self.event_store, session_id)
             session = view.sessions.get(session_id)
             if (session is None or session.context_seed is None
-                    or session.context_seed["request_fingerprint"] != fingerprint):
+                    or session.context_seed["request_fingerprint"] not in (fingerprint, legacy_fingerprint)):
                 raise MemorySeedConflictError("Target session has another creation request")
             await self._ensure_memory_seed(session)
             await self._rebuild_session_locked(session_id, strict=True)
@@ -3370,6 +3372,7 @@ class CtxWeftRuntime:
         await capture_context(state, ctx, options)
         state.extra.update(observe_id=options["observe_id"],
             observe_effects=list(options.get("effects", [])))
+        state.extra["observe_fork_options"] = options
         if options.get("completion"):
             state.extra["observe_completion"] = options["completion"]
         mechanical = bool(options.get("verdict"))

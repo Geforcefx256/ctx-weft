@@ -48,7 +48,8 @@ _AGENT_FIELDS = _fields("id", "status", "status_reason", "current_task_id", "tem
                         "llm_config", "created_at")
 _HITL_FIELDS = _fields("id", "hitl_id", "form", "session_id", "task_id", "agent_id", "tenant_id",
                        "delivery", "tool_call_id", "stage", "outcome")
-_OBSERVE_FIELDS = _fields("task_id", "observe_id", "judge_task", "observe_index", "started")
+_OBSERVE_FIELDS = _fields("task_id", "agent_id", "observe_id", "judge_task", "observe_index", "started",
+                         "reply_anchor", "replaces_observe_id", "fork_base_record_ids", "fork_checkpoint")
 
 _PAYLOAD_FIELDS = {
     EventType.AGENT_MEMORY_SEED_REQUESTED: _fields(
@@ -70,6 +71,7 @@ _PAYLOAD_FIELDS = {
        if kind != EventType.TASK_REVIEWING},
     **{kind: _fields("reason") for kind in _AGENT_STATUS_BY_EVENT},
     EventType.OBSERVE_REQUESTED: _OBSERVE_FIELDS,
+    EventType.REPLY_FORK_CHECKPOINT_PREPARED: _OBSERVE_FIELDS,
     EventType.OBSERVE_STARTED: _OBSERVE_FIELDS,
     EventType.OBSERVE_APPLIED: _OBSERVE_FIELDS,
     EventType.HITL_OPENED: (*_HITL_FIELDS,
@@ -95,7 +97,7 @@ _PAYLOAD_FIELDS[EventType.STATE_SNAPSHOT] = (
     *tuple(("state_blob", *path) for path in _BLOB_PATHS),
 )
 STARTUP_PROJECTION = EventReadProjection(_PAYLOAD_FIELDS)
-STARTUP_SNAPSHOT_VERSION = 5
+STARTUP_SNAPSHOT_VERSION = 6
 STARTUP_SNAPSHOT_PROJECTION = EventReadProjection({EventType.STATE_SNAPSHOT: _fields(
     "cut_position", "projection_version", "chain_depth", "reason",
     "startup_state_blob", "startup_projection_version",

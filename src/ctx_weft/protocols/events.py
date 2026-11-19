@@ -111,6 +111,7 @@ class EventType(StrEnum):
     SESSION_CREATED = "SessionCreated"
     AGENT_MEMORY_SEED_REQUESTED = "AgentMemorySeedRequested"
     AGENT_MEMORY_SEED_APPLIED = "AgentMemorySeedApplied"
+    REPLY_FORK_CHECKPOINT_PREPARED = "ReplyForkCheckpointPrepared"
     SESSION_RESUMED = "SessionResumed"     # recover_session 续跑被打断的 session 时发
     SESSION_STATUS_CHANGED = "SessionStatusChanged"
     SESSION_FINISHED = "SessionFinished"   # TaskManager 确定 session 真正结束时发（含 final_status）

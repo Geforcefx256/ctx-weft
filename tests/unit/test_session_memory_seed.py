@@ -28,7 +28,7 @@ async def source(core, *, tools=False, inline=False):
         MemoryEvent(
             id="source-user",
             kind=MemoryKind.CONVERSATION_TURN,
-            scope=MemoryScope.TASK,
+            scope=MemoryScope.AGENT,
             address=address,
             content="old user input",
             role="user",
@@ -41,7 +41,7 @@ async def source(core, *, tools=False, inline=False):
                 MemoryEvent(
                     id="source-call",
                     kind=MemoryKind.CONVERSATION_TURN,
-                    scope=MemoryScope.TASK,
+                    scope=MemoryScope.AGENT,
                     address=address,
                     content="looking it up",
                     role="assistant",
@@ -55,7 +55,7 @@ async def source(core, *, tools=False, inline=False):
                 MemoryEvent(
                     id="source-result",
                     kind=MemoryKind.CONVERSATION_TURN,
-                    scope=MemoryScope.TASK,
+                    scope=MemoryScope.AGENT,
                     address=address,
                     content="old tool result",
                     role="tool",
@@ -113,7 +113,48 @@ async def source(core, *, tools=False, inline=False):
         },
     )
     await core.event_bus.emit_batch((prompt, response))
+    await publish_checkpoint(core, response, [m.id for m in memories])
     return handle, prompt, response
+
+
+async def publish_checkpoint(core, response, ids, *, applied=True):
+    """Commit the Observe protocol for storage-focused seed tests."""
+    observe_id = "obs:" + response.id
+    anchor = {"response_event_id": response.id, "response_memory_id": response.payload["memory_id"]}
+    checkpoint = {
+        "version": 1,
+        "observe_id": observe_id,
+        "reply_anchor": anchor,
+        "agent_id": response.agent_id,
+        "task_id": response.task_id,
+        "agent_memory_ids": list(ids),
+    }
+
+    def event(kind, payload):
+        return new_event(
+            kind,
+            session_id=response.session_id,
+            tenant_id=response.tenant_id,
+            agent_id=response.agent_id,
+            task_id=response.task_id,
+            origin="loop.observe",
+            payload={
+                "task_id": response.task_id,
+                "agent_id": response.agent_id,
+                "observe_id": observe_id,
+                **payload,
+            },
+        )
+
+    events = (
+        event(EventType.OBSERVE_REQUESTED, {"reply_anchor": anchor, "fork_base_record_ids": ids}),
+        event(EventType.OBSERVE_COMPLETED, {"action": "recap", "accepted": True}),
+        event(EventType.REPLY_FORK_CHECKPOINT_PREPARED, {"fork_checkpoint": checkpoint}),
+    )
+    if applied:
+        events += (event(EventType.OBSERVE_APPLIED, {"fork_checkpoint": checkpoint}),)
+    await core.event_bus.emit_batch(events)
+    return checkpoint
 
 
 async def fork(core, response, **kwargs):
@@ -147,12 +188,11 @@ async def test_copies_saved_candidates_superseded_and_inline_without_running(mon
     monkeypatch.setattr(memory, "load_view_ids", no_recall)
     result = await fork(core, response)
     assert isinstance(result, SessionForkResult)
-    assert result.prompt_event_id == prompt.id and result.record_count == 3
+    assert result.prompt_event_id == prompt.id and result.record_count == 2
     monkeypatch.undo()
     records = await seed_records(core, result)
     assert [r.content for r in records] == [
         "old user input",
-        "inline user input",
         "selected answer",
     ]
     assert all(r.scope == MemoryScope.AGENT and r.address.task_id is None for r in records)
@@ -170,7 +210,7 @@ async def test_copies_saved_candidates_superseded_and_inline_without_running(mon
         EventType.AGENT_MEMORY_SEED_APPLIED,
     ]
     assert await fork(core, response) == result
-    assert len(await seed_records(core, result)) == 3
+    assert len(await seed_records(core, result)) == 2
     await core.close()
 
 
@@ -468,7 +508,7 @@ async def test_images_are_owned_by_target_in_both_blob_namespaces(opaque):
     record = MemoryEvent(
         id="source-image",
         kind=MemoryKind.CONVERSATION_TURN,
-        scope=MemoryScope.TASK,
+        scope=MemoryScope.AGENT,
         address=MemoryAddress(session_id="s1", agent_id=response.agent_id, task_id="task"),
         role="user",
         content=[
@@ -487,6 +527,7 @@ async def test_images_are_owned_by_target_in_both_blob_namespaces(opaque):
     response.id += "image"
     response.payload["request_id"] = "image"
     await core.event_bus.emit_batch((prompt, response))
+    await publish_checkpoint(core, response, ["source-user", record.id])
     result = await fork(core, response)
     original_memory = core.providers.get_memory()
     await core.close()
@@ -611,7 +652,7 @@ async def test_first_fork_from_cold_source_does_not_load_source_execution():
 
 
 @pytest.mark.asyncio
-async def test_inline_staged_record_without_persistent_id_is_copied():
+async def test_inline_task_record_is_not_copied():
     from ctx_weft.core.assembler.context import json_value
 
     core = runtime()
@@ -620,7 +661,7 @@ async def test_inline_staged_record_without_persistent_id_is_copied():
         ["source-user"], ProviderContext(session_id="s1")
     )
     inline = json_value(record)
-    inline.update(id="", content="staged input")
+    inline.update(id="", content="staged input", scope="task")
     prompt = deepcopy(prompt)
     prompt.id += "inline"
     prompt.payload["request_id"] = "inline"
@@ -629,9 +670,9 @@ async def test_inline_staged_record_without_persistent_id_is_copied():
     response.id += "inline"
     response.payload["request_id"] = "inline"
     await core.event_bus.emit_batch((prompt, response))
+    await publish_checkpoint(core, response, [])
     result = await fork(core, response)
     assert [r.content for r in await seed_records(core, result)] == [
-        "staged input",
         "selected answer",
     ]
     await core.close()
@@ -669,4 +710,145 @@ async def test_sql_events_and_memory_survive_full_close_and_reopen(tmp_path, mon
         monkeypatch.setattr(store, "read_range", target_only)
         assert await fork(core, response) == result
         assert len(await seed_records(core, result)) == result.record_count
+        await core.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prepared", [False, True])
+async def test_unapplied_reply_is_not_forkable_and_does_not_load_source(prepared):
+    from ctx_weft import ForkCheckpointUnavailableError
+
+    core = runtime()
+    _, prompt, response = await source(core)
+    prompt = deepcopy(prompt)
+    prompt.id += "pending"
+    prompt.payload["request_id"] = "pending"
+    response = deepcopy(response)
+    response.id += "pending"
+    response.payload["request_id"] = "pending"
+    await core.event_bus.emit_batch((prompt, response))
+    if prepared:
+        await publish_checkpoint(core, response, ["source-user"], applied=False)
+    cold = runtime(core.event_store)
+    cold.providers.register_memory(core.providers.get_memory())
+    with pytest.raises(ForkCheckpointUnavailableError):
+        await fork(cold, response)
+    assert not cold._task_managers
+    assert await core.event_store.committed_head("branch") == 0
+    await cold.close()
+    await core.close()
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_cannot_import_task_scope_even_if_referenced():
+    core = runtime()
+    _, prompt, response = await source(core)
+    await core.providers.get_memory().ingest(
+        MemoryEvent(
+            id="private-task",
+            kind=MemoryKind.SUMMARY,
+            scope=MemoryScope.TASK,
+            address=MemoryAddress(session_id="s1", agent_id=response.agent_id, task_id="task"),
+            role="assistant",
+            content="private task recap",
+            timestamp=datetime.now(UTC),
+        ),
+        ProviderContext(session_id="s1"),
+    )
+    prompt, response = deepcopy(prompt), deepcopy(response)
+    prompt.id += "private"
+    prompt.payload["request_id"] = "private"
+    response.id += "private"
+    response.payload["request_id"] = "private"
+    await core.event_bus.emit_batch((prompt, response))
+    await publish_checkpoint(core, response, ["private-task"])
+    with pytest.raises(MemorySeedConflictError):
+        await fork(core, response)
+    assert await core.event_store.committed_head("branch") == 0
+    await core.close()
+
+
+@pytest.mark.asyncio
+async def test_v1_seed_remains_recoverable_with_original_fingerprint(monkeypatch):
+    from ctx_weft.core.memory_seed import digest, identity, prepare_seed
+
+    core = runtime()
+    _, _, response = await source(core)
+    fingerprint = digest(
+        dict(
+            source_session_id="s1",
+            response_event_id=response.id,
+            template_id=None,
+            llm_account=None,
+            llm_model=None,
+            llm_config=None,
+            format_version=1,
+        )
+    )
+    events = await prepare_seed(
+        core,
+        source_session_id="s1",
+        response_event_id=response.id,
+        session_id="legacy",
+        agent_id=identity("legacy", "root-agent"),
+        fingerprint=fingerprint,
+        template_id=None,
+        llm_account=None,
+        llm_model=None,
+        llm_config=None,
+    )
+    request = events[-1]
+    request.payload["format_version"] = 1
+    for item in request.payload["records"]:
+        item.pop("kind")
+    request.payload["manifest_hash"] = digest(request.payload["records"])
+    await core.event_bus.emit_batch(events)
+    cold = runtime(core.event_store)
+    original = cold.event_store.read_range
+
+    async def target_only(sid, **kwargs):
+        assert sid == "legacy"
+        return await original(sid, **kwargs)
+
+    monkeypatch.setattr(cold.event_store, "read_range", target_only)
+    result = await cold.fork_session_from_response(
+        source_session_id="s1", response_event_id=response.id, session_id="legacy"
+    )
+    assert len(await seed_records(cold, result)) == 2
+    await cold.close()
+    monkeypatch.undo()
+    await core.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "corruption", ["binding", "agent", "duplicate_ids", "invalid_id", "applied"]
+)
+async def test_reducer_rejects_changed_checkpoint_materials(corruption):
+    from ctx_weft.core.control.reducers import reduce_events
+
+    core = runtime()
+    try:
+        await source(core)
+        events = [deepcopy(row.event) for row in await core.event_store.read_range("s1")]
+        kind = (
+            EventType.OBSERVE_APPLIED
+            if corruption == "applied"
+            else EventType.REPLY_FORK_CHECKPOINT_PREPARED
+        )
+        event = next(event for event in events if event.type == kind)
+        checkpoint = event.payload["fork_checkpoint"]
+        if corruption == "binding":
+            checkpoint["reply_anchor"]["response_memory_id"] = "another-reply"
+        elif corruption == "agent":
+            checkpoint["agent_id"] = "another-agent"
+        elif corruption == "duplicate_ids":
+            checkpoint["agent_memory_ids"] *= 2
+        elif corruption == "invalid_id":
+            checkpoint["agent_memory_ids"] = [{}]
+        else:
+            checkpoint["agent_memory_ids"] = []
+        with pytest.raises(MemorySeedConflictError):
+            reduce_events(events, "")
+    finally:
         await core.close()
